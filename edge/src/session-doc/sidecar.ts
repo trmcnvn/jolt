@@ -36,6 +36,8 @@ export interface DiffSidecar {
   readonly chatId: string;
   readonly deviceId: string;
   readonly checkoutPath: string;
+  readonly vcs?: "git" | "jujutsu";
+  readonly label?: string;
   readonly branch?: string;
   readonly headSha?: string;
   /** Unified patch, bounded (same 3MiB cap as today). */

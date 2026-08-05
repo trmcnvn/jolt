@@ -1,7 +1,7 @@
-//! Loader motion — the pure math behind comet's loading indicators.
+//! Loader motion — the pure math behind jolt's loading indicators.
 //!
 //! These are the curves and constants the gpui viewport animates with
-//! (`comet-ui/src/motion.rs`, `comet-ui/src/loaders.rs`), lifted here so any
+//! (`jolt-ui/src/motion.rs`, `jolt-ui/src/loaders.rs`), lifted here so any
 //! surface animates the *same* loaders rather than inventing its own spinner.
 //! A loading indicator is a brand surface; two of them that disagree read as
 //! two products.
@@ -10,24 +10,26 @@
 //! it from a frame delta or from wall-clock elapsed time and get identical
 //! output.
 
-/// Comet loader pulse period.
-pub const COMET_PULSE_MS: u64 = 2_400;
+/// Jolt loader pulse period.
+pub const JOLT_PULSE_MS: u64 = 2_400;
 /// Gradient matrix spinner wave period.
 pub const GRADIENT_SPIN_MS: u64 = 750;
+/// Dotted activity-orb sweep period.
+pub const ACTIVITY_ORB_MS: u64 = 2_800;
 
-/// Cells in the comet wave loader.
-pub const COMET_CELLS: usize = 5;
+/// Cells in the jolt wave loader.
+pub const JOLT_CELLS: usize = 5;
 /// Side length of the gradient spinner matrix.
 pub const MATRIX_SIDE: usize = 3;
 
-/// Comet loader cells rest at this opacity between pulses.
+/// Jolt loader cells rest at this opacity between pulses.
 pub const PULSE_MIN_OPACITY: f32 = 0.08;
 /// …and at this scale.
 pub const PULSE_MIN_SCALE: f32 = 0.9;
 /// Per-cell stagger, as a fraction of the pulse period (0.15s of 2.4s).
 pub const PULSE_STAGGER: f32 = 0.15 / 2.4;
 
-/// Per-row tints of the gradient matrix spinner — comet's "sunrise" gradient
+/// Per-row tints of the gradient matrix spinner — jolt's "sunrise" gradient
 /// sampled at each row: cool blue at the top, through amber, to pink.
 pub const GSPIN_ROW_TINTS: [u32; MATRIX_SIDE] = [0xB6D3EF, 0xEDB185, 0xF888A0];
 /// Opacity a gradient-spinner cell rests at between pulses.
@@ -39,6 +41,58 @@ pub const GSPIN_DIM: f32 = 0.1;
 pub const MINI_RING: [[usize; 2]; 3] = [[0, 1], [5, 2], [4, 3]];
 /// Cells in the mini spinner's ring.
 pub const MINI_RING_LEN: f32 = 6.0;
+
+/// One projected dot in the activity orb, in normalized canvas coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActivityOrbDot {
+    pub x: f32,
+    pub y: f32,
+    pub depth: f32,
+    pub radius: f32,
+    pub opacity: f32,
+}
+
+/// Position and shade one point on a static dotted globe while a bright
+/// meridian sweeps around it. Keeping geometry fixed avoids tiny moving dots
+/// quantizing between device pixels; only radius and opacity animate.
+pub fn activity_orb_dot(
+    phase: f32,
+    latitude: usize,
+    latitude_count: usize,
+    longitude: usize,
+    longitude_count: usize,
+) -> ActivityOrbDot {
+    let latitude_count = latitude_count.max(2);
+    let latitude = latitude.min(latitude_count - 1);
+    let lat = -std::f32::consts::FRAC_PI_2
+        + latitude as f32 / (latitude_count - 1) as f32 * std::f32::consts::PI;
+    let lon = longitude as f32 / longitude_count.max(1) as f32 * std::f32::consts::TAU;
+    let cos_lat = lat.cos();
+    let x = cos_lat * lon.cos();
+    let y = lat.sin();
+    let z = cos_lat * lon.sin();
+
+    let yaw = 0.55_f32;
+    let tilt = 0.38_f32;
+    let x1 = x * yaw.cos() + z * yaw.sin();
+    let z1 = -x * yaw.sin() + z * yaw.cos();
+    let y1 = y * tilt.cos() - z1 * tilt.sin();
+    let z2 = y * tilt.sin() + z1 * tilt.cos();
+    let depth = (z2 + 1.0) * 0.5;
+
+    let scan = phase.rem_euclid(1.0) * std::f32::consts::TAU;
+    let angle = lon + yaw - scan;
+    let distance = angle.sin().atan2(angle.cos());
+    let boost = (-(distance * distance) / 0.16).exp() * z2.max(0.0);
+
+    ActivityOrbDot {
+        x: 0.5 + x1 * 0.4,
+        y: 0.5 - y1 * 0.4,
+        depth,
+        radius: 0.024 + 0.025 * depth + 0.026 * boost,
+        opacity: (0.32 + 0.42 * depth + 0.26 * boost).min(1.0),
+    }
+}
 
 /// Linear interpolation.
 pub fn lerp(from: f32, to: f32, t: f32) -> f32 {
@@ -55,18 +109,18 @@ pub fn pulse_wave(phase: f32) -> f32 {
     0.5 - 0.5 * (phase * std::f32::consts::TAU).cos()
 }
 
-/// Comet loader cell opacity for a phase: 0.08 → 1 → 0.08.
+/// Jolt loader cell opacity for a phase: 0.08 → 1 → 0.08.
 pub fn pulse_opacity(phase: f32) -> f32 {
     PULSE_MIN_OPACITY + (1.0 - PULSE_MIN_OPACITY) * pulse_wave(phase)
 }
 
-/// Comet loader cell scale for a phase: 0.9 → 1 → 0.9.
+/// Jolt loader cell scale for a phase: 0.9 → 1 → 0.9.
 pub fn pulse_scale(phase: f32) -> f32 {
     PULSE_MIN_SCALE + (1.0 - PULSE_MIN_SCALE) * pulse_wave(phase)
 }
 
 /// Gradient-spin cell opacity for a local phase `t` (0..1 of the period),
-/// ported from comet's `gradient-spin-pulse` keyframes: full at the cycle
+/// ported from jolt's `gradient-spin-pulse` keyframes: full at the cycle
 /// start, easing down to `dim` by 45%, resting at `dim` until 92%, then rising
 /// back to full — the per-cell phase offset sweeps this pulse across the grid.
 pub fn gspin_opacity(t: f32, dim: f32) -> f32 {
@@ -90,8 +144,8 @@ pub fn gspin_cell_phase(row: usize, col: usize) -> f32 {
     if max == 0.0 { 0.0 } else { d / (max + 1.0) }
 }
 
-/// The comet mark's pixels — `[x, y]` of each 100×100 cell on the 820×940
-/// canvas (comet's `logo.tsx` CELLS), shared by the static mark and the
+/// The jolt mark's pixels — `[x, y]` of each 100×100 cell on the 820×940
+/// canvas (jolt's `logo.tsx` CELLS), shared by the static mark and the
 /// animated loader.
 #[rustfmt::skip]
 pub const MARK_CELLS: [(f32, f32); 34] = [
@@ -105,7 +159,7 @@ pub const MARK_CELLS: [(f32, f32); 34] = [
 /// Fraction of the pulse cycle the mark's light sweep occupies.
 pub const MARK_SPREAD: f32 = 0.55;
 
-/// Per-cell stagger along the comet's flight axis. The stagger *adds* phase
+/// Per-cell stagger along the jolt's flight axis. The stagger *adds* phase
 /// (the original uses a negative CSS delay, starting the cell mid-cycle), so a
 /// larger value means the cell is further along and therefore **leads**: the
 /// tail tip `(720, 0)` leads at `MARK_SPREAD`, the head `(0, 840)` trails at 0.
@@ -155,7 +209,7 @@ mod tests {
         );
         // Always inside the unit interval, for any input.
         for raw in [-4.2f32, -0.1, 0.0, 0.5, 7.9] {
-            for index in 0..COMET_CELLS {
+            for index in 0..JOLT_CELLS {
                 let phase = staggered_phase(raw, index, PULSE_STAGGER);
                 assert!((0.0..1.0).contains(&phase), "{raw} {index} -> {phase}");
             }
@@ -212,6 +266,31 @@ mod tests {
                 "({x},{y}) -> {stagger}"
             );
         }
+    }
+
+    #[test]
+    fn activity_orb_sweep_loops_without_moving_the_lattice() {
+        let mut changed = false;
+        for latitude in 0..6 {
+            for longitude in 0..12 {
+                let dot = activity_orb_dot(0.37, latitude, 6, longitude, 12);
+                assert!((0.0..=1.0).contains(&dot.x), "x={}", dot.x);
+                assert!((0.0..=1.0).contains(&dot.y), "y={}", dot.y);
+                assert!((0.0..=1.0).contains(&dot.depth));
+                assert!(dot.radius > 0.0);
+                assert!((0.0..=1.0).contains(&dot.opacity));
+
+                let later = activity_orb_dot(0.62, latitude, 6, longitude, 12);
+                close(dot.x, later.x, "lattice x stays fixed");
+                close(dot.y, later.y, "lattice y stays fixed");
+                changed |= (dot.opacity - later.opacity).abs() > 1e-4;
+
+                let looped = activity_orb_dot(1.37, latitude, 6, longitude, 12);
+                close(dot.radius, looped.radius, "orb radius loops");
+                close(dot.opacity, looped.opacity, "orb opacity loops");
+            }
+        }
+        assert!(changed, "the meridian sweep should animate dot intensity");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! CheckoutDiffSync — checkout-scoped working-tree diff production (feature-inventory
-//! §3.5; port of comet's `checkout-diff-sync.ts` + `git-metadata-sync.ts`).
+//! §3.5; port of jolt's `checkout-diff-sync.ts` + `git-metadata-sync.ts`).
 //!
-//! Chats do not own working-tree state: a concrete Git checkout does. This service
+//! Chats do not own working-copy state: a concrete VCS checkout does. This service
 //! groups this device's chats by their canonical checkout identity (`chat.cwd` →
 //! [`Repos::checkout_identity`]), computes one bounded atomic snapshot per checkout,
 //! and publishes it three ways:
@@ -11,12 +11,12 @@
 //! - a [`DiffSidecar`] JSON `POST {edge}/diff/{chatId}` for every syncing chat of
 //!   the checkout (bearer = engine edge token), so "review pending changes while
 //!   the host sleeps" works;
-//! - `chat.branch` upkeep: the same fs events cover the checkout's git dir (HEAD),
-//!   so each snapshot reconciles mismatched workspace chat rows' `branch` (and
+//! - `chat.branch` upkeep: each snapshot reconciles mismatched workspace chat rows' `branch` (and
 //!   `checkoutId` at reconcile time).
 //!
-//! Fast recursive `notify` watchers (debounced [`WATCH_DEBOUNCE`]) are backed by a
-//! slow 2-minute repair tick because native watchers may coalesce or drop events.
+//! Recursive `notify` watchers provide low-latency Git updates. While the Changes
+//! stream has subscribers, every checkout is also refreshed every five seconds;
+//! this is the primary refresh path for JJ and repairs dropped native events.
 //! Snapshots carry a sha256 checksum; an unchanged checksum publishes nothing.
 
 use std::collections::{HashMap, HashSet};
@@ -29,11 +29,12 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
 
-use comet_proto::{Chat, CheckoutDiff, DiffFileSummary};
+use jolt_proto::{Chat, CheckoutDiff, DiffFileSummary, VcsKind};
 
 use crate::EngineError;
 use crate::doc_host::EdgeConfig;
 use crate::repos::{CheckoutIdentity, Repos};
+use crate::vcs::compose_command_path;
 use crate::workspace_host::WorkspaceHost;
 
 /// Hard cap on the unified patch (plus untracked hunks) — "Partial snapshot".
@@ -42,6 +43,9 @@ pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Slow repair pass: re-reconcile + re-sync every checkout.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
+/// Live JJ snapshots are intentionally pull-driven: opening the Changes pane
+/// subscribes, then refreshes at this cadence until it closes.
+const ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Max subdirectories a checkout may have before we skip its live recursive
 /// watch (one OS watch per dir; past this the watcher thread's own bookkeeping
 /// costs more than instant diffs are worth). A normal source tree is well
@@ -59,6 +63,9 @@ pub struct DiffSidecar {
     pub chat_id: String,
     pub device_id: String,
     pub checkout_path: String,
+    pub vcs: VcsKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,6 +82,8 @@ pub struct DiffSidecar {
 /// One bounded atomic snapshot of a checkout's working tree.
 #[derive(Debug, Clone)]
 pub struct DiffSnapshot {
+    pub vcs: VcsKind,
+    pub label: Option<String>,
     pub branch: String,
     pub head_sha: Option<String>,
     pub patch: String,
@@ -272,10 +281,13 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
     // the initial + repair sync still keep the snapshot correct.
     let mut watchers = Vec::new();
     let mut targets: Vec<&PathBuf> = vec![&identity.root];
-    if !identity.git_dir.starts_with(&identity.root) {
-        targets.push(&identity.git_dir);
+    if !identity.metadata_dir.starts_with(&identity.root) {
+        targets.push(&identity.metadata_dir);
     }
     for target in targets {
+        if inner.repos.vcs_kind() != Some(VcsKind::Git) {
+            break;
+        }
         // A recursive `notify` watch installs one OS watch per subdirectory and
         // has no way to prune subtrees. On a checkout carrying big dependency
         // trees (node_modules, vendored deps) that is tens of thousands of
@@ -325,7 +337,6 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         Arc::downgrade(&entry),
         kick_rx,
     ));
-    let _ = kick_tx.send(()); // initial snapshot
 }
 
 /// Per-checkout task: trailing-debounce fs kicks, then compute + publish. Runs
@@ -347,6 +358,9 @@ async fn entry_task(
         let (Some(inner), Some(entry)) = (inner.upgrade(), entry.upgrade()) else {
             return;
         };
+        if inner.diffs_tx.receiver_count() == 0 {
+            continue;
+        }
         sync_entry(&inner, &entry).await;
     }
 }
@@ -385,6 +399,8 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
         checkout_id: entry.identity.id.clone(),
         device_id: inner.device_id.clone(),
         cwd: entry.identity.root.to_string_lossy().to_string(),
+        vcs: snapshot.vcs,
+        label: snapshot.label.clone(),
         patch: snapshot.patch.clone(),
         files: snapshot.files.clone(),
         additions: snapshot.additions,
@@ -408,6 +424,8 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
                 chat_id: chat.id.clone(),
                 device_id: inner.device_id.clone(),
                 checkout_path: entry.identity.root.to_string_lossy().to_string(),
+                vcs: snapshot.vcs,
+                label: snapshot.label.clone(),
                 branch: Some(snapshot.branch.clone()),
                 head_sha: snapshot.head_sha.clone(),
                 patch: snapshot.patch.clone(),
@@ -467,12 +485,15 @@ fn publish_watch(inner: &Arc<DiffSyncInner>) {
     publish_watch_with(inner, None);
 }
 
-/// Chat-watch follower + repair tick. Holds only weak handles so dropping the
+/// Chat-watch follower + active-pane refresh tick. Holds only weak handles so dropping the
 /// service tears the loop down.
 async fn diff_sync_task(inner: Weak<DiffSyncInner>, mut chats_rx: watch::Receiver<Vec<Chat>>) {
     let mut repair = tokio::time::interval(REPAIR_INTERVAL);
     repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    repair.tick().await; // consume the immediate first tick
+    repair.tick().await;
+    let mut active_refresh = tokio::time::interval(ACTIVE_REFRESH_INTERVAL);
+    active_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    active_refresh.tick().await;
     loop {
         tokio::select! {
             changed = chats_rx.changed() => {
@@ -487,8 +508,18 @@ async fn diff_sync_task(inner: Weak<DiffSyncInner>, mut chats_rx: watch::Receive
                 let Some(inner) = inner.upgrade() else { break };
                 let chats = chats_rx.borrow().clone();
                 reconcile(&inner, chats).await;
-                for entry in lock(&inner.entries).values() {
-                    let _ = entry.kick_tx.send(());
+                if inner.diffs_tx.receiver_count() > 0 {
+                    for entry in lock(&inner.entries).values() {
+                        let _ = entry.kick_tx.send(());
+                    }
+                }
+            }
+            _ = active_refresh.tick() => {
+                let Some(inner) = inner.upgrade() else { break };
+                if inner.diffs_tx.receiver_count() > 0 {
+                    for entry in lock(&inner.entries).values() {
+                        let _ = entry.kick_tx.send(());
+                    }
                 }
             }
         }
@@ -504,29 +535,39 @@ struct Capture {
     truncated: bool,
 }
 
-/// Run git capturing stdout under a hard byte ceiling — the child is killed once
+/// Run the active VCS capturing stdout under a hard byte ceiling — the child is killed once
 /// the cap is hit, so an arbitrarily large repository diff never buffers fully.
-async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capture, EngineError> {
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C").arg(cwd).args(args);
+async fn capture_command(
+    repos: &Repos,
+    cwd: &Path,
+    args: &[&str],
+    max_bytes: usize,
+) -> Result<Capture, EngineError> {
+    let backend = repos.vcs_command()?;
+    let mut cmd = tokio::process::Command::new(&backend.executable);
+    if backend.kind == VcsKind::Git {
+        cmd.arg("-C").arg(cwd);
+    } else {
+        cmd.current_dir(cwd);
+    }
+    cmd.args(args);
+    compose_command_path(&mut cmd, &backend.executable);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     let mut child = cmd
         .spawn()
-        .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
+        .map_err(|e| EngineError::Other(format!("{} spawn failed: {e}", backend.kind.label())))?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        EngineError::Other(format!("{} stdout unavailable", backend.kind.label()))
+    })?;
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 64 * 1024];
     let mut truncated = false;
     loop {
-        let n = stdout
-            .read(&mut buf)
-            .await
-            .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
+        let n = stdout.read(&mut buf).await.map_err(|e| {
+            EngineError::Other(format!("{} read failed: {e}", backend.kind.label()))
+        })?;
         if n == 0 {
             break;
         }
@@ -542,14 +583,14 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
     let output = child
         .wait_with_output()
         .await
-        .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
+        .map_err(|e| EngineError::Other(format!("{} wait failed: {e}", backend.kind.label())))?;
     if !output.status.success() && !truncated {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let message = stderr.trim();
         return Err(EngineError::Other(if message.is_empty() {
-            format!("git exited {}", output.status)
+            format!("{} exited {}", backend.kind.label(), output.status)
         } else {
-            format!("git: {message}")
+            format!("{}: {message}", backend.kind.label())
         }));
     }
     Ok(Capture {
@@ -675,7 +716,17 @@ fn untracked_patch(path: &str, content: &str) -> String {
 /// as synthesized new-file hunks. 3MiB patch cap with a `truncated` flag; sha256
 /// checksum over branch ‖ head ‖ patch ‖ files ‖ truncated.
 pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, EngineError> {
-    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
+    match repos.vcs_kind() {
+        Some(VcsKind::Git) => capture_git_diff(repos, root).await,
+        Some(VcsKind::Jujutsu) => capture_jj_diff(repos, root).await,
+        None => Err(EngineError::Other(
+            "No supported VCS executable found".into(),
+        )),
+    }
+}
+
+async fn capture_git_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, EngineError> {
+    let head = capture_command(repos, root, &["rev-parse", "--verify", "HEAD"], 256)
         .await
         .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
         .unwrap_or_default();
@@ -689,19 +740,22 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
         .await
         .unwrap_or_else(|_| "HEAD".into());
 
-    let names = capture_git(
+    let names = capture_command(
+        repos,
         root,
         &["diff", "--name-status", "-z", "--find-renames", base, "--"],
         2 * 1024 * 1024,
     )
     .await?;
-    let nums = capture_git(
+    let nums = capture_command(
+        repos,
         root,
         &["diff", "--numstat", "-z", "--find-renames", base, "--"],
         2 * 1024 * 1024,
     )
     .await?;
-    let tracked = capture_git(
+    let tracked = capture_command(
+        repos,
         root,
         &[
             "diff",
@@ -717,7 +771,8 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
     .await?;
     // Untracked listing via porcelain status; `--no-optional-locks` keeps this
     // read-only (a status-triggered index refresh would re-kick our own watcher).
-    let status = capture_git(
+    let status = capture_command(
+        repos,
         root,
         &["--no-optional-locks", "status", "--porcelain", "-z"],
         2 * 1024 * 1024,
@@ -732,7 +787,7 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
         patch.truncate(boundary);
-        patch.push_str("\n# Comet diff truncated\n");
+        patch.push_str("\n# Jolt diff truncated\n");
     }
 
     // `?? path` records; rename records (`R  new\0old`) consume their extra field.
@@ -817,6 +872,8 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
     let checksum = crate::repos::hex(&hasher.finalize());
 
     Ok(DiffSnapshot {
+        vcs: VcsKind::Git,
+        label: None,
         branch,
         head_sha: (!head.is_empty()).then_some(head),
         patch,
@@ -825,6 +882,143 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
         deletions,
         truncated,
         checksum,
+    })
+}
+
+fn parse_jj_files(value: &[u8]) -> Vec<DiffFileSummary> {
+    String::from_utf8_lossy(value)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let (Some(status), Some(source), Some(target)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return None;
+            };
+            let status = match status {
+                "added" => "added",
+                "removed" => "deleted",
+                "renamed" => "renamed",
+                "copied" => "copied",
+                _ => "modified",
+            };
+            Some(DiffFileSummary {
+                path: target.to_string(),
+                old_path: (source != target).then(|| source.to_string()),
+                status: status.into(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+            })
+        })
+        .collect()
+}
+
+fn apply_patch_stats_by_order(files: &mut [DiffFileSummary], patch: &str) {
+    let mut index = None;
+    for line in patch.lines() {
+        if line.starts_with("diff --git ") {
+            let next = index.map_or(0, |index: usize| index + 1);
+            index = (next < files.len()).then_some(next);
+            continue;
+        }
+        let Some(file) = index.and_then(|index| files.get_mut(index)) else {
+            continue;
+        };
+        if line.starts_with("Binary files ") || line == "GIT binary patch" {
+            file.binary = true;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            file.additions = file.additions.saturating_add(1);
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            file.deletions = file.deletions.saturating_add(1);
+        }
+    }
+}
+
+async fn capture_jj_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, EngineError> {
+    let tracked = capture_command(
+        repos,
+        root,
+        &[
+            "--no-pager",
+            "--color=never",
+            "diff",
+            "--git",
+            "--context",
+            "3",
+        ],
+        MAX_PATCH_BYTES,
+    )
+    .await?;
+    let listed = capture_command(
+        repos,
+        root,
+        &[
+            "--no-pager",
+            "--color=never",
+            "--ignore-working-copy",
+            "diff",
+            "-T",
+            "status ++ \"\\t\" ++ source.path() ++ \"\\t\" ++ target.path() ++ \"\\n\"",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let identity = capture_command(
+        repos,
+        root,
+        &[
+            "--no-pager",
+            "--color=never",
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "change_id.shortest(8) ++ \"\\t\" ++ commit_id ++ \"\\n\"",
+        ],
+        512,
+    )
+    .await?;
+
+    let identity = String::from_utf8_lossy(&identity.stdout);
+    let (change_id, commit_id) = identity.trim().split_once('\t').unwrap_or(("@", ""));
+    let label = format!("Working copy · {change_id}");
+    let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
+    let truncated = tracked.truncated || listed.truncated;
+    if tracked.truncated {
+        let boundary = patch.rfind('\n').unwrap_or(0);
+        patch.truncate(boundary);
+        patch.push_str("\n# Jolt diff truncated\n");
+    }
+    let mut files = parse_jj_files(&listed.stdout);
+    apply_patch_stats_by_order(&mut files, &patch);
+    let additions = files.iter().map(|file| file.additions).sum();
+    let deletions = files.iter().map(|file| file.deletions).sum();
+    let files_json = serde_json::to_string(&files)
+        .map_err(|err| EngineError::Other(format!("diff files serialize: {err}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    hasher.update([0]);
+    hasher.update(commit_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(patch.as_bytes());
+    hasher.update([0]);
+    hasher.update(files_json.as_bytes());
+    hasher.update(if truncated { b"1" } else { b"0" });
+
+    Ok(DiffSnapshot {
+        vcs: VcsKind::Jujutsu,
+        label: Some(label.clone()),
+        branch: label,
+        head_sha: (!commit_id.is_empty()).then(|| commit_id.to_string()),
+        patch,
+        files,
+        additions,
+        deletions,
+        truncated,
+        checksum: crate::repos::hex(&hasher.finalize()),
     })
 }
 

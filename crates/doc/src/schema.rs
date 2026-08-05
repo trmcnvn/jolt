@@ -349,6 +349,63 @@ impl SessionDoc {
         Ok(false)
     }
 
+    /// Replace one text part and stamp its message status in a single commit.
+    /// Returns `false` when the message or text part does not exist.
+    pub fn update_text_message(
+        &self,
+        message_id: &str,
+        part_id: &str,
+        text: &str,
+        status: MessageStatus,
+    ) -> Result<bool, DocError> {
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                entry.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == message_id
+            );
+            if !id_matches {
+                continue;
+            }
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                return Ok(false);
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let id_matches = matches!(
+                    part.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == part_id
+                );
+                if !id_matches {
+                    continue;
+                }
+                let Some(loro::ValueOrContainer::Container(loro::Container::Text(body))) =
+                    part.get("text")
+                else {
+                    return Ok(false);
+                };
+                body.update(text, Default::default())
+                    .map_err(|error| DocError::Schema(error.to_string()))?;
+                entry.insert("status", status_str(status))?;
+                self.doc.commit();
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        Ok(false)
+    }
+
     /// Append an error part to an existing entry (crash recovery: the aborted
     /// entry must SAY why it ended — "Run interrupted by engine restart…" —
     /// not just truncate silently). Returns `false` when no entry matches.
@@ -565,7 +622,7 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
 
 /// Incremental streaming writer for one assistant entry.
 ///
-/// Port of comet's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
+/// Port of jolt's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
 /// live segment (from `fold_event_into_parts`) at each commit tick, it diffs against what's in
 /// the doc and writes only the delta:
 /// - trailing text growth → `LoroText` append (RLE-merged),
@@ -776,7 +833,7 @@ pub fn materialize_tail(
 mod tests {
     use super::*;
     use crate::parts::fold_event_into_parts;
-    use comet_proto::{AgentEvent, ToolCall};
+    use jolt_proto::{AgentEvent, ToolCall};
 
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -949,6 +1006,29 @@ mod tests {
         );
         let entries = doc.read_entries().unwrap();
         assert_eq!(entries[0].status, Some(MessageStatus::Aborted));
+    }
+
+    #[test]
+    fn update_text_message_replaces_body_and_completes_entry() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let mut entry = user_entry("m1", "Running…");
+        entry.role = MessageRole::System;
+        entry.status = Some(MessageStatus::Streaming);
+        doc.push_message(&entry).unwrap();
+
+        assert!(
+            doc.update_text_message("m1", "t0", "finished", MessageStatus::Complete)
+                .unwrap()
+        );
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries[0].status, Some(MessageStatus::Complete));
+        assert_eq!(
+            entries[0].parts,
+            vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "finished".into(),
+            }]
+        );
     }
 
     #[test]

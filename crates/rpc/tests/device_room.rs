@@ -25,10 +25,10 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
 
-use comet_rpc::device_room::{
+use jolt_rpc::device_room::{
     CLIENT_CLOSED, CLIENT_GONE, HOST_CLOSED, HOST_OFFLINE, NUDGE_KIND, RELAY_KIND,
 };
-use comet_rpc::{
+use jolt_rpc::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
     RpcError, RpcReply, RpcService, StaticToken, decode_device_frame, device_room_ws_url,
     encode_device_frame, methods,
@@ -156,7 +156,7 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
         while let Some(out) = rx.recv().await {
             match out {
                 Out::Frame(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
+                    if sink.send(WsMessage::Binary(bytes.into())).await.is_err() {
                         break;
                     }
                 }
@@ -322,7 +322,7 @@ fn cache(edge_url: &str) -> Arc<LinkCache> {
     LinkCache::new(config)
 }
 
-fn noop_nudge() -> comet_rpc::NudgeHandler {
+fn noop_nudge() -> jolt_rpc::NudgeHandler {
     Arc::new(|_| {})
 }
 
@@ -531,7 +531,7 @@ async fn nudges_reach_the_host_callback() {
     let relay = FakeRelay::start().await;
     let service = TestService::new("host-a");
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id| {
+    let on_nudge: jolt_rpc::NudgeHandler = Arc::new(move |chat_id| {
         let _ = tx.send(chat_id);
     });
     let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, on_nudge);
@@ -546,15 +546,15 @@ async fn nudges_reach_the_host_callback() {
 }
 
 /// Live-edge variant: run the same host+client path through a real DeviceRoom DO.
-/// `COMET_EDGE_WS=http://127.0.0.1:26640 cargo test -p comet-rpc -- --ignored live_edge`
-/// (dev-mode edge; COMET_EDGE_TOKEN defaults to a fixed dev user id).
+/// `JOLT_EDGE_WS=http://127.0.0.1:26640 cargo test -p jolt-rpc -- --ignored live_edge`
+/// (dev-mode edge; JOLT_EDGE_TOKEN defaults to a fixed dev user id).
 #[tokio::test]
-#[ignore = "needs a running edge (set COMET_EDGE_WS)"]
+#[ignore = "needs a running edge (set JOLT_EDGE_WS)"]
 async fn live_edge_relay_round_trip() {
-    let Ok(edge_url) = std::env::var("COMET_EDGE_WS") else {
-        panic!("set COMET_EDGE_WS to the edge base URL (e.g. http://127.0.0.1:26640)");
+    let Ok(edge_url) = std::env::var("JOLT_EDGE_WS") else {
+        panic!("set JOLT_EDGE_WS to the edge base URL (e.g. http://127.0.0.1:26640)");
     };
-    let token = std::env::var("COMET_EDGE_TOKEN").unwrap_or_else(|_| "relay-live-test".into());
+    let token = std::env::var("JOLT_EDGE_TOKEN").unwrap_or_else(|_| "relay-live-test".into());
     let device_id = format!("relay-live-{}", uuid::Uuid::new_v4());
 
     let service = TestService::new("live-host");

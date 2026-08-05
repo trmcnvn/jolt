@@ -1,5 +1,5 @@
-//! Light/dark switching: what the user asked for, what the OS reports, and the
-//! plumbing that turns a change in either into a repaint.
+//! Appearance and typography switching: what the user selected, what the OS
+//! reports, and the plumbing that turns a change into a full repaint.
 //!
 //! Three pieces, following the pattern zed uses (`crates/theme/src/theme.rs`
 //! `SystemAppearance` + `reload_theme` + `cx.refresh_windows`):
@@ -21,11 +21,11 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{App, Global, Subscription, Window};
+use gpui::{App, Global, SharedString, Subscription, Window};
 use serde::{Deserialize, Serialize};
 
 use crate::settings::UiSettings;
-use crate::theme::{Appearance, Theme};
+use crate::theme::{Appearance, DEFAULT_CODE_FONT, DEFAULT_UI_FONT, Theme};
 
 /// The user's appearance preference. Persisted in `ui-settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -59,12 +59,23 @@ impl AppearanceMode {
 pub struct AppearanceState {
     pub mode: AppearanceMode,
     pub system: Appearance,
+    pub ui_font: SharedString,
+    pub code_font: SharedString,
+    pub terminal_font: SharedString,
     /// Where `ui-settings.json` lives, so a menu action can persist the choice
     /// without routing through the shell entity that normally owns settings.
     pub data_dir: PathBuf,
 }
 
 impl Global for AppearanceState {}
+
+/// Which part of Jolt a font preference controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontRole {
+    Ui,
+    Code,
+    Terminal,
+}
 
 /// Combine the user's choice with the OS state.
 pub fn resolve(mode: AppearanceMode, system: Appearance) -> Appearance {
@@ -78,16 +89,30 @@ pub fn resolve(mode: AppearanceMode, system: Appearance) -> Appearance {
 /// Install the appearance globals and the matching theme. Call once at boot,
 /// before any window opens, so the first frame is already the right palette
 /// (installing later produces a visible dark-to-light flash).
-pub fn init(mode: AppearanceMode, data_dir: impl Into<PathBuf>, cx: &mut App) {
+pub fn init(
+    mode: AppearanceMode,
+    ui_font: impl AsRef<str>,
+    code_font: impl AsRef<str>,
+    terminal_font: impl AsRef<str>,
+    data_dir: impl Into<PathBuf>,
+    cx: &mut App,
+) {
     let system = Appearance::from_window(cx.window_appearance());
+    let available = cx.text_system().all_font_names();
+    let ui_font = resolve_font_family(ui_font.as_ref(), DEFAULT_UI_FONT, &available);
+    let code_font = resolve_font_family(code_font.as_ref(), DEFAULT_CODE_FONT, &available);
+    let terminal_font = resolve_font_family(terminal_font.as_ref(), DEFAULT_CODE_FONT, &available);
     tracing::debug!(?mode, ?system, "appearance: initial");
     cx.set_global(AppearanceState {
         mode,
         system,
+        ui_font: ui_font.clone().into(),
+        code_font: code_font.clone().into(),
+        terminal_font: terminal_font.clone().into(),
         data_dir: data_dir.into(),
     });
     sync_ns_appearance(mode);
-    Theme::install(resolve(mode, system), cx);
+    Theme::install_with_fonts(resolve(mode, system), ui_font, code_font, terminal_font, cx);
 }
 
 /// The mode currently in effect (defaults to `System` before [`init`]).
@@ -95,6 +120,25 @@ pub fn mode(cx: &App) -> AppearanceMode {
     cx.try_global::<AppearanceState>()
         .map(|s| s.mode)
         .unwrap_or_default()
+}
+
+/// The effective UI, code, and terminal font families.
+pub fn font_families(cx: &App) -> (SharedString, SharedString, SharedString) {
+    cx.try_global::<AppearanceState>()
+        .map(|state| {
+            (
+                state.ui_font.clone(),
+                state.code_font.clone(),
+                state.terminal_font.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                DEFAULT_UI_FONT.into(),
+                DEFAULT_CODE_FONT.into(),
+                DEFAULT_CODE_FONT.into(),
+            )
+        })
 }
 
 /// Change the user's preference, repaint if that changed the palette, and write
@@ -109,19 +153,77 @@ pub fn set_mode(mode: AppearanceMode, cx: &mut App) {
     }
     state.mode = mode;
     let data_dir = state.data_dir.clone();
+    let ui_font = state.ui_font.clone();
+    let code_font = state.code_font.clone();
+    let terminal_font = state.terminal_font.clone();
     apply(cx);
-    persist(mode, &data_dir);
+    persist(mode, &ui_font, &code_font, &terminal_font, &data_dir);
 }
 
-/// Read-modify-write `ui-settings.json` for just the appearance key.
+/// Change one font family, immediately re-lay out every window, and persist it.
+pub fn set_font(role: FontRole, family: impl AsRef<str>, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let fallback = match role {
+        FontRole::Ui => DEFAULT_UI_FONT,
+        FontRole::Code | FontRole::Terminal => DEFAULT_CODE_FONT,
+    };
+    let available = cx.text_system().all_font_names();
+    let family = resolve_font_family(family.as_ref(), fallback, &available);
+    let state = cx.global_mut::<AppearanceState>();
+    let target = match role {
+        FontRole::Ui => &mut state.ui_font,
+        FontRole::Code => &mut state.code_font,
+        FontRole::Terminal => &mut state.terminal_font,
+    };
+    if target.as_ref() == family {
+        return;
+    }
+    *target = family.into();
+    let mode = state.mode;
+    let ui_font = state.ui_font.clone();
+    let code_font = state.code_font.clone();
+    let terminal_font = state.terminal_font.clone();
+    let data_dir = state.data_dir.clone();
+    apply(cx);
+    persist(mode, &ui_font, &code_font, &terminal_font, &data_dir);
+}
+
+/// Resolve a persisted family against the current machine's catalogue. Family
+/// names are matched case-insensitively, preserving the platform's spelling.
+pub fn resolve_font_family(requested: &str, fallback: &str, available: &[String]) -> String {
+    let requested = requested.trim();
+    available
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(requested))
+        .or_else(|| {
+            available
+                .iter()
+                .find(|name| name.eq_ignore_ascii_case(fallback))
+        })
+        .cloned()
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Read-modify-write `ui-settings.json` for the appearance-owned fields.
 ///
 /// Deliberately a fresh load rather than a write of some cached struct: the
 /// shell holds its own `UiSettings` and saves it debounced, so writing a stale
 /// snapshot from here would silently roll back a pane resize the user made
-/// seconds earlier. Reloading keeps this to the one field we own.
-fn persist(mode: AppearanceMode, data_dir: &Path) {
+/// seconds earlier. Reloading keeps this to the fields appearance owns.
+fn persist(
+    mode: AppearanceMode,
+    ui_font: &str,
+    code_font: &str,
+    terminal_font: &str,
+    data_dir: &Path,
+) {
     let mut settings = UiSettings::load(data_dir);
     settings.appearance = mode;
+    settings.ui_font = ui_font.to_string();
+    settings.code_font = code_font.to_string();
+    settings.terminal_font = terminal_font.to_string();
     if let Err(err) = settings.save(data_dir) {
         tracing::warn!(error = %err, "could not persist appearance");
     }
@@ -162,22 +264,27 @@ fn sync(system: Appearance, cx: &mut App) {
     apply(cx);
 }
 
-/// Re-resolve the palette and, if it moved, swap the theme and force a full
-/// repaint. A no-op when the resolved appearance is unchanged — the OS fires the
-/// notification for vibrancy and accent-color changes too, and repainting every
-/// window for those would be a visible hitch for nothing.
+/// Re-resolve the palette and typography and, if either moved, swap the theme
+/// and force a full repaint. A no-op when the effective theme is unchanged —
+/// the OS fires notifications for vibrancy and accent-color changes too.
 pub fn apply(cx: &mut App) {
     let Some(state) = cx.try_global::<AppearanceState>() else {
         return;
     };
     sync_ns_appearance(state.mode);
     let wanted = resolve(state.mode, state.system);
-    let changed = !cx
-        .try_global::<Theme>()
-        .is_some_and(|t| t.appearance == wanted);
+    let ui_font = state.ui_font.clone();
+    let code_font = state.code_font.clone();
+    let terminal_font = state.terminal_font.clone();
+    let changed = !cx.try_global::<Theme>().is_some_and(|t| {
+        t.appearance == wanted
+            && t.font_sans == ui_font
+            && t.font_mono == code_font
+            && t.font_terminal == terminal_font
+    });
     if changed {
-        tracing::debug!(?wanted, "appearance: installing palette");
-        Theme::install(wanted, cx);
+        tracing::debug!(?wanted, %ui_font, %code_font, %terminal_font, "appearance: installing theme");
+        Theme::install_with_fonts(wanted, ui_font, code_font, terminal_font, cx);
         cx.refresh_windows();
     }
     // Unconditional, even when the palette did not move: this is the only thing
@@ -272,6 +379,23 @@ mod tests {
     #[test]
     fn default_mode_is_system() {
         assert_eq!(AppearanceMode::default(), AppearanceMode::System);
+    }
+
+    #[test]
+    fn font_resolution_preserves_available_names_and_heals_missing_ones() {
+        let available = vec!["Geist".into(), "Geist Mono".into(), "Menlo".into()];
+        assert_eq!(
+            resolve_font_family("menlo", DEFAULT_CODE_FONT, &available),
+            "Menlo"
+        );
+        assert_eq!(
+            resolve_font_family("Removed Font", DEFAULT_CODE_FONT, &available),
+            DEFAULT_CODE_FONT
+        );
+        assert_eq!(
+            resolve_font_family("", DEFAULT_UI_FONT, &available),
+            DEFAULT_UI_FONT
+        );
     }
 
     /// The setting round-trips through the settings file as a lowercase string.

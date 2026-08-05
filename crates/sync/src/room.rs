@@ -198,7 +198,7 @@ pub enum RoomEvent {
 }
 
 /// Live sync introspection for one room — the data behind the engine's
-/// `SyncStatus` RPC and `comet sync`. Every 2026-08 incident was debugged
+/// `SyncStatus` RPC and `jolt sync`. Every 2026-08 incident was debugged
 /// blind because none of this was observable at runtime.
 #[derive(Debug, Clone, Default)]
 pub struct RoomStatsSnapshot {
@@ -336,7 +336,7 @@ async fn pump(
         tokio::select! {
             frame = out_rx.recv() => match frame {
                 Some(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
+                    if sink.send(WsMessage::Binary(bytes.into())).await.is_err() {
                         break;
                     }
                 }
@@ -349,7 +349,7 @@ async fn pump(
             frame = stream.next() => match frame {
                 Some(Ok(WsMessage::Binary(bytes))) => {
                     last_rx = tokio::time::Instant::now();
-                    if in_tx.send(bytes).await.is_err() {
+                    if in_tx.send(bytes.to_vec()).await.is_err() {
                         break;
                     }
                 }
@@ -548,7 +548,7 @@ impl RoomClient {
         let _ = self.redial.try_send(());
     }
 
-    /// Live counters/clocks for this room (SyncStatus RPC / `comet sync`).
+    /// Live counters/clocks for this room (SyncStatus RPC / `jolt sync`).
     pub fn stats(&self) -> RoomStatsSnapshot {
         self.stats.snapshot()
     }
@@ -1034,7 +1034,7 @@ impl Session {
             match &message {
                 ProtocolMessage::Ack { status, .. } => {
                     // Only an Ok ack means the write LANDED. Counting every
-                    // ack made `comet sync` read "acked 0s ago" while the
+                    // ack made `jolt sync` read "acked 0s ago" while the
                     // server rejected every single update for hours
                     // (2026-08-04 latched-session incident) — the one
                     // counter built to expose that wedge was hiding it.
@@ -1364,7 +1364,8 @@ impl Session {
                             "updates repeatedly rejected (stale peer or reset server doc); redialing fresh"
                         );
                         return Err(SyncError::WebSocket(
-                            "resync cap exhausted: server keeps rejecting our updates; redialing".into(),
+                            "resync cap exhausted: server keeps rejecting our updates; redialing"
+                                .into(),
                         ));
                     }
                     self.invalid_rejoins += 1;

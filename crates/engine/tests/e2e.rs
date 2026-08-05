@@ -2,25 +2,25 @@
 //! journal + broadcast + folded doc entries, plus interrupt/recovery/idempotence
 //! and the RPC surface over the in-memory transport.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use comet_doc::{
+use jolt_doc::{
     MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
 };
-use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
-use comet_harness::mock::MockHarness;
-use comet_harness::{Harness, HarnessError, RunControls};
-use comet_proto::{
+use jolt_engine::{EngineCore, HarnessRegistry, RunJournal};
+use jolt_harness::mock::MockHarness;
+use jolt_harness::{BashRequest, BashResult, Harness, HarnessError, RunControls};
+use jolt_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SessionStatus, SteeringMode, ToolCall,
 };
-use comet_sync::DocsStore;
+use jolt_sync::DocsStore;
 
 const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
@@ -132,6 +132,116 @@ impl Harness for ScriptedHarness {
     }
 }
 
+struct PromptCapturingHarness {
+    seen: Arc<Mutex<Vec<RunRequest>>>,
+}
+
+#[async_trait]
+impl Harness for PromptCapturingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Prompt capture"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.seen.lock().unwrap().push(request);
+        Ok(futures::stream::iter(vec![
+            Ok(AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock".into(),
+                tools: Vec::new(),
+                cwd: "/tmp".into(),
+                session_id: "capture-session".into(),
+                assistant_message_id: "capture-assistant".into(),
+            }),
+            Ok(done(DoneStatus::Completed)),
+        ])
+        .boxed())
+    }
+}
+
+struct BashHarness {
+    seen: Arc<Mutex<Vec<BashRequest>>>,
+    release: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[async_trait]
+impl Harness for BashHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Pi
+    }
+
+    fn display_name(&self) -> &str {
+        "Pi"
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    fn supports_native_bash(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn bash(&self, request: BashRequest) -> Result<BashResult, HarnessError> {
+        self.seen.lock().unwrap().push(request);
+        if let Some(release) = &self.release {
+            release.notified().await;
+        }
+        Ok(BashResult {
+            output: "shell-output\n".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            session_id: Some("pi-shell-session".into()),
+        })
+    }
+
+    async fn run(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        Err(HarnessError::Protocol("unexpected agent run".into()))
+    }
+}
+
 fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
     registry.register(harness);
@@ -151,7 +261,7 @@ fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
         doc.read_entries()
             .expect("read entries")
             .last()
-            .map(|m| comet_doc::CommandBasedOn {
+            .map(|m| jolt_doc::CommandBasedOn {
                 turn_id: Some(m.id.clone()),
                 frontier: None,
             });
@@ -212,6 +322,253 @@ fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, 
         .into_iter()
         .find(|c| c.id == id)
         .map(|c| (c.status, c.resolution))
+}
+
+#[tokio::test]
+async fn hidden_prompt_produces_an_assistant_turn_without_a_user_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-hidden-prompt",
+        SessionCommandPayload::HiddenPrompt {
+            request: run_request("Restate your last message simply."),
+        },
+    );
+    wait_for(
+        || {
+            command_status(&core, "cmd-hidden-prompt")
+                == Some((SessionCommandStatus::Applied, None))
+        },
+        "hidden prompt to complete",
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|entry| entry.role == MessageRole::Assistant)
+        },
+        "hidden prompt assistant response",
+    )
+    .await;
+
+    let transcript = entries(&core);
+    assert!(
+        !transcript
+            .iter()
+            .any(|entry| entry.role == MessageRole::User)
+    );
+    let assistant = transcript
+        .iter()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .expect("assistant response");
+    let Some(MessagePart::Text { text, .. }) = assistant.parts.first() else {
+        panic!("assistant text")
+    };
+    assert_eq!(text, "Hello");
+}
+
+#[tokio::test]
+async fn queued_bash_command_executes_without_an_agent_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let registry = registry_with(Arc::new(BashHarness {
+        seen: seen.clone(),
+        release: Some(release.clone()),
+    }));
+    let core = EngineCore::assemble(dir.path(), registry, HarnessId::Pi, None).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-bash-1",
+        SessionCommandPayload::Bash {
+            command: "pwd".into(),
+            exclude_from_context: true,
+            cwd: "/tmp".into(),
+            message_id: "msg-bash-1".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.id == "msg-bash-1" && entry.status == Some(MessageStatus::Streaming)
+            })
+        },
+        "pending bash transcript",
+    )
+    .await;
+    let pending = entries(&core);
+    let MessagePart::Text { text, .. } = &pending[0].parts[0] else {
+        panic!("expected pending shell transcript")
+    };
+    assert!(text.contains("Output pending…"));
+    assert_eq!(
+        command_status(&core, "cmd-bash-1"),
+        Some((SessionCommandStatus::Pending, None))
+    );
+
+    release.notify_one();
+    wait_for(
+        || {
+            command_status(&core, "cmd-bash-1")
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "bash command to complete",
+    )
+    .await;
+
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].command, "pwd");
+    assert!(requests[0].exclude_from_context);
+    drop(requests);
+
+    let transcript = entries(&core);
+    assert_eq!(transcript.len(), 1);
+    assert_eq!(transcript[0].id, "msg-bash-1");
+    assert_eq!(transcript[0].role, MessageRole::System);
+    let MessagePart::Text { text, .. } = &transcript[0].parts[0] else {
+        panic!("expected rendered shell output")
+    };
+    assert!(text.contains("$ pwd"));
+    assert!(text.contains("shell-output"));
+    assert!(text.contains("excluded from agent context"));
+    assert_eq!(
+        command_status(&core, "cmd-bash-1"),
+        Some((SessionCommandStatus::Applied, None))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_bash_fallback_includes_only_single_bang_output_in_next_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        dir.path(),
+        Arc::new(PromptCapturingHarness { seen: seen.clone() }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let cwd = dir.path().to_string_lossy().into_owned();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-bash-included",
+        SessionCommandPayload::Bash {
+            command: "printf included-shell-output".into(),
+            exclude_from_context: false,
+            cwd: cwd.clone(),
+            message_id: "msg-bash-included".into(),
+        },
+    );
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-bash-excluded",
+        SessionCommandPayload::Bash {
+            command: "printf excluded-shell-output".into(),
+            exclude_from_context: true,
+            cwd: cwd.clone(),
+            message_id: "msg-bash-excluded".into(),
+        },
+    );
+    wait_for(
+        || {
+            command_status(&core, "cmd-bash-excluded")
+                == Some((SessionCommandStatus::Applied, None))
+        },
+        "local bash commands to complete",
+    )
+    .await;
+
+    let mut request = run_request("use the shell result");
+    request.cwd = cwd;
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-after-bash",
+        SessionCommandPayload::Run {
+            request,
+            message_id: "msg-run-after-bash".into(),
+        },
+    );
+    wait_for(
+        || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.prompt.ends_with("use the shell result"))
+        },
+        "agent prompt after local bash",
+    )
+    .await;
+
+    let requests = seen.lock().unwrap();
+    let request = requests
+        .iter()
+        .find(|request| {
+            request.prompt.contains("included-shell-output")
+                && request.prompt.ends_with("use the shell result")
+        })
+        .expect("agent request");
+    assert!(request.prompt.contains("included-shell-output"));
+    assert!(!request.prompt.contains("excluded-shell-output"));
+    drop(requests);
+
+    let user = entries(&core)
+        .into_iter()
+        .find(|entry| entry.id == "msg-run-after-bash")
+        .expect("visible user entry");
+    assert_eq!(
+        user.parts,
+        vec![MessagePart::Text {
+            id: "t0".into(),
+            text: "use the shell result".into(),
+        }]
+    );
+    wait_for(
+        || {
+            command_status(&core, "cmd-run-after-bash")
+                == Some((SessionCommandStatus::Applied, None))
+        },
+        "first agent turn to be applied",
+    )
+    .await;
+    let mut second_request = run_request("second turn");
+    second_request.cwd = dir.path().to_string_lossy().into_owned();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-second-run",
+        SessionCommandPayload::Run {
+            request: second_request,
+            message_id: "msg-second-run".into(),
+        },
+    );
+    wait_for(
+        || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.prompt == "second turn")
+        },
+        "second agent turn",
+    )
+    .await;
+    let requests = seen.lock().unwrap();
+    let second = requests
+        .iter()
+        .find(|request| request.prompt == "second turn")
+        .expect("second agent request");
+    assert!(!second.prompt.contains("included-shell-output"));
 }
 
 #[tokio::test]
@@ -478,7 +835,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
     .await;
 
     // No live run anymore (mock finishes instantly): a steer command must fall back to
-    // dispatch-as-next-turn, per comet's executor.
+    // dispatch-as-next-turn, per jolt's executor.
     queue_as_viewer(
         handle.doc(),
         "cmd-steer-1",
@@ -568,9 +925,9 @@ async fn processed_commands_are_skipped_on_redelivery() {
     let entry = commands.iter().find(|c| c.id == "cmd-crashed").unwrap();
     let is_processed = |id: &str| store.is_processed(id).unwrap_or(false);
     let never_past = |_: &str| false;
-    let verdict = comet_doc::evaluate_command(
+    let verdict = jolt_doc::evaluate_command(
         entry,
-        &comet_doc::EvaluationContext {
+        &jolt_doc::EvaluationContext {
             is_processed: &is_processed,
             now_ms: chrono::Utc::now().timestamp_millis(),
             entries: &commands,
@@ -578,7 +935,7 @@ async fn processed_commands_are_skipped_on_redelivery() {
             turn_is_past: &never_past,
         },
     );
-    assert_eq!(verdict, comet_doc::CommandDisposition::Skip);
+    assert_eq!(verdict, jolt_doc::CommandDisposition::Skip);
 }
 
 #[tokio::test]
@@ -672,26 +1029,48 @@ async fn rpc_surface_over_in_memory_transport() {
             script: mock_script(),
         }),
     );
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = jolt_rpc::memory_client(core.rpc_service());
 
     // ListHarnesses + ListModels.
     let harnesses = client
-        .call(comet_rpc::methods::LIST_HARNESSES, serde_json::Value::Null)
+        .call(jolt_rpc::methods::LIST_HARNESSES, serde_json::Value::Null)
         .await
         .unwrap();
     assert_eq!(harnesses[0]["id"], "mock");
     let models = client
         .call(
-            comet_rpc::methods::LIST_MODELS,
+            jolt_rpc::methods::LIST_MODELS,
             serde_json::json!({"harness": "mock"}),
         )
         .await
         .unwrap();
     assert_eq!(models[0]["id"], "mock-1");
+    let commands = client
+        .call(
+            jolt_rpc::methods::LIST_COMMANDS,
+            serde_json::json!({"harness": "mock", "cwd": "/tmp"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        commands,
+        serde_json::json!([
+            {
+                "name": "answer",
+                "description": "Answer questions from the latest assistant response",
+                "source": "jolt"
+            },
+            {
+                "name": "bro",
+                "description": "Restate the latest assistant response in plain language",
+                "source": "jolt"
+            }
+        ])
+    );
 
     // WatchSessions + WatchDocMessages streams.
     let mut sessions_stream = client
-        .subscribe(comet_rpc::methods::WATCH_SESSIONS, serde_json::Value::Null)
+        .subscribe(jolt_rpc::methods::WATCH_SESSIONS, serde_json::Value::Null)
         .await
         .unwrap();
     let first_sessions = tokio::time::timeout(Duration::from_secs(5), sessions_stream.recv())
@@ -702,7 +1081,7 @@ async fn rpc_surface_over_in_memory_transport() {
 
     let mut messages_stream = client
         .subscribe(
-            comet_rpc::methods::WATCH_DOC_MESSAGES,
+            jolt_rpc::methods::WATCH_DOC_MESSAGES,
             serde_json::json!({"chatId": CHAT}),
         )
         .await
@@ -722,7 +1101,7 @@ async fn rpc_surface_over_in_memory_transport() {
     .unwrap();
     let queued = client
         .call(
-            comet_rpc::methods::QUEUE_COMMAND,
+            jolt_rpc::methods::QUEUE_COMMAND,
             serde_json::json!({"chatId": CHAT, "command": command}),
         )
         .await
@@ -739,8 +1118,8 @@ async fn rpc_surface_over_in_memory_transport() {
             .await
             .expect("doc messages before timeout")
             .expect("stream alive");
-        let frame: comet_doc::TranscriptFrame = serde_json::from_value(item).unwrap();
-        comet_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
+        let frame: jolt_doc::TranscriptFrame = serde_json::from_value(item).unwrap();
+        jolt_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
         if materialized.len() == 2 && materialized[1].status == Some(MessageStatus::Complete) {
             break materialized;
         }
@@ -797,7 +1176,7 @@ async fn respond_input_resolves_pending_question() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let answers = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                let answers = (controls.request_input)(vec![jolt_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
@@ -878,7 +1257,7 @@ async fn respond_input_resolves_pending_question() {
         "cmd-answer-1",
         SessionCommandPayload::RespondInput {
             request_id,
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![jolt_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["b".into()],
             }],
@@ -950,7 +1329,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let answers = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                let answers = (controls.request_input)(vec![jolt_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
@@ -1020,7 +1399,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         "cmd-answer-bogus",
         SessionCommandPayload::RespondInput {
             request_id: "bogus-id".into(),
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![jolt_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["a".into()],
             }],
@@ -1067,7 +1446,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         "cmd-answer-right",
         SessionCommandPayload::RespondInput {
             request_id,
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![jolt_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["b".into()],
             }],
@@ -1141,7 +1520,7 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
                     // Blocks on the question; an interrupt fails the resolver
                     // (empty answers) and cancels the token — like a real CLI
                     // being torn down, the stream then ends WITHOUT a Done.
-                    let _ = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                    let _ = (controls.request_input)(vec![jolt_proto::UserInputQuestion {
                         id: "q1".into(),
                         header: "Pick".into(),
                         question: "Which one?".into(),
@@ -1288,7 +1667,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let question = comet_proto::UserInputQuestion {
+                let question = jolt_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
@@ -1395,7 +1774,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
         "cmd-answer-twin",
         SessionCommandPayload::RespondInput {
             request_id,
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![jolt_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["a".into()],
             }],
@@ -1493,7 +1872,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
             seen: seen.clone(),
         }),
     );
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = jolt_rpc::memory_client(core.rpc_service());
 
     // Chunked upload exactly as the composer sends it: base64 split across
     // positional UploadChunk slots, then UploadCommit → the durable path.
@@ -1503,7 +1882,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     for (seq, data) in [(0, first), (1, second)] {
         client
             .call(
-                comet_rpc::methods::UPLOAD_CHUNK,
+                jolt_rpc::methods::UPLOAD_CHUNK,
                 serde_json::json!({ "uploadId": "e2e-att", "seq": seq, "data": data }),
             )
             .await
@@ -1511,7 +1890,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     }
     let committed = client
         .call(
-            comet_rpc::methods::UPLOAD_COMMIT,
+            jolt_rpc::methods::UPLOAD_COMMIT,
             serde_json::json!({ "uploadId": "e2e-att", "fileName": "red.png" }),
         )
         .await
@@ -1523,7 +1902,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
         "committed file holds the exact reassembled bytes"
     );
 
-    // Run with the comet `withAttachments` transport: refs embedded in the
+    // Run with the jolt `withAttachments` transport: refs embedded in the
     // prompt text (this is what persists), paths on the additive field.
     let prompt = format!(
         "what color is this?\n\nAttached images (local files — open them to view):\n- {path}"
@@ -1576,7 +1955,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     // Read-back over the same RPC surface the transcript uses.
     let chunk = client
         .call(
-            comet_rpc::methods::READ_ATTACHMENT_CHUNK,
+            jolt_rpc::methods::READ_ATTACHMENT_CHUNK,
             serde_json::json!({ "path": path, "offset": 0 }),
         )
         .await
@@ -1591,7 +1970,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
 /// color — it can only know it by SEEING the inline image block (the sandbox
 /// prompt forbids opening the file). Ignored by default: needs an installed,
 /// authenticated `claude` CLI and spends real tokens.
-/// Run with: `cargo test -p comet-engine --test e2e -- --ignored`
+/// Run with: `cargo test -p jolt-engine --test e2e -- --ignored`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires installed+authenticated claude CLI; spends tokens"]
 async fn real_claude_sees_uploaded_image_inline() {
@@ -1604,7 +1983,7 @@ async fn real_claude_sees_uploaded_image_inline() {
 
     let core = EngineCore::assemble(
         &dir,
-        Arc::new(comet_engine::default_registry()),
+        Arc::new(jolt_engine::default_registry()),
         HarnessId::ClaudeCode,
         None,
     )
@@ -1619,17 +1998,17 @@ async fn real_claude_sees_uploaded_image_inline() {
 
     // 8×8 solid-red PNG, uploaded exactly as the composer does.
     const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAB+GTG2wAAJP0GeGuMDBnAAAAAElFTkSuQmCC";
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = jolt_rpc::memory_client(core.rpc_service());
     client
         .call(
-            comet_rpc::methods::UPLOAD_CHUNK,
+            jolt_rpc::methods::UPLOAD_CHUNK,
             serde_json::json!({ "uploadId": "real-img", "seq": 0, "data": RED_PNG_B64 }),
         )
         .await
         .expect("UploadChunk");
     let committed = client
         .call(
-            comet_rpc::methods::UPLOAD_COMMIT,
+            jolt_rpc::methods::UPLOAD_COMMIT,
             serde_json::json!({ "uploadId": "real-img", "fileName": "swatch.png" }),
         )
         .await

@@ -1,5 +1,5 @@
 //! UI settings persisted to a small JSON file in the data dir — pane widths and
-//! collapse flags (comet persisted the same set in localStorage).
+//! collapse flags (jolt persisted the same set in localStorage).
 //!
 //! Loaded once at boot; saved debounced by the shell ([`SAVE_DEBOUNCE_MS`]).
 //! Corrupt or missing files fall back to defaults; loaded values are clamped so a
@@ -14,8 +14,11 @@ pub mod accounts;
 pub mod appearance;
 pub mod archived;
 pub mod composer;
+mod device_switcher;
 pub mod devices;
 pub mod shortcuts;
+pub mod terminal;
+pub mod vcs;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -60,12 +63,12 @@ pub struct UiSettings {
     /// are skipped; new spaces append in creation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
-    /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
+    /// Session notification chimes (done / awaiting-input). `JOLT_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
-    /// (`shell::SessionPanels`, comet `sessionPanels` parity). Kept for file
+    /// (`shell::SessionPanels`, jolt `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
     pub right_pane_open: bool,
     pub terminal_height: f32,
@@ -75,6 +78,15 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Font family for application chrome, prose, and controls.
+    pub ui_font: String,
+    /// Font family for code, diffs, and shortcut chips.
+    pub code_font: String,
+    /// Font family used by terminal grids.
+    pub terminal_font: String,
+    /// Shell command run when a new terminal opens. Empty uses the default
+    /// interactive login shell.
+    pub terminal_command: String,
 }
 
 impl Default for UiSettings {
@@ -93,6 +105,10 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            ui_font: crate::theme::DEFAULT_UI_FONT.into(),
+            code_font: crate::theme::DEFAULT_CODE_FONT.into(),
+            terminal_font: crate::theme::DEFAULT_CODE_FONT.into(),
+            terminal_command: String::new(),
         }
     }
 }
@@ -104,21 +120,36 @@ impl Default for UiSettings {
 /// The rebindable app shortcuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
+    NewSession,
+    ClearInput,
+    ArchiveSession,
+    OpenSettings,
+    AddSpace,
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 3] = [
+    pub const ALL: [ShortcutId; 8] = [
+        ShortcutId::NewSession,
+        ShortcutId::ClearInput,
+        ShortcutId::ArchiveSession,
+        ShortcutId::OpenSettings,
+        ShortcutId::AddSpace,
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
     ];
 
-    /// Row label (comet lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
+    /// Row label (jolt lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
+            ShortcutId::NewSession => "New session",
+            ShortcutId::ClearInput => "Clear input",
+            ShortcutId::ArchiveSession => "Archive current session",
+            ShortcutId::OpenSettings => "Open settings",
+            ShortcutId::AddSpace => "Add space",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
@@ -127,18 +158,28 @@ impl ShortcutId {
 
     pub fn default_combo(self) -> &'static str {
         match self {
-            ShortcutId::ToggleSidebar => "mod-s",
+            ShortcutId::NewSession => "mod-n",
+            ShortcutId::ClearInput => "mod-c",
+            ShortcutId::ArchiveSession => "mod-w",
+            ShortcutId::OpenSettings => "mod-,",
+            ShortcutId::AddSpace => "mod-k",
+            ShortcutId::ToggleSidebar => "mod-e",
             ShortcutId::ToggleChanges => "mod-b",
-            ShortcutId::ToggleTerminal => "mod-j",
+            ShortcutId::ToggleTerminal => "mod-`",
         }
     }
 }
 
-/// Persisted shortcut combos. Stored platform-neutral ("mod-s"); translated to
-/// "cmd-s"/"ctrl-s" at bind time by [`platform_combo`].
+/// Persisted shortcut combos. Stored platform-neutral (for example, "mod-e");
+/// translated to "cmd-e"/"ctrl-e" at bind time by [`platform_combo`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
+    pub new_session: String,
+    pub clear_input: String,
+    pub archive_session: String,
+    pub open_settings: String,
+    pub add_space: String,
     pub toggle_sidebar: String,
     pub toggle_changes: String,
     pub toggle_terminal: String,
@@ -147,6 +188,11 @@ pub struct KeymapConfig {
 impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
+            new_session: ShortcutId::NewSession.default_combo().into(),
+            clear_input: ShortcutId::ClearInput.default_combo().into(),
+            archive_session: ShortcutId::ArchiveSession.default_combo().into(),
+            open_settings: ShortcutId::OpenSettings.default_combo().into(),
+            add_space: ShortcutId::AddSpace.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
@@ -157,6 +203,11 @@ impl Default for KeymapConfig {
 impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
+            ShortcutId::NewSession => &self.new_session,
+            ShortcutId::ClearInput => &self.clear_input,
+            ShortcutId::ArchiveSession => &self.archive_session,
+            ShortcutId::OpenSettings => &self.open_settings,
+            ShortcutId::AddSpace => &self.add_space,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
@@ -165,6 +216,11 @@ impl KeymapConfig {
 
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
+            ShortcutId::NewSession => self.new_session = combo,
+            ShortcutId::ClearInput => self.clear_input = combo,
+            ShortcutId::ArchiveSession => self.archive_session = combo,
+            ShortcutId::OpenSettings => self.open_settings = combo,
+            ShortcutId::AddSpace => self.add_space = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
@@ -237,7 +293,7 @@ pub fn platform_combo(combo: &str) -> String {
         .join("-")
 }
 
-/// Human-readable combo for the shortcuts table ("mod-s" → "Cmd+S"/"Ctrl+S").
+/// Human-readable combo for the shortcuts table ("mod-e" → "Cmd+E"/"Ctrl+E").
 pub fn display_combo(combo: &str) -> String {
     combo
         .split('-')
@@ -352,6 +408,10 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            ui_font: "Avenir Next".into(),
+            code_font: "Menlo".into(),
+            terminal_font: "Berkeley Mono".into(),
+            terminal_command: "exec fish".into(),
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -370,6 +430,10 @@ mod tests {
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
+        assert_eq!(loaded.ui_font, crate::theme::DEFAULT_UI_FONT);
+        assert_eq!(loaded.code_font, crate::theme::DEFAULT_CODE_FONT);
+        assert_eq!(loaded.terminal_font, crate::theme::DEFAULT_CODE_FONT);
+        assert!(loaded.terminal_command.is_empty());
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
     }
@@ -406,24 +470,41 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_comet() {
+    fn defaults_match_jolt() {
         let d = UiSettings::default();
         assert_eq!(d.sidebar_width, 256.0);
         assert_eq!(d.right_pane_width, 520.0);
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
+        assert_eq!(d.ui_font, crate::theme::DEFAULT_UI_FONT);
+        assert_eq!(d.code_font, crate::theme::DEFAULT_CODE_FONT);
+        assert_eq!(d.terminal_font, crate::theme::DEFAULT_CODE_FONT);
+        assert!(d.terminal_command.is_empty());
     }
 
     #[test]
     fn keymap_defaults_and_reset() {
         let mut keymap = KeymapConfig::default();
-        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-s");
+        assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
+        assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
+        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-w");
+        assert_eq!(keymap.get(ShortcutId::OpenSettings), "mod-,");
+        assert_eq!(keymap.get(ShortcutId::AddSpace), "mod-k");
+        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-e");
         assert_eq!(keymap.get(ShortcutId::ToggleChanges), "mod-b");
-        assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-j");
+        assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-`");
+        keymap.set(ShortcutId::ClearInput, "mod-shift-c".into());
+        assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-shift-c");
+        keymap.reset(ShortcutId::ClearInput);
+        assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
+        keymap.set(ShortcutId::ArchiveSession, "mod-shift-w".into());
+        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-w");
+        keymap.reset(ShortcutId::ArchiveSession);
+        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-w");
         keymap.set(ShortcutId::ToggleSidebar, "mod-shift-x".into());
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
         keymap.reset(ShortcutId::ToggleSidebar);
-        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-s");
+        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-e");
     }
 
     #[test]
@@ -462,11 +543,16 @@ mod tests {
     fn conflict_detection() {
         let mut keymap = KeymapConfig::default();
         assert!(conflicted_shortcuts(&keymap).is_empty());
-        keymap.set(ShortcutId::ToggleChanges, "mod-s".into());
+        keymap.set(ShortcutId::ToggleChanges, "mod-e".into());
         let conflicts = conflicted_shortcuts(&keymap);
         assert!(conflicts.contains(&ShortcutId::ToggleSidebar));
         assert!(conflicts.contains(&ShortcutId::ToggleChanges));
         assert!(!conflicts.contains(&ShortcutId::ToggleTerminal));
+        assert!(!conflicts.contains(&ShortcutId::AddSpace));
+        assert!(!conflicts.contains(&ShortcutId::OpenSettings));
+        assert!(!conflicts.contains(&ShortcutId::NewSession));
+        assert!(!conflicts.contains(&ShortcutId::ClearInput));
+        assert!(!conflicts.contains(&ShortcutId::ArchiveSession));
         keymap.reset(ShortcutId::ToggleChanges);
         assert!(conflicted_shortcuts(&keymap).is_empty());
     }
@@ -479,6 +565,10 @@ mod tests {
             "ctrl"
         };
         assert_eq!(platform_combo("mod-s"), format!("{primary}-s"));
+        assert_eq!(platform_combo("mod-,"), format!("{primary}-,"));
+        assert_eq!(platform_combo("mod-`"), format!("{primary}-`"));
+        assert!(gpui::Keystroke::parse(&platform_combo("mod-,")).is_ok());
+        assert!(gpui::Keystroke::parse(&platform_combo("mod-`")).is_ok());
         assert_eq!(platform_combo("alt-f4"), "alt-f4");
         let display_primary = if cfg!(target_os = "macos") {
             "Cmd"
@@ -490,6 +580,8 @@ mod tests {
             format!("{display_primary}+Shift+S")
         );
         assert_eq!(display_combo("f5"), "F5");
+        assert_eq!(display_combo("mod-,"), format!("{display_primary}+,"));
+        assert_eq!(display_combo("mod-`"), format!("{display_primary}+`"));
     }
 
     #[test]
@@ -500,6 +592,24 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
+    }
+
+    #[test]
+    fn old_keymap_gains_new_shortcut_defaults() {
+        let keymap: KeymapConfig = serde_json::from_str(
+            r#"{
+                "toggleSidebar": "mod-shift-e",
+                "toggleChanges": "mod-b",
+                "toggleTerminal": "mod-`"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
+        assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
+        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-w");
+        assert_eq!(keymap.get(ShortcutId::OpenSettings), "mod-,");
+        assert_eq!(keymap.get(ShortcutId::AddSpace), "mod-k");
+        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-e");
     }
 
     #[test]

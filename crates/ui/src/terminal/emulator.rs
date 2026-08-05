@@ -1,31 +1,24 @@
-//! The terminal emulator core: `alacritty_terminal`'s `Term` + vte's ANSI
-//! `Processor` wrapped as a pure state machine.
+//! The terminal emulator core: `libghostty_vt` wrapped as a pure state
+//! machine.
 //!
 //! Bytes in ([`Emulator::feed`] — the decoded `SubscribeTerminal` Data frames),
-//! grid snapshots out ([`Emulator::line`], [`Emulator::cursor`]). No I/O, no
-//! timers, no gpui: the panel owns RPC and scheduling, the view owns paint.
-//! That split makes the whole escape-sequence surface unit-testable with
-//! scripted byte strings.
-//!
-//! API notes for the pinned `alacritty_terminal 0.26` / `vte 0.15`:
-//! - `Processor::advance` consumes a byte slice; `Term` implements the
-//!   `vte::ansi::Handler` trait directly, so no event-loop machinery is needed.
-//! - `Term::new` takes any `grid::Dimensions` impl — [`GridSize`] here (the
-//!   crate's own `TermSize` lives in a `term::test` helper module).
-//! - Query responses (DSR/DA/…) surface as `Event::PtyWrite` on the listener;
-//!   [`Emulator::feed`] returns them so the panel can write them back.
+//! grid snapshots out ([`Emulator::snapshot`]). No PTY I/O, timers, or GPUI:
+//! the panel owns RPC and scheduling, while the view owns paint. Query
+//! responses (DSR/DA/…) are captured through Ghostty's effect callbacks and
+//! returned from [`Emulator::feed`] for the panel to write back.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{
-    Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb as AnsiRgb,
+use libghostty_vt::render::{CellIterator, RowIterator};
+use libghostty_vt::screen::CellWide;
+use libghostty_vt::style::{StyleColor, Underline};
+use libghostty_vt::terminal::{
+    ColorScheme, ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
+    PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
+    TertiaryDeviceAttributes,
 };
+use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 
 /// Scrollback history kept client-side (lines). The engine's replay window is
 /// bounded separately (1 MiB); this only caps what stays scrollable in the UI.
@@ -47,18 +40,6 @@ impl GridSize {
     }
 }
 
-impl Dimensions for GridSize {
-    fn total_lines(&self) -> usize {
-        self.rows as usize
-    }
-    fn screen_lines(&self) -> usize {
-        self.rows as usize
-    }
-    fn columns(&self) -> usize {
-        self.cols as usize
-    }
-}
-
 /// A cell's paint color, decoupled from the palette: the view resolves these
 /// against the theme (default fg/bg, 256-color index, or direct RGB).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,39 +54,19 @@ pub enum CellColor {
     Rgb(u8, u8, u8),
 }
 
-fn map_color(color: AnsiColor) -> CellColor {
+fn map_style_color(color: StyleColor, default: CellColor) -> CellColor {
     match color {
-        AnsiColor::Spec(AnsiRgb { r, g, b }) => CellColor::Rgb(r, g, b),
-        AnsiColor::Indexed(ix) => CellColor::Indexed(ix),
-        AnsiColor::Named(named) => {
-            let ix = named as usize;
-            if ix < 16 {
-                return CellColor::Indexed(ix as u8);
-            }
-            match named {
-                NamedColor::Background => CellColor::Background,
-                // Dim named colors fold onto their base index; the DIM flag
-                // still travels on the cell for paint-time dimming.
-                NamedColor::DimBlack
-                | NamedColor::DimRed
-                | NamedColor::DimGreen
-                | NamedColor::DimYellow
-                | NamedColor::DimBlue
-                | NamedColor::DimMagenta
-                | NamedColor::DimCyan
-                | NamedColor::DimWhite => {
-                    CellColor::Indexed((ix - NamedColor::DimBlack as usize) as u8)
-                }
-                _ => CellColor::Foreground,
-            }
-        }
+        StyleColor::None => default,
+        StyleColor::Palette(index) => CellColor::Indexed(index.0),
+        StyleColor::Rgb(rgb) => CellColor::Rgb(rgb.r, rgb.g, rgb.b),
     }
 }
 
-/// One rendered cell: char + colors + the flags paint cares about.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One rendered cell: grapheme + colors + the flags paint cares about.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CellSnapshot {
-    pub ch: char,
+    /// Full grapheme cluster. Empty terminal cells contain one space.
+    pub text: String,
     pub fg: CellColor,
     pub bg: CellColor,
     pub bold: bool,
@@ -114,9 +75,9 @@ pub struct CellSnapshot {
     pub underline: bool,
     pub inverse: bool,
     pub hidden: bool,
-    /// A double-width char (occupies this cell plus the next spacer cell).
+    /// A double-width grapheme (occupies this cell plus the next spacer cell).
     pub wide: bool,
-    /// The spacer half of a wide char — never shaped, only background-painted.
+    /// The spacer half of a wide grapheme — never shaped, only background-painted.
     pub wide_spacer: bool,
 }
 
@@ -139,172 +100,296 @@ pub struct CursorSnapshot {
     pub col: usize,
 }
 
-/// Captures `Term` callbacks. Interior-mutable because `EventListener::send_event`
-/// takes `&self`; single-threaded (the emulator lives inside a gpui entity).
-#[derive(Default, Clone)]
-struct EventCapture {
-    events: Rc<RefCell<Vec<Event>>>,
-}
-
-impl EventListener for EventCapture {
-    fn send_event(&self, event: Event) {
-        self.events.borrow_mut().push(event);
-    }
+#[derive(Debug, Default)]
+struct EffectCapture {
+    responses: Vec<u8>,
+    bell: bool,
 }
 
 /// The emulator: a pure fold of PTY bytes into a renderable grid.
 pub struct Emulator {
-    term: Term<EventCapture>,
-    parser: Processor,
-    capture: EventCapture,
-    title: Option<String>,
-    bell: bool,
+    term: Terminal<'static, 'static>,
+    render_state: RenderState<'static>,
+    row_iterator: RowIterator<'static>,
+    cell_iterator: CellIterator<'static>,
+    effects: Rc<RefCell<EffectCapture>>,
 }
 
 impl Emulator {
     pub fn new(cols: u16, rows: u16) -> Self {
-        let capture = EventCapture::default();
-        let config = Config {
-            scrolling_history: SCROLLBACK_LINES,
-            ..Config::default()
-        };
-        let term = Term::new(config, &GridSize::new(cols, rows), capture.clone());
+        let size = GridSize::new(cols, rows);
+        let effects = Rc::new(RefCell::new(EffectCapture::default()));
+        let mut term: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: size.cols,
+            rows: size.rows,
+            max_scrollback: SCROLLBACK_LINES,
+        })
+        .expect("libghostty-vt terminal should initialize");
+
+        term.on_pty_write({
+            let effects = effects.clone();
+            move |_term, data| effects.borrow_mut().responses.extend_from_slice(data)
+        })
+        .expect("libghostty-vt PTY callback should register");
+        term.on_bell({
+            let effects = effects.clone();
+            move |_term| effects.borrow_mut().bell = true
+        })
+        .expect("libghostty-vt bell callback should register");
+        term.on_title_changed(|_term| {})
+            .expect("libghostty-vt title callback should register");
+        term.on_xtversion(|_term| Some("Jolt"))
+            .expect("libghostty-vt version callback should register");
+        term.on_color_scheme(|_term| Some(ColorScheme::Dark))
+            .expect("libghostty-vt color-scheme callback should register");
+        term.on_size(|term| {
+            Some(SizeReportSize {
+                rows: term.rows().ok()?,
+                columns: term.cols().ok()?,
+                cell_width: 0,
+                cell_height: 0,
+            })
+        })
+        .expect("libghostty-vt size callback should register");
+        term.on_device_attributes(|_term| {
+            Some(DeviceAttributes {
+                primary: PrimaryDeviceAttributes::new(
+                    ConformanceLevel::VT220,
+                    &[DeviceAttributeFeature::ANSI_COLOR],
+                ),
+                secondary: SecondaryDeviceAttributes {
+                    device_type: DeviceType::VT220,
+                    firmware_version: 1,
+                    rom_cartridge: 0,
+                },
+                tertiary: TertiaryDeviceAttributes::default(),
+            })
+        })
+        .expect("libghostty-vt device-attributes callback should register");
+
         Self {
             term,
-            parser: Processor::new(),
-            capture,
-            title: None,
-            bell: false,
+            render_state: RenderState::new().expect("libghostty-vt render state should initialize"),
+            row_iterator: RowIterator::new().expect("libghostty-vt row iterator should initialize"),
+            cell_iterator: CellIterator::new()
+                .expect("libghostty-vt cell iterator should initialize"),
+            effects,
         }
     }
 
     /// Advance the state machine over decoded PTY output. Returns bytes the
     /// terminal wants written back to the PTY (DSR/DA query responses etc.).
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.parser.advance(&mut self.term, bytes);
-        let mut responses = Vec::new();
-        for event in self.capture.events.borrow_mut().drain(..) {
-            match event {
-                Event::PtyWrite(text) => responses.extend_from_slice(text.as_bytes()),
-                Event::Title(title) => self.title = Some(title),
-                Event::ResetTitle => self.title = None,
-                Event::Bell => self.bell = true,
-                _ => {}
-            }
-        }
-        responses
+        self.term.vt_write(bytes);
+        std::mem::take(&mut self.effects.borrow_mut().responses)
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.term.resize(GridSize::new(cols, rows));
+        let size = GridSize::new(cols, rows);
+        self.term
+            .resize(size.cols, size.rows, 0, 0)
+            .expect("valid terminal dimensions should resize");
     }
 
     pub fn cols(&self) -> usize {
-        self.term.columns()
+        usize::from(
+            self.term
+                .cols()
+                .expect("libghostty-vt terminal should report columns"),
+        )
     }
 
     pub fn rows(&self) -> usize {
-        self.term.screen_lines()
+        usize::from(
+            self.term
+                .rows()
+                .expect("libghostty-vt terminal should report rows"),
+        )
     }
 
     /// OSC title, if the running program set one.
     pub fn title(&self) -> Option<&str> {
-        self.title.as_deref()
+        let title = self
+            .term
+            .title()
+            .expect("libghostty-vt terminal should report its title");
+        (!title.is_empty()).then_some(title)
     }
 
     /// True once a BEL arrived; reading clears it.
     pub fn take_bell(&mut self) -> bool {
-        std::mem::take(&mut self.bell)
+        std::mem::take(&mut self.effects.borrow_mut().bell)
     }
 
     /// Arrow keys should send SS3 (`ESC O A`) instead of CSI.
     pub fn app_cursor_mode(&self) -> bool {
-        self.term.mode().contains(TermMode::APP_CURSOR)
+        self.term.mode(Mode::DECCKM).unwrap_or(false)
     }
 
     /// Pastes should be wrapped in `ESC [200~` / `ESC [201~`.
     pub fn bracketed_paste_mode(&self) -> bool {
-        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+        self.term.mode(Mode::BRACKETED_PASTE).unwrap_or(false)
     }
 
     /// Lines scrolled back into history (0 = pinned to the live bottom).
     pub fn display_offset(&self) -> usize {
-        self.term.grid().display_offset()
+        let scrollbar = self
+            .term
+            .scrollbar()
+            .expect("libghostty-vt terminal should report scrollbar state");
+        usize::try_from(
+            scrollbar
+                .total
+                .saturating_sub(scrollbar.len)
+                .saturating_sub(scrollbar.offset),
+        )
+        .unwrap_or(usize::MAX)
     }
 
     /// Lines available above the viewport.
     pub fn history_lines(&self) -> usize {
-        self.term.grid().history_size()
+        let scrollbar = self
+            .term
+            .scrollbar()
+            .expect("libghostty-vt terminal should report scrollbar state");
+        usize::try_from(scrollbar.total.saturating_sub(scrollbar.len)).unwrap_or(usize::MAX)
     }
 
     /// Scroll the view: positive = up into history, negative = toward live.
     pub fn scroll(&mut self, delta: i32) {
-        self.term.scroll_display(Scroll::Delta(delta));
+        self.term
+            .scroll_viewport(ScrollViewport::Delta((delta as isize).saturating_neg()));
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        self.term.scroll_display(Scroll::Bottom);
+        self.term.scroll_viewport(ScrollViewport::Bottom);
     }
 
-    /// Snapshot one viewport row (0 = top) honoring the scrollback offset.
-    pub fn line(&self, viewport_row: usize) -> Vec<CellSnapshot> {
-        let offset = self.display_offset() as i32;
-        let line = Line(viewport_row as i32 - offset);
-        let grid = self.term.grid();
-        let row = &grid[line];
-        (0..self.cols())
-            .map(|col| {
-                let cell = &row[Column(col)];
-                CellSnapshot {
-                    ch: cell.c,
-                    fg: map_color(cell.fg),
-                    bg: map_color(cell.bg),
-                    bold: cell.flags.intersects(Flags::BOLD),
-                    dim: cell.flags.intersects(Flags::DIM),
-                    italic: cell.flags.intersects(Flags::ITALIC),
-                    underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
-                    inverse: cell.flags.intersects(Flags::INVERSE),
-                    hidden: cell.flags.intersects(Flags::HIDDEN),
-                    wide: cell.flags.intersects(Flags::WIDE_CHAR),
-                    wide_spacer: cell
-                        .flags
-                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+    /// Snapshot the visible grid and cursor together from one render-state update.
+    pub fn snapshot(&mut self) -> (Vec<Vec<CellSnapshot>>, Option<CursorSnapshot>) {
+        let snapshot = self
+            .render_state
+            .update(&self.term)
+            .expect("libghostty-vt render state should update");
+        let cursor = if snapshot
+            .cursor_visible()
+            .expect("libghostty-vt cursor visibility should be readable")
+        {
+            snapshot
+                .cursor_viewport()
+                .expect("libghostty-vt cursor position should be readable")
+                .map(|cursor| CursorSnapshot {
+                    row: usize::from(cursor.y),
+                    col: usize::from(cursor.x),
+                })
+        } else {
+            None
+        };
+
+        let row_count = usize::from(
+            snapshot
+                .rows()
+                .expect("libghostty-vt render state should report rows"),
+        );
+        let col_count = usize::from(
+            snapshot
+                .cols()
+                .expect("libghostty-vt render state should report columns"),
+        );
+        let mut lines = Vec::with_capacity(row_count);
+        let mut rows = self
+            .row_iterator
+            .update(&snapshot)
+            .expect("libghostty-vt row iterator should update");
+        while let Some(row) = rows.next() {
+            let mut line = Vec::with_capacity(col_count);
+            let mut cells = self
+                .cell_iterator
+                .update(row)
+                .expect("libghostty-vt cell iterator should update");
+            while let Some(cell) = cells.next() {
+                let style = cell
+                    .style()
+                    .expect("libghostty-vt cell style should be readable");
+                let raw = cell
+                    .raw_cell()
+                    .expect("libghostty-vt raw cell should be readable");
+                let wide = raw
+                    .wide()
+                    .expect("libghostty-vt cell width should be readable");
+                let mut text = String::new();
+                cell.graphemes_utf8(&mut text)
+                    .expect("libghostty-vt cell grapheme should be readable");
+                if text.is_empty() {
+                    text.push(' ');
                 }
-            })
-            .collect()
+                let bg = match raw
+                    .content_tag()
+                    .expect("libghostty-vt cell content should be readable")
+                {
+                    libghostty_vt::screen::CellContentTag::BgColorPalette => CellColor::Indexed(
+                        raw.bg_color_palette()
+                            .expect("palette background should have an index")
+                            .0,
+                    ),
+                    libghostty_vt::screen::CellContentTag::BgColorRgb => {
+                        let color = raw
+                            .bg_color_rgb()
+                            .expect("RGB background should have a color");
+                        CellColor::Rgb(color.r, color.g, color.b)
+                    }
+                    _ => map_style_color(style.bg_color, CellColor::Background),
+                };
+                line.push(CellSnapshot {
+                    text,
+                    fg: map_style_color(style.fg_color, CellColor::Foreground),
+                    bg,
+                    bold: style.bold,
+                    dim: style.faint,
+                    italic: style.italic,
+                    underline: style.underline != Underline::None,
+                    inverse: style.inverse,
+                    hidden: style.invisible,
+                    wide: wide == CellWide::Wide,
+                    wide_spacer: matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead),
+                });
+            }
+            lines.push(line);
+        }
+        while lines.len() < row_count {
+            lines.push(Vec::new());
+        }
+        (lines, cursor)
+    }
+
+    /// Snapshot one viewport row (0 = top).
+    pub fn line(&mut self, viewport_row: usize) -> Vec<CellSnapshot> {
+        self.snapshot()
+            .0
+            .into_iter()
+            .nth(viewport_row)
+            .unwrap_or_default()
     }
 
     /// All viewport rows, top to bottom.
-    pub fn lines(&self) -> Vec<Vec<CellSnapshot>> {
-        (0..self.rows()).map(|r| self.line(r)).collect()
+    pub fn lines(&mut self) -> Vec<Vec<CellSnapshot>> {
+        self.snapshot().0
     }
 
     /// Cursor in viewport coordinates; `None` when hidden or scrolled out.
-    pub fn cursor(&self) -> Option<CursorSnapshot> {
-        let content = self.term.renderable_content();
-        if content.cursor.shape == CursorShape::Hidden {
-            return None;
-        }
-        let Point { line, column } = content.cursor.point;
-        let row = line.0 + self.display_offset() as i32;
-        if row < 0 || row >= self.rows() as i32 {
-            return None;
-        }
-        Some(CursorSnapshot {
-            row: row as usize,
-            col: column.0,
-        })
+    pub fn cursor(&mut self) -> Option<CursorSnapshot> {
+        self.snapshot().1
     }
 
     /// Test/diagnostic helper: a viewport row as trimmed text (wide-char
     /// spacers skipped).
-    pub fn row_text(&self, viewport_row: usize) -> String {
-        let mut text: String = self
-            .line(viewport_row)
-            .iter()
-            .filter(|c| !c.wide_spacer)
-            .map(|c| c.ch)
-            .collect();
+    pub fn row_text(&mut self, viewport_row: usize) -> String {
+        let mut text = String::new();
+        for cell in self.line(viewport_row) {
+            if !cell.wide_spacer {
+                text.push_str(&cell.text);
+            }
+        }
         while text.ends_with(' ') {
             text.pop();
         }
@@ -367,7 +452,7 @@ mod tests {
         // After reset: defaults.
         assert_eq!(line[4].fg, CellColor::Foreground);
         // Bold + blue background segment starts at col 10 ("red plain " = 10).
-        let bold_cell = line[10];
+        let bold_cell = &line[10];
         assert!(bold_cell.bold);
         assert_eq!(bold_cell.bg, CellColor::Indexed(4));
     }
@@ -386,13 +471,14 @@ mod tests {
     fn inverse_and_hidden_resolve_in_display_colors() {
         let mut e = emu(10, 2);
         e.feed(b"\x1b[7mI\x1b[0m\x1b[8mH");
-        let inv = e.line(0)[0];
+        let line = e.line(0);
+        let inv = &line[0];
         assert!(inv.inverse);
         assert_eq!(
             inv.display_colors(),
             (CellColor::Background, CellColor::Foreground)
         );
-        let hid = e.line(0)[1];
+        let hid = &line[1];
         assert!(hid.hidden);
         let (fg, bg) = hid.display_colors();
         assert_eq!(fg, bg, "hidden text paints foreground as background");
@@ -403,7 +489,7 @@ mod tests {
         let mut e = emu(20, 6);
         e.feed(b"\x1b[3;5Hx");
         // CSI H is 1-based; cell written at row 2, col 4; cursor advanced by 1.
-        assert_eq!(e.line(2)[4].ch, 'x');
+        assert_eq!(e.line(2)[4].text, "x");
         assert_eq!(e.cursor(), Some(CursorSnapshot { row: 2, col: 5 }));
         e.feed(b"\x1b[2D"); // left twice
         assert_eq!(e.cursor(), Some(CursorSnapshot { row: 2, col: 3 }));
@@ -526,11 +612,21 @@ mod tests {
         e.feed("宽w".as_bytes());
         let line = e.line(0);
         assert!(line[0].wide);
-        assert_eq!(line[0].ch, '宽');
+        assert_eq!(line[0].text, "宽");
         assert!(line[1].wide_spacer);
-        assert_eq!(line[2].ch, 'w');
+        assert_eq!(line[2].text, "w");
         assert_eq!(e.row_text(0), "宽w");
         assert_eq!(e.cursor(), Some(CursorSnapshot { row: 0, col: 3 }));
+    }
+
+    #[test]
+    fn combining_codepoints_stay_in_one_grapheme_cell() {
+        let mut e = emu(10, 2);
+        e.feed("e\u{301}x".as_bytes());
+        let line = e.line(0);
+        assert_eq!(line[0].text, "e\u{301}");
+        assert_eq!(line[1].text, "x");
+        assert_eq!(e.cursor(), Some(CursorSnapshot { row: 0, col: 2 }));
     }
 
     #[test]

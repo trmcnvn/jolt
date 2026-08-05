@@ -1,7 +1,7 @@
 //! The app theme — two concrete appearances, one token set.
 //!
 //! Colors are precomputed from an oklch-derived neutral scale (perceptually even
-//! lightness steps; the same scale comet's Tailwind theme used) into gpui [`Hsla`].
+//! lightness steps; the same scale jolt's Tailwind theme used) into gpui [`Hsla`].
 //! **Numbers drive layout, colors are paint**: layout constants live here as plain
 //! numbers and never depend on which color is painted.
 //!
@@ -35,6 +35,9 @@
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use gpui::{App, Global, Hsla, SharedString, hsla};
+
+pub const DEFAULT_UI_FONT: &str = "Geist";
+pub const DEFAULT_CODE_FONT: &str = "Geist Mono";
 
 /// Which appearance the app is painting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -279,8 +282,10 @@ pub struct Theme {
     /// UI font family (bundling of Geist lands with asset work; until then the
     /// text system falls back to the system sans when the family is missing).
     pub font_sans: SharedString,
-    /// Monospace family for code/terminal.
+    /// Monospace family for code and diffs.
     pub font_mono: SharedString,
+    /// Font family used by terminal grids.
+    pub font_terminal: SharedString,
     /// Explicit system fallbacks, for callers that want to skip the lookup.
     pub font_sans_fallback: SharedString,
     pub font_mono_fallback: SharedString,
@@ -307,7 +312,7 @@ impl Theme {
     /// see [`Self::glass_overlay`], where light coverage steps up to keep menu
     /// text legible over an unknown backdrop.
     pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
-    /// Main-panel header height (comet `h-11`) — in-card headers (changes pane).
+    /// Main-panel header height (jolt `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
     /// The unified window titlebar (traffic lights + cluster + tabs). Content
     /// rides [`Self::TITLEBAR_TOP_PAD`] lower than center so the air above
@@ -315,7 +320,7 @@ impl Theme {
     pub const TITLEBAR_HEIGHT: f32 = 38.0;
     /// Downward shift of titlebar content within the bar.
     pub const TITLEBAR_TOP_PAD: f32 = 2.0;
-    /// Reserved status strip under the content outlet (comet `h-6`) — the
+    /// Reserved status strip under the content outlet (jolt `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
     /// Message bubble corner radius.
@@ -470,8 +475,9 @@ impl Theme {
             diff_add: oklch(0.765, 0.177, 163.223),  // emerald-400
             diff_del: oklch(0.704, 0.191, 22.216),   // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
-            font_sans: "Geist".into(),
-            font_mono: "Geist Mono".into(),
+            font_sans: DEFAULT_UI_FONT.into(),
+            font_mono: DEFAULT_CODE_FONT.into(),
+            font_terminal: DEFAULT_CODE_FONT.into(),
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
         }
@@ -548,8 +554,9 @@ impl Theme {
             diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
-            font_sans: "Geist".into(),
-            font_mono: "Geist Mono".into(),
+            font_sans: DEFAULT_UI_FONT.into(),
+            font_mono: DEFAULT_CODE_FONT.into(),
+            font_terminal: DEFAULT_CODE_FONT.into(),
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
         }
@@ -567,8 +574,45 @@ impl Theme {
     /// context-free paint helpers at it. The **only** way the appearance should
     /// change — setting the global directly leaves [`current_appearance`] stale.
     pub fn install(appearance: Appearance, cx: &mut App) {
+        Self::install_with_fonts(
+            appearance,
+            DEFAULT_UI_FONT,
+            DEFAULT_CODE_FONT,
+            DEFAULT_CODE_FONT,
+            cx,
+        );
+    }
+
+    /// Install a palette with the user's UI and code font choices.
+    pub fn install_with_fonts(
+        appearance: Appearance,
+        ui_font: impl Into<SharedString>,
+        code_font: impl Into<SharedString>,
+        terminal_font: impl Into<SharedString>,
+        cx: &mut App,
+    ) {
+        let ui_font = ui_font.into();
+        let code_font = code_font.into();
+        let terminal_font = terminal_font.into();
+        let previous = cx.try_global::<Self>();
+        let appearance_changed = previous.is_some_and(|theme| theme.appearance != appearance);
+        let typography_changed = previous.is_some_and(|theme| {
+            theme.font_sans != ui_font
+                || theme.font_mono != code_font
+                || theme.font_terminal != terminal_font
+        });
         set_current_appearance(appearance);
-        cx.set_global(Self::for_appearance(appearance));
+        // `set_current_appearance` already invalidates caches when the palette
+        // changes. A font-only change needs the same generation bump so shaped
+        // transcript/code rows are rebuilt with the new metrics.
+        if typography_changed && !appearance_changed {
+            THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut theme = Self::for_appearance(appearance);
+        theme.font_sans = ui_font;
+        theme.font_mono = code_font;
+        theme.font_terminal = terminal_font;
+        cx.set_global(theme);
     }
 
     /// Read the theme global.
@@ -956,7 +1000,7 @@ mod tests {
 
     #[test]
     fn neutral_950_is_0a0a0a() {
-        // oklch(0.145 0 0) is Tailwind neutral-950, comet's app background.
+        // oklch(0.145 0 0) is Tailwind neutral-950, jolt's app background.
         let rgb = srgb_u8(oklch_to_srgb(0.145, 0.0, 0.0));
         assert_eq!(rgb, [10, 10, 10]);
     }
@@ -1450,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_numbers_match_comet() {
+    fn layout_numbers_match_jolt() {
         assert_eq!(Theme::HEADER_HEIGHT, 44.0); // h-11
         assert_eq!(Theme::STATUS_STRIP_HEIGHT, 24.0); // h-6
         assert_eq!(Theme::BUBBLE_RADIUS, 16.0);

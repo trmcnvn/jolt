@@ -1,8 +1,8 @@
-//! comet-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
+//! jolt-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
 //! transports, plus the device-room relay transport ({s,k,to,from} frames — [`device_room`]).
 //!
 //! Framing: ndjson envelopes, one JSON object per WebSocket text message (or per line on
-//! byte transports), matching the shape of comet's Effect RPC without the Effect runtime:
+//! byte transports), matching the shape of jolt's Effect RPC without the Effect runtime:
 //!
 //! - client → server: `{id, method, params}` to invoke, `{id, cancel: true}` to stop a stream;
 //! - server → client: `{id, ok}` / `{id, err}` for unary calls,
@@ -35,13 +35,16 @@ pub use server::{serve_connection, serve_ws_listener};
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const LIST_MODELS: &str = "ListModels";
+    pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    /// Extract prose questions from one completed assistant message.
+    pub const EXTRACT_QUESTIONS: &str = "ExtractQuestions";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
     pub const PROBE_SYNC: &str = "ProbeSync";
-    /// Live sync introspection (`comet sync` / debug surfaces): per-room
+    /// Live sync introspection (`jolt sync` / debug surfaces): per-room
     /// connection state, last pushed-frame/ack ages, rejoin/probe/resync
     /// counters for the workspace room and every open chat doc. No params;
     /// IPC-only.
@@ -65,8 +68,8 @@ pub mod methods {
     pub const COMPLETE_SIGN_IN: &str = "CompleteSignIn";
     pub const SIGN_OUT: &str = "SignOut";
     pub const LIST_ORGS: &str = "ListOrgs";
-    pub const CREATE_ORG: &str = "CreateOrg";
-    pub const SELECT_ORG: &str = "SelectOrg";
+    /// Provision or select the signed-in user's sole hidden organization.
+    pub const ENSURE_PERSONAL_ORG: &str = "EnsurePersonalOrg";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
@@ -80,6 +83,9 @@ pub mod methods {
     pub const SEARCH_FILES: &str = "SearchFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
+    /// Per-device active VCS backend and executable availability.
+    pub const VCS_SETTINGS: &str = "VcsSettings";
+    pub const SET_VCS_BACKEND: &str = "SetVcsBackend";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";

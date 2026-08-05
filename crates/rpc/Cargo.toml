@@ -1,13 +1,13 @@
 [package]
-name = "comet-rpc"
+name = "jolt-rpc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-comet-proto.workspace = true
-comet-sync.workspace = true
+jolt-proto.workspace = true
+jolt-sync.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures.workspace = true

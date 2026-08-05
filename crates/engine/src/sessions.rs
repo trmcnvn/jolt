@@ -1,7 +1,7 @@
 //! SessionsEngine — per-chat agent runs: dispatch, steering, interrupts, input bridging,
 //! journal + broadcast fan-out, and 120ms coalesced doc streaming.
 //!
-//! Pragmatic port of comet's `sessions.ts` (spec: feature-inventory §3.2):
+//! Pragmatic port of jolt's `sessions.ts` (spec: feature-inventory §3.2):
 //! - every `AgentEvent` is (a) appended to the on-disk run journal, (b) broadcast to
 //!   in-process subscribers, (c) folded via `fold_event_into_parts` and diffed into the
 //!   chat's `SessionDoc` through `SegmentWriter` on a coalesced `STREAM_COMMIT_MS` timer;
@@ -10,7 +10,7 @@
 //! - a `Steered` event splits the assistant entry at the exact boundary;
 //! - recovery (interrupt or a stale journal at boot) stamps the streaming entry `aborted`.
 //!
-//! Scope notes: sessions are keyed by chat id (one live run per chat). Comet's pulse
+//! Scope notes: sessions are keyed by chat id (one live run per chat). Jolt's pulse
 //! loop is ported as the 15s liveness heartbeat in `drive_run`; its stall watchdog is
 //! deliberately NOT ported (rejected in review — agents may legitimately wait on
 //! something for far longer than any timeout, and a live child IS the working signal).
@@ -18,18 +18,24 @@
 //! spawn failure, stream error, engine-restart recovery).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
 use futures::StreamExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use comet_doc::{
+use jolt_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     fold_event_into_parts, sanitize_tool_call,
 };
-use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
-use comet_proto::{
+use jolt_harness::{
+    BashMessage, BashRequest, BashResult, CancellationToken, Harness, RunControls, SteerMessage,
+};
+use jolt_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
 };
@@ -59,7 +65,7 @@ type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnsw
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
-/// directory — comet sessions.ts:563 "harness session stores are keyed by
+/// directory — jolt sessions.ts:563 "harness session stores are keyed by
 /// cwd"), so resume is only injected for runs launched from the same cwd.
 #[derive(Debug, Clone)]
 struct HarnessSessionRef {
@@ -71,6 +77,7 @@ struct RunHandle {
     run_id: String,
     steerable: bool,
     steer_tx: mpsc::Sender<SteerMessage>,
+    bash_tx: Option<mpsc::Sender<BashMessage>>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
@@ -96,7 +103,7 @@ struct Inner {
     last_requests: Mutex<HashMap<String, RunRequest>>,
     /// Harness-native session ids per chat (resume continuity across turns) —
     /// the live-process cache over the durable copy on the workspace chat row
-    /// (comet kept the same pair on `chats.harness_session_id`). An empty
+    /// (jolt kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
@@ -171,7 +178,7 @@ impl SessionsEngine {
         lock(&self.inner.statuses).values().any(|s| {
             matches!(
                 s.status,
-                comet_proto::SessionStatus::Working | comet_proto::SessionStatus::AwaitingInput
+                jolt_proto::SessionStatus::Working | jolt_proto::SessionStatus::AwaitingInput
             )
         })
     }
@@ -209,7 +216,7 @@ impl SessionsEngine {
     ///
     /// - The user message entry is written to the doc immediately (id = `message_id`).
     /// - A live steerable run receives the prompt as its next turn via the mailbox
-    ///   (comet's persistent-session routing); otherwise any live run is interrupted
+    ///   (jolt's persistent-session routing); otherwise any live run is interrupted
     ///   first — never two runtimes driving one chat.
     pub async fn dispatch(
         &self,
@@ -218,7 +225,35 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
-        self.dispatch_with(chat_id, harness_id, request, message_id, true)
+        self.dispatch_with(chat_id, harness_id, request, message_id, None, true, true)
+            .await
+    }
+
+    /// Dispatch while prepending host-generated context to the harness prompt
+    /// without exposing it in the user's transcript entry.
+    pub(crate) async fn dispatch_with_context(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        request: RunRequest,
+        message_id: Option<String>,
+        context: Option<String>,
+    ) -> Result<String, EngineError> {
+        self.dispatch_with(
+            chat_id, harness_id, request, message_id, context, true, true,
+        )
+        .await
+    }
+
+    /// Dispatch a control prompt to the harness without writing a user entry.
+    pub(crate) async fn dispatch_hidden_with_context(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        request: RunRequest,
+        context: Option<String>,
+    ) -> Result<String, EngineError> {
+        self.dispatch_with(chat_id, harness_id, request, None, context, true, false)
             .await
     }
 
@@ -233,9 +268,19 @@ impl SessionsEngine {
         harness_id: HarnessId,
         request: RunRequest,
         message_id: Option<String>,
+        context: Option<String>,
         inject_resume: bool,
+        write_user_entry: bool,
     ) -> futures::future::BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(self.dispatch_inner(chat_id, harness_id, request, message_id, inject_resume))
+        Box::pin(self.dispatch_inner(
+            chat_id,
+            harness_id,
+            request,
+            message_id,
+            context,
+            inject_resume,
+            write_user_entry,
+        ))
     }
 
     async fn dispatch_inner(
@@ -244,8 +289,14 @@ impl SessionsEngine {
         harness_id: HarnessId,
         mut request: RunRequest,
         message_id: Option<String>,
+        context: Option<String>,
         inject_resume: bool,
+        write_user_entry: bool,
     ) -> Result<String, EngineError> {
+        let turn_prompt = request.prompt.clone();
+        if let Some(context) = &context {
+            request.prompt = format!("{context}\n\n{turn_prompt}");
+        }
         let routed = lock(&self.inner.runs)
             .get(chat_id)
             .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()));
@@ -255,16 +306,20 @@ impl SessionsEngine {
                 message_id: message_id.clone(),
             };
             if steerable && steer_tx.try_send(message).is_ok() {
-                let user_id = message_id.unwrap_or_else(new_id);
-                let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                if write_user_entry {
+                    let user_id = message_id.unwrap_or_else(new_id);
+                    let handle = self.doc_handle(chat_id)?;
+                    handle.write_user_message(&user_id, &turn_prompt, now_ms())?;
+                }
                 // Working BEFORE the lastMessageAt bump: both ride the
                 // workspace doc from this one peer, so causal order makes it
                 // impossible for an observer to hold [new message, old status]
                 // — that gap read as unseen-with-no-live-run = a phantom
                 // "completed" flash on every remote send (2026-07-31).
                 self.set_status(chat_id, SessionStatus::Working, false);
-                self.inner.note_message(chat_id, &request.prompt);
+                if write_user_entry {
+                    self.inner.note_message(chat_id, &turn_prompt);
+                }
                 return Ok(run_id);
             }
             // Mailbox closed (runtime mid-teardown / non-steering harness): replace it.
@@ -274,9 +329,11 @@ impl SessionsEngine {
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        if write_user_entry {
+            handle.write_user_message(&user_id, &turn_prompt, now_ms())?;
+        }
 
-        // Engine-owned resume (comet sessions.ts:736 — every dispatch read the
+        // Engine-owned resume (jolt sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
         // the engine threads the chat's prior harness session back in so a new
         // process (app restart) continues the same harness conversation.
@@ -285,10 +342,13 @@ impl SessionsEngine {
             request.resume = self.inner.resume_for(chat_id, &request.cwd);
             resume_injected = request.resume.is_some();
         }
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+        let mut saved_request = request.clone();
+        saved_request.prompt = turn_prompt.clone();
+        lock(&self.inner.last_requests).insert(chat_id.to_string(), saved_request);
 
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
+        let (bash_tx, bash_rx) = mpsc::channel::<BashMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
@@ -313,6 +373,7 @@ impl SessionsEngine {
         let controls = RunControls {
             request_input,
             steering: steer_rx,
+            bash: bash_rx,
             interrupt: interrupt_token.clone(),
         };
 
@@ -322,6 +383,7 @@ impl SessionsEngine {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
                 steer_tx,
+                bash_tx: harness.supports_native_bash().then_some(bash_tx),
                 interrupt_token,
                 cancel: cancel_tx,
                 engine_tx,
@@ -331,15 +393,17 @@ impl SessionsEngine {
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
-        self.inner.note_message(chat_id, &request.prompt);
+        if write_user_entry {
+            self.inner.note_message(chat_id, &turn_prompt);
 
-        // Name the chat NOW, off the first prompt — not after the first
-        // exchange completes ("called New session for a long time for no
-        // reason"; the titler only needs the prompt and skips titled chats;
-        // the Done-time call below stays as the retry for a failed
-        // generation).
-        if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+            // Name the chat NOW, off the first prompt — not after the first
+            // exchange completes ("called New session for a long time for no
+            // reason"; the titler only needs the prompt and skips titled chats;
+            // the Done-time call below stays as the retry for a failed
+            // generation).
+            if let Some(titles) = self.inner.titles.get() {
+                titles.maybe_generate(chat_id, harness_id, &turn_prompt, &request.cwd);
+            }
         }
 
         tokio::spawn(drive_run(
@@ -355,9 +419,65 @@ impl SessionsEngine {
             RunResumeState {
                 user_message_id: user_id,
                 resume_injected,
+                turn_prompt,
+                context,
+                write_user_entry,
             },
         ));
         Ok(run_id)
+    }
+
+    /// Whether this harness records included shell output in its own session.
+    pub(crate) fn bash_context_is_native(
+        &self,
+        harness_id: HarnessId,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .inner
+            .registry
+            .resolve(harness_id)?
+            .supports_native_bash())
+    }
+
+    /// Execute a user shell command without starting an agent turn. Pi uses
+    /// its native session-aware RPC; other harnesses use Jolt's local Bash.
+    pub async fn bash(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        mut request: BashRequest,
+    ) -> Result<BashResult, EngineError> {
+        if request.resume.is_none() {
+            request.resume = self.inner.resume_for(chat_id, &request.cwd);
+        }
+        let target = lock(&self.inner.runs)
+            .get(chat_id)
+            .and_then(|handle| handle.bash_tx.clone());
+        let result = if let Some(target) = target {
+            let (response, result) = oneshot::channel();
+            target
+                .send(BashMessage {
+                    request: request.clone(),
+                    response,
+                })
+                .await
+                .map_err(|_| EngineError::Other("Pi shell command channel closed".into()))?;
+            result
+                .await
+                .map_err(|_| EngineError::Other("Pi shell command was cancelled".into()))??
+        } else {
+            let harness = self.inner.registry.resolve(harness_id)?;
+            if harness.supports_native_bash() {
+                harness.bash(request.clone()).await?
+            } else {
+                run_local_bash(&request).await?
+            }
+        };
+        if let Some(session_id) = &result.session_id {
+            self.inner
+                .remember_harness_session(chat_id, session_id, &request.cwd);
+        }
+        Ok(result)
     }
 
     /// Push a steer prompt into the live run's mailbox. `NotSteerable` when no live
@@ -368,6 +488,17 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
+        self.steer_with_context(chat_id, prompt, message_id, None)
+            .await
+    }
+
+    pub(crate) async fn steer_with_context(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: Option<String>,
+        context: Option<String>,
+    ) -> Result<SteerOutcome, EngineError> {
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
@@ -375,8 +506,11 @@ impl SessionsEngine {
         let Some(steer_tx) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
+        let harness_prompt = context
+            .map(|context| format!("{context}\n\n{prompt}"))
+            .unwrap_or_else(|| prompt.to_string());
         let message = SteerMessage {
-            prompt: prompt.to_string(),
+            prompt: harness_prompt,
             message_id: message_id.clone(),
         };
         if steer_tx.try_send(message).is_err() {
@@ -405,7 +539,7 @@ impl SessionsEngine {
         let Some((run_id, token, cancel, pending)) = target else {
             return Ok(false);
         };
-        // Unpark any blocked question FIRST (mirrors comet: harness teardown can await a
+        // Unpark any blocked question FIRST (mirrors jolt: harness teardown can await a
         // parked question callback — a run stuck on a question would deadlock the stop).
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
@@ -455,7 +589,7 @@ impl SessionsEngine {
     /// with a VISIBLE "Run interrupted by engine restart" error part, close the
     /// journal with a synthetic `Done{interrupted}` — and then PICK THE RUN BACK
     /// UP: a fresh crashed turn with revival budget left is re-dispatched against
-    /// the remembered harness session (comet: "not just eulogized";
+    /// the remembered harness session (jolt: "not just eulogized";
     /// `MAX_AUTO_RESUME` = 3 consecutive revivals, fresh = crashed < 12h ago).
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
         const MAX_AUTO_RESUME: u32 = 3;
@@ -471,7 +605,7 @@ impl SessionsEngine {
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
-            // same harness conversation (comet recoverDraft, sessions.ts:538).
+            // same harness conversation (jolt recoverDraft, sessions.ts:538).
             if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
                 self.inner
                     .remember_harness_session(&chat_id, &session_id, &cwd);
@@ -500,7 +634,10 @@ impl SessionsEngine {
                     entries
                         .iter()
                         .rev()
-                        .find(|e| e.status == Some(MessageStatus::Streaming))
+                        .find(|e| {
+                            e.role == MessageRole::Assistant
+                                && e.status == Some(MessageStatus::Streaming)
+                        })
                         .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
                 })
                 .unwrap_or(false);
@@ -536,7 +673,7 @@ impl SessionsEngine {
                 let request = sessions
                     .last_request(&chat_id)
                     .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
-                    // Last resort: the journal's own cwd (comet's draft config)
+                    // Last resort: the journal's own cwd (jolt's draft config)
                     // — a crash can predate the debounced workspace-row write.
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
@@ -546,7 +683,7 @@ impl SessionsEngine {
                             reasoning: None,
                             model_options: Default::default(),
                             cwd,
-                            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                            sandbox: jolt_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
                             attachments: Vec::new(),
                             resume: None,
@@ -696,7 +833,7 @@ impl Inner {
 
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
-    /// engine restart (comet sessions.ts:1039).
+    /// engine restart (jolt sessions.ts:1039).
     fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
         if session_id.is_empty() {
             return;
@@ -730,7 +867,7 @@ impl Inner {
     }
 
     /// The session id to resume for a run in `chat_id` launching from `cwd`
-    /// (comet sessions.ts:736, looked up on every dispatch):
+    /// (jolt sessions.ts:736, looked up on every dispatch):
     /// live-process cache → workspace chat row → journal scan (the crash path
     /// where the debounced row write never landed — SessionStarted/Done events
     /// are journaled per event, flushed immediately). Cwd-gated throughout:
@@ -874,13 +1011,89 @@ fn finish_segment<'a>(
     }
 }
 
-/// Resume bookkeeping for one run task: which user entry the run answers (so a
-/// failed-resume retry re-dispatches idempotently against the same doc entry)
-/// and whether `dispatch` injected the resume id itself (only engine-injected
-/// resumes are retried fresh — a caller-specified resume fails loudly).
+const BASH_TRANSCRIPT_MAX_BYTES: u64 = 50 * 1024;
+
+fn bash_executable() -> PathBuf {
+    let system_bash = Path::new("/bin/bash");
+    if system_bash.exists() {
+        system_bash.to_path_buf()
+    } else {
+        PathBuf::from("bash")
+    }
+}
+
+async fn run_local_bash(request: &BashRequest) -> Result<BashResult, EngineError> {
+    let output_path = std::env::temp_dir().join(format!("jolt-bash-{}.log", new_id()));
+    let stdout = std::fs::File::create(&output_path)?;
+    let stderr = stdout.try_clone()?;
+    let executable = bash_executable();
+    let mut command = Command::new(&executable);
+    command
+        .args(["-lc", &request.command])
+        .current_dir(&request.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    if let Some(path) = jolt_harness::shell_env::login_shell_path() {
+        command.env("PATH", path);
+    }
+
+    let status = match command.status().await {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&output_path).await;
+            return Err(error.into());
+        }
+    };
+    let output_result: Result<(Vec<u8>, bool), std::io::Error> = async {
+        let output_len = tokio::fs::metadata(&output_path).await?.len();
+        let truncated = output_len > BASH_TRANSCRIPT_MAX_BYTES;
+        let mut output_file = tokio::fs::File::open(&output_path).await?;
+        if truncated {
+            output_file
+                .seek(std::io::SeekFrom::Start(
+                    output_len - BASH_TRANSCRIPT_MAX_BYTES,
+                ))
+                .await?;
+        }
+        let mut output = Vec::with_capacity(output_len.min(BASH_TRANSCRIPT_MAX_BYTES) as usize);
+        output_file.read_to_end(&mut output).await?;
+        Ok((output, truncated))
+    }
+    .await;
+    let (output, truncated) = match output_result {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&output_path).await;
+            return Err(error.into());
+        }
+    };
+
+    let full_output_path = if truncated {
+        Some(output_path.to_string_lossy().into_owned())
+    } else {
+        let _ = tokio::fs::remove_file(&output_path).await;
+        None
+    };
+    Ok(BashResult {
+        output: String::from_utf8_lossy(&output).into_owned(),
+        exit_code: status.code(),
+        cancelled: false,
+        truncated,
+        full_output_path,
+        session_id: None,
+    })
+}
+
+/// Resume bookkeeping for one run task: the turn prompt stays separate from
+/// hidden shell context for titling and a failed-resume retry; only
+/// engine-injected resume ids are retried fresh.
 struct RunResumeState {
     user_message_id: String,
     resume_injected: bool,
+    turn_prompt: String,
+    context: Option<String>,
+    write_user_entry: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -899,7 +1112,7 @@ async fn drive_run(
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
-    let user_prompt = request.prompt.clone();
+    let user_prompt = resume_state.turn_prompt.clone();
     let run_cwd = request.cwd.clone();
     // Kept whole for the failed-resume retry (fresh session, same user entry).
     // Option so the retry branch (inside the event loop) can take ownership.
@@ -956,12 +1169,12 @@ async fn drive_run(
     // so the gate still catches real crashes. touch_session throttles at 10s.
     let mut live_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     live_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // PERSISTENT SESSION (comet runsBySession): a completed turn on a
+    // PERSISTENT SESSION (jolt runsBySession): a completed turn on a
     // steerable harness parks here instead of ending the run — the child and
     // its steering mailbox stay warm, and the next user message (dispatch
     // routes into a live run) starts the next turn with zero respawn/resume
     // latency. `Some(when)` = idle since then; the 30-min reaper below ends
-    // a session nobody comes back to (comet SESSION_IDLE_MS).
+    // a session nobody comes back to (jolt SESSION_IDLE_MS).
     const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
@@ -989,7 +1202,7 @@ async fn drive_run(
                 inner.touch_session(&chat_id);
                 continue;
             }
-            // Idle reaper (comet SESSION_IDLE_MS): a parked persistent session
+            // Idle reaper (jolt SESSION_IDLE_MS): a parked persistent session
             // nobody returned to in 30 minutes releases its child. The turn
             // was finalized at Done, so this end is clean — no aborted stamp.
             _ = tokio::time::sleep_until(
@@ -1077,7 +1290,7 @@ async fn drive_run(
                     ..
                 }
             )
-            && let Some(retry) = retry_request.take()
+            && let Some(mut retry) = retry_request.take()
         {
             tracing::warn!(
                 chat = %chat_id,
@@ -1090,11 +1303,22 @@ async fn drive_run(
             };
             let chat = chat_id.clone();
             let message_id = resume_state.user_message_id.clone();
+            retry.prompt = resume_state.turn_prompt.clone();
+            let context = resume_state.context.clone();
+            let write_user_entry = resume_state.write_user_entry;
             tokio::spawn(async move {
                 // `inject_resume = false`: the retry must start fresh. The user
                 // entry write inside dispatch is idempotent by message id.
                 if let Err(err) = engine
-                    .dispatch_with(&chat, harness_id, retry, Some(message_id), false)
+                    .dispatch_with(
+                        &chat,
+                        harness_id,
+                        retry,
+                        Some(message_id),
+                        context,
+                        false,
+                        write_user_entry,
+                    )
                     .await
                 {
                     tracing::error!(chat = %chat, error = %err, "fresh-session retry dispatch failed");
@@ -1175,7 +1399,7 @@ async fn drive_run(
 
         inner.publish(&chat_id, &event);
 
-        // Defensive rule from comet: a mid-run SessionStarted re-emission (Claude SDK
+        // Defensive rule from jolt: a mid-run SessionStarted re-emission (Claude SDK
         // background re-invocations) must not wipe the segment being written.
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
@@ -1222,6 +1446,7 @@ async fn drive_run(
             // Exchange completed on an untitled chat → name it (fire-and-forget;
             // interrupted/errored turns never trigger naming).
             if *status == DoneStatus::Completed
+                && resume_state.write_user_entry
                 && let Some(titles) = inner.titles.get()
             {
                 titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd);

@@ -4,7 +4,7 @@
 //! ## EngineHandle
 //! The UI talks the same typed RPC whether the engine is in-process or a separate
 //! daemon (ARCHITECTURE §1). [`EngineHandle::bootstrap`] probes the localhost IPC
-//! port, mirroring comet: if an engine is listening it connects over WebSocket
+//! port, mirroring jolt: if an engine is listening it connects over WebSocket
 //! ([`RemoteEngine`]); otherwise it embeds one via [`EngineCore::assemble`] and an
 //! in-memory RPC transport ([`InProcessEngine`]) — same envelopes, same dispatch.
 //!
@@ -27,10 +27,10 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use comet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
-use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
-use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+use jolt_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use jolt_engine::{Engine, EngineConfig, EngineSupervisor};
+use jolt_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
+use jolt_rpc::{RpcClient, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
 // Engine handle
@@ -39,7 +39,7 @@ use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_cl
 /// Everything needed to reach (or start) an engine.
 #[derive(Debug, Clone)]
 pub struct EngineBootConfig {
-    /// Data directory for the embedded engine (`~/.comet-native`).
+    /// Data directory for the embedded engine (`~/.jolt`).
     pub data_dir: PathBuf,
     /// Localhost IPC port to probe / serve.
     pub ipc_port: u16,
@@ -77,7 +77,7 @@ trait EngineBackend: Send + Sync {
 
 /// Embedded engine: owns the [`EngineCore`] and an in-memory RPC loop.
 struct InProcessEngine {
-    runtime: Arc<tokio::sync::Mutex<Option<EngineRuntime>>>,
+    supervisor: Arc<EngineSupervisor>,
     boot_task: tokio::task::JoinHandle<()>,
     refresh_task: tokio::task::JoinHandle<()>,
     /// Serves this engine to other viewports over the IPC port. `None` when the
@@ -101,47 +101,8 @@ impl EngineBackend for InProcessEngine {
         if let Some(ipc) = &self.ipc_task {
             ipc.abort();
         }
-        if let Some(runtime) = self.runtime.lock().await.take() {
-            runtime.shutdown().await;
-        }
+        self.supervisor.shutdown().await;
         self.refresh_task.abort();
-    }
-}
-
-#[derive(Clone)]
-enum DeferredEngineState {
-    Waiting,
-    Ready(Arc<dyn RpcService>),
-    Failed(String),
-}
-
-/// Serves AuthRpc immediately, then holds all data RPC calls until the signed-in
-/// user's identity-scoped engine is assembled. Existing UI subscriptions remain
-/// pending and attach to the real service without reconnecting.
-struct DeferredEngineRpc {
-    auth: AuthRpc,
-    state: tokio::sync::watch::Receiver<DeferredEngineState>,
-}
-
-#[async_trait]
-impl RpcService for DeferredEngineRpc {
-    async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
-        if AuthRpc::handles(method) {
-            return self.auth.handle(method, params).await;
-        }
-
-        let mut state = self.state.clone();
-        loop {
-            let current = { state.borrow().clone() };
-            match current {
-                DeferredEngineState::Waiting => {}
-                DeferredEngineState::Ready(service) => {
-                    return service.handle(method, params).await;
-                }
-                DeferredEngineState::Failed(message) => return Err(RpcError::Failed(message)),
-            }
-            state.changed().await.map_err(|_| RpcError::Closed)?;
-        }
     }
 }
 
@@ -210,12 +171,8 @@ impl EngineHandle {
         };
         let auth = Engine::build_auth(&engine_config).await;
         let refresh_task = auth.spawn_refresh_loop();
-        let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
-        let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
-            auth: AuthRpc::new(auth.clone()),
-            state: state_rx,
-        });
-        let client = memory_client(service.clone());
+        let supervisor = EngineSupervisor::new(engine_config.clone(), auth);
+        let client = memory_client(supervisor.clone());
 
         // Serve the same service on the IPC port so a terminal viewport can
         // attach to this window's engine with no setup. Deliberately the
@@ -225,45 +182,22 @@ impl EngineHandle {
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
-        let ipc_task = match comet_engine::serve_ipc(engine_config.ipc_port, service).await {
-            Ok(task) => Some(task),
-            Err(err) => {
-                tracing::warn!(
-                    port = engine_config.ipc_port,
-                    error = %err,
-                    "IPC port unavailable; other viewports cannot attach to this window"
-                );
-                None
-            }
-        };
-        let runtime = Arc::new(tokio::sync::Mutex::new(None));
-        let runtime_for_boot = runtime.clone();
-        let boot_task = tokio::spawn(async move {
-            let mut auth_state = auth.watch_state();
-            while !auth_state.borrow().is_signed_in() {
-                if auth_state.changed().await.is_err() {
-                    state_tx.send_replace(DeferredEngineState::Failed(
-                        "authentication state closed before sign-in".into(),
-                    ));
-                    return;
-                }
-            }
-
-            match Engine::assemble_runtime(&engine_config, auth).await {
-                Ok(engine_runtime) => {
-                    let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
-                    *runtime_for_boot.lock().await = Some(engine_runtime);
-                    state_tx.send_replace(DeferredEngineState::Ready(service));
-                }
+        let ipc_task =
+            match jolt_engine::serve_ipc(engine_config.ipc_port, supervisor.clone()).await {
+                Ok(task) => Some(task),
                 Err(err) => {
-                    tracing::error!(error = %err, "embedded engine assembly failed");
-                    state_tx.send_replace(DeferredEngineState::Failed(format!("{err:#}")));
+                    tracing::warn!(
+                        port = engine_config.ipc_port,
+                        error = %err,
+                        "IPC port unavailable; other viewports cannot attach to this window"
+                    );
+                    None
                 }
-            }
-        });
+            };
+        let boot_task = supervisor.spawn_when_ready();
         Ok(EngineHandle {
             inner: Arc::new(InProcessEngine {
-                runtime,
+                supervisor,
                 boot_task,
                 refresh_task,
                 ipc_task,
@@ -290,51 +224,14 @@ impl EngineHandle {
 // ---------------------------------------------------------------------------
 
 // The frontend-agnostic derivations (sort orders, staleness gating, sidebar
-// grouping, the boot gate, relative times) live in `comet_proto::view`, pure
+// grouping, the boot gate, relative times) live in `jolt_proto::view`, pure
 // and with their own test suite. Re-exported here because every call site in
 // this crate reads them as `state::…`.
-pub use comet_proto::view::{
+pub use jolt_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
     parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
 };
-
-// ---------------------------------------------------------------------------
-// Org gate (pure)
-// ---------------------------------------------------------------------------
-
-/// One org membership row (tolerant local mirror of the engine's ListOrgs
-/// reply — `{orgs: [{id, organizationId, name}]}`).
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrgRow {
-    pub organization_id: String,
-    pub name: String,
-}
-
-/// Parse a ListOrgs reply tolerantly (accepts a bare array too).
-pub fn parse_orgs(value: &serde_json::Value) -> Vec<OrgRow> {
-    let list = value.get("orgs").unwrap_or(value);
-    serde_json::from_value(list.clone()).unwrap_or_default()
-}
-
-/// Workspace names must be non-empty (trimmed) and reasonably short.
-pub fn org_name_valid(name: &str) -> bool {
-    let trimmed = name.trim();
-    !trimmed.is_empty() && trimmed.chars().count() <= 64
-}
-
-/// Memberships sorted by name (case-insensitive), deduped by organization id.
-pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
-    orgs.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    orgs.dedup_by(|a, b| a.organization_id == b.organization_id);
-    orgs
-}
 
 // ---------------------------------------------------------------------------
 // AppState entity
@@ -368,7 +265,7 @@ pub struct AppState {
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<comet_update::UpdateStatus>,
+    pub update: Option<jolt_update::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -446,7 +343,7 @@ impl AppState {
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
     /// the chips update on click; the next chats watch frame carries the same
     /// value once the engine applies the LWW write.
-    pub fn apply_chat_config(&mut self, chat_id: &str, config: comet_proto::ChatConfig) {
+    pub fn apply_chat_config(&mut self, chat_id: &str, config: jolt_proto::ChatConfig) {
         if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
             chat.config = Some(config);
         }
@@ -456,7 +353,7 @@ impl AppState {
         self.devices = devices;
     }
 
-    pub fn apply_update(&mut self, status: comet_update::UpdateStatus) {
+    pub fn apply_update(&mut self, status: jolt_update::UpdateStatus) {
         self.update = Some(status);
     }
 
@@ -473,7 +370,7 @@ impl AppState {
     }
 
     /// The signed-in user, if the engine reports one.
-    pub fn auth_user(&self) -> Option<&comet_proto::UserProfile> {
+    pub fn auth_user(&self) -> Option<&jolt_proto::UserProfile> {
         match self.auth.as_ref()? {
             AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
             AuthState::SignedOut => None,
@@ -496,7 +393,7 @@ impl AppState {
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
-        comet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        jolt_doc::apply_transcript_frame(&mut self.transcript, frame)?;
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
@@ -506,7 +403,7 @@ impl AppState {
         Ok(())
     }
 
-    /// Add an optimistic user echo (composer send path).
+    /// Add an optimistic transcript echo (prompt or pending shell command).
     pub fn push_echo(&mut self, chat_id: &str, entry: SessionMessageEntry) {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
@@ -691,13 +588,7 @@ impl AppState {
                 methods::WATCH_SPACES,
                 AppState::apply_spaces,
             ),
-            // Auth frames parse tolerantly — engine and proto tags differ today.
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::AUTH_STATUS,
-                AppState::apply_auth_value,
-            ),
+            spawn_auth_watch(cx, handle.clone()),
             spawn_watch(
                 cx,
                 handle.clone(),
@@ -801,7 +692,7 @@ impl AppState {
 
 /// Subscribe to a watch method and pump each frame through `apply`. Runs on the
 /// gpui executor; ends when the stream closes or the entity is released.
-/// Chats watch with boot auto-select: comet's `/` route redirected to the
+/// Chats watch with boot auto-select: jolt's `/` route redirected to the
 /// last-used chat; we approximate by selecting the most recent unarchived chat
 /// on the first frame when nothing is selected yet (manual selection wins).
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
@@ -841,6 +732,38 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 cx.notify();
             });
             if alive.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// Pump authentication state frames.
+fn spawn_auth_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        let mut rx = match handle
+            .client()
+            .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
+            .await
+        {
+            Ok(rx) => rx,
+            Err(err) => {
+                tracing::debug!(error = %err, "auth watch unavailable");
+                return;
+            }
+        };
+        while let Some(value) = rx.recv().await {
+            let Some(auth) = parse_auth_state(&value) else {
+                tracing::warn!("dropping unrecognized AuthStatus frame");
+                continue;
+            };
+            if this
+                .update(cx, |state, cx| {
+                    state.apply_auth(auth);
+                    cx.notify();
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -989,10 +912,10 @@ fn spawn_transcript_watch(
 mod tests {
     use super::*;
     use chrono::TimeDelta;
-    use comet_engine::{EngineCore, default_registry};
+    use jolt_engine::{EngineCore, default_registry};
     // `SessionStatus` is only needed to build the fixtures below — the module
-    // itself derives everything through `comet_proto::view`.
-    use comet_proto::{SessionStatus, UserProfile};
+    // itself derives everything through `jolt_proto::view`.
+    use jolt_proto::{SessionStatus, UserProfile};
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
@@ -1145,7 +1068,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_connects_when_daemon_is_listening() {
-        // Stand in for `comet headless`: an engine served over the WS IPC port.
+        // Stand in for `jolt headless`: an engine served over the WS IPC port.
         let daemon_dir = tempfile::tempdir().unwrap();
         let core = EngineCore::assemble(
             daemon_dir.path(),
@@ -1156,7 +1079,7 @@ mod tests {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(comet_rpc::serve_ws_listener(listener, core.rpc_service()));
+        tokio::spawn(jolt_rpc::serve_ws_listener(listener, core.rpc_service()));
 
         let ui_dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
@@ -1450,12 +1373,12 @@ mod tests {
     fn apply_chat_config_stamps_the_row() {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
-        let config = comet_proto::ChatConfig {
+        let config = jolt_proto::ChatConfig {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
-            reasoning: Some(comet_proto::ReasoningLevel::XHigh),
+            reasoning: Some(jolt_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
-            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            sandbox: jolt_proto::SandboxLevel::WorkspaceWrite,
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -1474,12 +1397,12 @@ mod tests {
         // Unknown chat: no-op, no panic.
         state.apply_chat_config(
             "missing",
-            comet_proto::ChatConfig {
+            jolt_proto::ChatConfig {
                 harness: HarnessId::ClaudeCode,
                 model: None,
                 reasoning: None,
                 model_options: serde_json::Map::new(),
-                sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                sandbox: jolt_proto::SandboxLevel::WorkspaceWrite,
             },
         );
     }
@@ -1500,7 +1423,7 @@ mod tests {
         state.selected_chat = Some("c1".into());
         let echo = SessionMessageEntry {
             id: "m1".into(),
-            role: comet_doc::MessageRole::User,
+            role: jolt_doc::MessageRole::User,
             parts: vec![],
             created_at: 0,
             device_id: "local".into(),
@@ -1572,7 +1495,7 @@ mod tests {
             ),
             GatePhase::Ready
         );
-        // No org yet → org gate.
+        // No hidden org yet → automatic account setup.
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
@@ -1622,8 +1545,8 @@ mod tests {
 
     #[test]
     fn project_labels_from_cwd() {
-        assert_eq!(project_label(Some("/home/w/dev/comet")), "comet");
-        assert_eq!(project_label(Some("/home/w/dev/comet/")), "comet");
+        assert_eq!(project_label(Some("/home/w/dev/jolt")), "jolt");
+        assert_eq!(project_label(Some("/home/w/dev/jolt/")), "jolt");
         assert_eq!(project_label(None), "No project");
         assert_eq!(project_label(Some("   ")), "No project");
         assert_eq!(project_label(Some("/")), "/");
@@ -1633,22 +1556,22 @@ mod tests {
     fn grouped_sidebar_preserves_recency_order() {
         // Input is sidebar-sorted (most recent first).
         let chats = [
-            chat_with_cwd("a", 9, Some("/dev/comet")),
+            chat_with_cwd("a", 9, Some("/dev/jolt")),
             chat_with_cwd("b", 8, Some("/dev/zed")),
-            chat_with_cwd("c", 7, Some("/dev/comet")),
+            chat_with_cwd("c", 7, Some("/dev/jolt")),
             chat_with_cwd("d", 6, None),
         ];
         let groups = group_chats(chats.iter());
         let labels: Vec<&str> = groups.iter().map(|g| g.label.as_str()).collect();
         // Groups ordered by their most recent chat; rows keep order.
-        assert_eq!(labels, ["comet", "zed", "No project"]);
-        let comet_ids: Vec<&str> = groups[0].chats.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(comet_ids, ["a", "c"]);
+        assert_eq!(labels, ["jolt", "zed", "No project"]);
+        let jolt_ids: Vec<&str> = groups[0].chats.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(jolt_ids, ["a", "c"]);
         assert!(group_chats(std::iter::empty()).is_empty());
     }
 
     #[test]
-    fn relative_times_match_comet_format() {
+    fn relative_times_match_jolt_format() {
         let now = Utc::now();
         let ago = |secs: i64| now - chrono::Duration::seconds(secs);
         assert_eq!(format_time_ago(ago(0), now), "now");
@@ -1673,10 +1596,10 @@ mod tests {
     #[test]
     fn chat_location_joins_project_and_branch() {
         let mut c = chat_with_cwd("x", 1, Some("/home/w/dev/soccertcg"));
-        c.branch = Some("comet/rebalance".into());
+        c.branch = Some("jolt/rebalance".into());
         assert_eq!(
             chat_location(&c).as_deref(),
-            Some("soccertcg · comet/rebalance")
+            Some("soccertcg · jolt/rebalance")
         );
         c.branch = None;
         assert_eq!(chat_location(&c).as_deref(), Some("soccertcg"));
@@ -1687,35 +1610,5 @@ mod tests {
         assert_eq!(chat_location(&c), None);
         c.branch = None;
         assert_eq!(chat_location(&c), None);
-    }
-
-    #[test]
-    fn org_gate_reducers() {
-        assert!(org_name_valid("Acme"));
-        assert!(org_name_valid("  padded  "));
-        assert!(!org_name_valid(""));
-        assert!(!org_name_valid("   "));
-        assert!(!org_name_valid(&"x".repeat(65)));
-
-        let rows = parse_orgs(&serde_json::json!({ "orgs": [
-            { "id": "m2", "organizationId": "o2", "name": "beta" },
-            { "id": "m1", "organizationId": "o1", "name": "Alpha" },
-            { "id": "m3", "organizationId": "o1", "name": "Alpha" },
-        ]}));
-        assert_eq!(rows.len(), 3);
-        let sorted = sort_memberships(rows);
-        let names: Vec<&str> = sorted.iter().map(|o| o.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["Alpha", "beta"],
-            "case-insensitive sort + dedupe by org id"
-        );
-        // Bare-array replies parse too; garbage yields empty.
-        assert_eq!(
-            parse_orgs(&serde_json::json!([{ "id": "m", "organizationId": "o", "name": "n" }]))
-                .len(),
-            1
-        );
-        assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
     }
 }

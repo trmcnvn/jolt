@@ -1,19 +1,19 @@
-//! comet-update — release checking and self-update, shared by the engine (the
-//! background checker + `ApplyUpdate`), the CLI (`comet update`), and the UI
+//! jolt-update — release checking and self-update, shared by the engine (the
+//! background checker + `ApplyUpdate`), the CLI (`jolt update`), and the UI
 //! (the sidebar update strip + macOS bundle swap).
 //!
 //! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
-//! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
+//! artifacts live in the `jolt-releases` R2 bucket, served pre-auth at
 //! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
 //! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
 //! releases published before the manifest existed.
 //!
 //! Install kinds and their update paths:
-//! - **Managed** (`~/.comet-native/app/<ver>` + `current` symlink — the curl|sh
+//! - **Managed** (`~/.jolt/app/<ver>` + `current` symlink — the curl|sh
 //!   installer): download the headless tarball into a new versioned dir, flip
 //!   the symlink, restart the service. Same flow the installer script performs,
 //!   natively.
-//! - **MacApp** (running out of `Comet.app`): download the app tarball, swap the
+//! - **MacApp** (running out of `Jolt.app`): download the app tarball, swap the
 //!   bundle directory, relaunch. Driven by the UI.
 //! - **Unmanaged** (source builds, hand-copied binaries): report only.
 
@@ -78,16 +78,16 @@ pub fn platform_key() -> (&'static str, &'static str) {
     (os, arch)
 }
 
-/// `comet-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI builds).
+/// `jolt-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI builds).
 pub fn headless_artifact(version: &str) -> String {
     let (os, arch) = platform_key();
-    format!("comet-{version}-{os}-{arch}.tar.gz")
+    format!("jolt-{version}-{os}-{arch}.tar.gz")
 }
 
-/// `comet-<ver>-macos-<arch>-app.tar.gz` — the packaged `Comet.app` bundle.
+/// `jolt-<ver>-macos-<arch>-app.tar.gz` — the packaged `Jolt.app` bundle.
 pub fn mac_app_artifact(version: &str) -> String {
     let (_, arch) = platform_key();
-    format!("comet-{version}-macos-{arch}-app.tar.gz")
+    format!("jolt-{version}-macos-{arch}-app.tar.gz")
 }
 
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
@@ -152,7 +152,7 @@ pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .user_agent(concat!("comet/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("jolt/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building http client")
 }
@@ -164,8 +164,8 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
 /// How this binary was installed — decides the update path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallKind {
-    /// `~/.comet-native/app/<ver>/comet` behind the `current` symlink
-    /// (curl|sh installer / a previous `comet update`).
+    /// `~/.jolt/app/<ver>/jolt` behind the `current` symlink
+    /// (curl|sh installer / a previous `jolt update`).
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
     MacApp { bundle: PathBuf },
@@ -184,7 +184,7 @@ pub fn detect_install() -> InstallKind {
 fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
     if let Some(home) = home {
         // `current_exe` resolves the `current` symlink to the versioned dir.
-        let app_root = home.join(".comet-native").join("app");
+        let app_root = home.join(".jolt").join("app");
         if exe.starts_with(&app_root) {
             return InstallKind::Managed { app_root };
         }
@@ -243,7 +243,7 @@ pub async fn download_release_file(
     out.flush().await.ok();
     drop(out);
     if let Some(expected) = expected {
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = hex(&hasher.finalize());
         if !actual.eq_ignore_ascii_case(expected.trim()) {
             tokio::fs::remove_file(&partial).await.ok();
             bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
@@ -253,6 +253,14 @@ pub async fn download_release_file(
         .await
         .with_context(|| format!("moving {} into place", dest.display()))?;
     Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
 }
 
 fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
@@ -284,7 +292,7 @@ pub async fn stage_headless(
 ) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
     let dest = app_root.join(version);
-    if dest.join("comet").exists() {
+    if dest.join("jolt").exists() {
         return Ok(dest);
     }
     let file = headless_artifact(version);
@@ -308,13 +316,13 @@ pub async fn stage_headless(
                 "--strip-components=1",
             ],
         )?;
-        if !unpacked.join("comet").is_file() {
-            bail!("tarball {file} did not contain a comet binary");
+        if !unpacked.join("jolt").is_file() {
+            bail!("tarball {file} did not contain a jolt binary");
         }
         match std::fs::rename(&unpacked, &dest) {
             Ok(()) => {}
             // Lost a race with another stager — the staged copy is equivalent.
-            Err(_) if dest.join("comet").exists() => {}
+            Err(_) if dest.join("jolt").exists() => {}
             Err(err) => {
                 return Err(err).with_context(|| format!("moving {} into place", dest.display()));
             }
@@ -332,7 +340,7 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let target = app_root.join(version);
-        if !target.join("comet").exists() {
+        if !target.join("jolt").exists() {
             bail!("{} is not a staged install", target.display());
         }
         let tmp = app_root.join(format!(".current-{}", std::process::id()));
@@ -348,7 +356,7 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Restart the installed engine service (the same units `comet daemon` and the
+/// Restart the installed engine service (the same units `jolt daemon` and the
 /// curl|sh installer manage). Called after a symlink swap so the running daemon
 /// picks up the new binary.
 pub fn restart_service() -> anyhow::Result<()> {
@@ -357,10 +365,10 @@ pub fn restart_service() -> anyhow::Result<()> {
         let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         run(
             "launchctl",
-            &["kickstart", "-k", &format!("gui/{uid}/sh.zeron.comet")],
+            &["kickstart", "-k", &format!("gui/{uid}/dev.trmcnvn.jolt")],
         )
     } else {
-        run("systemctl", &["--user", "restart", "comet-native.service"])
+        run("systemctl", &["--user", "restart", "jolt.service"])
     }
 }
 
@@ -368,7 +376,7 @@ pub fn restart_service() -> anyhow::Result<()> {
 // macOS app-bundle installs — the desktop path
 // ---------------------------------------------------------------------------
 
-/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Comet.app`
+/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Jolt.app`
 /// (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
     edge_url: &str,
@@ -377,8 +385,8 @@ pub async fn stage_mac_app(
 ) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
     let dir = data_dir.join("updates").join(version);
-    let staged = dir.join("Comet.app");
-    if staged.join("Contents/MacOS/comet").exists() {
+    let staged = dir.join("Jolt.app");
+    if staged.join("Contents/MacOS/Jolt").exists() {
         return Ok(staged);
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -396,8 +404,8 @@ pub async fn stage_mac_app(
         ],
     )?;
     std::fs::remove_file(&tarball).ok();
-    if !staged.join("Contents/MacOS/comet").exists() {
-        bail!("app tarball {file} did not contain Comet.app");
+    if !staged.join("Contents/MacOS/Jolt").exists() {
+        bail!("app tarball {file} did not contain Jolt.app");
     }
     Ok(staged)
 }
@@ -491,9 +499,9 @@ impl UpdateStatus {
     }
 }
 
-/// `COMET_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
+/// `JOLT_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
 fn auto_update_enabled() -> bool {
-    std::env::var("COMET_AUTO_UPDATE")
+    std::env::var("JOLT_AUTO_UPDATE")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
 }
@@ -504,7 +512,7 @@ pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Background release checker: polls `{edge}/releases` on a 6h cadence and
 /// publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
-/// stream). Managed installs with `COMET_AUTO_UPDATE` set stage + apply + service
+/// stream). Managed installs with `JOLT_AUTO_UPDATE` set stage + apply + service
 /// restart on their own — but only in a quiet window: while `quiescent` reports
 /// activity, the apply defers and re-probes every [`IDLE_RECHECK`].
 #[derive(Clone)]
@@ -512,6 +520,7 @@ pub struct Updater {
     edge_url: String,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
     quiescent: Option<QuiescentCheck>,
+    task: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl Updater {
@@ -522,10 +531,28 @@ impl Updater {
             edge_url,
             status_tx: Arc::new(status_tx),
             quiescent,
+            task: Arc::new(std::sync::Mutex::new(None)),
         };
         let for_loop = updater.clone();
-        tokio::spawn(async move { for_loop.check_loop().await });
+        let task = tokio::spawn(async move { for_loop.check_loop().await });
+        *updater
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task.abort_handle());
         updater
+    }
+
+    /// Stop this runtime's release checker. Clones share the same task handle,
+    /// so workspace reload teardown cancels exactly the checker it created.
+    pub fn shutdown(&self) {
+        if let Some(task) = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
     }
 
     pub fn watch(&self) -> watch::Receiver<UpdateStatus> {
@@ -653,6 +680,21 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn shutdown_aborts_release_checker() {
+        let updater = Updater::spawn("http://127.0.0.1:1".into(), None);
+        let task = updater
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("release checker task")
+            .clone();
+        updater.shutdown();
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+    }
+
     #[test]
     fn version_compare() {
         assert!(version_newer("0.1.1", "0.1.0"));
@@ -671,30 +713,30 @@ mod tests {
     fn install_kind_detection() {
         assert_eq!(
             detect_install_from(
-                Path::new("/home/u/.comet-native/app/0.1.1/comet"),
+                Path::new("/home/u/.jolt/app/0.1.1/jolt"),
                 Some(Path::new("/home/u")),
             ),
             InstallKind::Managed {
-                app_root: PathBuf::from("/home/u/.comet-native/app")
+                app_root: PathBuf::from("/home/u/.jolt/app")
             }
         );
         assert_eq!(
             detect_install_from(
-                Path::new("/Applications/Comet.app/Contents/MacOS/comet"),
+                Path::new("/Applications/Jolt.app/Contents/MacOS/Jolt"),
                 Some(Path::new("/Users/u")),
             ),
             InstallKind::MacApp {
-                bundle: PathBuf::from("/Applications/Comet.app")
+                bundle: PathBuf::from("/Applications/Jolt.app")
             }
         );
         // A path merely containing `.app` without the bundle layout is not a bundle.
         assert_eq!(
-            detect_install_from(Path::new("/tmp/foo.app/comet"), None),
+            detect_install_from(Path::new("/tmp/foo.app/jolt"), None),
             InstallKind::Unmanaged
         );
         assert_eq!(
             detect_install_from(
-                Path::new("/src/target/release/comet"),
+                Path::new("/src/target/release/Jolt"),
                 Some(Path::new("/home/u"))
             ),
             InstallKind::Unmanaged
@@ -704,23 +746,26 @@ mod tests {
     #[test]
     fn artifact_names_match_packaging() {
         let (os, arch) = platform_key();
-        assert!(headless_artifact("0.2.0").starts_with("comet-0.2.0-"));
+        assert!(headless_artifact("0.2.0").starts_with("jolt-0.2.0-"));
         assert_eq!(
             headless_artifact("0.2.0"),
-            format!("comet-0.2.0-{os}-{arch}.tar.gz")
+            format!("jolt-0.2.0-{os}-{arch}.tar.gz")
         );
-        assert!(mac_app_artifact("0.2.0").ends_with("-app.tar.gz"));
+        assert_eq!(
+            mac_app_artifact("0.2.0"),
+            format!("jolt-0.2.0-macos-{arch}-app.tar.gz")
+        );
     }
 
     #[test]
     fn manifest_parses_with_and_without_files() {
         let full: Manifest = serde_json::from_str(
-            r#"{"version":"0.1.1","files":{"comet-0.1.1-linux-x86_64.tar.gz":{"sha256":"abc"}}}"#,
+            r#"{"version":"0.1.1","files":{"jolt-0.1.1-linux-x86_64.tar.gz":{"sha256":"abc"}}}"#,
         )
         .unwrap();
         assert_eq!(full.version, "0.1.1");
         assert_eq!(
-            full.files["comet-0.1.1-linux-x86_64.tar.gz"]
+            full.files["jolt-0.1.1-linux-x86_64.tar.gz"]
                 .sha256
                 .as_deref(),
             Some("abc")
@@ -736,7 +781,7 @@ mod tests {
         let app_root = tmp.path().join("app");
         for ver in ["0.1.0", "0.1.1"] {
             std::fs::create_dir_all(app_root.join(ver)).unwrap();
-            std::fs::write(app_root.join(ver).join("comet"), ver).unwrap();
+            std::fs::write(app_root.join(ver).join("jolt"), ver).unwrap();
         }
         apply_headless(&app_root, "0.1.0").unwrap();
         assert_eq!(

@@ -2,8 +2,8 @@
 //! (Claude Code, Codex) with account rows — email, plan badge, Active, usage
 //! meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
 //! the add-account dialogs (paste-code and browser-poll flows) and
-//! account-shaped loading skeletons. Comet retargets devices from the settings
-//! sidebar (`targetDeviceId` passthrough kept plumbed, unused single-device).
+//! account-shaped loading skeletons. Jolt retargets devices from the shared
+//! page-header switcher via `targetDeviceId` passthrough.
 //!
 //! The accounts RPC surface is being implemented engine-side in parallel —
 //! every call here surfaces failures as inline UI states rather than assuming
@@ -16,12 +16,13 @@ use gpui::{
 };
 use std::time::Duration;
 
-use comet_proto::{
+use jolt_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
     AgentLoginStatus, HarnessId,
 };
-use comet_rpc::methods;
+use jolt_rpc::methods;
 
+use super::device_switcher::{DeviceSelected, DeviceSwitcher};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
 use crate::state::AppState;
@@ -96,7 +97,7 @@ pub fn force_usage_for(trigger: LoadTrigger) -> bool {
     }
 }
 
-/// Compact absolute reset moment (comet settings.agents.tsx `formatReset`):
+/// Compact absolute reset moment (jolt settings.agents.tsx `formatReset`):
 /// a local clock time ("3:45 PM") when it lands within ~22h, else a short
 /// weekday ("Mon"); the caller prefixes "resets ". Pure given `now`.
 pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
@@ -111,7 +112,7 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 }
 
 /// The provider cards, in display order: (harness, name, CLI command — named
-/// in the empty-state copy, comet settings.agents.tsx `PROVIDERS`).
+/// in the empty-state copy, jolt settings.agents.tsx `PROVIDERS`).
 pub const PROVIDERS: [(HarnessId, &str, &str); 2] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
@@ -155,7 +156,7 @@ enum LoginFlow {
 }
 
 impl LoginFlow {
-    /// Dialog title (comet: "Add Claude account" / "Add Codex account").
+    /// Dialog title (jolt: "Add Claude account" / "Add Codex account").
     fn title(&self) -> &'static str {
         let harness = match self {
             LoginFlow::Starting { harness }
@@ -172,13 +173,10 @@ impl LoginFlow {
 pub struct AccountsPage {
     state: Entity<AppState>,
     /// Which device's logins are shown; `None` = this device (no passthrough).
-    /// Retargeted by the page-header device switcher (comet parity: the
+    /// Retargeted by the page-header device switcher (jolt parity: the
     /// accounts RPCs are relay-forwardable, CLI logins are per-device).
     target_device: Option<String>,
-    device_menu_open: bool,
-    /// Outside-click dismissal instant — suppresses the trigger click that
-    /// follows the same mouse-down from instantly reopening the menu.
-    device_menu_dismissed_at: Option<std::time::Instant>,
+    device_switcher: Entity<DeviceSwitcher>,
     snapshot: Loadable<AgentAccountsSnapshot>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
@@ -190,6 +188,7 @@ pub struct AccountsPage {
     poll_task: Option<Task<()>>,
     _observe: Subscription,
     _code_events: Subscription,
+    _device_switcher_events: Subscription,
 }
 
 impl AccountsPage {
@@ -201,11 +200,17 @@ impl AccountsPage {
                 this.submit_code(cx);
             }
         });
+        let device_switcher = cx.new(|cx| DeviceSwitcher::new(state.clone(), cx));
+        let device_switcher_events = cx.subscribe(
+            &device_switcher,
+            |this: &mut Self, _, DeviceSelected(target), cx| {
+                this.set_target_device(target.clone(), cx);
+            },
+        );
         let mut page = Self {
             state,
             target_device: None,
-            device_menu_open: false,
-            device_menu_dismissed_at: None,
+            device_switcher,
             snapshot: Loadable::Idle,
             busy_account: None,
             login: None,
@@ -216,6 +221,7 @@ impl AccountsPage {
             poll_task: None,
             _observe: observe,
             _code_events: code_events,
+            _device_switcher_events: device_switcher_events,
         };
         // Force the usage probe on the visit's first list — a plain list
         // returns no usage windows on a cold engine cache, which rendered
@@ -230,7 +236,6 @@ impl AccountsPage {
     /// relay-forwardable, so the whole page — list, usage probes, switch,
     /// forget, login flows — follows the passthrough.
     fn set_target_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
-        self.device_menu_open = false;
         if self.target_device == target {
             cx.notify();
             return;
@@ -252,161 +257,6 @@ impl AccountsPage {
             object.insert("targetDeviceId".into(), serde_json::json!(target));
         }
         value
-    }
-
-    /// The page-header device switcher (comet device-switcher.tsx): a quiet
-    /// trigger — platform glyph · name · presence dot · sort glyph — opening a
-    /// dropdown of every registered device. Selecting one retargets the page.
-    fn render_device_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        use crate::icons::{self, icon};
-        let (mut devices, local_id) = {
-            let s = self.state.read(cx);
-            (s.devices.clone(), s.local_device_id.clone())
-        };
-        // Stable row order (registration time, then id) — comet's switcher
-        // sorts the same way so rows never reshuffle on heartbeats.
-        devices.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let effective = self.target_device.clone().or_else(|| local_id.clone());
-        let selected = devices
-            .iter()
-            .find(|d| Some(d.id.as_str()) == effective.as_deref())
-            .cloned();
-        let platform_glyph = |platform: &str| match platform {
-            "macos" | "darwin" => icons::LAPTOP,
-            "ios" | "android" => icons::SMARTPHONE,
-            _ => icons::MONITOR,
-        };
-        let trigger_glyph = platform_glyph(
-            selected
-                .as_ref()
-                .map(|d| d.platform.as_str())
-                .unwrap_or("macos"),
-        );
-        let trigger_label: SharedString = selected
-            .as_ref()
-            .map(|d| d.name.clone().into())
-            .unwrap_or_else(|| SharedString::from("This device"));
-        let emerald = theme.success;
-        let open = self.device_menu_open;
-
-        let mut trigger =
-            div()
-                .id("accounts-device-switcher")
-                .flex_none()
-                .h(px(28.0))
-                .px(px(8.0))
-                .rounded(px(6.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .cursor_pointer()
-                .bg(if open {
-                    crate::theme::ink(0.06)
-                } else {
-                    gpui::transparent_black()
-                })
-                .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.04))))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let just_dismissed = this
-                        .device_menu_dismissed_at
-                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                    this.device_menu_open = !this.device_menu_open && !just_dismissed;
-                    this.device_menu_dismissed_at = None;
-                    cx.notify();
-                }))
-                .child(
-                    icon(trigger_glyph)
-                        .size(px(16.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(12.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(trigger_label),
-                )
-                .child(div().size(px(6.0)).rounded_full().flex_none().bg(
-                    if effective == local_id {
-                        emerald
-                    } else {
-                        crate::theme::ink(0.2)
-                    },
-                ))
-                .child(
-                    icon(icons::SORT_VERTICAL)
-                        .size(px(14.0))
-                        .flex_none()
-                        .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
-                );
-
-        if open {
-            let menu = popover::popover_card(theme)
-                .w(px(220.0))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.device_menu_open = false;
-                    this.device_menu_dismissed_at = Some(std::time::Instant::now());
-                    cx.notify();
-                }))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(popover::menu_heading(theme, "Devices"))
-                .children(devices.into_iter().enumerate().map(|(ix, d)| {
-                    let is_active = Some(d.id.as_str()) == effective.as_deref();
-                    let is_local = local_id.as_deref() == Some(d.id.as_str());
-                    let glyph = platform_glyph(&d.platform);
-                    let name: SharedString = d.name.clone().into();
-                    let pick_local = is_local;
-                    let pick_id = d.id.clone();
-                    popover::menu_row(theme, is_active, format!("accounts-device-row-{ix}"))
-                        .id(("accounts-device-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // Local device = no passthrough (calls stay direct).
-                            let target = (!pick_local).then(|| pick_id.clone());
-                            this.set_target_device(target, cx);
-                        }))
-                        .child(
-                            icon(glyph)
-                                .size(px(16.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(name))
-                        .when(is_local, |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
-                                    .child(SharedString::from("You")),
-                            )
-                        })
-                        .when(is_active, |el| el.child(popover::menu_check(theme)))
-                        .child(
-                            div()
-                                .size(px(6.0))
-                                .rounded_full()
-                                .flex_none()
-                                .bg(if is_local {
-                                    emerald
-                                } else {
-                                    crate::theme::ink(0.2)
-                                }),
-                        )
-                }))
-                .into_any_element();
-            trigger = trigger.child(popover::anchored_menu("accounts-device-menu", menu));
-        }
-        trigger.into_any_element()
     }
 
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
@@ -486,7 +336,7 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 match result.and_then(|value| {
                     serde_json::from_value::<AgentLoginStart>(value)
-                        .map_err(|e| comet_rpc::RpcError::Failed(e.to_string()))
+                        .map_err(|e| jolt_rpc::RpcError::Failed(e.to_string()))
                 }) {
                     Ok(start) => {
                         cx.open_url(&start.url);
@@ -667,12 +517,12 @@ impl AccountsPage {
 
     // ---- render pieces ----
 
-    /// One usage window (comet settings.agents.tsx `UsageMeter`): label ·
+    /// One usage window (jolt settings.agents.tsx `UsageMeter`): label ·
     /// 5px rounded-full bar (indigo → amber ≥80% → red ≥95%) · "NN% used" ·
     /// quiet reset time.
     fn render_usage_meter(
         &self,
-        window: &comet_proto::AgentUsageWindow,
+        window: &jolt_proto::AgentUsageWindow,
         theme: &Theme,
         now: DateTime<Utc>,
     ) -> AnyElement {
@@ -711,7 +561,7 @@ impl AccountsPage {
                             div()
                                 .h_full()
                                 // A 1.5% floor keeps tiny non-zero usage
-                                // visible (comet `max(used, 1.5)%`).
+                                // visible (jolt `max(used, 1.5)%`).
                                 .w(gpui::relative(fraction.max(0.015)))
                                 .rounded_full()
                                 .bg(fill),
@@ -740,9 +590,8 @@ impl AccountsPage {
             .into_any_element()
     }
 
-    /// One account row (comet settings.agents.tsx `AccountRow`): initial
-    /// avatar, email + usage meters left; badges over the Switch/Forget
-    /// actions right-anchored.
+    /// One account row (jolt settings.agents.tsx `AccountRow`): email + usage
+    /// meters left; badges over the Switch/Forget actions right-anchored.
     fn render_account_row(
         &self,
         account: &AgentAccount,
@@ -760,12 +609,6 @@ impl AccountsPage {
             .or_else(|| account.display_name.clone())
             .unwrap_or_else(|| "Unknown account".into())
             .into();
-        let initial: SharedString = email
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
         let switch_account = account.clone();
         let forget_account = account.clone();
 
@@ -781,7 +624,7 @@ impl AccountsPage {
                 el.child(widgets::badge(theme, plan))
             });
 
-        // Actions only on INACTIVE accounts (comet `{!account.active && …}`):
+        // Actions only on INACTIVE accounts (jolt `{!account.active && …}`):
         // an icon-only Forget (trash, hover → foreground) then Switch, which
         // reads "Switching…" while the activate round-trips.
         let actions: Option<gpui::Div> = (!account.active).then(|| {
@@ -841,24 +684,6 @@ impl AccountsPage {
             .items_stretch()
             .gap(px(12.0))
             .child(
-                // Initial avatar: size-8 rounded-full border bg-white/[0.03].
-                div()
-                    .flex_none()
-                    .self_center()
-                    .size(px(32.0))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(crate::theme::ink(0.03))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text_muted)
-                    .child(initial),
-            )
-            .child(
                 div()
                     .flex_1()
                     .min_w_0()
@@ -867,7 +692,7 @@ impl AccountsPage {
                     .child(widgets::row_title(theme, email))
                     .map(|el| {
                         // Meters XOR the quiet fallback line — never both
-                        // (comet: `usage ? meters : "Usage unavailable"…`).
+                        // (jolt: `usage ? meters : "Usage unavailable"…`).
                         if account.usage_windows.is_empty() {
                             el.child(
                                 div()
@@ -919,7 +744,7 @@ impl AccountsPage {
         let url_link =
             |id: &'static str, label: &'static str, url: &str, cx: &mut Context<Self>| {
                 let open_url = url.to_string();
-                // "Reopen the …" text link (comet: `text-[12px]
+                // "Reopen the …" text link (jolt: `text-[12px]
                 // text-muted-foreground/60 hover:underline`).
                 div()
                     .id(id)
@@ -1041,10 +866,10 @@ impl AccountsPage {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(crate::loaders::gradient_spinner(
+                                .child(crate::loaders::activity_orb(
                                     "login-poll",
                                     &theme,
-                                    3.0,
+                                    16.0,
                                     cx.entity_id(),
                                     cx,
                                 ))
@@ -1088,8 +913,8 @@ impl AccountsPage {
         Some(popover::modal("add-account-dialog", viewport, card))
     }
 
-    /// A ghost account row (comet settings.agents.tsx `SkeletonRow`): avatar,
-    /// email line, two usage-meter ghosts, a badge — same geometry as the real
+    /// A ghost account row (jolt settings.agents.tsx `SkeletonRow`): email
+    /// line, two usage-meter ghosts, and a badge — same geometry as the real
     /// row so loaded data lands without a layout jump. `dim` fades row two.
     fn render_skeleton_row(
         &self,
@@ -1100,7 +925,7 @@ impl AccountsPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::motion;
-        let delta = motion::pulse_delta(&motion::COMET_PULSE, cx.entity_id(), cx);
+        let delta = motion::pulse_delta(&motion::JOLT_PULSE, cx.entity_id(), cx);
         let ghost = |w: gpui::Length, h: f32, round_full: bool| {
             div()
                 .w(w)
@@ -1145,14 +970,6 @@ impl AccountsPage {
             .gap(px(12.0))
             .child(
                 div()
-                    .flex_none()
-                    .self_center()
-                    .size(px(32.0))
-                    .rounded_full()
-                    .bg(crate::theme::ink(0.05)),
-            )
-            .child(
-                div()
                     .flex_1()
                     .min_w_0()
                     .child(ghost(px(176.0).into(), 13.0, false).max_w(gpui::relative(0.6)))
@@ -1188,13 +1005,14 @@ impl Render for AccountsPage {
 
         let provider_icon = |harness: HarnessId| match harness {
             HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
+            HarnessId::Pi => (crate::icons::TERMINAL, None),
             HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
             ),
         };
-        // Brand mark inside a 24px centered box (comet: `grid size-6
+        // Brand mark inside a 24px centered box (jolt: `grid size-6
         // place-items-center [&_svg]:size-4`).
         let provider_mark = |harness: HarnessId, theme: &Theme| {
             let (mark, tint) = provider_icon(harness);
@@ -1211,7 +1029,7 @@ impl Render for AccountsPage {
                 )
         };
 
-        // One section per provider (comet settings.agents.tsx `ProviderSection`):
+        // One section per provider (jolt settings.agents.tsx `ProviderSection`):
         // brand header + Add account, then the account rows card.
         let sections: Vec<AnyElement> = match &self.snapshot {
             Loadable::Idle | Loadable::Loading => PROVIDERS
@@ -1289,7 +1107,7 @@ impl Render for AccountsPage {
                     .into_iter()
                     .map(|(harness, name, cli)| {
                         let accounts = provider_accounts(&snapshot, harness);
-                        // EVERY warning renders its own strip (comet maps them).
+                        // EVERY warning renders its own strip (jolt maps them).
                         let warnings: Vec<String> = snapshot
                             .warnings
                             .iter()
@@ -1383,7 +1201,7 @@ impl Render for AccountsPage {
                             .child(div().flex_1())
                             .child(
                                 // `text-[12.5px]` + leading 16px Refresh icon,
-                                // dimmed while a refresh is in flight (comet
+                                // dimmed while a refresh is in flight (jolt
                                 // `disabled:opacity-50`).
                                 widgets::ghost_action(&theme)
                                     .id("accounts-refresh")
@@ -1401,11 +1219,11 @@ impl Render for AccountsPage {
                                     )
                                     .child(SharedString::from("Refresh")),
                             )
-                            .child(self.render_device_switcher(&theme, cx)),
+                            .child(self.device_switcher.clone()),
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code and Codex logins on this device. Comet detects the \
+                        "The Claude Code and Codex logins on this device. Jolt detects the \
                          live session, keeps each account backed up, and can swap between \
                          them.",
                     ))
@@ -1421,7 +1239,7 @@ impl Render for AccountsPage {
                         )
                     })
                     .children(sections)
-                    // Footer note (comet: `mt-6 text-[12px] leading-relaxed
+                    // Footer note (jolt: `mt-6 text-[12px] leading-relaxed
                     // text-muted-foreground/60`).
                     .child(
                         div()
@@ -1462,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_thresholds_match_comet() {
+    fn usage_thresholds_match_jolt() {
         assert_eq!(usage_level(0.0), UsageLevel::Normal);
         assert_eq!(usage_level(0.79), UsageLevel::Normal);
         assert_eq!(usage_level(0.80), UsageLevel::Warn);

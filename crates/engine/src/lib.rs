@@ -1,4 +1,4 @@
-//! comet-engine — the headless backend: sessions engine, doc host + command executor,
+//! jolt-engine — the headless backend: sessions engine, doc host + command executor,
 //! run journal + crash recovery, and the IPC RPC server.
 //!
 //! Spec: ARCHITECTURE.md §5 and docs/research/feature-inventory.md §3. M2 surface:
@@ -8,15 +8,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use comet_proto::HarnessId;
+use async_trait::async_trait;
+use jolt_rpc::{RpcError, RpcReply, RpcService};
 
-use comet_sync::DocsStore;
+pub use jolt_proto::HarnessId;
+
+use jolt_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
+mod question_extraction;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -26,6 +30,7 @@ pub mod spaces;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
+pub mod vcs;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -42,6 +47,7 @@ pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
+pub use vcs::Vcs;
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
@@ -49,13 +55,13 @@ pub use workspace_host::{
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("doc: {0}")]
-    Doc(#[from] comet_doc::DocError),
+    Doc(#[from] jolt_doc::DocError),
     #[error("journal: {0}")]
     Journal(#[from] run_journal::JournalError),
     #[error("store: {0}")]
-    Store(#[from] comet_sync::StoreError),
+    Store(#[from] jolt_sync::StoreError),
     #[error("harness: {0}")]
-    Harness(#[from] comet_harness::HarnessError),
+    Harness(#[from] jolt_harness::HarnessError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -73,7 +79,7 @@ pub(crate) fn new_id() -> String {
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Data directory (default `~/.comet-native`, dev `~/.comet-native-dev`).
+    /// Data directory (default `~/.jolt`, dev `~/.jolt-dev`).
     pub data_dir: PathBuf,
     /// Edge base URL.
     pub edge_url: String,
@@ -83,7 +89,7 @@ pub struct EngineConfig {
     pub ipc_port: u16,
     /// Harness for doc-command runs on chats without a workspace `config` row.
     pub default_harness: HarnessId,
-    /// Workspace-doc org (`ws/{orgId}` room). `None` = `$COMET_ORG_ID` or the dev default.
+    /// Workspace-doc org (`ws/{orgId}` room). `None` = `$JOLT_ORG_ID` or the dev default.
     /// In WorkOS mode the signed-in session's org wins.
     pub org_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
@@ -107,10 +113,10 @@ pub struct EngineCore {
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
-    links: std::sync::Mutex<Option<Arc<comet_rpc::LinkCache>>>,
+    links: std::sync::Mutex<Option<Arc<jolt_rpc::LinkCache>>>,
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
-    updater: std::sync::Mutex<Option<comet_update::Updater>>,
+    updater: std::sync::Mutex<Option<jolt_update::Updater>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -118,7 +124,7 @@ pub struct EngineCore {
 impl EngineCore {
     /// Open stores under `data_dir`, wire sessions ⇄ doc host ⇄ workspace host, and
     /// recover stale journals from a previous crash. Identity comes from
-    /// `$COMET_ORG_ID` / `$COMET_USER_ID` (dev defaults `dev-org` / `dev-user`);
+    /// `$JOLT_ORG_ID` / `$JOLT_USER_ID` (dev defaults `dev-org` / `dev-user`);
     /// use [`Self::assemble_with_identity`] to pass one explicitly.
     pub fn assemble(
         data_dir: &Path,
@@ -126,8 +132,8 @@ impl EngineCore {
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
     ) -> Result<Self, EngineError> {
-        let org_id = env_or("COMET_ORG_ID", DEFAULT_ORG_ID);
-        let user_id = env_or("COMET_USER_ID", DEFAULT_USER_ID);
+        let org_id = env_or("JOLT_ORG_ID", DEFAULT_ORG_ID);
+        let user_id = env_or("JOLT_USER_ID", DEFAULT_USER_ID);
         Self::assemble_with_identity(data_dir, registry, default_harness, edge, &org_id, &user_id)
     }
 
@@ -228,7 +234,7 @@ impl EngineCore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         slot.get_or_insert_with(|| {
-            let dev_user = std::env::var("COMET_EDGE_TOKEN")
+            let dev_user = std::env::var("JOLT_EDGE_TOKEN")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "dev-user".into());
@@ -240,14 +246,14 @@ impl EngineCore {
     }
 
     /// Attach the peer link cache — enables `targetDeviceId` routing and [`Self::dial_device`].
-    pub fn set_links(&self, links: Arc<comet_rpc::LinkCache>) {
+    pub fn set_links(&self, links: Arc<jolt_rpc::LinkCache>) {
         *self
             .links
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(links);
     }
 
-    pub fn links(&self) -> Option<Arc<comet_rpc::LinkCache>> {
+    pub fn links(&self) -> Option<Arc<jolt_rpc::LinkCache>> {
         self.links
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -255,14 +261,14 @@ impl EngineCore {
     }
 
     /// Attach the release checker (before building the RPC service).
-    pub fn set_updater(&self, updater: comet_update::Updater) {
+    pub fn set_updater(&self, updater: jolt_update::Updater) {
         *self
             .updater
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(updater);
     }
 
-    pub fn updater(&self) -> Option<comet_update::Updater> {
+    pub fn updater(&self) -> Option<jolt_update::Updater> {
         self.updater
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -274,7 +280,7 @@ impl EngineCore {
     pub async fn dial_device(
         &self,
         device_id: &str,
-    ) -> Result<Arc<comet_rpc::RpcClient>, EngineError> {
+    ) -> Result<Arc<jolt_rpc::RpcClient>, EngineError> {
         let links = self
             .links()
             .ok_or_else(|| EngineError::Other("peer links unavailable (offline)".into()))?;
@@ -287,12 +293,12 @@ impl EngineCore {
     /// Start hosting our device room: serve the full RPC surface to relay clients and
     /// warm-open chat docs on nudges (§7 cold-chat command delivery). The token source
     /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
-    pub fn start_host_relay(&self, edge_url: &str) -> comet_rpc::HostRelay {
+    pub fn start_host_relay(&self, edge_url: &str) -> jolt_rpc::HostRelay {
         let auth = self.auth();
         let config =
-            comet_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+            jolt_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
         let doc_host = self.doc_host.clone();
-        let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
+        let on_nudge: jolt_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
             // subscription — the command executes with no standing per-chat socket.
             match doc_host.open(&chat_id) {
@@ -302,7 +308,7 @@ impl EngineCore {
                 }
             }
         });
-        comet_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+        jolt_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
@@ -314,6 +320,7 @@ impl EngineCore {
             self.repos.clone(),
             self.terminals.clone(),
             self.diff_sync.clone(),
+            self.spaces_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
         )
@@ -332,6 +339,9 @@ impl EngineCore {
     /// snapshot.
     pub async fn shutdown(&self) {
         self.sessions.shutdown().await;
+        if let Some(updater) = self.updater() {
+            updater.shutdown();
+        }
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
         self.doc_host.flush_all();
@@ -348,7 +358,110 @@ pub struct Engine {
 /// in-process engine so their production authentication paths cannot diverge.
 pub struct EngineRuntime {
     core: EngineCore,
-    _host_relay: Option<comet_rpc::HostRelay>,
+    _host_relay: Option<jolt_rpc::HostRelay>,
+}
+
+#[derive(Clone)]
+enum SupervisedEngineState {
+    Waiting,
+    Ready(Arc<EngineRpc>),
+    Failed(String),
+}
+
+/// Process-level RPC owner that keeps authentication available while the sole
+/// identity-scoped runtime waits for sign-in and automatic organization setup.
+pub struct EngineSupervisor {
+    config: EngineConfig,
+    auth: Auth,
+    auth_rpc: rpc::AuthRpc,
+    state_tx: tokio::sync::watch::Sender<SupervisedEngineState>,
+    runtime: tokio::sync::Mutex<Option<EngineRuntime>>,
+    assembly_gate: tokio::sync::Mutex<()>,
+}
+
+impl EngineSupervisor {
+    pub fn new(config: EngineConfig, auth: Auth) -> Arc<Self> {
+        let (state_tx, _) = tokio::sync::watch::channel(SupervisedEngineState::Waiting);
+        Arc::new(Self {
+            config,
+            auth: auth.clone(),
+            auth_rpc: rpc::AuthRpc::new(auth),
+            state_tx,
+            runtime: tokio::sync::Mutex::new(None),
+            assembly_gate: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Wait for the automatically-provisioned org-scoped session and assemble
+    /// the runtime. Auth RPCs remain usable while this task waits.
+    pub fn spawn_when_ready(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            let mut auth_state = supervisor.auth.watch_state();
+            while !auth_state.borrow().is_signed_in() {
+                if auth_state.changed().await.is_err() {
+                    supervisor
+                        .state_tx
+                        .send_replace(SupervisedEngineState::Failed(
+                            "authentication state closed before sign-in".into(),
+                        ));
+                    return;
+                }
+            }
+            if let Err(err) = supervisor.assemble_current().await {
+                tracing::error!(error = %err, "engine assembly failed");
+                supervisor
+                    .state_tx
+                    .send_replace(SupervisedEngineState::Failed(format!("{err:#}")));
+            }
+        })
+    }
+
+    /// Assemble immediately for callers that already completed authentication
+    /// and automatic organization provisioning.
+    pub async fn assemble_current(&self) -> anyhow::Result<()> {
+        let _gate = self.assembly_gate.lock().await;
+        if self.runtime.lock().await.is_some() {
+            return Ok(());
+        }
+        let runtime = Engine::assemble_runtime(&self.config, self.auth.clone()).await?;
+        let service = runtime.core().rpc_service();
+        *self.runtime.lock().await = Some(runtime);
+        self.state_tx
+            .send_replace(SupervisedEngineState::Ready(service));
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        self.state_tx.send_replace(SupervisedEngineState::Waiting);
+        if let Some(runtime) = self.runtime.lock().await.take() {
+            runtime.shutdown().await;
+        }
+    }
+}
+
+#[async_trait]
+impl RpcService for EngineSupervisor {
+    async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        if rpc::AuthRpc::handles(method) {
+            return self.auth_rpc.handle(method, params).await;
+        }
+
+        let mut state = self.state_tx.subscribe();
+        loop {
+            let current = { state.borrow().clone() };
+            match current {
+                SupervisedEngineState::Waiting => {}
+                SupervisedEngineState::Ready(service) => {
+                    return service.handle(method, params).await;
+                }
+                SupervisedEngineState::Failed(message) => {
+                    return Err(RpcError::Failed(message));
+                }
+            }
+            state.changed().await.map_err(|_| RpcError::Closed)?;
+        }
+    }
 }
 
 impl EngineRuntime {
@@ -372,13 +485,13 @@ impl Engine {
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
         auth_config.workos_client_id = config.workos_client_id.clone();
-        if let Ok(base) = std::env::var("COMET_WORKOS_API_BASE")
+        if let Ok(base) = std::env::var("JOLT_WORKOS_API_BASE")
             && !base.trim().is_empty()
         {
             auth_config.workos_api_base = base;
         }
         auth_config.callback_port = Some(
-            std::env::var("COMET_CALLBACK_PORT")
+            std::env::var("JOLT_CALLBACK_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(27641),
@@ -415,10 +528,10 @@ impl Engine {
             .map(str::to_string)
             .or(dev_token_org)
             .or(config.org_id.clone())
-            .unwrap_or_else(|| env_or("COMET_ORG_ID", DEFAULT_ORG_ID));
+            .unwrap_or_else(|| env_or("JOLT_ORG_ID", DEFAULT_ORG_ID));
         let user_id = auth
             .user_id()
-            .unwrap_or_else(|| env_or("COMET_USER_ID", DEFAULT_USER_ID));
+            .unwrap_or_else(|| env_or("JOLT_USER_ID", DEFAULT_USER_ID));
         let core = EngineCore::assemble_with_identity(
             &config.data_dir,
             Arc::new(default_registry()),
@@ -429,21 +542,21 @@ impl Engine {
         )?;
         core.set_auth(auth.clone());
         // Release checker: polls {edge}/releases on a 6h cadence; headless
-        // installs with COMET_AUTO_UPDATE=1 apply + restart themselves — gated
+        // installs with JOLT_AUTO_UPDATE=1 apply + restart themselves — gated
         // on quiescence so a restart never lands under a live run or open PTY.
-        let quiescent: comet_update::QuiescentCheck = {
+        let quiescent: jolt_update::QuiescentCheck = {
             let sessions = core.sessions.clone();
             let terminals = core.terminals.clone();
             Arc::new(move || !sessions.any_active() && !terminals.any_open())
         };
-        core.set_updater(comet_update::Updater::spawn(
+        core.set_updater(jolt_update::Updater::spawn(
             config.edge_url.clone(),
             Some(quiescent),
         ));
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 
         let host_relay = edge.as_ref().map(|edge| {
-            let links = comet_rpc::LinkCache::new(comet_rpc::LinkCacheConfig::new(
+            let links = jolt_rpc::LinkCache::new(jolt_rpc::LinkCacheConfig::new(
                 edge.url.clone(),
                 Arc::new(auth.clone()),
             ));
@@ -475,22 +588,23 @@ impl Engine {
 
         // WorkOS mode: gate edge features on a signed-in, org-scoped session. A TTY
         // gets the interactive paste-code flow; a service manager (systemd/launchd)
-        // fails fast with a "run `comet login`" error instead of hanging on a prompt.
+        // fails fast with a "run `jolt login`" error instead of hanging on a prompt.
         if auth.workos_enabled() {
             terminal_sign_in(&auth).await?;
         }
 
-        let runtime = Self::assemble_runtime(&config, auth).await?;
+        let supervisor = EngineSupervisor::new(config.clone(), auth);
+        supervisor.assemble_current().await?;
 
         // A daemon exists to serve this port, so a bind failure is fatal here —
         // unlike the headed app, which can still work over its in-process
         // transport (see `serve_ipc`).
-        let server = serve_ipc(config.ipc_port, runtime.core().rpc_service()).await?;
+        let server = serve_ipc(config.ipc_port, supervisor.clone()).await?;
 
         shutdown_signal().await?;
         tracing::info!("shutting down");
         server.abort();
-        runtime.shutdown().await;
+        supervisor.shutdown().await;
         Ok(())
     }
 }
@@ -526,26 +640,22 @@ async fn shutdown_signal() -> std::io::Result<()> {
 /// port, not who can reach it.
 pub async fn serve_ipc(
     port: u16,
-    service: std::sync::Arc<dyn comet_rpc::RpcService>,
+    service: std::sync::Arc<dyn jolt_rpc::RpcService>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "IPC server listening");
-    Ok(tokio::spawn(comet_rpc::serve_ws_listener(
-        listener, service,
-    )))
+    Ok(tokio::spawn(jolt_rpc::serve_ws_listener(listener, service)))
 }
 
-/// Block until the WorkOS session is signed in AND org-scoped. On a TTY, print the
-/// headless (paste-code) sign-in URL, read the pasted `state.code` from stdin, and
-/// run workspace onboarding (create / auto-join / numbered picker). Off a TTY this
-/// errors immediately — a daemon under systemd/launchd must load the session that
-/// `comet login` persisted, never wait on a prompt nobody can see.
+/// Block until the WorkOS session is signed in and scoped to its hidden Personal
+/// organization. On a TTY, print the headless sign-in URL and read the pasted
+/// `state.code`; organization setup is automatic. Off a TTY, only a missing login
+/// errors — a persisted org-less session can finish setup unattended.
 pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     use std::io::IsTerminal;
     let interactive = std::io::stdin().is_terminal();
     let mut state_rx = auth.watch_state();
     let mut stdin_reader: Option<tokio::task::JoinHandle<()>> = None;
-    let mut org_reader: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let state = state_rx.borrow().clone();
         match state {
@@ -555,31 +665,18 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                 break;
             }
             AuthState::NeedsOrganization { user } => {
-                if !interactive {
-                    // No reader tasks have been spawned on this path (both spawns
-                    // are TTY-gated), so an early return leaks nothing.
-                    return Err(EngineError::Other(format!(
-                        "signed in as {} but no workspace is selected — run `comet login` on this machine to pick one",
-                        user.email
-                    )));
-                }
-                if org_reader.is_none() {
-                    // Workspace onboarding on the TTY (old comet's
-                    // `backend login` flow): create if none, auto-join a
-                    // single membership, numbered picker otherwise.
-                    println!("Signed in as {}.", user.email);
-                    org_reader = Some(tokio::spawn(run_org_onboarding(auth.clone())));
-                }
+                tracing::info!(email = %user.email, "auth: provisioning personal workspace");
+                auth.ensure_personal_org().await?;
             }
             AuthState::SignedOut => {
                 if !interactive {
                     return Err(EngineError::Other(
-                        "not signed in — run `comet login` on this machine first".into(),
+                        "not signed in — run `jolt login` on this machine first".into(),
                     ));
                 }
                 if stdin_reader.is_none() {
                     let url = auth.start_headless_sign_in();
-                    println!("Sign in to Comet:\n\n  {url}\n");
+                    println!("Sign in to Jolt:\n\n  {url}\n");
                     println!("Then paste the code shown in the browser here and press enter.");
                     let auth = auth.clone();
                     stdin_reader = Some(tokio::spawn(async move {
@@ -607,9 +704,6 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     if let Some(reader) = stdin_reader {
         reader.abort();
     }
-    if let Some(reader) = org_reader {
-        reader.abort();
-    }
     Ok(())
 }
 
@@ -627,76 +721,9 @@ async fn read_stdin_line() -> Option<String> {
     .flatten()
 }
 
-/// TTY workspace onboarding for an org-less session (ports old comet's
-/// `backend login` flow): no memberships → prompt a name and create; exactly
-/// one → auto-join; several → numbered picker. Success flips the auth state to
-/// `SignedIn`, which ends [`wait_for_sign_in`]'s wait (and aborts this task).
-async fn run_org_onboarding(auth: Auth) {
-    let orgs = match auth.list_orgs().await {
-        Ok(orgs) => orgs,
-        Err(err) => {
-            println!(
-                "Could not list workspaces ({err}) — create or select one from the Comet UI to continue."
-            );
-            return;
-        }
-    };
-    match orgs.len() {
-        0 => {
-            println!("No workspaces yet — name your new workspace and press enter:");
-            loop {
-                let Some(line) = read_stdin_line().await else {
-                    return;
-                };
-                let name = line.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                match auth.create_org(name).await {
-                    Ok(()) => return,
-                    Err(err) => println!("Creating workspace failed: {err}"),
-                }
-            }
-        }
-        1 => {
-            let only = &orgs[0];
-            println!("Joining workspace \"{}\"…", only.name);
-            if let Err(err) = auth.select_org(&only.organization_id).await {
-                println!("Joining workspace failed: {err}");
-            }
-        }
-        _ => {
-            println!("\nYour workspaces:");
-            for (index, org) in orgs.iter().enumerate() {
-                println!("  {}. {}", index + 1, org.name);
-            }
-            println!("Pick a workspace [1-{}]:", orgs.len());
-            loop {
-                let Some(line) = read_stdin_line().await else {
-                    return;
-                };
-                let choice = line
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|n| n.checked_sub(1))
-                    .and_then(|index| orgs.get(index));
-                let Some(org) = choice else {
-                    println!("Pick a workspace [1-{}]:", orgs.len());
-                    continue;
-                };
-                match auth.select_org(&org.organization_id).await {
-                    Ok(()) => return,
-                    Err(err) => println!("Joining workspace failed: {err}"),
-                }
-            }
-        }
-    }
-}
-
 /// Best-effort human name for this device's registry row (hostname).
 fn local_device_name() -> String {
-    std::env::var("COMET_DEVICE_NAME")
+    std::env::var("JOLT_DEVICE_NAME")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok())

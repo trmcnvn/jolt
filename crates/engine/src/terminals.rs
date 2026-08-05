@@ -1,5 +1,5 @@
 //! Terminals — PTY sessions owned by this device (feature-inventory §3.4; port of
-//! comet's `terminals.ts` over `portable-pty`).
+//! jolt's `terminals.ts` over `portable-pty`).
 //!
 //! - `open` spawns the user's login shell in the chat's cwd; `subscribe` replays a
 //!   bounded 1MB window (resumable via `afterSeq`) then tails live output, batched
@@ -9,7 +9,7 @@
 //!   Only EXITED sessions expire (30min TTL on their inert replay buffers), and
 //!   [`MAX_TERMINALS`] bounds leakage from renderers that lost their tab state.
 //! - Ownership: M5 is single-user local — every IPC/relay caller is the device
-//!   owner, so the per-user owner re-checks from comet's Router land with real
+//!   owner, so the per-user owner re-checks from jolt's Router land with real
 //!   multi-account auth in M6.
 
 use std::collections::{HashMap, VecDeque};
@@ -22,13 +22,14 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 
-use comet_doc::TERMINAL_OUTPUT_BATCH_MS;
-use comet_proto::{TerminalEvent, TerminalSession};
+use jolt_doc::TERMINAL_OUTPUT_BATCH_MS;
+use jolt_proto::{TerminalEvent, TerminalSession};
 
 use crate::{EngineError, new_id};
 
 const MAX_TERMINALS: usize = 32;
 const MAX_INPUT_BYTES: usize = 64 * 1024;
+const MAX_LAUNCH_COMMAND_BYTES: usize = 8 * 1024;
 const MAX_REPLAY_BYTES: usize = 1024 * 1024;
 const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
@@ -138,7 +139,19 @@ impl Terminals {
     /// Open a login shell in `cwd`. The PTY outlives every subscriber; it dies on
     /// [`Self::close`], shell exit + TTL, or engine shutdown.
     pub fn open(&self, cwd: &str, cols: u16, rows: u16) -> Result<TerminalSession, EngineError> {
-        self.open_with_shell(cwd, cols, rows, None)
+        self.open_configured(cwd, cols, rows, None, None)
+    }
+
+    /// Open a terminal with an optional command interpreted by the user's
+    /// login shell. Blank commands retain the default interactive shell.
+    pub fn open_with_command(
+        &self,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        command: Option<&str>,
+    ) -> Result<TerminalSession, EngineError> {
+        self.open_configured(cwd, cols, rows, None, command)
     }
 
     /// Explicit shell override (tests use `/bin/sh`).
@@ -148,6 +161,17 @@ impl Terminals {
         cols: u16,
         rows: u16,
         shell: Option<&str>,
+    ) -> Result<TerminalSession, EngineError> {
+        self.open_configured(cwd, cols, rows, shell, None)
+    }
+
+    fn open_configured(
+        &self,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        shell: Option<&str>,
+        command: Option<&str>,
     ) -> Result<TerminalSession, EngineError> {
         if lock(&self.inner.sessions).len() >= MAX_TERMINALS {
             return Err(EngineError::Other(format!(
@@ -161,6 +185,12 @@ impl Terminals {
         }
 
         let shell = shell.map(str::to_string).unwrap_or_else(selected_shell);
+        let command = command.map(str::trim).filter(|command| !command.is_empty());
+        if command.is_some_and(|command| command.len() > MAX_LAUNCH_COMMAND_BYTES) {
+            return Err(EngineError::Other(
+                "Terminal launch command is too long".into(),
+            ));
+        }
         let shell_name = std::path::Path::new(&shell)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -171,13 +201,22 @@ impl Terminals {
             .openpty(clamp_size(cols, rows))
             .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
         let mut cmd = CommandBuilder::new(&shell);
-        if !cfg!(windows) {
-            cmd.arg("-l"); // login shell — the user's real PATH/profile
+        if let Some(command) = command {
+            if cfg!(windows) {
+                let powershell = shell_name.eq_ignore_ascii_case("powershell.exe")
+                    || shell_name.eq_ignore_ascii_case("pwsh.exe");
+                cmd.arg(if powershell { "-Command" } else { "/C" });
+            } else {
+                cmd.arg("-lc");
+            }
+            cmd.arg(command);
+        } else if !cfg!(windows) {
+            cmd.arg("-l"); // interactive login shell — the user's real PATH/profile
         }
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "Comet");
+        cmd.env("TERM_PROGRAM", "Jolt");
         let mut child = pair
             .slave
             .spawn_command(cmd)

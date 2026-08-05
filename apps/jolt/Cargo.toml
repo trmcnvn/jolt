@@ -1,0 +1,30 @@
+[package]
+name = "jolt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+debug-ui = ["jolt-ui/debug-ui"]
+
+[[bin]]
+name = "Jolt"
+path = "src/main.rs"
+
+[dependencies]
+jolt-engine.workspace = true
+jolt-rpc.workspace = true
+jolt-ui.workspace = true
+jolt-update.workspace = true
+tokio.workspace = true
+clap.workspace = true
+mimalloc.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

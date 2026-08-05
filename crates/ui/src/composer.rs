@@ -24,11 +24,17 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
-use comet_proto::{FileSearchMatch, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion};
-use comet_rpc::{RpcError, methods};
+use jolt_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry,
+};
+use jolt_proto::{
+    AgentCommand, AgentCommandSource, ExtractQuestionsResult, ExtractedQuestion, FileSearchMatch,
+    RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
+};
+use jolt_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
+use crate::loaders;
 use crate::motion;
 use crate::pickers::Pickers;
 use crate::state::{AppState, Indicator};
@@ -38,17 +44,93 @@ use crate::theme::Theme;
 // Constants + pure decision logic
 // ---------------------------------------------------------------------------
 
-/// Expanded-mode textarea vertical padding: `pt-4 pb-1` (comet composer.tsx
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellCommand {
+    command: String,
+    exclude_from_context: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellScope {
+    AgentContext,
+    LocalOnly,
+}
+
+fn shell_scope(text: &str) -> Option<ShellScope> {
+    let text = text.trim_start();
+    if text.starts_with("!!!") {
+        None
+    } else if text.starts_with("!!") {
+        Some(ShellScope::LocalOnly)
+    } else if text.starts_with('!') {
+        Some(ShellScope::AgentContext)
+    } else {
+        None
+    }
+}
+
+fn shell_command(text: &str) -> Option<ShellCommand> {
+    let text = text.trim();
+    let (prefix, exclude_from_context) = match shell_scope(text)? {
+        ShellScope::AgentContext => ("!", false),
+        ShellScope::LocalOnly => ("!!", true),
+    };
+    let command = text.strip_prefix(prefix)?.trim();
+    (!command.is_empty()).then(|| ShellCommand {
+        command: command.to_string(),
+        exclude_from_context,
+    })
+}
+
+fn bash_pending_transcript(command: &str) -> String {
+    let command = format!("$ {command}");
+    let longest = command
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let delimiter = "`".repeat((longest + 1).max(3));
+    format!("{delimiter}bash\n{command}\n{delimiter}\n\n_Output pending…_")
+}
+
+fn shell_mode_chip(scope: ShellScope, theme: &Theme) -> gpui::AnyElement {
+    let (label, color) = match scope {
+        ShellScope::AgentContext => ("Bash · Agent context", theme.accent),
+        ShellScope::LocalOnly => ("Bash · Local only", theme.text_muted),
+    };
+    div()
+        .id("composer-shell-mode")
+        .h(px(28.0))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .rounded_full()
+        .border_1()
+        .border_color(color.opacity(0.22))
+        .bg(color.opacity(0.08))
+        .px(px(10.0))
+        .text_size(px(12.0))
+        .text_color(color)
+        .child(
+            crate::icons::icon(crate::icons::TERMINAL)
+                .size(px(13.0))
+                .text_color(color),
+        )
+        .child(label)
+        .into_any_element()
+}
+
+/// Expanded-mode textarea vertical padding: `pt-4 pb-1` (jolt composer.tsx
 /// line 578) = 16 + 4.
 pub const TEXTAREA_PAD_V: f32 = 20.0;
 /// The expanded textarea BOX (content + padding) is clamped by the original's
 /// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, 76),
-/// 260)` (comet composer.tsx line 235). The 76px floor applies even when
+/// 260)` (jolt composer.tsx line 235). The 76px floor applies even when
 /// empty — it's what makes the always-expanded new-chat composer tall.
 pub const TEXTAREA_MIN: f32 = 76.0;
 pub const TEXTAREA_MAX: f32 = 260.0;
 /// Expanded actions row: `pt-1` (4) + h-8 picker chips (32 — the tallest
-/// children; composer/styles.tsx pickerChip) + `pb-2.5` (10) — comet
+/// children; composer/styles.tsx pickerChip) + `pb-2.5` (10) — jolt
 /// composer-actions.tsx line 60.
 pub const ACTIONS_ROW_HEIGHT: f32 = 46.0;
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
@@ -66,10 +148,25 @@ pub const MIN_COMPACT_INPUT_WIDTH: f32 = 200.0;
 /// Input text metrics: `text-[14px] leading-relaxed` = 14 × 1.625 = 22.75.
 pub const INPUT_LINE_HEIGHT: f32 = 22.75;
 pub const INPUT_TEXT_SIZE: f32 = 14.0;
-/// Single-select questions auto-advance after this long.
+/// Intermediate single-select questions auto-advance after this long.
 pub const AUTO_ADVANCE_MS: u64 = 220;
 /// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
 pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
+
+const COMMAND_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const COMMAND_CACHE_FAILURE_RETRY: Duration = Duration::from_secs(15);
+const COMMAND_CACHE_CAPACITY: usize = 16;
+
+const DEFAULT_PLACEHOLDER: &str = "What do you want to work on?";
+const BUSY_PLACEHOLDER: &str = "Send a follow-up to steer the conversation";
+
+fn composer_placeholder(is_busy: bool) -> &'static str {
+    if is_busy {
+        BUSY_PLACEHOLDER
+    } else {
+        DEFAULT_PLACEHOLDER
+    }
+}
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
@@ -187,7 +284,7 @@ fn input_drag_scroll_delta(
     distance.signum() * (distance.abs() * 0.2).clamp(1.0, line_height)
 }
 
-/// Staged-attachment strip metrics (comet attachment-ui.tsx AttachmentStrip:
+/// Staged-attachment strip metrics (jolt attachment-ui.tsx AttachmentStrip:
 /// `flex flex-wrap gap-2 px-4 pt-3`, `size-14` thumbs).
 pub const STRIP_THUMB: f32 = 56.0;
 pub const STRIP_GAP: f32 = 8.0;
@@ -432,14 +529,15 @@ pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &s
 #[derive(Debug, Clone, PartialEq)]
 pub enum WizardStep {
     Stay,
-    /// Single-select landed — advance after [`AUTO_ADVANCE_MS`].
+    /// An intermediate single-select landed — advance after [`AUTO_ADVANCE_MS`].
     AutoAdvance,
     /// All pages answered — submit these answers.
     Done(Vec<UserInputAnswer>),
 }
 
-/// Paged question state ("1/3"): single-select auto-advances, multi-select and
-/// typed answers advance explicitly, number keys 1-9 select, Back pages back.
+/// Paged question state ("1/3"): intermediate single-select pages auto-advance;
+/// final, multi-select, and typed answers advance explicitly. Number keys 1-9
+/// select and Back pages back.
 #[derive(Debug, Clone)]
 pub struct Wizard {
     pub request_id: String,
@@ -500,6 +598,11 @@ impl Wizard {
                 None => picked.push(option_ix),
             }
             WizardStep::Stay
+        } else if self.page + 1 >= self.questions.len() {
+            *picked = vec![option_ix];
+            // The final choice is a reviewable selection, not an immediate
+            // approval. The user must explicitly submit it.
+            WizardStep::Stay
         } else {
             *picked = vec![option_ix];
             WizardStep::AutoAdvance
@@ -518,6 +621,10 @@ impl Wizard {
         if let Some(slot) = self.typed.get_mut(self.page) {
             *slot = text;
         }
+    }
+
+    pub fn current_typed(&self) -> &str {
+        self.typed.get(self.page).map_or("", String::as_str)
     }
 
     /// Explicit submit / auto-advance landing.
@@ -569,6 +676,117 @@ impl Wizard {
     }
 }
 
+/// The local `/answer`-style flow: extraction runs first, then free-text pages.
+#[derive(Debug, Clone)]
+enum ExtractedAnswerState {
+    Extracting { source_message_id: String },
+    Answering(ExtractedWizard),
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedAnswerFlow {
+    chat_id: String,
+    state: ExtractedAnswerState,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedWizard {
+    questions: Vec<ExtractedQuestion>,
+    answers: Vec<String>,
+    page: usize,
+}
+
+impl ExtractedWizard {
+    fn new(questions: Vec<ExtractedQuestion>) -> Self {
+        let count = questions.len();
+        Self {
+            questions,
+            answers: vec![String::new(); count],
+            page: 0,
+        }
+    }
+
+    fn current(&self) -> Option<&ExtractedQuestion> {
+        self.questions.get(self.page)
+    }
+
+    fn counter(&self) -> String {
+        format!("{}/{}", self.page + 1, self.questions.len().max(1))
+    }
+
+    fn save(&mut self, answer: String) {
+        if let Some(slot) = self.answers.get_mut(self.page) {
+            *slot = answer;
+        }
+    }
+
+    fn advance(&mut self) -> bool {
+        if self.page + 1 < self.questions.len() {
+            self.page += 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn back(&mut self) -> bool {
+        if self.page == 0 {
+            false
+        } else {
+            self.page -= 1;
+            true
+        }
+    }
+
+    fn current_answer(&self) -> &str {
+        self.answers.get(self.page).map_or("", String::as_str)
+    }
+
+    fn compiled_message(&self) -> String {
+        let mut lines = vec!["I answered your questions in the following way:".to_string()];
+        for (question, answer) in self.questions.iter().zip(&self.answers) {
+            lines.push(String::new());
+            lines.push(format!("Q: {}", question.question));
+            if let Some(context) = &question.context {
+                lines.push(format!("> {context}"));
+            }
+            let answer = answer.trim();
+            lines.push(format!(
+                "A: {}",
+                if answer.is_empty() {
+                    "(no answer)"
+                } else {
+                    answer
+                }
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+/// Latest completed assistant text entry eligible for extraction.
+fn latest_answerable_message(transcript: &[SessionMessageEntry]) -> Option<(String, String)> {
+    transcript.iter().rev().find_map(|entry| {
+        if entry.role != MessageRole::Assistant
+            || entry.status != Some(jolt_doc::MessageStatus::Complete)
+        {
+            return None;
+        }
+        let text = entry
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.is_empty()).then(|| (entry.id.clone(), text))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Multiline text input (adapted from gpui examples/input.rs)
 // ---------------------------------------------------------------------------
 // Multiline text input (adapted from gpui examples/input.rs)
 // ---------------------------------------------------------------------------
@@ -603,6 +821,7 @@ actions!(
         DeleteWordRight,
         DeleteToLineStart,
         DeleteToLineEnd,
+        ClearSelection,
         Copy,
         Cut,
         Paste,
@@ -634,7 +853,7 @@ const MENTION_TOOLTIP_HEIGHT: f32 = 24.0;
 const MENTION_SIDE_PAD: &str = "\u{00A0}";
 /// A private URI scheme keeps file mentions distinguishable from ordinary
 /// Markdown links pasted into the composer.
-const FILE_MENTION_SCHEME: &str = "comet-file:";
+const FILE_MENTION_SCHEME: &str = "jolt-file:";
 
 /// A restorable point in the input's history: text plus where the caret and
 /// selection sat when the edit landed.
@@ -1447,6 +1666,29 @@ impl ComposerInput {
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
     }
+    /// Replace a leading slash query as one non-coalescing undo step.
+    pub fn replace_command(&mut self, range: Range<usize>, name: &str, cx: &mut Context<Self>) {
+        let command = format!("/{name}");
+        let next = self.content[range.end..].chars().next();
+        let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
+        let inserted = if existing_separator.is_some() {
+            command
+        } else {
+            format!("{command} ")
+        };
+        self.record_edit(&range, &inserted);
+        self.content =
+            self.content[..range.start].to_owned() + &inserted + &self.content[range.end..];
+        self.refresh_projection();
+        let cursor =
+            range.start + inserted.len() + existing_separator.map(char::len_utf8).unwrap_or(0);
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.follow_cursor = true;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+    }
 
     pub fn is_empty(&self) -> bool {
         self.content.is_empty()
@@ -1720,6 +1962,9 @@ impl ComposerInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if crate::markdown::selection::clear() {
+            cx.refresh_windows();
+        }
         let offset = self.projection.normalize_range(offset..offset).start;
         if self.selection_reversed {
             self.selected_range.start = offset;
@@ -2002,16 +2247,26 @@ impl ComposerInput {
         self.delete_to(end, window, cx);
     }
 
-    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    fn clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
-        } else if let Some(text) = crate::markdown::selection::selected_text() {
-            // The composer keeps focus while the user reads the transcript —
-            // Cmd+C with no input selection copies the markdown selection.
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.move_to(self.cursor_offset(), cx);
         }
+    }
+
+    fn copy_selected_text(&self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = selected_copy_text(
+            &self.content,
+            &self.selected_range,
+            crate::markdown::selection::selected_text(),
+        ) else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selected_text(cx);
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
@@ -2215,6 +2470,9 @@ impl ComposerInput {
         cx: &mut Context<Self>,
     ) {
         self.invalidate_mention_tooltip();
+        if crate::markdown::selection::clear() {
+            cx.refresh_windows();
+        }
         window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
         self.drag_position = Some(event.position);
@@ -2392,8 +2650,8 @@ impl ComposerInput {
     ) -> f32 {
         // Rebuild this even for an empty draft. Otherwise deleting the final
         // mention can leave its previous paint geometry alive while the
-        // placeholder is already being shaped, tinting "Do anything" for a
-        // frame (or longer when no subsequent layout is requested).
+        // placeholder is already being shaped, tinting it for a frame (or
+        // longer when no subsequent layout is requested).
         self.refresh_projection();
         let (display, is_placeholder) = if self.content.is_empty() {
             (self.placeholder.clone(), true)
@@ -3021,6 +3279,7 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::delete_word_right))
             .on_action(cx.listener(Self::delete_to_line_start))
             .on_action(cx.listener(Self::delete_to_line_end))
+            .on_action(cx.listener(Self::clear_selection))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
@@ -3096,6 +3355,143 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashCommandToken {
+    range: Range<usize>,
+    query: String,
+}
+
+/// Slash completion is intentionally limited to the first message token. A
+/// slash elsewhere is prose, a path, or Markdown and keeps normal editing.
+fn slash_command_token(text: &str, cursor: usize) -> Option<SlashCommandToken> {
+    if !text.starts_with('/') || cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let end = text
+        .char_indices()
+        .find_map(|(at, ch)| ch.is_whitespace().then_some(at))
+        .unwrap_or(text.len());
+    if cursor > end {
+        return None;
+    }
+    Some(SlashCommandToken {
+        range: 0..end,
+        query: text[1..cursor].to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CommandCacheKey {
+    harness: jolt_proto::HarnessId,
+    target_device: String,
+    cwd: String,
+    model_options: String,
+}
+
+#[derive(Debug, Clone)]
+struct CommandCacheEntry {
+    catalog: Vec<AgentCommand>,
+    fetched_at: Option<Instant>,
+    failed_at: Option<Instant>,
+    error: Option<SharedString>,
+    last_used: Instant,
+}
+
+impl CommandCacheEntry {
+    fn empty(now: Instant) -> Self {
+        Self {
+            catalog: Vec::new(),
+            fetched_at: None,
+            failed_at: None,
+            error: None,
+            last_used: now,
+        }
+    }
+}
+
+fn prune_command_cache(cache: &mut HashMap<CommandCacheKey, CommandCacheEntry>) {
+    while cache.len() > COMMAND_CACHE_CAPACITY {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SlashCommandState {
+    token: Option<SlashCommandToken>,
+    results: Vec<AgentCommand>,
+    active: Option<usize>,
+    request: u64,
+    loading: bool,
+    error: Option<SharedString>,
+    notice: Option<SharedString>,
+    cache_key: Option<CommandCacheKey>,
+    dismissed: Option<(Range<usize>, String)>,
+}
+
+fn command_model_options_key(options: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut entries: Vec<_> = options.iter().collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    serde_json::to_string(&entries).unwrap_or_default()
+}
+
+fn command_cache_should_fetch(
+    fetched_at: Option<Instant>,
+    failed_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let stale = fetched_at.is_some_and(|at| now.saturating_duration_since(at) >= COMMAND_CACHE_TTL);
+    let failed_recently =
+        failed_at.is_some_and(|at| now.saturating_duration_since(at) < COMMAND_CACHE_FAILURE_RETRY);
+    (fetched_at.is_none() || stale) && !failed_recently
+}
+
+const ANSWER_QUESTIONS_COMMAND: &str = "answer";
+const BRO_COMMAND: &str = "bro";
+const BRO_PROMPT: &str = "Restate your last message. Stop using jargon and speak coherently. State it more simply and concisely, like one human talking to another.";
+
+fn filtered_commands(catalog: &[AgentCommand], query: &str) -> Vec<AgentCommand> {
+    let query = query.to_lowercase();
+    let mut commands: Vec<_> = catalog
+        .iter()
+        .filter(|command| {
+            command.source == AgentCommandSource::Jolt
+                && (query.is_empty()
+                    || command.name.to_lowercase().contains(&query)
+                    || command
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| description.to_lowercase().contains(&query)))
+        })
+        .cloned()
+        .collect();
+    commands.sort_by_key(|command| {
+        let name = command.name.to_lowercase();
+        (!name.starts_with(&query), name)
+    });
+    commands
+}
+
+fn is_answer_questions_command(text: &str) -> bool {
+    text.trim().strip_prefix('/') == Some(ANSWER_QUESTIONS_COMMAND)
+}
+
+fn is_bro_command(text: &str) -> bool {
+    text.trim().strip_prefix('/') == Some(BRO_COMMAND)
+}
+
+#[derive(Debug, Clone)]
+struct BroRun {
+    source_message_id: String,
+    saw_live_run: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FileMentionState {
     token: Option<MentionToken>,
@@ -3124,7 +3520,7 @@ fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
 fn mention_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older comet — update it to search its files".into()
+            "The session's device runs an older Jolt version — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
@@ -3147,11 +3543,24 @@ pub struct Composer {
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
     mention: FileMentionState,
+    command_task: Option<Task<()>>,
+    command: SlashCommandState,
+    command_cache: HashMap<CommandCacheKey, CommandCacheEntry>,
+    command_scroll: gpui::ScrollHandle,
     current_key: String,
     sending: bool,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
+    /// User-invoked extraction and free-text answer flow.
+    extracted_answers: Option<ExtractedAnswerFlow>,
+    /// In-progress extracted answers survive session navigation like drafts.
+    extracted_answer_stash: HashMap<String, ExtractedAnswerFlow>,
+    extraction_task: Option<Task<()>>,
+    extraction_notice: Option<SharedString>,
+    /// Hidden `/bro` control turns, retained across conversation navigation.
+    bro_runs: HashMap<String, BroRun>,
     wizard_focus: FocusHandle,
+    wizard_scroll: gpui::ScrollHandle,
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
@@ -3196,7 +3605,7 @@ impl EventEmitter<ComposerEvent> for Composer {}
 impl Composer {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
-            let mut input = ComposerInput::new("Do anything…", cx);
+            let mut input = ComposerInput::new(DEFAULT_PLACEHOLDER, cx);
             input.enable_mentions();
             input
         });
@@ -3235,11 +3644,21 @@ impl Composer {
             picker_task: None,
             mention_task: None,
             mention: FileMentionState::default(),
+            command_task: None,
+            command: SlashCommandState::default(),
+            command_cache: HashMap::new(),
+            command_scroll: gpui::ScrollHandle::new(),
             current_key,
             sending: false,
             failure: None,
             wizard: None,
+            extracted_answers: None,
+            extracted_answer_stash: HashMap::new(),
+            extraction_task: None,
+            extraction_notice: None,
+            bro_runs: HashMap::new(),
             wizard_focus: cx.focus_handle(),
+            wizard_scroll: gpui::ScrollHandle::new(),
             answered_requests: HashSet::new(),
             advance_task: None,
             send_task: None,
@@ -3259,9 +3678,9 @@ impl Composer {
             _input_events: input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
-        // a rig) — `COMET_ATTACH=/path/a.png[,/path/b.png]`, and
-        // `COMET_ATTACH_PREVIEW=1` boots with the first one's lightbox open.
-        if let Ok(spec) = std::env::var("COMET_ATTACH") {
+        // a rig) — `JOLT_ATTACH=/path/a.png[,/path/b.png]`, and
+        // `JOLT_ATTACH_PREVIEW=1` boots with the first one's lightbox open.
+        if let Ok(spec) = std::env::var("JOLT_ATTACH") {
             let staged: Vec<StagedAttachment> = spec
                 .split(',')
                 .filter(|s| !s.trim().is_empty())
@@ -3269,13 +3688,13 @@ impl Composer {
                     match attachments::stage_file(std::path::Path::new(path.trim())) {
                         Ok(att) => Some(att),
                         Err(err) => {
-                            tracing::warn!(%path, error = %err, "COMET_ATTACH stage failed");
+                            tracing::warn!(%path, error = %err, "JOLT_ATTACH stage failed");
                             None
                         }
                     }
                 })
                 .collect();
-            if std::env::var("COMET_ATTACH_PREVIEW").is_ok_and(|v| v == "1")
+            if std::env::var("JOLT_ATTACH_PREVIEW").is_ok_and(|v| v == "1")
                 && let Some(first) = staged.first()
             {
                 composer.preview = Some(attachments::PreviewImage {
@@ -3291,10 +3710,11 @@ impl Composer {
                     .extend(staged);
             }
         }
+        composer.sync_default_placeholder(cx);
         composer
     }
 
-    /// Capture-knob passthrough (`COMET_OPEN_DIALOG=model`): open the
+    /// Capture-knob passthrough (`JOLT_OPEN_DIALOG=model`): open the
     /// combined harness/model menu.
     pub fn debug_open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pickers
@@ -3360,6 +3780,15 @@ impl Composer {
     /// raw image bytes, and a deleted chat's stage could never be sent again.
     pub fn purge_chat(&mut self, chat_id: &str) {
         self.attachments.remove(chat_id);
+        self.extracted_answer_stash.remove(chat_id);
+        if self
+            .extracted_answers
+            .as_ref()
+            .is_some_and(|flow| flow.chat_id == chat_id)
+        {
+            self.extracted_answers = None;
+            self.extraction_task = None;
+        }
     }
 
     /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
@@ -3454,9 +3883,259 @@ impl Composer {
         }));
     }
 
+    fn command_rpc_context(&self, cx: &App) -> Option<(serde_json::Value, CommandCacheKey)> {
+        let resolved = self.pickers.read(cx).resolved(cx);
+        let harness = resolved.harness?;
+        let selected_worktree = match self.pickers.read(cx).checkout_plan() {
+            crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
+            _ => None,
+        };
+        let state = self.state.read(cx);
+        let (cwd, target_device) = if let Some(chat) = state.selected_chat_row() {
+            let cwd = chat
+                .cwd
+                .clone()
+                .or_else(|| state.selected_space_row().map(|space| space.path.clone()))?;
+            (cwd, chat.device_id.clone())
+        } else {
+            let space = state.selected_space_row()?;
+            (
+                selected_worktree.unwrap_or_else(|| space.path.clone()),
+                space.device_id.clone(),
+            )
+        };
+        let cache_key = CommandCacheKey {
+            harness,
+            target_device: target_device.clone(),
+            cwd: cwd.clone(),
+            model_options: command_model_options_key(&resolved.model_options),
+        };
+        Some((
+            serde_json::json!({
+                "harness": harness,
+                "cwd": cwd,
+                "modelOptions": resolved.model_options,
+                "targetDeviceId": target_device,
+            }),
+            cache_key,
+        ))
+    }
+
+    fn reset_command(&mut self, cx: &mut Context<Self>) {
+        self.command.request = self.command.request.wrapping_add(1);
+        self.command_task = None;
+        self.command = SlashCommandState {
+            request: self.command.request,
+            ..SlashCommandState::default()
+        };
+        self.command_scroll.set_offset(Point::default());
+        self.sync_mention_controls(cx);
+    }
+
+    fn update_command_completion(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let token = slash_command_token(text, cursor);
+        let still_dismissed = token.as_ref().is_some_and(|token| {
+            self.command
+                .dismissed
+                .as_ref()
+                .is_some_and(|(range, value)| {
+                    token.range == *range && text.get(range.clone()) == Some(value.as_str())
+                })
+        });
+        if still_dismissed {
+            self.command.token = None;
+            self.sync_mention_controls(cx);
+            return false;
+        }
+        self.command.dismissed = None;
+        let Some(token) = token else {
+            self.command.token = None;
+            self.command.results.clear();
+            self.command.active = None;
+            self.command.error = None;
+            self.command.notice = None;
+            self.sync_mention_controls(cx);
+            return false;
+        };
+        let opening = self.command.token.is_none();
+        let query_changed = self
+            .command
+            .token
+            .as_ref()
+            .is_none_or(|previous| previous.query != token.query);
+        let Some((params, cache_key)) = self.command_rpc_context(cx) else {
+            self.command.request = self.command.request.wrapping_add(1);
+            self.command_task = None;
+            self.command.token = Some(token);
+            self.command.results.clear();
+            self.command.active = None;
+            self.command.loading = false;
+            self.command.error = None;
+            self.command.notice = None;
+            self.command.cache_key = None;
+            self.sync_mention_controls(cx);
+            return true;
+        };
+        if self.command.cache_key.as_ref() != Some(&cache_key) {
+            self.command.request = self.command.request.wrapping_add(1);
+            self.command_task = None;
+            self.command.loading = false;
+            self.command.error = None;
+            self.command.notice = None;
+            self.command.cache_key = Some(cache_key.clone());
+            self.command_scroll.set_offset(Point::default());
+        } else if opening {
+            self.command_scroll.set_offset(Point::default());
+        }
+        self.command.token = Some(token.clone());
+
+        let now = Instant::now();
+        let snapshot = self.command_cache.get_mut(&cache_key).map(|entry| {
+            entry.last_used = now;
+            (
+                entry.catalog.clone(),
+                entry.fetched_at,
+                entry.failed_at,
+                entry.error.clone(),
+            )
+        });
+        let (catalog, fetched_at, failed_at, cached_error) = snapshot.unwrap_or_default();
+        self.command.results = filtered_commands(&catalog, &token.query);
+        self.command.active = (!self.command.results.is_empty()).then_some(0);
+        if query_changed {
+            self.command_scroll.set_offset(Point::default());
+        }
+
+        let should_fetch =
+            self.command_task.is_none() && command_cache_should_fetch(fetched_at, failed_at, now);
+        let has_cached_catalog = fetched_at.is_some();
+        self.command.error = (!has_cached_catalog)
+            .then_some(cached_error.clone())
+            .flatten();
+        self.command.notice = if has_cached_catalog && cached_error.is_some() {
+            Some("Couldn't refresh — showing cached commands".into())
+        } else if has_cached_catalog && should_fetch {
+            Some("Refreshing commands…".into())
+        } else {
+            None
+        };
+        self.command.loading = should_fetch;
+        if !should_fetch {
+            self.sync_mention_controls(cx);
+            return true;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.command.loading = false;
+            if has_cached_catalog {
+                self.command.notice = Some("Offline — showing cached commands".into());
+            } else {
+                self.command.error = Some("Engine not connected".into());
+            }
+            self.sync_mention_controls(cx);
+            return true;
+        };
+
+        self.command.request = self.command.request.wrapping_add(1);
+        let request = self.command.request;
+        self.command_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_COMMANDS, params)
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<AgentCommand>>(value)
+                        .map_err(|error| RpcError::Failed(error.to_string()))
+                });
+            this.update(cx, |composer, cx| {
+                if composer.command.request != request
+                    || composer.command.cache_key.as_ref() != Some(&cache_key)
+                {
+                    return;
+                }
+                composer.command_task = None;
+                composer.command.loading = false;
+                let now = Instant::now();
+                let entry = composer
+                    .command_cache
+                    .entry(cache_key.clone())
+                    .or_insert_with(|| CommandCacheEntry::empty(now));
+                entry.last_used = now;
+                match result {
+                    Ok(catalog) => {
+                        entry.catalog = catalog;
+                        entry.fetched_at = Some(now);
+                        entry.failed_at = None;
+                        entry.error = None;
+                    }
+                    Err(error) => {
+                        let message: SharedString = match error {
+                            RpcError::UnknownMethod(_) => {
+                                "Update the session's device to use slash commands".into()
+                            }
+                            RpcError::Transport(_) | RpcError::Closed => {
+                                "The session's device is unreachable".into()
+                            }
+                            RpcError::BadParams(_) | RpcError::Failed(_) => {
+                                "Couldn't load slash commands".into()
+                            }
+                        };
+                        entry.failed_at = Some(now);
+                        entry.error = Some(message);
+                    }
+                }
+                let catalog = entry.catalog.clone();
+                let fetched = entry.fetched_at.is_some();
+                let cached_error = entry.error.clone();
+                prune_command_cache(&mut composer.command_cache);
+
+                let active_name = composer
+                    .command
+                    .active
+                    .and_then(|active| composer.command.results.get(active))
+                    .map(|command| command.name.clone());
+                if let Some(token) = &composer.command.token {
+                    composer.command.results = filtered_commands(&catalog, &token.query);
+                    composer.command.active = active_name
+                        .and_then(|name| {
+                            composer
+                                .command
+                                .results
+                                .iter()
+                                .position(|command| command.name == name)
+                        })
+                        .or_else(|| (!composer.command.results.is_empty()).then_some(0));
+                    if let Some(active) = composer.command.active {
+                        composer.command_scroll.scroll_to_item(active);
+                    }
+                }
+                composer.command.error = (!fetched).then_some(cached_error.clone()).flatten();
+                composer.command.notice = if fetched && cached_error.is_some() {
+                    Some("Couldn't refresh — showing cached commands".into())
+                } else {
+                    None
+                };
+                composer.sync_mention_controls(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+        self.sync_mention_controls(cx);
+        true
+    }
+
     fn sync_mention_controls(&mut self, cx: &mut Context<Self>) {
-        let open = self.mention.token.is_some();
-        let has_selection = self.mention.active.is_some();
+        let command_open = self.command.token.is_some();
+        let open = command_open || self.mention.token.is_some();
+        let has_selection = if command_open {
+            self.command.active.is_some()
+        } else {
+            self.mention.active.is_some()
+        };
         self.input.update(cx, |input, cx| {
             input.set_mention_controls(open, has_selection, cx)
         });
@@ -3487,6 +4166,13 @@ impl Composer {
             let input = self.input.read(cx);
             (input.text().to_string(), input.cursor_offset())
         };
+        if self.update_command_completion(&text, cursor, cx) {
+            if self.mention.token.is_some() || self.mention_task.is_some() {
+                self.reset_mention(None, cx);
+            }
+            cx.notify();
+            return;
+        }
         let token = mention_token(&text, cursor);
         let still_dismissed = token.as_ref().is_some_and(|token| {
             self.mention
@@ -3613,6 +4299,16 @@ impl Composer {
     }
 
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.command.token.is_some() {
+            self.command.active =
+                crate::popover::menu_step(self.command.active, self.command.results.len(), delta);
+            if let Some(active) = self.command.active {
+                self.command_scroll.scroll_to_item(active);
+            }
+            self.sync_mention_controls(cx);
+            cx.notify();
+            return;
+        }
         self.mention.active =
             crate::popover::menu_step(self.mention.active, self.mention.results.len(), delta);
         self.sync_mention_controls(cx);
@@ -3620,6 +4316,20 @@ impl Composer {
     }
 
     fn dismiss_mention(&mut self, cx: &mut Context<Self>) {
+        if let Some(token) = self.command.token.clone() {
+            self.command.dismissed = self
+                .input
+                .read(cx)
+                .text()
+                .get(token.range.clone())
+                .map(|text| (token.range, text.to_string()));
+            self.command.token = None;
+            self.command.results.clear();
+            self.command.active = None;
+            self.sync_mention_controls(cx);
+            cx.notify();
+            return;
+        }
         let dismissed = self.mention.token.as_ref().and_then(|token| {
             self.input
                 .read(cx)
@@ -3632,6 +4342,22 @@ impl Composer {
     }
 
     fn accept_mention(&mut self, cx: &mut Context<Self>) {
+        if let Some(token) = self.command.token.clone() {
+            let Some(name) = self
+                .command
+                .active
+                .and_then(|active| self.command.results.get(active))
+                .map(|command| command.name.clone())
+            else {
+                return;
+            };
+            self.input.update(cx, |input, cx| {
+                input.replace_command(token.range, &name, cx)
+            });
+            self.reset_command(cx);
+            cx.notify();
+            return;
+        }
         let Some(token) = self.mention.token.clone() else {
             return;
         };
@@ -3648,6 +4374,114 @@ impl Composer {
         });
         self.reset_mention(None, cx);
         cx.notify();
+    }
+
+    fn render_command_popup(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let token = self.command.token.as_ref()?;
+        let mut card = crate::popover::popover_card(theme)
+            .w(px(420.0))
+            .max_h(px(320.0))
+            .overflow_hidden()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
+        if self.command.loading && self.command.results.is_empty() {
+            card = card.child(crate::popover::skeleton_rows(
+                "slash-command-loading",
+                theme,
+                3,
+                cx.entity_id(),
+                cx,
+            ));
+        } else if let Some(error) = self.command.error.clone() {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.danger_muted)
+                    .child(error),
+            );
+        } else if self.command.results.is_empty() {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(if token.query.is_empty() {
+                        "No commands available"
+                    } else {
+                        "No matching commands"
+                    }),
+            );
+        } else {
+            let mut rows = div()
+                .id("slash-command-scroll")
+                .max_h(px(280.0))
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(&self.command_scroll);
+            for (ix, command) in self.command.results.iter().enumerate() {
+                let selected = self.command.active == Some(ix);
+                rows = rows.child(
+                    crate::popover::menu_row(theme, selected, format!("slash-command-{ix}"))
+                        .id(("slash-command", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.command.active = Some(ix);
+                            this.accept_mention(cx);
+                        }))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(theme.text)
+                                        .child(format!("/{}", command.name)),
+                                )
+                                .children(command.description.as_ref().map(|description| {
+                                    div()
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .child(description.clone())
+                                })),
+                        ),
+                );
+            }
+            card = card.child(rows);
+        }
+        if let Some(notice) = self.command.notice.clone() {
+            card = card.child(
+                div()
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .text_size(px(10.5))
+                    .text_color(theme.text_muted)
+                    .child(notice),
+            );
+        }
+        let anchor = self
+            .input
+            .read(cx)
+            .visible_point_for_index(token.range.start)?;
+        Some(crate::popover::anchored_menu_above_at(
+            "slash-command-popup",
+            anchor,
+            card.into_any_element(),
+        ))
     }
 
     fn render_file_mention_popup(
@@ -3754,7 +4588,284 @@ impl Composer {
         div()
             .relative()
             .child(self.input.clone())
+            .children(self.render_command_popup(theme, cx))
             .children(self.render_file_mention_popup(theme, cx))
+    }
+
+    /// Ask the active harness to restate its latest response in plain language.
+    /// The control prompt reaches the harness but never becomes a user bubble.
+    fn start_bro(&mut self, cx: &mut Context<Self>) {
+        self.extraction_notice = None;
+        if !self.staged().is_empty() {
+            self.extraction_notice = Some("Remove attachments before using /bro.".into());
+            cx.notify();
+            return;
+        }
+        let (engine, chat_id, cwd, source_message_id) = {
+            let state = self.state.read(cx);
+            let Some(engine) = state.engine().cloned() else {
+                self.failure = Some("Engine not connected".into());
+                cx.notify();
+                return;
+            };
+            let Some(chat) = state.selected_chat_row() else {
+                self.extraction_notice = Some("Select a session first.".into());
+                cx.notify();
+                return;
+            };
+            let Some((source_message_id, _)) = latest_answerable_message(&state.transcript) else {
+                self.extraction_notice =
+                    Some("There is no completed assistant response to restate.".into());
+                cx.notify();
+                return;
+            };
+            (
+                engine,
+                chat.id.clone(),
+                chat.cwd.clone().unwrap_or_else(|| ".".into()),
+                source_message_id,
+            )
+        };
+        let resolved = self.pickers.read(cx).resolved(cx);
+        self.bro_runs.insert(
+            chat_id.clone(),
+            BroRun {
+                source_message_id: source_message_id.clone(),
+                saw_live_run: false,
+            },
+        );
+        self.failure = None;
+        self.sending = true;
+        cx.emit(ComposerEvent::Sent {
+            chat_id: chat_id.clone(),
+        });
+        cx.notify();
+
+        let command = SessionCommandPayload::HiddenPrompt {
+            request: RunRequest {
+                prompt: BRO_PROMPT.into(),
+                model: resolved.model.clone(),
+                reasoning: resolved.reasoning,
+                model_options: resolved.model_options.clone(),
+                cwd,
+                sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
+                resume: None,
+                attachments: Vec::new(),
+            },
+        };
+        self.send_task = Some(cx.spawn(async move |this, cx| {
+            let result = async {
+                let command = serde_json::to_value(command)
+                    .map_err(|error| format!("Send failed: {error}"))?;
+                let params = serde_json::json!({ "chatId": chat_id, "command": command });
+                engine
+                    .client()
+                    .call(methods::QUEUE_COMMAND, params)
+                    .await
+                    .map_err(|error| format!("Send failed: {error}"))?;
+                Ok::<_, String>(())
+            }
+            .await;
+            this.update(cx, |composer, cx| {
+                composer.sending = false;
+                if let Err(message) = result {
+                    if composer
+                        .bro_runs
+                        .get(&chat_id)
+                        .is_some_and(|run| run.source_message_id == source_message_id)
+                    {
+                        composer.bro_runs.remove(&chat_id);
+                    }
+                    composer.failure = Some(message.into());
+                }
+                composer.sync_default_placeholder(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Start the native equivalent of the local Pi `/answer` extension.
+    fn start_answer_questions(&mut self, cx: &mut Context<Self>) {
+        self.extraction_notice = None;
+        if self.sending
+            || self.run_live(cx)
+            || self.wizard.is_some()
+            || self.extracted_answers.is_some()
+        {
+            self.extraction_notice = Some("Wait for the current interaction to finish.".into());
+            cx.notify();
+            return;
+        }
+        if !self.input.read(cx).text().trim().is_empty() || !self.staged().is_empty() {
+            self.extraction_notice =
+                Some("Send or clear the current draft before answering questions.".into());
+            cx.notify();
+            return;
+        }
+        let (engine, chat_id, host_device_id, source_message_id) = {
+            let state = self.state.read(cx);
+            let Some(engine) = state.engine().cloned() else {
+                self.failure = Some("Engine not connected".into());
+                cx.notify();
+                return;
+            };
+            let Some(chat) = state.selected_chat_row() else {
+                self.extraction_notice = Some("Select a session first.".into());
+                cx.notify();
+                return;
+            };
+            let Some((source_message_id, _)) = latest_answerable_message(&state.transcript) else {
+                self.extraction_notice =
+                    Some("There is no completed assistant response to inspect.".into());
+                cx.notify();
+                return;
+            };
+            (
+                engine,
+                chat.id.clone(),
+                chat.device_id.clone(),
+                source_message_id,
+            )
+        };
+
+        self.reset_mention(None, cx);
+        self.input.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.set_placeholder("Preparing questions…", cx);
+        });
+        self.extracted_answers = Some(ExtractedAnswerFlow {
+            chat_id: chat_id.clone(),
+            state: ExtractedAnswerState::Extracting {
+                source_message_id: source_message_id.clone(),
+            },
+        });
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "sourceMessageId": source_message_id,
+            "targetDeviceId": host_device_id,
+        });
+        self.extraction_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::EXTRACT_QUESTIONS, params)
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<ExtractQuestionsResult>(value)
+                        .map_err(|error| RpcError::Failed(error.to_string()))
+                });
+            this.update(cx, |composer, cx| {
+                composer.extraction_task = None;
+                let expected =
+                    composer
+                        .extracted_answers
+                        .as_ref()
+                        .and_then(|flow| match &flow.state {
+                            ExtractedAnswerState::Extracting { source_message_id } => {
+                                Some((flow.chat_id.as_str(), source_message_id.as_str()))
+                            }
+                            ExtractedAnswerState::Answering(_) => None,
+                        });
+                let Some((expected_chat, expected_source)) = expected else {
+                    return;
+                };
+                if composer.current_key != expected_chat {
+                    composer.close_extracted_answers(cx);
+                    return;
+                }
+                match result {
+                    Ok(result) if result.source_message_id == expected_source => {
+                        let still_latest =
+                            latest_answerable_message(&composer.state.read(cx).transcript)
+                                .is_some_and(|(id, _)| id == result.source_message_id);
+                        if !still_latest {
+                            composer.close_extracted_answers(cx);
+                            composer.extraction_notice =
+                                Some("A newer assistant response arrived. Try again.".into());
+                        } else if result.questions.is_empty() {
+                            composer.close_extracted_answers(cx);
+                            composer.extraction_notice =
+                                Some("No questions requiring an answer were found.".into());
+                        } else {
+                            if let Some(flow) = composer.extracted_answers.as_mut() {
+                                flow.state = ExtractedAnswerState::Answering(ExtractedWizard::new(
+                                    result.questions,
+                                ));
+                            }
+                            composer.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
+                            composer.input.update(cx, |input, cx| {
+                                input.set_text("", cx);
+                                input.set_placeholder("Type your answer…", cx);
+                            });
+                        }
+                    }
+                    Ok(_) => {
+                        composer.close_extracted_answers(cx);
+                        composer.failure = Some("Question extraction became stale.".into());
+                    }
+                    Err(error) => {
+                        composer.close_extracted_answers(cx);
+                        composer.failure =
+                            Some(format!("Question extraction failed: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn close_extracted_answers(&mut self, cx: &mut Context<Self>) {
+        self.extracted_answers = None;
+        self.extraction_task = None;
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.sync_default_placeholder(cx);
+    }
+
+    fn extracted_back(&mut self, cx: &mut Context<Self>) {
+        let current = self.input.read(cx).text().to_string();
+        let previous = self.extracted_answers.as_mut().and_then(|flow| {
+            let ExtractedAnswerState::Answering(wizard) = &mut flow.state else {
+                return None;
+            };
+            wizard.save(current);
+            wizard.back().then(|| wizard.current_answer().to_string())
+        });
+        if let Some(previous) = previous {
+            self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
+            self.input
+                .update(cx, |input, cx| input.set_text(previous, cx));
+            cx.notify();
+        }
+    }
+
+    fn extracted_advance(&mut self, cx: &mut Context<Self>) {
+        let current = self.input.read(cx).text().to_string();
+        let outcome = self.extracted_answers.as_mut().and_then(|flow| {
+            let ExtractedAnswerState::Answering(wizard) = &mut flow.state else {
+                return None;
+            };
+            wizard.save(current);
+            if wizard.advance() {
+                Some(Ok(wizard.compiled_message()))
+            } else {
+                Some(Err(wizard.current_answer().to_string()))
+            }
+        });
+        match outcome {
+            Some(Ok(message)) => {
+                self.close_extracted_answers(cx);
+                self.send(message, false, cx);
+            }
+            Some(Err(next)) => {
+                self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
+                self.input.update(cx, |input, cx| input.set_text(next, cx));
+                cx.notify();
+            }
+            None => {}
+        }
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
@@ -3766,8 +4877,31 @@ impl Composer {
             )
         };
 
+        // A real agent input request takes priority over the optional prose
+        // extraction flow. Unlike route navigation, this cancels rather than
+        // stashes because the live run is blocked on its own question.
+        if pending.is_some() && self.extracted_answers.is_some() {
+            self.close_extracted_answers(cx);
+        }
+        if pending.is_some() {
+            self.bro_runs.remove(&key);
+        }
+
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
+            if let Some(mut flow) = self.extracted_answers.take() {
+                match &mut flow.state {
+                    ExtractedAnswerState::Answering(wizard) => {
+                        wizard.save(self.input.read(cx).text().to_string());
+                        self.extracted_answer_stash
+                            .insert(self.current_key.clone(), flow);
+                    }
+                    ExtractedAnswerState::Extracting { .. } => {
+                        self.extraction_task = None;
+                    }
+                }
+                self.input.update(cx, |input, cx| input.set_text("", cx));
+            }
             let old_text = self.input.read(cx).text().to_string();
             if old_text.is_empty() {
                 self.drafts.remove(&self.current_key);
@@ -3777,12 +4911,14 @@ impl Composer {
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
             self.failure = None;
+            self.extraction_notice = None;
             self.wizard = None;
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
             self.preview = None;
             self.reset_mention(None, cx);
             // Route changes snap (round 5/6): a mode difference between the
+            self.reset_command(cx);
             // old and new session's composer must not glide across
             // navigation. Killing the in-flight morph here isn't enough —
             // the nav-driven flip only commits AFTER the swapped draft has
@@ -3792,6 +4928,58 @@ impl Composer {
             self.last_rendered_height = 0.0;
             self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
+            if pending.is_none()
+                && let Some(flow) = self.extracted_answer_stash.remove(&self.current_key)
+            {
+                let answer = match &flow.state {
+                    ExtractedAnswerState::Answering(wizard) => wizard.current_answer().to_string(),
+                    ExtractedAnswerState::Extracting { .. } => String::new(),
+                };
+                self.extracted_answers = Some(flow);
+                self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
+                self.input.update(cx, |input, cx| {
+                    input.set_text(answer, cx);
+                    input.set_placeholder("Type your answer…", cx);
+                });
+            }
+        }
+
+        // A hidden control turn stays in the composer until its replacement
+        // response completes (or its live run settles without one). Tracking
+        // both signals avoids flicker around the Working status transition.
+        let (latest_assistant_id, live_runs) = {
+            let state = self.state.read(cx);
+            let now = chrono::Utc::now();
+            (
+                latest_answerable_message(&state.transcript).map(|(id, _)| id),
+                self.bro_runs
+                    .keys()
+                    .map(|chat_id| {
+                        let live = matches!(
+                            state.indicator_for(chat_id, now),
+                            Indicator::Working | Indicator::AwaitingInput
+                        );
+                        (chat_id.clone(), live)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut finished = Vec::new();
+        for (chat_id, live) in live_runs {
+            let Some(run) = self.bro_runs.get_mut(&chat_id) else {
+                continue;
+            };
+            run.saw_live_run |= live;
+            let response_arrived = chat_id == self.current_key
+                && latest_assistant_id
+                    .as_deref()
+                    .is_some_and(|id| id != run.source_message_id);
+            if response_arrived || (run.saw_live_run && !live) {
+                finished.push(chat_id);
+            }
+        }
+        for chat_id in finished {
+            self.bro_runs.remove(&chat_id);
         }
 
         // Question panel lifecycle (wizard state cached per request id).
@@ -3804,6 +4992,7 @@ impl Composer {
                 if !same {
                     self.reset_mention(None, cx);
                     self.wizard = Some(Wizard::new(request_id, questions));
+                    self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
                     self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
                     self.input.update(cx, |input, cx| {
@@ -3829,13 +5018,25 @@ impl Composer {
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
-                        self.input
-                            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
                     }
                 }
             }
         }
+        self.sync_default_placeholder(cx);
         cx.notify();
+    }
+
+    fn sync_default_placeholder(&self, cx: &mut Context<Self>) {
+        if self.wizard.is_some() || self.extracted_answers.is_some() || self.bro_active() {
+            return;
+        }
+        let placeholder = composer_placeholder(self.sending || self.run_live(cx));
+        self.input
+            .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+    }
+
+    fn bro_active(&self) -> bool {
+        self.bro_runs.contains_key(&self.current_key)
     }
 
     fn run_live(&self, cx: &App) -> bool {
@@ -3856,13 +5057,27 @@ impl Composer {
         send_button_mode(self.run_live(cx), has_text)
     }
 
+    /// Copy an active text selection, or clear the current session's composer.
+    pub fn clear_input(&mut self, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            // Clear input and Copy share mod-c by default. The app-level clear
+            // action wins dispatch, so preserve normal copy behavior here.
+            if !input.copy_selected_text(cx) {
+                input.set_text("", cx);
+            }
+        });
+    }
+
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.extracted_answers.as_ref().map(|flow| &flow.state),
+            Some(ExtractedAnswerState::Answering(_))
+        ) {
+            self.extracted_advance(cx);
+            return;
+        }
         if self.wizard.is_some() {
             // Enter inside the panel's free-text input submits the page.
-            let typed = self.input.read(cx).text().trim().to_string();
-            if let Some(w) = self.wizard.as_mut() {
-                w.set_typed(typed);
-            }
             self.wizard_advance(cx);
             return;
         }
@@ -3870,13 +5085,26 @@ impl Composer {
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
             _ if text.is_empty() && self.staged().is_empty() => {}
+            SendButtonMode::Send if is_answer_questions_command(&text) => {
+                self.reset_command(cx);
+                self.input.update(cx, |input, cx| input.set_text("", cx));
+                self.drafts.remove(&self.current_key);
+                self.start_answer_questions(cx);
+            }
+            SendButtonMode::Send if is_bro_command(&text) => {
+                self.reset_command(cx);
+                self.input.update(cx, |input, cx| input.set_text("", cx));
+                self.drafts.remove(&self.current_key);
+                self.start_bro(cx);
+            }
             SendButtonMode::Send => self.send(text, false, cx),
             SendButtonMode::Steer => self.send(text, true, cx),
         }
     }
 
-    /// Queue a Run (or Steer) doc command with an optimistic echo. New chats
-    /// thread the picked config in: worktree creation (when the isolated toggle
+    /// Queue a Run, Steer, or Pi Bash doc command. Agent prompts get an
+    /// optimistic echo; direct shell output appears when execution completes.
+    /// New chats thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
@@ -3898,6 +5126,19 @@ impl Composer {
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
+        let scope = shell_scope(&text);
+        let shell = shell_command(&text);
+        if scope.is_some() && shell.is_none() {
+            self.failure = Some("Enter a Bash command after ! or !!".into());
+            cx.notify();
+            return;
+        }
+        if shell.is_some() && !self.staged().is_empty() {
+            self.failure = Some("Send or remove attachments before running a shell command".into());
+            cx.notify();
+            return;
+        }
+        let is_shell = shell.is_some();
         let existing_cwd = self
             .state
             .read(cx)
@@ -3947,11 +5188,16 @@ impl Composer {
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
         // back into the chat's stash.
-        let staged = self
-            .attachments
-            .remove(&self.current_key)
-            .unwrap_or_default();
-        self.preview = None;
+        let staged = if is_shell {
+            Vec::new()
+        } else {
+            self.attachments
+                .remove(&self.current_key)
+                .unwrap_or_default()
+        };
+        if !is_shell {
+            self.preview = None;
+        }
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
 
@@ -3964,18 +5210,33 @@ impl Composer {
         };
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
-        // so the doc frame dedups it away).
-        let echo = SessionMessageEntry {
-            id: message_id.clone(),
-            role: comet_doc::MessageRole::User,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: echo_text.clone(),
-            }],
-            created_at,
-            device_id: "local".into(),
-            status: None,
-            continuation_of: None,
+        // so the doc frame dedups it away). Shell commands appear immediately
+        // as streaming system entries while their output is still pending.
+        let echo = match &shell {
+            Some(shell) => SessionMessageEntry {
+                id: message_id.clone(),
+                role: MessageRole::System,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: bash_pending_transcript(&shell.command),
+                }],
+                created_at,
+                device_id: "local".into(),
+                status: Some(MessageStatus::Streaming),
+                continuation_of: None,
+            },
+            None => SessionMessageEntry {
+                id: message_id.clone(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: echo_text.clone(),
+                }],
+                created_at,
+                device_id: "local".into(),
+                status: None,
+                continuation_of: None,
+            },
         };
         self.state.update(cx, |s, cx| {
             if is_new {
@@ -3989,12 +5250,13 @@ impl Composer {
         self.drafts.remove(&self.current_key);
         self.failure = None;
         self.sending = true;
+        self.sync_default_placeholder(cx);
         cx.emit(ComposerEvent::Sent {
             chat_id: chat_id.clone(),
         });
         cx.notify();
 
-        let steer_cmd = steer && !is_new;
+        let steer_cmd = steer && !is_new && !is_shell;
         let restore_text = text.clone();
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
@@ -4048,10 +5310,11 @@ impl Composer {
                                     .call(methods::CREATE_WORKTREE, params)
                                     .await
                                     .map_err(|e| format!("Worktree failed: {e}"))?;
-                                let worktree: comet_proto::Worktree = serde_json::from_value(value)
+                                let worktree: jolt_proto::Worktree = serde_json::from_value(value)
                                     .map_err(|e| format!("Worktree reply malformed: {e}"))?;
                                 cwd = worktree.path.clone();
                                 worktree_cwd = Some(worktree.path);
+                                chat_branch = Some(worktree.branch);
                             }
                         }
                     }
@@ -4133,7 +5396,7 @@ impl Composer {
                     // without flickering).
                     let refreshed = SessionMessageEntry {
                         id: message_id.clone(),
-                        role: comet_doc::MessageRole::User,
+                        role: jolt_doc::MessageRole::User,
                         parts: vec![MessagePart::Text {
                             id: "t0".into(),
                             text: content.clone(),
@@ -4154,7 +5417,14 @@ impl Composer {
                     .ok();
                 }
 
-                let command = if steer_cmd {
+                let command = if let Some(shell) = &shell {
+                    SessionCommandPayload::Bash {
+                        command: shell.command.clone(),
+                        exclude_from_context: shell.exclude_from_context,
+                        cwd: cwd.clone(),
+                        message_id: message_id.clone(),
+                    }
+                } else if steer_cmd {
                     SessionCommandPayload::Steer {
                         prompt: content.clone(),
                         message_id: Some(message_id.clone()),
@@ -4188,6 +5458,7 @@ impl Composer {
             .await;
             this.update(cx, |composer, cx| {
                 composer.sending = false;
+                composer.sync_default_placeholder(cx);
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
                     // draft, staged files back in the chat's stash.
@@ -4213,6 +5484,14 @@ impl Composer {
             })
             .ok();
         }));
+    }
+
+    fn cancel_bro(&mut self, cx: &mut Context<Self>) {
+        self.bro_runs.remove(&self.current_key);
+        self.sending = false;
+        self.interrupt(cx);
+        self.sync_default_placeholder(cx);
+        cx.notify();
     }
 
     fn interrupt(&mut self, cx: &mut Context<Self>) {
@@ -4275,24 +5554,67 @@ impl Composer {
     }
 
     fn wizard_advance(&mut self, cx: &mut Context<Self>) {
-        let Some(wizard) = self.wizard.as_mut() else {
-            return;
+        let current = self.input.read(cx).text().to_string();
+        let outcome = {
+            let Some(wizard) = self.wizard.as_mut() else {
+                return;
+            };
+            if current.trim().is_empty() && !wizard.page_has_pick() {
+                return;
+            }
+            wizard.set_typed(current);
+            match wizard.advance() {
+                WizardStep::Done(answers) => Ok(answers),
+                WizardStep::Stay | WizardStep::AutoAdvance => {
+                    Err((wizard.current_typed().to_string(), wizard.page_has_pick()))
+                }
+            }
         };
-        match wizard.advance() {
-            WizardStep::Done(answers) => self.wizard_finish(answers, cx),
-            _ => {
-                // Moving on: clear the shared free-text input for the next page.
-                self.input.update(cx, |input, cx| input.set_text("", cx));
+        match outcome {
+            Ok(answers) => self.wizard_finish(answers, cx),
+            Err((next, has_pick)) => {
+                self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
+                self.input.update(cx, |input, cx| {
+                    input.set_text(next, cx);
+                    input.set_placeholder(
+                        if has_pick {
+                            "Type your own answer, or leave this blank to use the selected option"
+                        } else {
+                            "Type your own answer, or pick an option above"
+                        },
+                        cx,
+                    );
+                });
                 cx.notify();
             }
         }
     }
 
     fn wizard_back(&mut self, cx: &mut Context<Self>) {
-        if let Some(wizard) = self.wizard.as_mut() {
-            wizard.back();
-            cx.notify();
-        }
+        let current = self.input.read(cx).text().to_string();
+        let previous = self.wizard.as_mut().and_then(|wizard| {
+            wizard.set_typed(current);
+            wizard
+                .back()
+                .then(|| (wizard.current_typed().to_string(), wizard.page_has_pick()))
+        });
+        let Some((previous, has_pick)) = previous else {
+            return;
+        };
+        self.advance_task = None;
+        self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.input.update(cx, |input, cx| {
+            input.set_text(previous, cx);
+            input.set_placeholder(
+                if has_pick {
+                    "Type your own answer, or leave this blank to use the selected option"
+                } else {
+                    "Type your own answer, or pick an option above"
+                },
+                cx,
+            );
+        });
+        cx.notify();
     }
 
     /// Submit RespondInput and retire the panel.
@@ -4302,11 +5624,9 @@ impl Composer {
         };
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
-        self.input.update(cx, |input, cx| {
-            input.set_text("", cx);
-            // The panel borrowed the composer input; hand back its identity.
-            input.set_placeholder("Do anything…", cx);
-        });
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        // The panel borrowed the composer input; hand back its identity.
+        self.sync_default_placeholder(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -4383,7 +5703,228 @@ impl Composer {
 
     // ---- render pieces ----
 
-    /// The agent-asked-a-question panel (comet question-panel.tsx), rendered in
+    fn render_bro_loader(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::of(cx).clone();
+        div()
+            .id("bro-loader")
+            .rounded(px(26.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.input_bg)
+            .shadow_lg()
+            .px(px(18.0))
+            .py(px(16.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(loaders::activity_orb(
+                "bro-spinner",
+                &theme,
+                16.0,
+                cx.entity_id(),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(13.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("Rephrasing nonsense lines for clarity…")),
+            )
+            .child(
+                crate::popover::btn_ghost(&theme, "Cancel", "bro-cancel")
+                    .id("bro-cancel")
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_bro(cx))),
+            )
+            .into_any_element()
+    }
+
+    fn render_extraction_loader(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::of(cx).clone();
+        div()
+            .id("question-extraction-loader")
+            .rounded(px(26.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.input_bg)
+            .shadow_lg()
+            .px(px(18.0))
+            .py(px(16.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(loaders::activity_orb(
+                "question-extraction-spinner",
+                &theme,
+                16.0,
+                cx.entity_id(),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(13.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("Finding questions…")),
+            )
+            .child(
+                crate::popover::btn_ghost(&theme, "Cancel", "question-extraction-cancel")
+                    .id("question-extraction-cancel")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_extracted_answers(cx);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_extracted_wizard(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::of(cx).clone();
+        let Some(wizard) = self
+            .extracted_answers
+            .as_ref()
+            .and_then(|flow| match &flow.state {
+                ExtractedAnswerState::Answering(wizard) => Some(wizard.clone()),
+                ExtractedAnswerState::Extracting { .. } => None,
+            })
+        else {
+            return gpui::Empty.into_any_element();
+        };
+        let Some(question) = wizard.current().cloned() else {
+            return gpui::Empty.into_any_element();
+        };
+        let last = wizard.page + 1 >= wizard.questions.len();
+        let left = if wizard.page > 0 {
+            crate::popover::btn_ghost(&theme, "Back", "extracted-question-back")
+                .id("extracted-question-back")
+                .on_click(cx.listener(|this, _, _, cx| this.extracted_back(cx)))
+                .into_any_element()
+        } else {
+            crate::popover::btn_ghost(&theme, "Cancel", "extracted-question-cancel")
+                .id("extracted-question-cancel")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_extracted_answers(cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+
+        div()
+            .id("extracted-question-panel")
+            .track_focus(&self.wizard_focus)
+            .rounded(px(26.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.input_bg)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .max_h(relative(1.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(16.0))
+                    .pt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child(SharedString::from(crate::popover::tracked_upper(
+                                "Questions",
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .h(px(20.0))
+                            .px(px(6.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(6.0))
+                            .bg(crate::theme::ink(0.06))
+                            .text_size(px(10.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child(SharedString::from(wizard.counter())),
+                    ),
+            )
+            .child(
+                div()
+                    .id("extracted-question-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.wizard_scroll)
+                    .px(px(16.0))
+                    .pt(px(6.0))
+                    .pb(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .line_height(px(20.0))
+                            .font_weight(gpui::FontWeight::NORMAL)
+                            .text_color(theme.text)
+                            .child(SharedString::from(question.question)),
+                    )
+                    .when_some(question.context, |el, context| {
+                        el.child(
+                            div()
+                                .mt(px(8.0))
+                                .rounded(px(10.0))
+                                .bg(crate::theme::ink(0.035))
+                                .px(px(10.0))
+                                .py(px(8.0))
+                                .text_size(px(12.0))
+                                .line_height(px(17.0))
+                                .text_color(theme.text_muted.opacity(0.8))
+                                .child(SharedString::from(context)),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .mx(px(16.0))
+                    .border_t_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .pt(px(12.0))
+                    .pb(px(4.0))
+                    .px(px(4.0))
+                    .child(self.input.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .px(px(16.0))
+                    .pb(px(16.0))
+                    .pt(px(4.0))
+                    .child(left)
+                    .child(
+                        crate::popover::btn_primary(&theme, if last { "Submit" } else { "Next" })
+                            .id("extracted-question-submit")
+                            .px(px(16.0))
+                            .on_click(cx.listener(|this, _, _, cx| this.extracted_advance(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The agent-asked-a-question panel (jolt question-panel.tsx), rendered in
+    /// The agent-asked-a-question panel (jolt question-panel.tsx), rendered in
     /// place of the composer: the same floating-pill chrome (`rounded-[26px]
     /// border-white/[0.08] bg-white/[0.03] shadow-xl`), uppercase header +
     /// "1/3" counter chip, option rows with number kbd chips, a free-text
@@ -4404,7 +5945,7 @@ impl Composer {
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
-            // (typed answers win — comet question-panel.tsx `isSel`).
+            // (typed answers win — jolt question-panel.tsx `isSel`).
             let picked = wizard.is_picked(ix) && typed_empty;
             div()
                 .id(("wizard-option", ix))
@@ -4421,7 +5962,7 @@ impl Composer {
                 } else {
                     gpui::transparent_black()
                 })
-                // comet question-panel.tsx option rows: `transition-colors`.
+                // jolt question-panel.tsx option rows: `transition-colors`.
                 .bg(if picked {
                     crate::theme::ink(0.09)
                 } else {
@@ -4486,50 +6027,62 @@ impl Composer {
             .shadow_lg()
             .flex()
             .flex_col()
+            .min_h_0()
+            .max_h(relative(1.0))
+            .overflow_hidden()
+            // The request identity and progress stay visible while the body
+            // scrolls, so a long approval still has clear context.
             .child(
                 div()
+                    .flex_none()
                     .px(px(16.0))
                     .pt(px(16.0))
                     .flex()
-                    .flex_col()
-                    // Header: tracked uppercase + counter chip when paged.
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
                     .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.0))
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(crate::popover::tracked_upper(
-                                        &question.header,
-                                    ))),
-                            )
-                            .when(wizard.questions.len() > 1, |el| {
-                                el.child(
-                                    div()
-                                        .h(px(20.0))
-                                        .px(px(6.0))
-                                        .flex()
-                                        .items_center()
-                                        .rounded(px(6.0))
-                                        .bg(crate::theme::ink(0.06))
-                                        .text_size(px(10.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text_muted.opacity(0.6))
-                                        .child(SharedString::from(counter)),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .mt(px(6.0))
-                            .text_size(px(15.0))
-                            .line_height(px(20.0))
+                            .text_size(px(10.5))
                             .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child(SharedString::from(crate::popover::tracked_upper(
+                                &question.header,
+                            ))),
+                    )
+                    .when(wizard.questions.len() > 1, |el| {
+                        el.child(
+                            div()
+                                .h(px(20.0))
+                                .px(px(6.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.0))
+                                .bg(crate::theme::ink(0.06))
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text_muted.opacity(0.6))
+                                .child(SharedString::from(counter)),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("question-panel-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.wizard_scroll)
+                    .px(px(16.0))
+                    .pt(px(6.0))
+                    .pb(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .line_height(px(20.0))
+                            .font_weight(gpui::FontWeight::NORMAL)
                             .text_color(theme.text)
                             .child(SharedString::from(question.question.clone())),
                     )
@@ -4549,22 +6102,24 @@ impl Composer {
                             .flex_col()
                             .gap(px(4.0))
                             .children(options),
-                    )
-                    // Free-text override over a hairline (shares the composer
-                    // input entity).
-                    .child(
-                        div()
-                            .mt(px(12.0))
-                            .border_t_1()
-                            .border_color(crate::theme::hairline(0.06))
-                            .pt(px(12.0))
-                            .pb(px(4.0))
-                            .px(px(4.0))
-                            .child(self.input.clone()),
                     ),
+            )
+            // The custom answer and actions stay reachable while a long
+            // prompt or option list scrolls above them.
+            .child(
+                div()
+                    .flex_none()
+                    .mx(px(16.0))
+                    .border_t_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .pt(px(12.0))
+                    .pb(px(4.0))
+                    .px(px(4.0))
+                    .child(self.input.clone()),
             )
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .justify_between()
@@ -4578,14 +6133,16 @@ impl Composer {
                             .on_click(cx.listener(|this, _, _, cx| this.wizard_back(cx)))
                             .into_any_element()
                     } else {
-                        gpui::Empty.into_any_element()
+                        div().flex_1().into_any_element()
                     })
                     .child(
                         crate::popover::btn_primary(&theme, if last { "Submit" } else { "Next" })
                             .id("wizard-submit")
                             .px(px(16.0))
-                            .when(!can_advance, |el| el.opacity(0.4))
-                            .on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx))),
+                            .when(!can_advance, |el| el.opacity(0.4).cursor_default())
+                            .when(can_advance, |el| {
+                                el.on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx)))
+                            }),
                     ),
             )
             .into_any_element()
@@ -4597,7 +6154,7 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
-        // Comet composer-actions.tsx: a size-7 filled circle — up-arrow to
+        // Jolt composer-actions.tsx: a size-7 filled circle — up-arrow to
         // send/steer, a dark rounded square on the same light circle to stop.
         match mode {
             SendButtonMode::Stop => div()
@@ -4647,14 +6204,15 @@ impl Focusable for Composer {
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let wizard_active = self.wizard.is_some();
+        let wizard_active =
+            self.wizard.is_some() || self.extracted_answers.is_some() || self.bro_active();
         if self.mention.token.is_some()
             && (wizard_active || !self.input.focus_handle(cx).is_focused(window))
         {
             self.reset_mention(None, cx);
         }
         let mode = self.button_mode(cx);
-        let (text_width, has_newline, content_height, last_width, epoch) = {
+        let (text_width, has_newline, content_height, last_width, epoch, shell_scope) = {
             let input = self.input.read(cx);
             (
                 input.measured_text_width(),
@@ -4662,6 +6220,7 @@ impl Render for Composer {
                 input.measured_content_height(),
                 input.last_width,
                 input.layout_epoch,
+                shell_scope(input.text()),
             )
         };
         let now = Instant::now();
@@ -4755,7 +6314,8 @@ impl Render for Composer {
         let expanded = self.expanded_mode;
 
         let failure = self.failure.clone();
-        // Centered composer column (comet `mx-auto w-full max-w-3xl`).
+        let extraction_notice = self.extraction_notice.clone();
+        // Centered composer column (jolt `mx-auto w-full max-w-3xl`).
         let container = div()
             .w_full()
             .max_w(px(768.0))
@@ -4766,7 +6326,7 @@ impl Render for Composer {
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
             .when_some(failure, |el, message| {
-                // comet composer.tsx `Notice` (matches the transcript
+                // jolt composer.tsx `Notice` (matches the transcript
                 // ErrorChip palette): `flex items-start gap-2 rounded-xl
                 // border px-3 py-2 text-[12px] leading-snug` with a 14px
                 // DangerTriangle — a subtle tinted wash, not a bare red
@@ -4820,15 +6380,85 @@ impl Render for Composer {
                         )
                         .child(div().min_w_0().child(message)),
                 )
+            })
+            .when_some(extraction_notice, |el, message| {
+                el.child(
+                    div()
+                        .id("question-extraction-notice")
+                        .mx(px(4.0))
+                        .mt(px(6.0))
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(crate::theme::ink(0.035))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .text_size(px(12.0))
+                        .line_height(px(16.0))
+                        .text_color(theme.text_muted)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.extraction_notice = None;
+                            cx.notify();
+                        }))
+                        .child(message),
+                )
             });
 
-        if wizard_active {
+        if self.bro_active() {
+            let loader = self.render_bro_loader(cx);
+            return container.child(motion::fade_quick("bro-loader", div().child(loader)));
+        }
+        if matches!(
+            self.extracted_answers.as_ref().map(|flow| &flow.state),
+            Some(ExtractedAnswerState::Extracting { .. })
+        ) {
+            let loader = self.render_extraction_loader(cx);
+            return container.child(motion::fade_quick(
+                "question-extraction-loader",
+                div().child(loader),
+            ));
+        }
+        if matches!(
+            self.extracted_answers.as_ref().map(|flow| &flow.state),
+            Some(ExtractedAnswerState::Answering(_))
+        ) {
+            let wizard = self.render_extracted_wizard(cx);
+            return container
+                .min_h_0()
+                .max_h(relative(1.0))
+                .overflow_hidden()
+                .child(motion::fade_quick(
+                    "extracted-question-wizard",
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .child(wizard),
+                ));
+        }
+        if self.wizard.is_some() {
             let wizard = self.render_wizard(cx);
-            return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
+            return container
+                .min_h_0()
+                .max_h(relative(1.0))
+                .overflow_hidden()
+                .child(motion::fade_quick(
+                    "composer-wizard",
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .child(wizard),
+                ));
         }
 
         // New chats always use the expanded layout: the repo/branch pickers
-        // need the full-width actions row (comet composer-actions.tsx
+        // need the full-width actions row (jolt composer-actions.tsx
         // `mustExpand = isNew || …`).
         let expanded = expanded || new_chat;
 
@@ -4875,7 +6505,7 @@ impl Render for Composer {
             .justify_center()
             .rounded_full()
             .cursor_pointer()
-            // comet composer-actions.tsx attach: `transition-colors`.
+            // jolt composer-actions.tsx attach: `transition-colors`.
             .bg(motion::hover_blend(
                 "composer-attach",
                 gpui::transparent_black(),
@@ -4892,7 +6522,7 @@ impl Render for Composer {
         // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
 
-        // The pill chrome (comet composer.tsx): `rounded-[26px] border
+        // The pill chrome (jolt composer.tsx): `rounded-[26px] border
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Picker chips,
         // attach, and the send circle all live INSIDE the pill.
@@ -4955,7 +6585,14 @@ impl Render for Composer {
                         .pr(px(morph_cluster_inset(true, morph_t)))
                         .pt(px(4.0))
                         .pb(px(10.0))
-                        .child(div().flex_1().min_w_0().child(self.pickers.clone()))
+                        .child(if let Some(scope) = shell_scope {
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(shell_mode_chip(scope, &theme))
+                        } else {
+                            div().flex_1().min_w_0().child(self.pickers.clone())
+                        })
                         .child(attach)
                         .child(send_button),
                 )
@@ -5001,7 +6638,7 @@ impl Render for Composer {
                                 .flex_row()
                                 .items_center()
                                 // Shared cluster metrics (`gap-1 pl-1 pr-2`,
-                                // comet composer-actions.tsx): identical
+                                // jolt composer-actions.tsx): identical
                                 // internals to expanded; the right inset
                                 // glides 12→8 on collapse.
                                 .gap(px(4.0))
@@ -5009,7 +6646,11 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(div().flex_none().child(self.pickers.clone()))
+                                .child(if let Some(scope) = shell_scope {
+                                    div().flex_none().child(shell_mode_chip(scope, &theme))
+                                } else {
+                                    div().flex_none().child(self.pickers.clone())
+                                })
                                 .child(attach)
                                 .child(send_button),
                         ),
@@ -5019,9 +6660,9 @@ impl Render for Composer {
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
         let container = container.child(motion::fade_quick("composer-input", body));
-        // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
+        // Ref/workspace toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
-        // labels once the session exists. Git spaces only.
+        // labels once the session exists. VCS spaces only.
         let footer = self
             .pickers
             .update(cx, |pickers, cx| pickers.render_footer(cx));
@@ -5048,6 +6689,18 @@ impl Render for Composer {
     }
 }
 
+fn selected_copy_text(
+    content: &str,
+    selected_range: &Range<usize>,
+    transcript_selection: Option<String>,
+) -> Option<String> {
+    if selected_range.is_empty() {
+        transcript_selection
+    } else {
+        Some(content[selected_range.clone()].to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5057,6 +6710,19 @@ mod tests {
             range,
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn copy_prefers_composer_selection_then_transcript_selection() {
+        assert_eq!(
+            selected_copy_text("draft text", &(0..5), Some("response".into())).as_deref(),
+            Some("draft")
+        );
+        assert_eq!(
+            selected_copy_text("draft text", &(0..0), Some("response".into())).as_deref(),
+            Some("response")
+        );
+        assert_eq!(selected_copy_text("draft text", &(0..0), None), None);
     }
 
     #[test]
@@ -5134,6 +6800,147 @@ mod tests {
     }
 
     #[test]
+    fn shell_commands_match_universal_prefix_semantics() {
+        assert_eq!(shell_scope("!"), Some(ShellScope::AgentContext));
+        assert_eq!(shell_scope("!!"), Some(ShellScope::LocalOnly));
+        assert_eq!(shell_scope("!!!"), None);
+        assert_eq!(shell_scope("!!!! echo normally"), None);
+        assert_eq!(shell_scope("  ! pwd"), Some(ShellScope::AgentContext));
+        assert_eq!(shell_scope("ordinary prompt"), None);
+        assert_eq!(
+            shell_command("! cargo test "),
+            Some(ShellCommand {
+                command: "cargo test".into(),
+                exclude_from_context: false,
+            })
+        );
+        assert_eq!(
+            shell_command("!!pwd"),
+            Some(ShellCommand {
+                command: "pwd".into(),
+                exclude_from_context: true,
+            })
+        );
+        assert!(shell_command("!").is_none());
+        assert!(shell_command("!!").is_none());
+        assert!(shell_command("!!!echo nope").is_none());
+        assert!(shell_command("ordinary prompt").is_none());
+        let pending = bash_pending_transcript("printf '```'");
+        assert!(pending.contains("$ printf '```'"));
+        assert!(pending.ends_with("_Output pending…_"));
+    }
+
+    #[test]
+    fn slash_command_cache_key_ignores_model_option_insertion_order() {
+        let mut left = serde_json::Map::new();
+        left.insert("trust".into(), serde_json::json!("yes"));
+        left.insert("tools".into(), serde_json::json!("read"));
+        let mut right = serde_json::Map::new();
+        right.insert("tools".into(), serde_json::json!("read"));
+        right.insert("trust".into(), serde_json::json!("yes"));
+        assert_eq!(
+            command_model_options_key(&left),
+            command_model_options_key(&right)
+        );
+    }
+
+    #[test]
+    fn slash_command_cache_evicts_the_least_recently_used_project() {
+        let now = Instant::now();
+        let key = |index: usize| CommandCacheKey {
+            harness: jolt_proto::HarnessId::Mock,
+            target_device: "device".into(),
+            cwd: format!("/project/{index}"),
+            model_options: "{}".into(),
+        };
+        let mut cache = HashMap::new();
+        for index in 0..=COMMAND_CACHE_CAPACITY {
+            let mut entry = CommandCacheEntry::empty(now);
+            entry.last_used = now - Duration::from_secs((COMMAND_CACHE_CAPACITY - index) as u64);
+            cache.insert(key(index), entry);
+        }
+        prune_command_cache(&mut cache);
+        assert_eq!(cache.len(), COMMAND_CACHE_CAPACITY);
+        assert!(!cache.contains_key(&key(0)));
+        assert!(cache.contains_key(&key(COMMAND_CACHE_CAPACITY)));
+    }
+
+    #[test]
+    fn slash_command_cache_refreshes_stale_entries_with_failure_backoff() {
+        let now = Instant::now();
+        assert!(command_cache_should_fetch(None, None, now));
+        assert!(!command_cache_should_fetch(Some(now), None, now));
+
+        let stale = now - COMMAND_CACHE_TTL;
+        assert!(command_cache_should_fetch(Some(stale), None, now));
+        assert!(!command_cache_should_fetch(Some(stale), Some(now), now));
+        assert!(command_cache_should_fetch(
+            Some(stale),
+            Some(now - COMMAND_CACHE_FAILURE_RETRY),
+            now,
+        ));
+    }
+
+    #[test]
+    fn slash_commands_only_complete_the_leading_token() {
+        assert_eq!(
+            slash_command_token("/review", 7),
+            Some(SlashCommandToken {
+                range: 0..7,
+                query: "review".into(),
+            })
+        );
+        assert_eq!(
+            slash_command_token("/review later", 4).map(|token| token.range),
+            Some(0..7)
+        );
+        assert!(slash_command_token("/review later", 10).is_none());
+        assert!(slash_command_token("try /review", 11).is_none());
+        assert!(slash_command_token("/réview", 3).is_none());
+    }
+
+    #[test]
+    fn built_in_commands_filter_and_sort() {
+        let command = |name: &str, description: Option<&str>| AgentCommand {
+            name: name.into(),
+            description: description.map(str::to_owned),
+            argument_hint: None,
+            source: AgentCommandSource::Jolt,
+        };
+        let catalog = vec![
+            command("zebra", None),
+            command("answer", Some("Answer questions")),
+            AgentCommand {
+                name: "discovered".into(),
+                description: None,
+                argument_hint: None,
+                source: AgentCommandSource::Extension,
+            },
+        ];
+        let commands = filtered_commands(&catalog, "");
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["answer", "zebra"]
+        );
+        assert_eq!(filtered_commands(&catalog, "questions")[0].name, "answer");
+    }
+
+    #[test]
+    fn native_commands_require_exact_invocations() {
+        assert!(is_answer_questions_command("/answer "));
+        assert!(!is_answer_questions_command("/answer later"));
+        assert!(is_bro_command("/bro"));
+        assert!(!is_bro_command("/bro please"));
+        assert_eq!(
+            BRO_PROMPT,
+            "Restate your last message. Stop using jargon and speak coherently. State it more simply and concisely, like one human talking to another."
+        );
+    }
+
+    #[test]
     fn mention_token_requires_a_token_boundary_and_tracks_full_token() {
         assert_eq!(
             mention_token("Fix @src/com", 12),
@@ -5170,7 +6977,7 @@ mod tests {
         let raw = local_file_link("src/a file#[x].rs", false);
         assert_eq!(
             raw,
-            "[a file#\\[x\\].rs](comet-file:src/a%20file%23%5Bx%5D.rs)"
+            "[a file#\\[x\\].rs](jolt-file:src/a%20file%23%5Bx%5D.rs)"
         );
         let links = file_mention_links(&raw);
         assert_eq!(links.len(), 1);
@@ -5179,7 +6986,7 @@ mod tests {
         assert!(!links[0].is_dir);
 
         let folder = local_file_link("src/components", true);
-        assert_eq!(folder, "[components](comet-file:src/components/)");
+        assert_eq!(folder, "[components](jolt-file:src/components/)");
         let links = file_mention_links(&folder);
         assert_eq!(links[0].path, "src/components");
         assert!(links[0].is_dir);
@@ -5283,14 +7090,70 @@ mod tests {
     fn sent_mention_display_leaves_plain_prompts_untouched() {
         assert_eq!(sent_mention_display("fix the composer"), None);
         assert_eq!(
-            sent_mention_display("what is a comet-file: link?"),
+            sent_mention_display("what is a jolt-file: link?"),
             None,
             "scheme substring without a valid mention link"
         );
         assert_eq!(
-            sent_mention_display("[a.rs](comet-file:../a.rs)"),
+            sent_mention_display("[a.rs](jolt-file:../a.rs)"),
             None,
             "a hostile path never becomes a chip in the transcript either"
+        );
+    }
+
+    #[test]
+    fn extracted_answers_restore_pages_and_compile_message() {
+        let mut wizard = ExtractedWizard::new(vec![
+            ExtractedQuestion {
+                question: "Which database?".into(),
+                context: Some("MySQL and PostgreSQL are supported.".into()),
+            },
+            ExtractedQuestion {
+                question: "Enable caching?".into(),
+                context: None,
+            },
+        ]);
+        wizard.save("PostgreSQL".into());
+        assert!(!wizard.advance());
+        wizard.save(String::new());
+        assert!(wizard.back());
+        assert_eq!(wizard.current_answer(), "PostgreSQL");
+        assert!(!wizard.advance());
+        assert!(wizard.advance());
+        assert_eq!(
+            wizard.compiled_message(),
+            "I answered your questions in the following way:\n\nQ: Which database?\n> MySQL and PostgreSQL are supported.\nA: PostgreSQL\n\nQ: Enable caching?\nA: (no answer)"
+        );
+    }
+
+    #[test]
+    fn latest_answerable_message_uses_completed_assistant_text() {
+        let transcript = vec![
+            SessionMessageEntry {
+                id: "a1".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "First question?".into(),
+                }],
+                created_at: 1,
+                device_id: "d".into(),
+                status: Some(jolt_doc::MessageStatus::Complete),
+                continuation_of: None,
+            },
+            SessionMessageEntry {
+                id: "u1".into(),
+                role: MessageRole::User,
+                parts: vec![],
+                created_at: 2,
+                device_id: "d".into(),
+                status: Some(jolt_doc::MessageStatus::Complete),
+                continuation_of: None,
+            },
+        ];
+        assert_eq!(
+            latest_answerable_message(&transcript),
+            Some(("a1".into(), "First question?".into()))
         );
     }
 
@@ -5367,7 +7230,7 @@ mod tests {
 
     #[test]
     fn auto_grow_math() {
-        // The source heights (comet composer.tsx line 235 clamp, composer-
+        // The source heights (jolt composer.tsx line 235 clamp, composer-
         // actions.tsx row, 1px hairlines): 76+46+2 empty … 260+46+2 capped.
         assert_eq!(COMPOSER_MIN_HEIGHT, 124.0);
         assert_eq!(COMPOSER_MAX_HEIGHT, 308.0);
@@ -5384,7 +7247,7 @@ mod tests {
             h4,
             4.0 * INPUT_LINE_HEIGHT + TEXTAREA_PAD_V + ACTIONS_ROW_HEIGHT + PILL_BORDER_V
         );
-        // Caps at a 260px textarea box (comet max-h-[260px] / the JS clamp).
+        // Caps at a 260px textarea box (jolt max-h-[260px] / the JS clamp).
         assert_eq!(
             composer_total_height(input_content_height(100)),
             COMPOSER_MAX_HEIGHT
@@ -5605,6 +7468,15 @@ mod tests {
     }
 
     #[test]
+    fn busy_composer_invites_a_follow_up() {
+        assert_eq!(composer_placeholder(false), DEFAULT_PLACEHOLDER);
+        assert_eq!(
+            composer_placeholder(true),
+            "Send a follow-up to steer the conversation"
+        );
+    }
+
+    #[test]
     fn send_button_morph() {
         assert_eq!(send_button_mode(false, false), SendButtonMode::Send);
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
@@ -5626,7 +7498,7 @@ mod tests {
         assert!(w.is_picked(1));
         assert_eq!(w.advance(), WizardStep::Stay);
         assert_eq!(w.counter(), "2/2");
-        assert_eq!(w.select(0), WizardStep::AutoAdvance);
+        assert_eq!(w.select(0), WizardStep::Stay);
         let WizardStep::Done(answers) = w.advance() else {
             panic!("expected Done")
         };
@@ -5655,7 +7527,7 @@ mod tests {
         let mut w = Wizard::new("req".into(), vec![question("q", &["a", "b"], false)]);
         assert_eq!(w.press_number(9), WizardStep::Stay, "out of range ignored");
         assert_eq!(w.press_number(0), WizardStep::Stay);
-        assert_eq!(w.press_number(2), WizardStep::AutoAdvance);
+        assert_eq!(w.press_number(2), WizardStep::Stay);
         assert!(w.is_picked(1));
         assert_eq!(w.select(5), WizardStep::Stay, "bad option ix ignored");
     }
@@ -5677,6 +7549,7 @@ mod tests {
         assert!(!w.back(), "already at first page");
         w.advance();
         w.set_typed("  custom answer  ".into());
+        assert_eq!(w.current_typed(), "  custom answer  ");
         let WizardStep::Done(answers) = w.advance() else {
             panic!()
         };
@@ -5690,7 +7563,7 @@ mod tests {
 
     #[test]
     fn pending_input_detection() {
-        use comet_doc::MessageStatus;
+        use jolt_doc::MessageStatus;
         let input_part = MessagePart::Input {
             id: "in-r1".into(),
             request_id: "r1".into(),

@@ -1,31 +1,30 @@
-//! Loaders: the comet pulse loader, the gradient matrix spinner, and the boot
+//! Loaders: the jolt pulse loader, dotted activity orb, gradient matrix spinner, and boot
 //! splash content. All motion routes through `crate::motion` pure helpers, so
 //! the math is unit-tested and these elements are testable-by-compile.
 //!
-//! Rendering pattern: each cell is its own `with_animation` repeating element
-//! sharing one period; per-cell offsets come from [`motion::staggered_phase`],
-//! so all cells stay phase-locked (they start on the same frame) without a
-//! shared clock. Cells animate inside fixed-size slots — opacity and inner size
-//! are paint-local and never move surrounding layout. Reduced motion snaps every
-//! cell to its rest state automatically (gpui `reduce_motion`).
+//! Rendering pattern: repeating loaders share the leased clock in `motion` so
+//! instances stay phase-locked and stop scheduling when unmounted. The activity
+//! orb uses display-linked canvas paint; cell loaders animate inside fixed
+//! slots. Motion is paint-local and never shifts surrounding layout, while
+//! reduced motion snaps every loader to a static frame.
 
-use gpui::{AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, div, px};
-
-use crate::motion::{self, COMET_PULSE, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT};
-use crate::theme::Theme;
-
-// Shared with the terminal viewport (`comet_proto::motion`) so both animate the
-// same loaders from the same numbers.
-pub use comet_proto::motion::{
-    COMET_CELLS, MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, mark_cell_stagger,
+use gpui::{
+    AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, canvas, div, px,
 };
 
-/// The animated comet mark (comet-loader.tsx `CometLoader`): the full logo
+use crate::motion::{self, ACTIVITY_ORB, GRADIENT_SPIN, JOLT_PULSE, PULSE_STAGGER, SPLASH_OUT};
+use crate::theme::Theme;
+
+// Shared with the terminal viewport (`jolt_proto::motion`) so both animate the
+// same loaders from the same numbers.
+pub use jolt_proto::motion::{JOLT_CELLS, MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, mark_cell_stagger};
+
+/// The animated jolt mark (jolt-loader.tsx `JoltLoader`): the full logo
 /// pixel grid with a light wave sweeping tail→head. Each cell rests dim
 /// (opacity 0.08, scale 0.9) and flares to full as the crest passes; per-cell
 /// stagger follows the flight axis. `height_px` sets the mark's height (width
 /// follows the 820:940 canvas).
-pub fn comet_mark_loader(
+pub fn jolt_mark_loader(
     _id: &'static str,
     theme: &Theme,
     height_px: f32,
@@ -35,7 +34,7 @@ pub fn comet_mark_loader(
     let color = theme.text;
     let scale = height_px / 940.0;
     let cell = 100.0 * scale;
-    let delta = motion::pulse_delta(&COMET_PULSE, view, cx);
+    let delta = motion::pulse_delta(&JOLT_PULSE, view, cx);
     div()
         .relative()
         .w(px(820.0 * scale))
@@ -53,7 +52,7 @@ pub fn comet_mark_loader(
                 .justify_center()
                 .child({
                     // Negative CSS delay ⇒ the cell starts mid-cycle:
-                    // the stagger ADDS phase (comet-loader.tsx delayFor).
+                    // the stagger ADDS phase (jolt-loader.tsx delayFor).
                     let phase = (delta + stagger).rem_euclid(1.0);
                     div()
                         .rounded(px(16.0 * scale))
@@ -64,12 +63,12 @@ pub fn comet_mark_loader(
         }))
 }
 
-/// The comet wave loader: a row of cells pulsing opacity 0.08→1 / scale 0.9→1
+/// The jolt wave loader: a row of cells pulsing opacity 0.08→1 / scale 0.9→1
 /// over 2.4s with a 0.15s stagger per cell.
 ///
 /// `id` scopes the per-cell animation state — give each loader instance a
 /// distinct id.
-pub fn comet_loader(
+pub fn jolt_loader(
     _id: &'static str,
     theme: &Theme,
     cell_px: f32,
@@ -78,13 +77,13 @@ pub fn comet_loader(
 ) -> impl IntoElement {
     let color = theme.text;
     let slot = cell_px;
-    let delta = motion::pulse_delta(&COMET_PULSE, view, cx);
+    let delta = motion::pulse_delta(&JOLT_PULSE, view, cx);
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(slot / 2.0))
-        .children((0..COMET_CELLS).map(move |i| {
+        .children((0..JOLT_CELLS).map(move |i| {
             // Fixed slot; the animated cell breathes inside it.
             div()
                 .size(px(slot))
@@ -102,9 +101,74 @@ pub fn comet_loader(
         }))
 }
 
-pub use comet_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
+pub use jolt_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 
-/// The gradient matrix spinner (WorkingIndicator), ported from comet's
+/// Display-linked dotted activity orb used while work is in progress.
+///
+/// The violet globe stays geometrically fixed while a bright meridian sweeps
+/// around it, avoiding the tiny moving-dot quantization of the solving orb.
+pub fn activity_orb(
+    key: impl Into<SharedString>,
+    theme: &Theme,
+    size_px: f32,
+    _view: EntityId,
+    _cx: &mut App,
+) -> impl IntoElement {
+    let _key = key.into();
+    let compact = size_px <= 10.0;
+    let latitude_count = if compact { 4 } else { 6 };
+    let longitude_density = if compact { 8 } else { 12 };
+    let minimum_radius = if compact { 0.45 } else { 0.4 };
+    let orb_color = theme.code_text;
+
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, cx| {
+            let phase = motion::display_link_delta(&ACTIVITY_ORB, window, cx);
+            let mut dots = Vec::with_capacity(latitude_count * longitude_density);
+            for latitude in 0..latitude_count {
+                let lat = -std::f32::consts::FRAC_PI_2
+                    + latitude as f32 / (latitude_count - 1) as f32 * std::f32::consts::PI;
+                let longitude_count = (lat.cos().abs() * longitude_density as f32)
+                    .round()
+                    .max(1.0) as usize;
+                for longitude in 0..longitude_count {
+                    dots.push(jolt_proto::motion::activity_orb_dot(
+                        phase,
+                        latitude,
+                        latitude_count,
+                        longitude,
+                        longitude_count,
+                    ));
+                }
+            }
+            dots.sort_by(|a, b| a.depth.total_cmp(&b.depth));
+
+            for dot in dots {
+                let radius = (size_px * dot.radius).max(minimum_radius);
+                let dot_bounds = gpui::Bounds::new(
+                    gpui::point(
+                        bounds.left() + px(size_px * dot.x - radius),
+                        bounds.top() + px(size_px * dot.y - radius),
+                    ),
+                    gpui::size(px(radius * 2.0), px(radius * 2.0)),
+                );
+                window.paint_quad(gpui::quad(
+                    dot_bounds,
+                    px(radius),
+                    orb_color.opacity(dot.opacity),
+                    px(0.0),
+                    gpui::transparent_black(),
+                    gpui::BorderStyle::default(),
+                ));
+            }
+        },
+    )
+    .size(px(size_px))
+    .flex_none()
+}
+
+/// The gradient matrix spinner, ported from jolt's
 /// gradient-spin.tsx: a 3×3 grid of round cells tinted per row from the
 /// sunrise gradient. Each cell pulses opacity once per 750ms period; the
 /// per-cell phase follows the "arrow-up" pattern (the pulse enters at the
@@ -144,8 +208,8 @@ pub fn gradient_spinner(
         }))
 }
 
-/// A 2×3 miniature of [`gradient_spinner`] sized for a status-dot slot
-/// (sessions-sidebar working rows): same row tints and pulse timing, but the
+/// A 2×3 miniature of [`gradient_spinner`] sized for compact loading slots:
+/// same row tints and pulse timing, but the
 /// brightness SNAKES around the grid's perimeter (every cell of a 2×3 grid is
 /// on the ring) instead of sweeping as a vertical wave — a tiny radial chase.
 /// ~6×10px footprint at the default 2.5px cells.
@@ -184,7 +248,7 @@ pub fn mini_gradient_spinner(
         }))
 }
 
-/// Full-window boot splash (comet App.tsx `Splash`): the animated comet mark
+/// Full-window boot splash (jolt App.tsx `Splash`): the animated jolt mark
 /// (`h-16`) over the app background with an uppercase tracked "Loading" line.
 /// While `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px
 /// lift); the shell removes it once [`SPLASH_OUT`] has run its course.
@@ -198,7 +262,7 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
         .items_center()
         .justify_center()
         .gap(px(28.0))
-        .child(comet_mark_loader("boot-splash", theme, 64.0, view, cx))
+        .child(jolt_mark_loader("boot-splash", theme, 64.0, view, cx))
         .child(loading_word(theme));
     if fading {
         motion::splash_out("boot-splash-out", content).into_any_element()
@@ -222,8 +286,9 @@ pub fn loading_word(theme: &Theme) -> impl IntoElement {
 // Compile-time proof the specs referenced here stay wired to the catalog.
 const _: () = {
     assert!(SPLASH_OUT.delay_ms == 150);
-    assert!(COMET_PULSE.duration_ms == 2400);
+    assert!(JOLT_PULSE.duration_ms == 2400);
     assert!(GRADIENT_SPIN.duration_ms == 750);
+    assert!(ACTIVITY_ORB.duration_ms == 2800);
 };
 
 #[cfg(test)]

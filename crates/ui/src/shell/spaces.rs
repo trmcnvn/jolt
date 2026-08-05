@@ -1,6 +1,6 @@
 //! Spaces sidebar: the spaces list (folder + device rows), the global
-//! Sessions list, and the add-space palette (⌘K-style: device tabs + filtered
-//! folder browser).
+//! Sessions list, and the add-space command center (device tabs + filtered
+//! folder browser, opened by a customizable shortcut).
 //!
 //! A space = a synced (device, folder) pair; the sidebar's job is switching
 //! between them and surfacing which sessions want attention. Child module of
@@ -9,9 +9,10 @@
 use super::*;
 use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
+use crate::settings::{ShortcutId, display_combo};
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
-use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
+use jolt_proto::{ChatIndicator, Device, FolderListing, Space};
 
 /// Space-row slot height for drag drop-index math: py(6)×2 + 17px line ≈ 29,
 /// plus the 2px column gap.
@@ -65,10 +66,9 @@ impl Render for SpaceGhost {
     }
 }
 
-/// The add-space palette (a command-K surface, summoned by ⌘K): search bar
-/// across the top, folder browser on the left, a Devices rail on the right,
-/// kbd-hint footer. One surface — picking a device in the rail rebrowses in
-/// place, no step wizard.
+/// The add-space command center: search bar across the top, folder browser on
+/// the left, a Devices rail on the right, and a keyboard-hint footer. One
+/// surface — picking a device in the rail rebrowses in place, no step wizard.
 pub(super) struct AddSpaceFlow {
     /// The device currently browsed (the highlighted rail row).
     device: Option<Device>,
@@ -583,7 +583,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
-        let rows: Vec<(ChatIndicator, comet_proto::Chat, String, Option<String>)> = {
+        let rows: Vec<(ChatIndicator, jolt_proto::Chat, String, Option<String>)> = {
             let state = self.state.read(cx);
             state
                 .overview_chats(now)
@@ -637,7 +637,7 @@ impl Shell {
             .collect()
     }
 
-    // ---- add-space flow (the ⌘K palette) ----
+    // ---- add-space command center ----
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
         let devices: Vec<Device> = self.state.read(cx).devices.clone();
@@ -708,7 +708,7 @@ impl Shell {
 
     /// The current listing's folder rows filtered by the search query
     /// (prefix matches first — `popover::filter_indices`).
-    fn add_space_filtered(&self, cx: &App) -> Vec<comet_proto::FolderEntry> {
+    fn add_space_filtered(&self, cx: &App) -> Vec<jolt_proto::FolderEntry> {
         let Some(flow) = self.add_space.as_ref() else {
             return Vec::new();
         };
@@ -986,8 +986,9 @@ impl Shell {
         }
     }
 
-    /// The palette card: ⌘K search bar (with the ⌘⏎ add / esc chips) ·
-    /// breadcrumbs + folder list beside the devices rail · kbd-hint footer.
+    /// The command-center card: search bar (with configurable summon shortcut,
+    /// ⌘⏎ add, and esc chips) · breadcrumbs + folder list beside the devices
+    /// rail · kbd-hint footer.
     pub(super) fn render_add_space_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
@@ -995,6 +996,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
+        let summon_shortcut: SharedString =
+            display_combo(self.settings.keymap.get(ShortcutId::AddSpace)).into();
         {
             let flow = self.add_space.as_mut()?;
             if std::mem::take(&mut flow.focus_pending) {
@@ -1050,7 +1053,7 @@ impl Shell {
             .unwrap_or_else(|| "This device".to_string())
             .into();
 
-        // A quiet mono key-cap chip ("⌘K" / "esc") for the search bar ends.
+        // Quiet mono key-cap chips for the configured summon shortcut and Esc.
         let key_chip = |theme: &Theme| {
             div()
                 .h(px(22.0))
@@ -1067,7 +1070,7 @@ impl Shell {
                 .text_color(theme.text_muted.opacity(0.7))
         };
 
-        // ── search bar (the ⌘K bar): summon chip · input · "⌘ Enter" add ·
+        // ── search bar: configured summon chip · input · "⌘ Enter" add ·
         //    esc. The primary chip leads with the ⌘ glyph, then says "Enter"
         //    in words (user request — the bare return arrow read as noise).
         let submit_chip = popover::btn_primary(&theme, "")
@@ -1111,15 +1114,7 @@ impl Shell {
             .bg(band)
             .border_b_1()
             .border_color(hairline)
-            .child(
-                key_chip(&theme)
-                    .child(
-                        icon(icons::COMMAND)
-                            .size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.7)),
-                    )
-                    .child(SharedString::from("K")),
-            )
+            .child(key_chip(&theme).child(summon_shortcut))
             .child(
                 div()
                     .flex_1()
@@ -1140,7 +1135,7 @@ impl Shell {
                     .child(SharedString::from("esc")),
             );
 
-        // ── breadcrumbs ("MacBook Pro / Projects / comet"): the quiet mono
+        // ── breadcrumbs ("MacBook Pro / Projects / jolt"): the quiet mono
         //    path voice, `/` separators. The device crumb stands in for home —
         //    everything up to the resolved home path folds into it; below
         //    home the full path shows. Ancestors (device crumb included) are

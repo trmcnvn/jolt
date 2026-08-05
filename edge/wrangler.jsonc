@@ -1,28 +1,40 @@
 {
-  // Comet-native edge: per-session + per-workspace Loro sync DOs, per-device
-  // relay DOs, R2 blobs, and the absorbed WorkOS auth routes.
-  // Design: loro-sessions §2 (topology), §3 (persistence), §6.1 (diff
-  // sidecar), §8 (device-room streams), §1.2 (R2 attachments), §3.3 (R2
-  // backups); comet-native ARCHITECTURE.md §6.
-  "$schema": "node_modules/wrangler/config-schema.json",
   // Deployed by .github/workflows/deploy.yml on pushes to main that touch
   // edge/ (CLOUDFLARE_API_TOKEN repo secret).
-  "name": "comet-native-edge",
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "jolt-edge",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
-  "account_id": "b57dde68ee5964dccc025437b5478a5b",
+  "account_id": "2cd5db709b9369660ed7f1d52527c933",
   "workers_dev": true,
-  // Public hostname on the zeron.sh zone, plus the install surface carved out
+  // Public hostname on the trmcnvn.dev zone, plus the install surface carved out
   // of the (old) landing host: path routes beat the landing worker's custom
-  // domain, so `curl -fsSL https://comet.zeron.sh/install.sh | sh` now
-  // installs comet-native while the rest of comet.zeron.sh is untouched.
+  // domain, so `curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh` now
+  // installs jolt while the rest of jolt.trmcnvn.dev is untouched.
   "routes": [
-    { "pattern": "edge.comet.zeron.sh", "custom_domain": true },
-    { "pattern": "comet.zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "comet.zeron.sh/releases/*", "zone_name": "zeron.sh" }
+    {
+      "pattern": "edge.jolt.trmcnvn.dev",
+      "custom_domain": true
+    },
+    {
+      "pattern": "jolt.trmcnvn.dev/install.sh",
+      "zone_name": "trmcnvn.dev"
+    },
+    {
+      "pattern": "jolt.trmcnvn.dev/releases/*",
+      "zone_name": "trmcnvn.dev"
+    }
   ],
   // Serve src/install.sh as a string (the /install.sh route).
-  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  "rules": [
+    {
+      "type": "Text",
+      "globs": [
+        "**/*.sh"
+      ],
+      "fallthrough": true
+    }
+  ],
   // loro-crdt's default entry loads its WASM via URL fetch, which workerd
   // cannot do at runtime; the base64 entry inlines the module instead.
   "alias": {
@@ -30,32 +42,46 @@
   },
   "durable_objects": {
     "bindings": [
-      { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
-      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
-      { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" }
+      {
+        "name": "SESSION_ROOMS",
+        "class_name": "SessionRoom"
+      },
+      {
+        "name": "DEVICE_ROOMS",
+        "class_name": "DeviceRoom"
+      },
+      {
+        "name": "REGISTRY_ROOMS",
+        "class_name": "RegistryRoom"
+      }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["SessionRoom", "DeviceRoom"]
+      "new_sqlite_classes": [
+        "SessionRoom",
+        "DeviceRoom"
+      ]
     },
     {
       // Workspace registry (docs/registry-sync.md) — the row-table sidebar
       // sync that replaces the Loro workspace doc rooms.
       "tag": "v2",
-      "new_sqlite_classes": ["RegistryRoom"]
+      "new_sqlite_classes": [
+        "RegistryRoom"
+      ]
     }
   ],
   "r2_buckets": [
     {
       "binding": "BLOBS",
-      "bucket_name": "comet-native-blobs"
+      "bucket_name": "jolt-blobs"
     },
     {
       // Release artifacts for /releases/* (curl-install + dmg downloads).
       "binding": "RELEASES",
-      "bucket_name": "comet-native-releases"
+      "bucket_name": "jolt-releases"
     }
   ],
   "vars": {
@@ -63,7 +89,7 @@
     // set the real client id before deploying. Set AUTH_MODE=dev locally to
     // accept bearer==userId. WORKOS_API_KEY is a wrangler secret
     // (`wrangler secret put WORKOS_API_KEY`) powering the /auth/* routes.
-    "WORKOS_CLIENT_ID": "client_01KWD0EAKZKD50YCQJNYSRE4BY",
+    "WORKOS_CLIENT_ID": "client_01KZ8TAWMB4TZHF5RSTJPGR84J",
     "AUTH_MODE": "workos"
   },
   "observability": {

@@ -1,6 +1,6 @@
 //! Native menu bar + app-level window actions (macOS-first).
 //!
-//! comet never called `cx.set_menus`, so on macOS `NSApp.mainMenu` stayed nil:
+//! jolt never called `cx.set_menus`, so on macOS `NSApp.mainMenu` stayed nil:
 //! no app menu, no ⌘Q quit, and nothing for the auto-hidden system menu bar to
 //! reveal on hover (gpui only calls `setMainMenu_` from `set_menus` —
 //! gpui_macos/src/platform.rs `fn set_menus`). Structure ported from zed's
@@ -16,9 +16,11 @@ use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, ac
 
 use crate::appearance::{self, AppearanceMode};
 use crate::composer;
+#[cfg(any(debug_assertions, feature = "debug-ui"))]
+use crate::debug::TogglePerformanceHud;
 
 actions!(
-    comet,
+    jolt,
     [
         About,
         Quit,
@@ -44,7 +46,7 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-    // Window verbs route to the active window. comet is single-window, so a
+    // Window verbs route to the active window. jolt is single-window, so a
     // global handler suffices where zed registers these per-workspace
     // (crates/zed/src/zed.rs `register_action(Minimize/Zoom)`).
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
@@ -63,7 +65,7 @@ fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {
     }
 }
 
-/// ⌘Q / "Quit Comet". `cx.quit()` runs the platform's standard quit routine,
+/// ⌘Q / "Quit Jolt". `cx.quit()` runs the platform's standard quit routine,
 /// which invokes gpui `App::shutdown` — that fires the `on_app_quit` observers
 /// registered in `run_app` (embedded-engine drain: live runs + doc snapshot
 /// flush) with gpui's shutdown timeout before the process exits. Same graceful
@@ -95,7 +97,7 @@ fn macos_key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-/// The comet menu bar. macOS renders this natively; mac-only entries are gated
+/// The jolt menu bar. macOS renders this natively; mac-only entries are gated
 /// at runtime (`cfg!`) so the whole module compiles and tests on Linux.
 pub fn app_menus() -> Vec<Menu> {
     let macos = cfg!(target_os = "macos");
@@ -104,23 +106,23 @@ pub fn app_menus() -> Vec<Menu> {
     // what we pass, but gpui still wants a name.
     let mut app_items = vec![
         // Placeholder until a real about dialog exists (explicitly disabled).
-        MenuItem::action("About Comet", About).disabled(true),
+        MenuItem::action("About Jolt", About).disabled(true),
         MenuItem::separator(),
     ];
     if macos {
         app_items.extend([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide Comet", Hide),
+            MenuItem::action("Hide Jolt", Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::action("Show All", ShowAll),
             MenuItem::separator(),
         ]);
     }
-    app_items.push(MenuItem::action("Quit Comet", Quit));
+    app_items.push(MenuItem::action("Quit Jolt", Quit));
 
     let mut menus = vec![
-        Menu::new("Comet").items(app_items),
+        Menu::new("Jolt").items(app_items),
         // Standard clipboard verbs tied to the composer's existing actions via
         // their native selectors (`OsAction` → cut:/copy:/paste:/selectAll:),
         // so the OS Edit menu routes through the responder chain to the focused
@@ -141,11 +143,20 @@ pub fn app_menus() -> Vec<Menu> {
     ];
     // Appearance lives under View on every platform — it is the only View verb
     // today, but "Appearance" as a top-level menu would read oddly next to Edit.
-    menus.push(Menu::new("View").items([
+    let view_items = vec![
         MenuItem::action("Appearance: System", AppearanceSystem),
         MenuItem::action("Appearance: Light", AppearanceLight),
         MenuItem::action("Appearance: Dark", AppearanceDark),
-    ]));
+    ];
+    #[cfg(any(debug_assertions, feature = "debug-ui"))]
+    let view_items = {
+        let mut items = view_items;
+        items.push(MenuItem::submenu(Menu::new("Developer").items([
+            MenuItem::action("Performance HUD", TogglePerformanceHud),
+        ])));
+        items
+    };
+    menus.push(Menu::new("View").items(view_items));
     if macos {
         // Standard Window menu; macOS appends the open-window list itself.
         menus.push(Menu::new("Window").items([
@@ -176,11 +187,11 @@ mod tests {
     #[test]
     fn app_menu_ends_with_quit() {
         let menus = app_menus();
-        assert_eq!(menus[0].name.as_ref(), "Comet");
+        assert_eq!(menus[0].name.as_ref(), "Jolt");
         let Some(MenuItem::Action { name, action, .. }) = menus[0].items.last() else {
             panic!("last app-menu item must be an action");
         };
-        assert_eq!(name.as_ref(), "Quit Comet");
+        assert_eq!(name.as_ref(), "Quit Jolt");
         assert_eq!(action.name(), Quit.name());
     }
 
@@ -229,6 +240,15 @@ mod tests {
     }
 
     #[test]
+    fn app_menu_has_no_conversation_menu() {
+        assert!(
+            app_menus()
+                .iter()
+                .all(|menu| menu.name.as_ref() != "Conversation")
+        );
+    }
+
+    #[test]
     fn view_menu_offers_all_three_appearance_modes() {
         let menus = app_menus();
         let view = menus
@@ -243,6 +263,25 @@ mod tests {
                 AppearanceDark.name()
             ]
         );
+    }
+
+    #[cfg(any(debug_assertions, feature = "debug-ui"))]
+    #[test]
+    fn view_menu_offers_performance_hud_in_developer_submenu() {
+        let menus = app_menus();
+        let view = menus
+            .iter()
+            .find(|menu| menu.name.as_ref() == "View")
+            .expect("View menu present");
+        let developer = view
+            .items
+            .iter()
+            .find_map(|item| match item {
+                MenuItem::Submenu(menu) if menu.name.as_ref() == "Developer" => Some(menu),
+                _ => None,
+            })
+            .expect("Developer submenu present");
+        assert_eq!(action_names(developer), vec![TogglePerformanceHud.name()]);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //!
 //! The RPC path multiplexes NOTHING new: each distinct client `connId` becomes a virtual
 //! string-frame connection feeding the existing [`serve_connection`] seam, so every RPC
-//! handler works through the relay untouched (the port of comet's `device-room-host.ts`).
+//! handler works through the relay untouched (the port of jolt's `device-room-host.ts`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -234,7 +234,7 @@ impl HostRelayConfig {
 /// `service` to every client conn through virtual string-frame connections. Immortal
 /// supervisor: quiet while signed out, reconnects with backoff when the socket drops
 /// (including the 4409 "superseded by new host connection" close — the newest host wins,
-/// so the superseded process backs off and retries, mirroring comet's DeviceRoomHost).
+/// so the superseded process backs off and retries, mirroring jolt's DeviceRoomHost).
 pub struct HostRelay {
     task: tokio::task::JoinHandle<()>,
 }
@@ -246,7 +246,7 @@ impl HostRelay {
         on_nudge: NudgeHandler,
     ) -> Self {
         let task = tokio::spawn(async move {
-            let mut wake = comet_sync::wake::subscribe();
+            let mut wake = jolt_sync::wake::subscribe();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
             // host sessions (hibernation/deploys). Every second the host is
             // away, client dials bounce with "readiness check failed" (user
@@ -380,7 +380,7 @@ async fn host_session(
         tokio::select! {
             frame = out_rx.recv() => match frame {
                 Some(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
+                    if sink.send(WsMessage::Binary(bytes.into())).await.is_err() {
                         break;
                     }
                 }
@@ -516,7 +516,7 @@ impl DeviceLink {
                                     continue;
                                 }
                             };
-                            if sink.send(WsMessage::Binary(encoded)).await.is_err() {
+                            if sink.send(WsMessage::Binary(encoded.into())).await.is_err() {
                                 break "connection lost".to_string();
                             }
                         }
@@ -603,7 +603,7 @@ pub struct LinkCacheConfig {
     pub edge_url: String,
     pub token: Arc<dyn TokenSource>,
     /// Exponential dial cooldown after failures (base, cap) — a dead peer must not be
-    /// redialed at full cadence; callers fail fast in between (comet peers.ts behavior).
+    /// redialed at full cadence; callers fail fast in between (jolt peers.ts behavior).
     pub cooldown_base: Duration,
     pub cooldown_max: Duration,
     /// Readiness probe budget: the relay accepts client joins even when the host is
@@ -614,7 +614,7 @@ pub struct LinkCacheConfig {
 impl LinkCacheConfig {
     pub fn new(edge_url: impl Into<String>, token: Arc<dyn TokenSource>) -> Self {
         // Interactive remote control (remote folders, terminals, accounts) rides
-        // this cache: one blip must cost seconds, not minutes. The old comet
+        // this cache: one blip must cost seconds, not minutes. The old jolt
         // 15s→5min curve punished a single failed dial with a 5-minute refusal;
         // here the first failure backs off 5s and even a dead peer is re-probed
         // within a minute. A generous probe budget keeps a slow-waking laptop
@@ -640,7 +640,7 @@ struct DialState {
     cooldown_until: Option<Instant>,
 }
 
-/// Lazily-dialed, cached peer links keyed by device id — the Rust twin of comet's
+/// Lazily-dialed, cached peer links keyed by device id — the Rust twin of jolt's
 /// `Peers`. Cache hits never wait behind an in-flight dial; dials to the same device are
 /// serialized per device (a global lock would head-of-line-block healthy peers); links
 /// self-evict when the transport drops; a failed RPC should call [`LinkCache::invalidate`]
@@ -667,7 +667,7 @@ impl LinkCache {
         if tokio::runtime::Handle::try_current().is_ok() {
             let weak = Arc::downgrade(&cache);
             tokio::spawn(async move {
-                let mut wake = comet_sync::wake::subscribe();
+                let mut wake = jolt_sync::wake::subscribe();
                 while wake.recv().await.is_ok() {
                     let Some(cache) = weak.upgrade() else { return };
                     lock(&cache.links).clear();

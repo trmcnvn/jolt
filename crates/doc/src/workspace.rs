@@ -1,4 +1,4 @@
-//! Workspace doc schema over `loro` — the per-org entity index that replaces comet's
+//! Workspace doc schema over `loro` — the per-org entity index that replaces jolt's
 //! residual entity sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
 //! SessionRoom class, doc id `ws/{orgId}`).
 //!
@@ -17,18 +17,18 @@
 //!
 //! Writer discipline (ARCHITECTURE §2.2): each device writes its own device row, its
 //! own session rows, and rows for chats it hosts; title/archived renames are LWW map
-//! sets from any device — matching comet's Mutate surface. Presence rides the room's
+//! sets from any device — matching jolt's Mutate surface. Presence rides the room's
 //! `EphemeralStore` under keys `presence/{deviceId}` (an online timestamp), replacing
-//! comet's 15s heartbeat writes so liveness never grows the oplog.
+//! jolt's 15s heartbeat writes so liveness never grows the oplog.
 //!
 //! Timestamps are stored as epoch millis (the session-doc convention) and surface as
-//! `chrono::DateTime<Utc>` through the `comet_proto` entity types.
+//! `chrono::DateTime<Utc>` through the `jolt_proto` entity types.
 
 use chrono::{DateTime, Utc};
 use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{Chat, ChatConfig, Device, Session, SessionStatus, Space};
+use jolt_proto::{Chat, ChatConfig, Device, Session, SessionStatus, Space};
 
 use crate::schema::DocError;
 
@@ -380,7 +380,7 @@ impl WorkspaceDoc {
     }
 
     /// Host-side resume continuity: the harness-native session id of the chat's
-    /// latest run and the cwd it was created under (comet stored the same pair
+    /// latest run and the cwd it was created under (jolt stored the same pair
     /// on the chats table). An empty
     /// `session_id` is the explicit "do not resume" tombstone written after a
     /// harness rejects a resume. `false` when no such row.
@@ -698,7 +698,7 @@ impl From<RawSession> for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::{HarnessId, SandboxLevel};
+    use jolt_proto::{HarnessId, SandboxLevel};
 
     fn ts(ms: i64) -> DateTime<Utc> {
         dt(ms)
@@ -789,7 +789,7 @@ mod tests {
         let config = ChatConfig {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
-            reasoning: Some(comet_proto::ReasoningLevel::XHigh),
+            reasoning: Some(jolt_proto::ReasoningLevel::XHigh),
             model_options: options,
             sandbox: SandboxLevel::WorkspaceWrite,
         };

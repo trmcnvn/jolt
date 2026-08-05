@@ -9,7 +9,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use comet_harness::{ClaudeHarness, CodexHarness, Harness};
+use jolt_harness::{ClaudeHarness, CodexHarness, Harness, PiHarness};
 
 fn write_executable(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
@@ -23,6 +23,9 @@ async fn cli_on_login_shell_path_only_is_resolved() {
     std::fs::create_dir(&shell_bin).unwrap();
     write_executable(&shell_bin.join("codex"), "#!/bin/sh\nexit 0\n");
     write_executable(&shell_bin.join("claude"), "#!/bin/sh\nexit 0\n");
+    let fake_pi = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-pi.sh");
+    std::fs::copy(fake_pi, shell_bin.join("pi")).unwrap();
+    std::fs::set_permissions(shell_bin.join("pi"), std::fs::Permissions::from_mode(0o755)).unwrap();
 
     // A $SHELL whose init shapes PATH — the shape resolution must survive.
     let fake_shell = dir.path().join("fake-shell");
@@ -47,10 +50,11 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         std::env::set_var("PATH", "/usr/bin:/bin");
         std::env::remove_var("CODEX_EXECUTABLE");
         std::env::remove_var("CLAUDE_CODE_EXECUTABLE");
-        std::env::remove_var("COMET_NO_LOGIN_SHELL");
+        std::env::remove_var("JOLT_PI_EXECUTABLE");
+        std::env::remove_var("JOLT_NO_LOGIN_SHELL");
     }
 
-    let snapshot = comet_harness::shell_env::login_shell_path().expect("snapshot captured");
+    let snapshot = jolt_harness::shell_env::login_shell_path().expect("snapshot captured");
     let snapshot = snapshot.to_string_lossy();
     assert!(
         snapshot.starts_with(&format!("{}:", shell_bin.display())),
@@ -67,4 +71,8 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         .models()
         .await
         .expect("claude resolves via login-shell PATH");
+    PiHarness::new()
+        .models()
+        .await
+        .expect("pi resolves via login-shell PATH");
 }

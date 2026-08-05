@@ -20,11 +20,11 @@ use gpui::{
     Subscription, Task, Window, div, prelude::*, px,
 };
 
-use comet_engine::registry::HarnessDescriptor;
-use comet_proto::{
+use jolt_engine::registry::HarnessDescriptor;
+use jolt_proto::{
     ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
 };
-use comet_rpc::methods;
+use jolt_rpc::methods;
 
 /// Display cap for the ref list (t3code shows pages of 100 with a status
 /// footer; a flat cap + "Showing X of Y refs" reads the same without
@@ -43,7 +43,7 @@ use crate::theme::Theme;
 // ---------------------------------------------------------------------------
 
 /// Everything a new chat is configured with before the first send. The folder
-/// and device come from the selected SPACE — the draft only carries the git
+/// and device come from the selected SPACE — the draft only carries the VCS
 /// extras (ref + checkout kind) and the run config.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DraftConfig {
@@ -55,6 +55,9 @@ pub struct DraftConfig {
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
     /// when reusing one). `None` = the repo's current branch.
     pub branch: Option<String>,
+    /// Backend revision corresponding to `branch`; differs for JJ working-copy
+    /// labels (`Working copy · …` displays, `@` executes).
+    pub revision: Option<String>,
     /// Where the new session runs (the t3code env-mode).
     pub checkout: CheckoutKind,
 }
@@ -79,9 +82,9 @@ pub enum CheckoutPlan {
     /// picked or current ref), carried onto `createChat` so the session names
     /// it from the first frame; `None` = refs never loaded.
     CurrentCheckout { branch: Option<String> },
-    /// Reuse the picked ref's existing worktree (a cwd override; no git).
+    /// Reuse the picked ref's existing checkout (a cwd override; no VCS mutation).
     ReuseWorktree { path: String, branch: String },
-    /// `CreateWorktree` off `base` on send (comet mints a `comet/<name>`
+    /// `CreateWorktree` off `base` on send (jolt mints a `jolt/<name>`
     /// branch). `base: None` = refs never loaded — send falls back to the
     /// space folder rather than failing.
     NewWorktree { base: Option<String> },
@@ -116,13 +119,13 @@ impl ResolvedRunConfig {
 // ---------------------------------------------------------------------------
 
 /// The harness's default model: the first catalog row (both curated catalogs
-/// lead with the flagship — comet's `pickDefaultModel` Opus preference maps to
+/// lead with the flagship — jolt's `pickDefaultModel` Opus preference maps to
 /// the same row here).
 pub fn default_model(models: &[Model]) -> Option<&Model> {
     models.first()
 }
 
-/// A model's default reasoning: X-High when the ladder offers it (comet
+/// A model's default reasoning: X-High when the ladder offers it (jolt
 /// `DEFAULT_REASONING = "xhigh"`), else High, else the ladder's first entry.
 /// `None` only for ladder-less models (e.g. Haiku's thinking toggle instead).
 pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
@@ -139,7 +142,7 @@ pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
 
 /// Clamp a picked/remembered level to what the model actually offers: keep it
 /// when the ladder lists it, else fall to the model's default (never a stale
-/// or foreign level — comet use-run-config.ts's derived-model discipline).
+/// or foreign level — jolt use-run-config.ts's derived-model discipline).
 pub fn clamp_reasoning(
     level: Option<ReasoningLevel>,
     ladder: &[ReasoningLevel],
@@ -169,7 +172,7 @@ pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
 }
 
 /// The TraitsPicker trigger summary: non-default reasoning + non-default model
-/// option choices, joined with " · " (comet: "High · 1M · Fast"). `None` when
+/// option choices, joined with " · " (jolt: "High · 1M · Fast"). `None` when
 /// everything is at its default.
 pub fn traits_summary(
     model: Option<&Model>,
@@ -239,7 +242,7 @@ pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
 }
 
 /// Directory rows of a listing (files never render in the browser).
-pub fn browser_rows(listing: &FolderListing) -> Vec<&comet_proto::FolderEntry> {
+pub fn browser_rows(listing: &FolderListing) -> Vec<&jolt_proto::FolderEntry> {
     listing.entries.iter().filter(|e| e.is_dir).collect()
 }
 
@@ -261,7 +264,7 @@ pub enum PickerKind {
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
-    /// Sticky last-used picks (comet `comet.composer.defaults:v1`): seeds the
+    /// Sticky last-used picks (jolt `jolt.composer.defaults:v1`): seeds the
     /// new-chat chips and is rewritten on every new-chat pick.
     defaults: ComposerDefaults,
     /// Where [`Self::defaults`] persists (`{data_dir}/composer-defaults.json`);
@@ -289,7 +292,7 @@ pub struct Pickers {
     /// Re-open suppression after outside-click dismissal (the dismiss and the
     /// trigger click would otherwise toggle twice).
     suppressed: Option<(PickerKind, Instant)>,
-    /// `COMET_OPEN_PICKER` boot: keep claiming focus until it sticks, so
+    /// `JOLT_OPEN_PICKER` boot: keep claiming focus until it sticks, so
     /// keyboard nav drives the data-side-opened popover (headless rigs have
     /// no synthetic pointer, but synthetic keys do arrive).
     boot_focus_pending: bool,
@@ -344,6 +347,7 @@ impl Pickers {
             if space != this.space_owner {
                 this.space_owner = space;
                 this.config.branch = None;
+                this.config.revision = None;
                 this.config.checkout = CheckoutKind::default();
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
@@ -354,10 +358,10 @@ impl Pickers {
             }
             cx.notify();
         });
-        // Dev/testing knob: `COMET_OPEN_PICKER=model|traits|repo|branch` boots
+        // Dev/testing knob: `JOLT_OPEN_PICKER=model|traits|repo|branch` boots
         // with that popover open — synthetic input can't reach the app on
         // headless compositors, so captures need a data-side path.
-        let open = match std::env::var("COMET_OPEN_PICKER").ok().as_deref() {
+        let open = match std::env::var("JOLT_OPEN_PICKER").ok().as_deref() {
             Some("model") => Some(PickerKind::HarnessModel),
             Some("traits") => Some(PickerKind::HarnessModel),
             Some("branch") => Some(PickerKind::Branch),
@@ -462,7 +466,7 @@ impl Pickers {
         // Fall back to the first VISIBLE harness: the registry lists the mock
         // harness first, and resolving chips against it would boot the
         // new-chat canvas onto "Mock" instead of Claude Code + its default
-        // model (it stays available under `COMET_HARNESS=mock`).
+        // model (it stays available under `JOLT_HARNESS=mock`).
         self.harnesses
             .ready()
             .and_then(|list| visible_harnesses(list).first().map(|d| d.id))
@@ -554,7 +558,7 @@ impl Pickers {
         cx.notify();
     }
 
-    /// Capture knob (`COMET_OPEN_DIALOG=model`): open the combined
+    /// Capture knob (`JOLT_OPEN_DIALOG=model`): open the combined
     /// harness/model menu programmatically.
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open != Some(PickerKind::HarnessModel) {
@@ -807,9 +811,11 @@ impl Pickers {
             // t3code `reuseExistingWorktree` path.
             self.config.branch = Some(row.name.clone());
             self.config.checkout = CheckoutKind::Local;
+            self.config.revision = row.revision.clone().or_else(|| Some(row.name.clone()));
         } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
             // Base pick for a new worktree, or the already-current ref.
             self.config.branch = Some(row.name.clone());
+            self.config.revision = row.revision.clone().or_else(|| Some(row.name.clone()));
         } else {
             // Local mode + a plain non-current ref: CHECK OUT the space
             // folder (full t3code `switchRef` — picking `main` means "put my
@@ -821,9 +827,9 @@ impl Pickers {
         cx.notify();
     }
 
-    /// Draft-mode checkout switch: `git checkout` in the SPACE's folder
+    /// Draft-mode ref switch in the SPACE's folder
     /// (relay-forwarded for remote spaces). Success records the pick and
-    /// refreshes tags; failure keeps the popover open with git's message.
+    /// refreshes tags; failure keeps the popover open with the VCS message.
     fn switch_draft_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
         if self.switching.is_some() {
             return; // one switch at a time
@@ -838,6 +844,8 @@ impl Pickers {
         self.switch_error = None;
         self.switching = Some(row.name.clone());
         let ref_name = row.name.clone();
+        let revision = row.revision.clone().unwrap_or_else(|| row.name.clone());
+        let jujutsu = row.kind != jolt_proto::RepoRefKind::Branch;
         self.switch_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert(
@@ -846,7 +854,7 @@ impl Pickers {
             );
             params.insert(
                 "refName".into(),
-                serde_json::Value::String(ref_name.clone()),
+                serde_json::Value::String(revision.clone()),
             );
             if local.as_deref() != Some(space.device_id.as_str()) {
                 params.insert(
@@ -861,8 +869,14 @@ impl Pickers {
             this.update(cx, |pickers, cx| {
                 pickers.switching = None;
                 match result {
-                    Ok(_) => {
-                        pickers.config.branch = Some(ref_name);
+                    Ok(value) => {
+                        let label = value
+                            .get("branch")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(&ref_name)
+                            .to_string();
+                        pickers.config.branch = Some(label);
+                        pickers.config.revision = Some(if jujutsu { "@".into() } else { revision });
                         pickers.open = None;
                         pickers.ensure_refs(true, cx);
                     }
@@ -879,13 +893,13 @@ impl Pickers {
     ///
     /// - The picked ref already lives in ANOTHER worktree → RETARGET the
     ///   session onto that worktree (`reuseExistingWorktree`): a `setChatCwd`
-    ///   + `setChatBranch` mutate, no git. Resume is cwd-scoped, so the next
+    ///   + `setChatBranch` mutate, no VCS mutation. Resume is cwd-scoped, so the next
     ///   run there starts a fresh harness conversation — the transcript
     ///   itself carries on.
-    /// - Otherwise → `git checkout` in the SESSION's own cwd (`SwitchRef`,
+    /// - Otherwise → switch the ref in the SESSION's own cwd (`SwitchRef`,
     ///   relay-forwarded to the host device). The host's HEAD watcher
     ///   reconciles `chat.branch` to every device. Errors (dirty tree, ref
-    ///   held by the MAIN checkout) keep the popover open with git's message.
+    ///   held by the MAIN checkout) keep the popover open with the VCS message.
     fn switch_session_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
         if self.switching.is_some() {
             return; // one switch at a time
@@ -909,6 +923,7 @@ impl Pickers {
         self.switch_error = None;
         self.switching = Some(row.name.clone());
         let ref_name = row.name.clone();
+        let revision = row.revision.clone().unwrap_or_else(|| row.name.clone());
         let retarget = row.worktree_path.clone();
         self.switch_task = Some(cx.spawn(async move |this, cx| {
             let result = match retarget {
@@ -933,10 +948,7 @@ impl Pickers {
                 None => {
                     let mut params = serde_json::Map::new();
                     params.insert("repoPath".into(), serde_json::Value::String(cwd));
-                    params.insert(
-                        "refName".into(),
-                        serde_json::Value::String(ref_name.clone()),
-                    );
+                    params.insert("refName".into(), serde_json::Value::String(revision));
                     if local.as_deref() != Some(chat.device_id.as_str()) {
                         params.insert(
                             "targetDeviceId".into(),
@@ -976,6 +988,7 @@ impl Pickers {
             // drop the pick (we don't checkout the main folder) — the current
             // branch takes over.
             self.config.branch = None;
+            self.config.revision = None;
         }
         self.config.checkout = kind;
         self.open = None;
@@ -1186,17 +1199,53 @@ impl Pickers {
 
     // ---- checkout resolution (the t3code env-mode semantics) ----
 
-    /// Index of the highlighted-by-default row in the (filtered) ref list:
-    /// the session's branch on an existing chat, the draft pick on a new one,
-    /// else the current branch. Capped to the displayed window.
+    /// The ref that actually owns an existing chat's cwd. Live checkout state
+    /// wins over the persisted branch label: JJ working-copy labels change as
+    /// the change id advances, and a new chat can appear before its branch has
+    /// been stamped by the host.
+    fn session_ref<'a>(
+        &'a self,
+        chat: &jolt_proto::Chat,
+        space: &jolt_proto::Space,
+    ) -> Option<&'a RepoRef> {
+        let refs = self.refs.ready()?;
+        let same_checkout = chat.cwd.as_deref() == Some(space.path.as_str())
+            || chat
+                .checkout_id
+                .as_deref()
+                .zip(space.checkout_id.as_deref())
+                .is_some_and(|(chat, space)| chat == space);
+        session_checkout_ref(
+            refs,
+            chat.branch.as_deref(),
+            chat.cwd.as_deref(),
+            same_checkout,
+        )
+    }
+
+    /// Selected ref for either an existing chat or the new-chat draft. An
+    /// unstamped chat defaults to the working-copy/current row rather than
+    /// displaying an unselected "Select ref" state.
+    fn selected_ref_name(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        if let Some(chat) = state.selected_chat_row() {
+            return state
+                .space_for_chat(chat)
+                .and_then(|space| self.session_ref(chat, space))
+                .map(|row| row.name.clone())
+                .or_else(|| chat.branch.clone());
+        }
+        self.config
+            .branch
+            .clone()
+            .or_else(|| self.selected_ref().map(|row| row.name.clone()))
+    }
+
+    /// Index of the highlighted-by-default row in the (filtered) ref list.
+    /// Capped to the displayed window.
     fn selected_ref_index(&self, cx: &App) -> usize {
         let rows = self.filtered_ref_rows(cx);
-        let selected = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.branch.clone())
-            .or_else(|| self.config.branch.clone());
+        let selected = self.selected_ref_name(cx);
         let index = match selected {
             Some(name) => rows.iter().position(|r| r.name == name).unwrap_or(0),
             None => rows.iter().position(|r| r.current).unwrap_or(0),
@@ -1221,6 +1270,14 @@ impl Pickers {
             .or_else(|| self.selected_ref().map(|r| r.name.clone()))
     }
 
+    fn effective_ref_revision(&self) -> Option<String> {
+        self.config
+            .revision
+            .clone()
+            .or_else(|| self.selected_ref().and_then(|row| row.revision.clone()))
+            .or_else(|| self.effective_ref_name())
+    }
+
     /// The existing worktree the picked ref is materialized in, if any.
     fn selected_ref_worktree(&self) -> Option<String> {
         self.selected_ref().and_then(|r| r.worktree_path.clone())
@@ -1230,7 +1287,7 @@ impl Pickers {
     pub fn checkout_plan(&self) -> CheckoutPlan {
         match self.config.checkout {
             CheckoutKind::NewWorktree => CheckoutPlan::NewWorktree {
-                base: self.effective_ref_name(),
+                base: self.effective_ref_revision(),
             },
             CheckoutKind::Local => match self.selected_ref_worktree() {
                 Some(path) => CheckoutPlan::ReuseWorktree {
@@ -1247,15 +1304,16 @@ impl Pickers {
     /// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel` /
     /// `resolveCurrentWorkspaceLabel`).
     fn checkout_label(&self) -> &'static str {
+        let jujutsu = self.refs.ready().is_some_and(|refs| {
+            refs.iter()
+                .any(|row| row.kind != jolt_proto::RepoRefKind::Branch)
+        });
         match self.config.checkout {
+            CheckoutKind::NewWorktree if jujutsu => "New workspace",
             CheckoutKind::NewWorktree => "New worktree",
-            CheckoutKind::Local => {
-                if self.selected_ref_worktree().is_some() {
-                    "Current worktree"
-                } else {
-                    "Current checkout"
-                }
-            }
+            CheckoutKind::Local if jujutsu => "Working copy",
+            CheckoutKind::Local if self.selected_ref_worktree().is_some() => "Current worktree",
+            CheckoutKind::Local => "Current checkout",
         }
     }
 
@@ -1351,7 +1409,7 @@ impl Pickers {
         };
         let open = self.open == Some(kind)
             || (kind == PickerKind::Traits && self.open == Some(PickerKind::HarnessModel));
-        // Ghost pill (comet composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
+        // Ghost pill (jolt composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
         div()
@@ -1366,7 +1424,7 @@ impl Pickers {
             .rounded(px(8.0))
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            // comet composer/styles.tsx `pill`: `transition-colors` — the wash
+            // jolt composer/styles.tsx `pill`: `transition-colors` — the wash
             // and text brighten fade over 150ms.
             .text_color(motion::hover_blend(
                 id,
@@ -1479,7 +1537,7 @@ impl Pickers {
     }
 
     /// The composer footer row (t3code BranchToolbar): checkout-kind on the
-    /// left, the ref selector right-aligned. `None` for non-git spaces. On an
+    /// left, the ref selector right-aligned. `None` for non-VCS spaces. On an
     /// existing session both sides are read-only labels ("Worktree" /
     /// "Local checkout" + the chat's branch).
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1522,9 +1580,8 @@ impl Pickers {
         // checkout switch on an existing session (t3code keeps its branch
         // selector interactive mid-session too).
         let ref_label = match &session {
-            Some(chat) => chat
-                .branch
-                .clone()
+            Some(_) => self
+                .selected_ref_name(cx)
                 .map(SharedString::from)
                 .unwrap_or_else(|| SharedString::from("Select ref")),
             None => self.ref_label(),
@@ -1553,9 +1610,29 @@ impl Pickers {
 
         if let Some(chat) = &session {
             // The checkout KIND is fixed at creation (harness resume is
-            // cwd-scoped — the session never moves folders): label only.
-            let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
-            let (icon_path, label) = if is_worktree {
+            // cwd-scoped — the session never moves folders): label only. JJ
+            // checkouts are working copies/workspaces, never Git worktrees.
+            let session_ref = self.session_ref(chat, &space);
+            let jujutsu = session_ref
+                .is_some_and(|row| row.kind == jolt_proto::RepoRefKind::WorkingCopy)
+                || self.refs.ready().is_some_and(|refs| {
+                    refs.iter()
+                        .any(|row| row.kind != jolt_proto::RepoRefKind::Branch)
+                })
+                || chat
+                    .branch
+                    .as_deref()
+                    .is_some_and(|branch| branch.starts_with("Working copy · "));
+            let outside_space = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
+            let is_secondary_checkout = match session_ref {
+                Some(row) if row.kind == jolt_proto::RepoRefKind::WorkingCopy => !row.current,
+                Some(_) | None => outside_space,
+            };
+            let (icon_path, label) = if jujutsu && is_secondary_checkout {
+                (crate::icons::FOLDER_WITH_FILES, "Workspace")
+            } else if jujutsu {
+                (crate::icons::FOLDER, "Working copy")
+            } else if is_secondary_checkout {
                 (crate::icons::FOLDER_WITH_FILES, "Worktree")
             } else {
                 (crate::icons::FOLDER, "Local checkout")
@@ -1592,7 +1669,7 @@ impl Pickers {
         let theme = Theme::of(cx).clone();
         popover::popover_card(&theme)
             .w(px(width))
-            // comet caps its tallest picker at min(640px, 75vh).
+            // jolt caps its tallest picker at min(640px, 75vh).
             .max_h(px(640.0))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1606,7 +1683,7 @@ impl Pickers {
     }
 
     /// [`Self::popover_frame`] without the p-1 inset — the harness/model
-    /// picker's rail + list panes bleed to the card edge (comet
+    /// picker's rail + list panes bleed to the card edge (jolt
     /// harness-model-picker.tsx `className="w-80 p-0"`).
     fn popover_frame_flush(
         &self,
@@ -1682,14 +1759,9 @@ impl Pickers {
         let rows = self.filtered_ref_rows(cx);
         let total = rows.len();
         let shown = total.min(MAX_REF_ROWS);
-        // Existing session: the highlighted row is the SESSION's branch and a
-        // pick switches the checkout (see `pick_ref`); a new chat highlights
-        // the draft pick.
-        let session_branch = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.branch.clone());
+        // Existing session: the highlighted row is the ref owning the
+        // session's cwd; a new chat highlights the draft/current ref.
+        let selected_ref = self.selected_ref_name(cx);
         let switching = self.switching.clone();
         let body: AnyElement =
             match &self.refs {
@@ -1708,7 +1780,7 @@ impl Pickers {
                     .into_any_element(),
                 Loadable::Ready(_) => {
                     let active = self.active;
-                    let selected = session_branch.or_else(|| self.config.branch.clone());
+                    let selected = selected_ref;
                     div()
                         .id("branch-list")
                         .flex()
@@ -1722,12 +1794,21 @@ impl Pickers {
                                 let is_selected = selected.as_deref() == Some(row.name.as_str());
                                 // Right-aligned muted tag (t3code `text-[10px]
                                 // text-muted-foreground/45`): current beats worktree.
-                                let tag: Option<&'static str> = if row.current {
-                                    Some("current")
-                                } else if row.worktree_path.is_some() {
-                                    Some("worktree")
-                                } else {
-                                    None
+                                let tag: Option<&'static str> = match row.kind {
+                                    jolt_proto::RepoRefKind::WorkingCopy if row.current => {
+                                        Some("working copy")
+                                    }
+                                    jolt_proto::RepoRefKind::WorkingCopy => Some("workspace"),
+                                    jolt_proto::RepoRefKind::Bookmark => Some("bookmark"),
+                                    jolt_proto::RepoRefKind::Branch if row.current => {
+                                        Some("current")
+                                    }
+                                    jolt_proto::RepoRefKind::Branch
+                                        if row.worktree_path.is_some() =>
+                                    {
+                                        Some("worktree")
+                                    }
+                                    jolt_proto::RepoRefKind::Branch => None,
                                 };
                                 let is_switching = switching.as_deref() == Some(row.name.as_str());
                                 popover::menu_row_nav(
@@ -1772,7 +1853,7 @@ impl Pickers {
             .child(self.search_box(&theme))
             .child(body);
         // Mid-session switch failure (dirty tree, ref checked out elsewhere):
-        // git's own message, under a hairline.
+        // the VCS's own message, under a hairline.
         if let Some(error) = &self.switch_error {
             popover = popover.child(
                 popover::menu_section().child(
@@ -1807,7 +1888,13 @@ impl Pickers {
     fn render_checkout_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let has_worktree = self.selected_ref_worktree().is_some();
-        let local_label: &'static str = if has_worktree {
+        let jujutsu = self.refs.ready().is_some_and(|refs| {
+            refs.iter()
+                .any(|row| row.kind != jolt_proto::RepoRefKind::Branch)
+        });
+        let local_label: &'static str = if jujutsu {
+            "Working copy"
+        } else if has_worktree {
             "Current worktree"
         } else {
             "Current checkout"
@@ -1821,7 +1908,11 @@ impl Pickers {
             (CheckoutKind::Local, local_label, local_icon),
             (
                 CheckoutKind::NewWorktree,
-                "New worktree",
+                if jujutsu {
+                    "New workspace"
+                } else {
+                    "New worktree"
+                },
                 crate::icons::FOLDER_WITH_FILES,
             ),
         ];
@@ -1865,7 +1956,7 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// The combined harness + model switcher (comet harness-model-picker.tsx):
+    /// The combined harness + model switcher (jolt harness-model-picker.tsx):
     /// a vertical harness rail of square brand-icon tabs on the left, the
     /// viewed harness's models on the right. On an existing chat the other
     /// tabs stay visible but disabled — the lock reads as a rule.
@@ -2289,11 +2380,12 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
             Some(crate::icons::claude_brand()),
         ),
         HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
+        HarnessId::Pi => (crate::icons::PI_MARK, None),
         HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
     }
 }
 
-/// Display-only toggle switch (comet branch-picker.tsx `Toggle`): an 18×32
+/// Display-only toggle switch (jolt branch-picker.tsx `Toggle`): an 18×32
 /// pill whose knob slides right and track flips white when on. State is owned
 /// by the parent row.
 #[allow(dead_code)]
@@ -2324,20 +2416,16 @@ fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
         )
 }
 
-/// `COMET_HARNESS=mock` (the e2e/dev rig) opts the mock harness into the UI;
+/// `JOLT_HARNESS=mock` (the e2e/dev rig) opts the mock harness into the UI;
 /// production launches never set it, so the mock never surfaces there.
 fn mock_harness_enabled() -> bool {
-    std::env::var("COMET_HARNESS")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-        == Some("mock")
+    std::env::var("JOLT_HARNESS").ok().as_deref().map(str::trim) == Some("mock")
 }
 
 /// Production pickers AND chip resolution hide the mock harness — the
 /// registry always lists it, but it must never surface in real UI (neither in
 /// the picker rail nor as the eager default the chips resolve against).
-/// `COMET_HARNESS=mock` shows it; otherwise it only remains when it's
+/// `JOLT_HARNESS=mock` shows it; otherwise it only remains when it's
 /// literally all there is (a dev build with no real harness registered).
 pub fn visible_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
     visible_harnesses_impl(list, mock_harness_enabled())
@@ -2353,6 +2441,30 @@ fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
         .cloned()
         .collect();
     if real.is_empty() { list.to_vec() } else { real }
+}
+
+/// Resolve the live ref owning a chat checkout. Cwd/current markers take
+/// precedence over a potentially stale persisted branch label.
+fn session_checkout_ref<'a>(
+    refs: &'a [RepoRef],
+    branch: Option<&str>,
+    cwd: Option<&str>,
+    same_checkout: bool,
+) -> Option<&'a RepoRef> {
+    if let Some(cwd) = cwd
+        && let Some(row) = refs
+            .iter()
+            .find(|row| row.worktree_path.as_deref() == Some(cwd))
+    {
+        return Some(row);
+    }
+    if same_checkout && let Some(row) = refs.iter().find(|row| row.current) {
+        return Some(row);
+    }
+    match branch {
+        Some(branch) => refs.iter().find(|row| row.name == branch),
+        None => refs.iter().find(|row| row.current),
+    }
 }
 
 /// Attach the (single) open popover overlay to its trigger chip.
@@ -2391,7 +2503,7 @@ fn attach_overlay_end(
 impl Render for Pickers {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        // A COMET_OPEN_PICKER popover never went through `toggle`, so claim
+        // A JOLT_OPEN_PICKER popover never went through `toggle`, so claim
         // its keyboard focus here (re-claim until it sticks — the shell's
         // first-paint fallback focuses the composer after our first render).
         if self.boot_focus_pending {
@@ -2424,7 +2536,7 @@ impl Render for Pickers {
         if let Some(harness) = self.effective_harness(cx) {
             self.ensure_models(harness, cx);
         }
-        // A popover opened data-side (COMET_OPEN_PICKER) never went through
+        // A popover opened data-side (JOLT_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
         if matches!(
             self.open,
@@ -2433,7 +2545,7 @@ impl Render for Pickers {
         {
             self.ensure_refs(false, cx);
         }
-        // Chip shows the model's display name alone (comet `modelText`); the
+        // Chip shows the model's display name alone (jolt `modelText`); the
         // harness reads from the brand mark beside it. Never "Default model":
         // before the catalog lands the remembered label (or the configured id)
         // names the pick; the loaded list then resolves it to a concrete row.
@@ -2492,7 +2604,7 @@ impl Render for Pickers {
 
         // Left cluster (the branch chip moved to the composer FOOTER row).
         // Right cluster: agent+model and traits — the composer appends
-        // attach + send after this element (comet composer-actions.tsx
+        // attach + send after this element (jolt composer-actions.tsx
         // arrangement).
         let left = div()
             .flex()
@@ -2543,7 +2655,55 @@ impl Render for Pickers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+    use jolt_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    fn repo_ref(
+        name: &str,
+        kind: jolt_proto::RepoRefKind,
+        current: bool,
+        worktree_path: Option<&str>,
+    ) -> RepoRef {
+        RepoRef {
+            name: name.into(),
+            revision: None,
+            kind,
+            current,
+            worktree_path: worktree_path.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn session_checkout_ref_defaults_to_the_jj_working_copy() {
+        let refs = [
+            repo_ref(
+                "Working copy · abcdef12",
+                jolt_proto::RepoRefKind::WorkingCopy,
+                true,
+                None,
+            ),
+            repo_ref(
+                "Working copy · 12345678",
+                jolt_proto::RepoRefKind::WorkingCopy,
+                false,
+                Some("/repo/other"),
+            ),
+            repo_ref("main", jolt_proto::RepoRefKind::Bookmark, false, None),
+        ];
+
+        assert_eq!(
+            session_checkout_ref(&refs, Some("main"), Some("/repo"), true).map(|row| &*row.name),
+            Some("Working copy · abcdef12")
+        );
+        assert_eq!(
+            session_checkout_ref(&refs, None, Some("/repo/other"), false).map(|row| &*row.name),
+            Some("Working copy · 12345678")
+        );
+    }
+
+    #[test]
+    fn pi_uses_its_brand_mark() {
+        assert_eq!(harness_brand_icon(HarnessId::Pi).0, crate::icons::PI_MARK);
+    }
 
     #[test]
     fn traits_summary_formats_non_defaults() {
@@ -2644,7 +2804,7 @@ mod tests {
                     is_repo: false,
                 },
                 FolderEntry {
-                    name: "comet".into(),
+                    name: "jolt".into(),
                     is_dir: true,
                     is_repo: true,
                 },
@@ -2653,7 +2813,7 @@ mod tests {
         };
         // Files never show as rows.
         assert_eq!(browser_rows(&listing).len(), 2);
-        assert_eq!(browser_rows(&listing)[1].name, "comet");
+        assert_eq!(browser_rows(&listing)[1].name, "jolt");
     }
 
     #[test]
@@ -2727,7 +2887,7 @@ mod tests {
             id,
             name: name.into(),
             supports_steering: true,
-            steering_mode: comet_proto::SteeringMode::StepBoundary,
+            steering_mode: jolt_proto::SteeringMode::StepBoundary,
             reasoning_levels: vec![],
         };
         let mixed = vec![
@@ -2740,7 +2900,7 @@ mod tests {
         assert_eq!(visible[0].id, HarnessId::ClaudeCode);
         let only_mock = vec![descriptor(HarnessId::Mock, "Mock")];
         assert_eq!(visible_harnesses_impl(&only_mock, false).len(), 1);
-        // …and opted back in by COMET_HARNESS=mock (the e2e rig).
+        // …and opted back in by JOLT_HARNESS=mock (the e2e rig).
         assert_eq!(visible_harnesses_impl(&mixed, true).len(), 2);
         assert_eq!(visible_harnesses_impl(&mixed, true)[0].id, HarnessId::Mock);
     }

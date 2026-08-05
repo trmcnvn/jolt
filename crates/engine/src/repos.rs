@@ -1,14 +1,16 @@
-//! Repos — this device's git repositories, branches, worktrees, and the folder
-//! browser (feature-inventory §3.5; port of comet's `repos.ts` + `folder-lister.ts`).
+//! Repos — this device's repositories, refs, working copies, and the folder
+//! browser (feature-inventory §3.5; port of jolt's `repos.ts` + `folder-lister.ts`).
 //!
 //! Repos are device-local (paths differ per machine), so the known set is a plain
 //! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
-//! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
-//! created under `~/.comet-native/worktrees/<repoName>/<worktreeName>` (NOT the data
-//! dir — worktrees are user-facing working checkouts), with an auto-generated name +
-//! matching `comet/<name>` branch. `COMET_WORKTREES_DIR` overrides the root.
+//! the user points us; cloned/created ones land in `{data_dir}/repos`. Git worktrees
+//! are created under `~/.jolt/worktrees/<repoName>/<worktreeName>`, with an
+//! auto-generated name and matching `jolt/<name>` branch. JJ workspaces use
+//! `~/.jolt/workspaces/<repoName>/<workspaceName>`. `JOLT_WORKTREES_DIR` and
+//! `JOLT_WORKSPACES_DIR` override those roots.
 //!
-//! All git access is via subprocess (`tokio::process`) — never libgit2.
+//! VCS access is via subprocess (`tokio::process`). Exactly one device-local
+//! backend is active at a time; see [`crate::vcs`].
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,9 +19,13 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use comet_proto::{FileSearchMatch, FolderEntry, FolderListing, Repo, RepoRef, Worktree};
+use jolt_proto::{
+    FileSearchMatch, FolderEntry, FolderListing, Repo, RepoRef, RepoRefKind, VcsKind,
+    VcsSettingsSnapshot, Worktree,
+};
 
 use crate::EngineError;
+use crate::vcs::{Vcs, VcsCommand, compose_command_path};
 
 /// Existence probe timeout for user-chosen / remembered paths, which can point at
 /// dead network mounts where a bare `stat` hangs for minutes.
@@ -39,19 +45,19 @@ const ADJECTIVES: &[&str] = &[
     "sharp", "gentle", "vivid", "amber", "cobalt",
 ];
 const NOUNS: &[&str] = &[
-    "otter", "harbor", "falcon", "cedar", "meadow", "comet", "delta", "ember", "lynx", "maple",
+    "otter", "harbor", "falcon", "cedar", "meadow", "jolt", "delta", "ember", "lynx", "maple",
     "onyx", "quartz", "raven", "summit", "willow", "aspen",
 ];
 
 /// Canonical identity shared by every chat operating in this exact worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckoutIdentity {
-    /// `sha256(deviceId ‖ NUL ‖ canonical git dir)` — device-scoped, path-stable.
+    /// `sha256(deviceId ‖ NUL ‖ backend ‖ NUL ‖ canonical metadata path)`.
     pub id: String,
-    /// Canonical worktree root (`rev-parse --show-toplevel`, symlinks resolved).
+    /// Canonical working-copy root, with symlinks resolved.
     pub root: PathBuf,
-    /// Canonical git dir (worktree-specific for linked worktrees).
-    pub git_dir: PathBuf,
+    /// Canonical backend metadata path (`.git` or JJ workspace metadata).
+    pub metadata_dir: PathBuf,
 }
 
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
@@ -68,19 +74,28 @@ pub(crate) fn home_dir() -> PathBuf {
 }
 
 /// Where new worktrees live. Deliberately NOT under the backend data dir —
-/// worktrees are user-facing working checkouts. `COMET_WORKTREES_DIR` overrides
+/// worktrees are user-facing working checkouts. `JOLT_WORKTREES_DIR` overrides
 /// (test isolation); empty reads as unset.
 fn default_worktrees_root() -> PathBuf {
-    std::env::var_os("COMET_WORKTREES_DIR")
+    std::env::var_os("JOLT_WORKTREES_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".comet-native").join("worktrees"))
+        .unwrap_or_else(|| home_dir().join(".jolt").join("worktrees"))
+}
+
+fn default_workspaces_root() -> PathBuf {
+    std::env::var_os("JOLT_WORKSPACES_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".jolt").join("workspaces"))
 }
 
 struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
     worktrees_root: PathBuf,
+    workspaces_root: PathBuf,
+    vcs: Vcs,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
@@ -91,21 +106,68 @@ pub struct Repos {
 
 impl Repos {
     /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
-    /// comes from `$COMET_WORKTREES_DIR` or `~/.comet-native/worktrees`.
+    /// comes from `$JOLT_WORKTREES_DIR` or `~/.jolt/worktrees`.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
-        Self::with_worktrees_root(data_dir, device_id, default_worktrees_root())
+        Self::with_roots(
+            data_dir,
+            device_id,
+            default_worktrees_root(),
+            default_workspaces_root(),
+            false,
+        )
     }
 
     /// Explicit worktree root (tests).
     pub fn with_worktrees_root(data_dir: &Path, device_id: &str, worktrees_root: PathBuf) -> Self {
+        Self::with_roots(
+            data_dir,
+            device_id,
+            worktrees_root,
+            data_dir.join("workspaces"),
+            true,
+        )
+    }
+
+    fn with_roots(
+        data_dir: &Path,
+        device_id: &str,
+        worktrees_root: PathBuf,
+        workspaces_root: PathBuf,
+        prefer_git_for_tests: bool,
+    ) -> Self {
+        let vcs = Vcs::new(data_dir);
+        if prefer_git_for_tests {
+            let _ = vcs.set_selected(VcsKind::Git);
+        }
         Self {
             inner: std::sync::Arc::new(ReposInner {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
                 worktrees_root,
+                workspaces_root,
+                vcs,
                 file_searches: std::sync::Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    pub fn vcs_settings(&self) -> VcsSettingsSnapshot {
+        self.inner.vcs.snapshot()
+    }
+
+    pub fn set_vcs(&self, kind: VcsKind) -> Result<VcsSettingsSnapshot, EngineError> {
+        self.inner.vcs.set_selected(kind)
+    }
+
+    pub fn vcs_kind(&self) -> Option<VcsKind> {
+        self.inner.vcs.active_kind()
+    }
+
+    pub(crate) fn vcs_command(&self) -> Result<VcsCommand, EngineError> {
+        self.inner
+            .vcs
+            .active_command()
+            .ok_or_else(|| EngineError::Other("No supported VCS executable found".into()))
     }
 
     // ── registry (repos.json) ───────────────────────────────────────────────
@@ -137,34 +199,69 @@ impl Repos {
         self.save_paths(&paths)
     }
 
-    // ── git plumbing ────────────────────────────────────────────────────────
+    // ── VCS plumbing ────────────────────────────────────────────────────────
 
-    /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
-    async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
-        let mut cmd = tokio::process::Command::new("git");
+    async fn command(
+        &self,
+        expected: VcsKind,
+        args: &[&str],
+        cwd: Option<&Path>,
+    ) -> Result<String, EngineError> {
+        let backend = self
+            .inner
+            .vcs
+            .active_command()
+            .ok_or_else(|| EngineError::Other("No supported VCS executable found".into()))?;
+        if backend.kind != expected {
+            return Err(EngineError::Other(format!(
+                "{} is not the active VCS backend",
+                expected.label()
+            )));
+        }
+        let mut cmd = tokio::process::Command::new(&backend.executable);
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
+        compose_command_path(&mut cmd, &backend.executable);
         cmd.stdin(std::process::Stdio::null());
         let output = cmd
             .output()
             .await
-            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+            .map_err(|e| EngineError::Other(format!("{} spawn failed: {e}", expected.label())))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let message = stderr.trim();
             return Err(EngineError::Other(if message.is_empty() {
                 format!(
-                    "git {} failed ({})",
+                    "{} {} failed ({})",
+                    expected.label(),
                     args.first().unwrap_or(&"?"),
                     output.status
                 )
             } else {
-                format!("git: {message}")
+                format!("{}: {message}", expected.label())
             }));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
+        self.command(VcsKind::Git, args, cwd).await
+    }
+
+    async fn jj(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+        ignore_working_copy: bool,
+    ) -> Result<String, EngineError> {
+        let mut full = vec!["--no-pager", "--color=never"];
+        if ignore_working_copy {
+            full.push("--ignore-working-copy");
+        }
+        full.extend_from_slice(args);
+        self.command(VcsKind::Jujutsu, &full, cwd).await
     }
 
     /// Async existence probe with a timeout: a wedged network mount just reads
@@ -177,56 +274,91 @@ impl Repos {
         )
     }
 
-    /// Is `path` inside a git work tree? (Also the SpacesSync git-presence probe.)
+    /// Is `path` inside the active backend's working copy?
     pub async fn is_repo(&self, path: &Path) -> bool {
-        matches!(
-            self.git(&["rev-parse", "--is-inside-work-tree"], Some(path)).await,
-            Ok(out) if out == "true"
-        )
+        match self.vcs_kind() {
+            Some(VcsKind::Git) => matches!(
+                self.git(&["rev-parse", "--is-inside-work-tree"], Some(path)).await,
+                Ok(out) if out == "true"
+            ),
+            Some(VcsKind::Jujutsu) => self.jj(&["root"], Some(path), true).await.is_ok(),
+            None => false,
+        }
     }
 
     /// The branch currently checked out at a repo/worktree path (`"HEAD"` when detached).
     pub async fn current_branch(&self, path: &Path) -> Result<String, EngineError> {
-        let branch = self.git(&["branch", "--show-current"], Some(path)).await?;
-        Ok(if branch.is_empty() {
-            "HEAD".to_string()
-        } else {
-            branch
-        })
+        match self.vcs_kind() {
+            Some(VcsKind::Git) => {
+                let branch = self.git(&["branch", "--show-current"], Some(path)).await?;
+                Ok(if branch.is_empty() {
+                    "HEAD".into()
+                } else {
+                    branch
+                })
+            }
+            Some(VcsKind::Jujutsu) => self.working_copy_label(path).await,
+            None => Err(EngineError::Other(
+                "No supported VCS executable found".into(),
+            )),
+        }
     }
 
-    /// The absolute Git `HEAD` file for event-driven external branch reconciliation.
-    pub async fn git_head_path(&self, path: &Path) -> Result<PathBuf, EngineError> {
-        let git_dir = self
-            .git(&["rev-parse", "--absolute-git-dir"], Some(path))
-            .await?;
-        Ok(PathBuf::from(git_dir).join("HEAD"))
-    }
-
-    /// Canonical identity shared by every chat operating in this exact worktree:
-    /// `sha256(deviceId ‖ NUL ‖ canonical git dir)`.
-    pub async fn checkout_identity(&self, path: &Path) -> Result<CheckoutIdentity, EngineError> {
-        let root = self
-            .git(&["rev-parse", "--show-toplevel"], Some(path))
-            .await?;
-        let git_dir = self
-            .git(
-                &["rev-parse", "--path-format=absolute", "--git-dir"],
+    async fn working_copy_label(&self, path: &Path) -> Result<String, EngineError> {
+        let id = self
+            .jj(
+                &[
+                    "log",
+                    "-r",
+                    "@",
+                    "--no-graph",
+                    "-T",
+                    "change_id.shortest(8)",
+                ],
                 Some(path),
+                true,
             )
             .await?;
+        Ok(format!("Working copy · {id}"))
+    }
+
+    /// Canonical identity shared by every chat using this exact working copy.
+    pub async fn checkout_identity(&self, path: &Path) -> Result<CheckoutIdentity, EngineError> {
+        let (root, metadata_dir) = match self.vcs_kind() {
+            Some(VcsKind::Git) => {
+                let root = self
+                    .git(&["rev-parse", "--show-toplevel"], Some(path))
+                    .await?;
+                let metadata = self
+                    .git(
+                        &["rev-parse", "--path-format=absolute", "--git-dir"],
+                        Some(path),
+                    )
+                    .await?;
+                (root, PathBuf::from(metadata))
+            }
+            Some(VcsKind::Jujutsu) => {
+                let root = self.jj(&["root"], Some(path), true).await?;
+                let metadata = PathBuf::from(&root).join(".jj").join("working_copy");
+                (root, metadata)
+            }
+            None => {
+                return Err(EngineError::Other(
+                    "No supported VCS executable found".into(),
+                ));
+            }
+        };
         let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(&root));
-        let canonical_git_dir =
-            std::fs::canonicalize(&git_dir).unwrap_or_else(|_| PathBuf::from(&git_dir));
+        let canonical_metadata_dir = std::fs::canonicalize(&metadata_dir).unwrap_or(metadata_dir);
         let mut hasher = Sha256::new();
         hasher.update(self.inner.device_id.as_bytes());
         hasher.update([0u8]);
-        hasher.update(canonical_git_dir.to_string_lossy().as_bytes());
+        hasher.update(canonical_metadata_dir.to_string_lossy().as_bytes());
         let id = hex(&hasher.finalize());
         Ok(CheckoutIdentity {
             id,
             root: canonical_root,
-            git_dir: canonical_git_dir,
+            metadata_dir: canonical_metadata_dir,
         })
     }
 
@@ -274,7 +406,8 @@ impl Repos {
         }
         if !self.is_repo(&abs).await {
             return Err(EngineError::Other(format!(
-                "Not a git repository: {}",
+                "Not a {} repository: {}",
+                self.vcs_kind().map(VcsKind::label).unwrap_or("VCS"),
                 abs.display()
             )));
         }
@@ -302,8 +435,31 @@ impl Repos {
             )));
         }
         std::fs::create_dir_all(&repos_dir)?;
-        self.git(&["clone", trimmed, &target.to_string_lossy()], None)
-            .await?;
+        match self.vcs_kind() {
+            Some(VcsKind::Git) => {
+                self.git(&["clone", trimmed, &target.to_string_lossy()], None)
+                    .await?;
+            }
+            Some(VcsKind::Jujutsu) => {
+                self.jj(
+                    &[
+                        "git",
+                        "clone",
+                        "--colocate",
+                        trimmed,
+                        &target.to_string_lossy(),
+                    ],
+                    None,
+                    false,
+                )
+                .await?;
+            }
+            None => {
+                return Err(EngineError::Other(
+                    "No supported VCS executable found".into(),
+                ));
+            }
+        }
         self.register(&target.to_string_lossy())?;
         self.to_repo(&target).await
     }
@@ -332,7 +488,20 @@ impl Repos {
             )));
         }
         std::fs::create_dir_all(&target)?;
-        self.git(&["init", "-b", "main"], Some(&target)).await?;
+        match self.vcs_kind() {
+            Some(VcsKind::Git) => {
+                self.git(&["init", "-b", "main"], Some(&target)).await?;
+            }
+            Some(VcsKind::Jujutsu) => {
+                self.jj(&["git", "init", "--colocate", "."], Some(&target), false)
+                    .await?;
+            }
+            None => {
+                return Err(EngineError::Other(
+                    "No supported VCS executable found".into(),
+                ));
+            }
+        }
         self.register(&target.to_string_lossy())?;
         self.to_repo(&target).await
     }
@@ -342,6 +511,14 @@ impl Repos {
     /// All branches (`git branch -a`), local first, deduped against their remote
     /// counterparts, with the repo's default branch first.
     pub async fn branches(&self, repo_path: &Path) -> Result<Vec<String>, EngineError> {
+        if self.vcs_kind() == Some(VcsKind::Jujutsu) {
+            return Ok(self
+                .jj_bookmarks(repo_path)
+                .await?
+                .into_iter()
+                .map(|row| row.name)
+                .collect());
+        }
         let out = self
             .git(&["branch", "-a", "--format=%(refname)"], Some(repo_path))
             .await?;
@@ -393,11 +570,27 @@ impl Repos {
         Ok(names)
     }
 
+    fn user_worktree_path(&self, path: &str) -> String {
+        let path = PathBuf::from(path);
+        let canonical_root = std::fs::canonicalize(&self.inner.worktrees_root)
+            .unwrap_or_else(|_| self.inner.worktrees_root.clone());
+        path.strip_prefix(&canonical_root)
+            .ok()
+            .map(|relative| self.inner.worktrees_root.join(relative))
+            .filter(|candidate| candidate.exists())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// [`Self::branches`] enriched with checkout state: which branch the MAIN
     /// folder has checked out (`current`) and which branches are materialized
     /// as linked worktrees (`worktree_path`). Feeds the composer's ref picker
     /// and its checkout-kind selector.
     pub async fn refs(&self, repo_path: &Path) -> Result<Vec<RepoRef>, EngineError> {
+        if self.vcs_kind() == Some(VcsKind::Jujutsu) {
+            return self.jj_refs(repo_path).await;
+        }
         let names = self.branches(repo_path).await?;
         let current = self.current_branch(repo_path).await.ok();
         // `git worktree list --porcelain`: stanzas of `worktree <path>` /
@@ -415,7 +608,7 @@ impl Repos {
                 if let Some(p) = line.strip_prefix("worktree ") {
                     stanza += 1;
                     // The first stanza is the main checkout, not a linked tree.
-                    path = (stanza > 1).then(|| p.to_string());
+                    path = (stanza > 1).then(|| self.user_worktree_path(p));
                 } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
                     && let Some(path) = path.take()
                 {
@@ -426,11 +619,89 @@ impl Repos {
         Ok(names
             .into_iter()
             .map(|name| RepoRef {
+                revision: Some(name.clone()),
+                kind: RepoRefKind::Branch,
                 current: current.as_deref() == Some(name.as_str()),
                 worktree_path: worktrees.get(&name).cloned(),
                 name,
             })
             .collect())
+    }
+
+    async fn jj_bookmarks(&self, repo_path: &Path) -> Result<Vec<RepoRef>, EngineError> {
+        let out = self
+            .jj(
+                &[
+                    "bookmark",
+                    "list",
+                    "--all-remotes",
+                    "-T",
+                    "name ++ \"\\t\" ++ remote ++ \"\\n\"",
+                ],
+                Some(repo_path),
+                true,
+            )
+            .await?;
+        let mut seen = HashSet::new();
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                let (name, remote) = line.split_once('\t')?;
+                (remote.is_empty() && !name.is_empty() && seen.insert(name.to_string())).then(
+                    || RepoRef {
+                        name: name.to_string(),
+                        revision: Some(name.to_string()),
+                        kind: RepoRefKind::Bookmark,
+                        current: false,
+                        worktree_path: None,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn jj_refs(&self, repo_path: &Path) -> Result<Vec<RepoRef>, EngineError> {
+        let current_root = self.jj(&["root"], Some(repo_path), true).await?;
+        let current_root =
+            std::fs::canonicalize(&current_root).unwrap_or_else(|_| PathBuf::from(&current_root));
+        let out = self
+            .jj(
+                &[
+                    "workspace",
+                    "list",
+                    "-T",
+                    "name ++ \"\\t\" ++ target.change_id().shortest(8) ++ \"\\t\" ++ root ++ \"\\n\"",
+                ],
+                Some(repo_path),
+                true,
+            )
+            .await?;
+        let mut rows = Vec::new();
+        for line in out.lines() {
+            let mut fields = line.splitn(3, '\t');
+            let (Some(workspace), Some(change_id), Some(root)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let root_path = PathBuf::from(root);
+            let canonical = std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
+            let current = canonical == current_root;
+            rows.push(RepoRef {
+                name: format!("Working copy · {change_id}"),
+                revision: Some(if current {
+                    "@".into()
+                } else {
+                    format!("{workspace}@")
+                }),
+                kind: RepoRefKind::WorkingCopy,
+                current,
+                worktree_path: (!current).then(|| root.to_string()),
+            });
+        }
+        rows.sort_by_key(|row| !row.current);
+        rows.extend(self.jj_bookmarks(repo_path).await?);
+        Ok(rows)
     }
 
     /// Whether `candidate` is the repository root or one of its linked
@@ -465,6 +736,12 @@ impl Repos {
     /// already checked out in another worktree fails with git's own message.
     /// Returns the resulting current branch.
     pub async fn switch_ref(&self, cwd: &Path, ref_name: &str) -> Result<String, EngineError> {
+        if self.vcs_kind() == Some(VcsKind::Jujutsu) {
+            if ref_name != "@" {
+                self.jj(&["new", ref_name], Some(cwd), false).await?;
+            }
+            return self.working_copy_label(cwd).await;
+        }
         let local = self
             .git(
                 &[
@@ -508,7 +785,7 @@ impl Repos {
     // ── worktrees ───────────────────────────────────────────────────────────
 
     /// `git worktree add` an isolated checkout under
-    /// `{worktrees_root}/<repoName>/<generatedName>`, on a fresh `comet/<name>`
+    /// `{worktrees_root}/<repoName>/<generatedName>`, on a fresh `jolt/<name>`
     /// branch off `branch`.
     pub async fn create_worktree(
         &self,
@@ -519,7 +796,10 @@ impl Repos {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
-        let base = self.inner.worktrees_root.join(&repo_name);
+        let base = match self.vcs_kind() {
+            Some(VcsKind::Jujutsu) => self.inner.workspaces_root.join(&repo_name),
+            _ => self.inner.worktrees_root.join(&repo_name),
+        };
         std::fs::create_dir_all(&base)?;
         // Auto-generate a name colliding with neither an existing dir nor branch.
         let existing: HashSet<String> = self
@@ -540,8 +820,7 @@ impl Repos {
                 ADJECTIVES[(seed % ADJECTIVES.len() as u64) as usize],
                 NOUNS[((seed / 31) % NOUNS.len() as u64) as usize]
             );
-            if !base.join(&candidate).exists() && !existing.contains(&format!("comet/{candidate}"))
-            {
+            if !base.join(&candidate).exists() && !existing.contains(&format!("jolt/{candidate}")) {
                 name = Some(candidate);
                 break;
             }
@@ -549,19 +828,46 @@ impl Repos {
         let name =
             name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
         let path = base.join(&name);
-        let branch_name = format!("comet/{name}");
-        self.git(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch_name,
-                &path.to_string_lossy(),
-                branch,
-            ],
-            Some(repo_path),
-        )
-        .await?;
+        let branch_name = match self.vcs_kind() {
+            Some(VcsKind::Git) => {
+                let branch_name = format!("jolt/{name}");
+                self.git(
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        &branch_name,
+                        &path.to_string_lossy(),
+                        branch,
+                    ],
+                    Some(repo_path),
+                )
+                .await?;
+                branch_name
+            }
+            Some(VcsKind::Jujutsu) => {
+                self.jj(
+                    &[
+                        "workspace",
+                        "add",
+                        "--name",
+                        &name,
+                        "-r",
+                        branch,
+                        &path.to_string_lossy(),
+                    ],
+                    Some(repo_path),
+                    false,
+                )
+                .await?;
+                self.working_copy_label(&path).await?
+            }
+            None => {
+                return Err(EngineError::Other(
+                    "No supported VCS executable found".into(),
+                ));
+            }
+        };
         let checkout = self.checkout_identity(&path).await?;
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
@@ -586,10 +892,10 @@ impl Repos {
         .is_ok()
     }
 
-    /// Rename a comet-created worktree branch after its chat's generated title
-    /// (port of comet's `renameWorktreeBranch`). Guards:
+    /// Rename a jolt-created worktree branch after its chat's generated title
+    /// (port of jolt's `renameWorktreeBranch`). Guards:
     /// - respect an external checkout/rename: only act while the worktree is still
-    ///   on `expected_branch` AND that branch is the original `comet/<folderName>`;
+    ///   on `expected_branch` AND that branch is the original `jolt/<folderName>`;
     /// - a title-slug collision gets a stable 6-hex suffix (hash of the worktree
     ///   path); a collision on THAT too fails.
     ///
@@ -602,11 +908,14 @@ impl Repos {
         title: &str,
     ) -> Result<String, EngineError> {
         let current = self.current_branch(worktree_path).await?;
+        if self.vcs_kind() == Some(VcsKind::Jujutsu) {
+            return self.current_branch(worktree_path).await;
+        }
         let folder = worktree_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if current != expected_branch || expected_branch != format!("comet/{folder}") {
+        if current != expected_branch || expected_branch != format!("jolt/{folder}") {
             return Ok(current);
         }
         let preferred = worktree_branch_from_title(title);
@@ -635,13 +944,42 @@ impl Repos {
     }
 
     /// Best-effort worktree removal (if it still exists), then prune stale refs.
-    /// Deletes the worktree's branch ONLY when comet created it (`comet/…`) — the
+    /// Deletes the worktree's branch ONLY when jolt created it (`jolt/…`) — the
     /// user may have checked out their own branch inside the worktree.
     pub async fn delete_worktree(
         &self,
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
+        if self.vcs_kind() == Some(VcsKind::Jujutsu) {
+            let out = self
+                .jj(
+                    &[
+                        "workspace",
+                        "list",
+                        "-T",
+                        "name ++ \"\\t\" ++ root ++ \"\\n\"",
+                    ],
+                    Some(repo_path),
+                    true,
+                )
+                .await?;
+            let canonical = std::fs::canonicalize(worktree_path)
+                .unwrap_or_else(|_| worktree_path.to_path_buf());
+            let workspace = out.lines().find_map(|line| {
+                let (name, root) = line.split_once('\t')?;
+                let root = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
+                (root == canonical).then(|| name.to_string())
+            });
+            if let Some(workspace) = workspace {
+                self.jj(&["workspace", "forget", &workspace], Some(repo_path), true)
+                    .await?;
+            }
+            if worktree_path.exists() {
+                std::fs::remove_dir_all(worktree_path)?;
+            }
+            return Ok(());
+        }
         let branch = if worktree_path.exists() {
             self.current_branch(worktree_path).await.unwrap_or_default()
         } else {
@@ -665,7 +1003,7 @@ impl Repos {
             }
         }
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
-        if branch.starts_with("comet/") {
+        if branch.starts_with("jolt/") {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
         Ok(())
@@ -738,7 +1076,7 @@ impl Repos {
     /// The walk runs on a DETACHED OS thread (not the tokio blocking pool): a
     /// readdir wedged in the kernel can't be cancelled, and a poisoned blocking
     /// pool — or a runtime shutdown waiting on it — must never be possible. On
-    /// timeout the thread is simply abandoned (the comet backend's disposable
+    /// timeout the thread is simply abandoned (the jolt backend's disposable
     /// worker, minus the terminate()).
     #[doc(hidden)]
     pub async fn list_folders_with(
@@ -751,6 +1089,7 @@ impl Repos {
             Some(p) => absolutize(Path::new(&p)),
             None => home_dir(),
         };
+        let vcs_kind = self.vcs_kind();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("folder-list".into())
@@ -760,7 +1099,7 @@ impl Repos {
                     // exit reclaims it) — the caller must hit its timeout.
                     std::thread::sleep(Duration::from_secs(3600));
                 }
-                let _ = tx.send(list_folders_blocking(&target));
+                let _ = tx.send(list_folders_blocking(&target, vcs_kind));
             });
         if let Err(err) = spawned {
             return Err(EngineError::Other(format!("folder listing failed: {err}")));
@@ -799,10 +1138,13 @@ async fn disposable_worker<T: Send + 'static>(
 
 /// The blocking walk: ONE readdir of the target; `is_repo` is a cheap `.git`
 /// existence probe per directory entry.
-fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
+fn list_folders_blocking(
+    target: &Path,
+    vcs_kind: Option<VcsKind>,
+) -> Result<FolderListing, EngineError> {
     let read = std::fs::read_dir(target).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
-            EngineError::Other("Comet doesn't have access to this folder on the device.".into())
+            EngineError::Other("Jolt doesn't have access to this folder on the device.".into())
         }
         _ => EngineError::Other(format!("could not read that folder: {e}")),
     })?;
@@ -813,7 +1155,11 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let is_repo = is_dir && entry.path().join(".git").exists();
+        let metadata = match vcs_kind {
+            Some(VcsKind::Jujutsu) => ".jj",
+            _ => ".git",
+        };
+        let is_repo = is_dir && entry.path().join(metadata).exists();
         entries.push(FolderEntry {
             name,
             is_dir,
@@ -927,7 +1273,9 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+        .filter_entry(|entry| {
+            entry.depth() == 0 || (entry.file_name() != ".git" && entry.file_name() != ".jj")
+        })
         .build();
     for entry in walker {
         if cancelled() {
@@ -977,8 +1325,8 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
         .collect())
 }
 
-/// Turn a generated chat title into the semantic portion of a Comet branch
-/// (port of comet's `worktreeBranchFromTitle`). Comet NFKD-normalizes accented
+/// Turn a generated chat title into the semantic portion of a Jolt branch
+/// (port of jolt's `worktreeBranchFromTitle`). Jolt NFKD-normalizes accented
 /// letters first; native keeps it ASCII-only (generated titles are Title Case
 /// English), so non-ASCII characters collapse into the `-` separator.
 pub fn worktree_branch_from_title(title: &str) -> String {
@@ -995,7 +1343,7 @@ pub fn worktree_branch_from_title(title: &str) -> String {
     }
     slug.truncate(48);
     let slug = slug.trim_matches('-');
-    format!("comet/{}", if slug.is_empty() { "update" } else { slug })
+    format!("jolt/{}", if slug.is_empty() { "update" } else { slug })
 }
 
 /// Absolute form of a possibly-relative path (no filesystem access).
@@ -1107,6 +1455,47 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn jujutsu_repo_working_copy_and_workspace_round_trip() {
+        let data = tempfile::tempdir().unwrap();
+        let repos = Repos::with_roots(
+            data.path(),
+            "device",
+            data.path().join("git-worktrees"),
+            data.path().join("jj-workspaces"),
+            false,
+        );
+        if repos.set_vcs(VcsKind::Jujutsu).is_err() {
+            return; // jj 0.43+ is optional on test hosts
+        }
+
+        let repo = repos.create("jj-example").await.unwrap();
+        let root = PathBuf::from(&repo.path);
+        assert!(root.join(".jj").is_dir());
+        assert!(root.join(".git").is_dir(), "JJ repos are always colocated");
+        std::fs::write(root.join("hello.txt"), "hello\n").unwrap();
+
+        let snapshot = crate::capture_diff(&repos, &root).await.unwrap();
+        assert_eq!(snapshot.vcs, VcsKind::Jujutsu);
+        assert!(snapshot.branch.starts_with("Working copy · "));
+        assert!(snapshot.patch.contains("hello.txt"));
+        assert!(snapshot.files.iter().any(|file| file.path == "hello.txt"));
+
+        let refs = repos.refs(&root).await.unwrap();
+        let current = refs.iter().find(|row| row.current).unwrap();
+        assert_eq!(current.kind, RepoRefKind::WorkingCopy);
+        assert_eq!(current.revision.as_deref(), Some("@"));
+
+        let workspace = repos.create_worktree(&root, "@").await.unwrap();
+        assert!(Path::new(&workspace.path).join(".jj").is_dir());
+        assert!(workspace.branch.starts_with("Working copy · "));
+        repos
+            .delete_worktree(&root, Path::new(&workspace.path))
+            .await
+            .unwrap();
+        assert!(!Path::new(&workspace.path).exists());
     }
 
     #[tokio::test]

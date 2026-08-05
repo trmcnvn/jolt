@@ -139,7 +139,7 @@ pub fn sort_chats(chats: &mut [Chat]) {
 // Boot gate
 // ---------------------------------------------------------------------------
 
-/// The app gate (comet's App.tsx phases). Pure.
+/// The app gate (jolt's App.tsx phases). Pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatePhase {
     /// Booting / probing — splash covers this.
@@ -148,7 +148,7 @@ pub enum GatePhase {
     Failed(String),
     /// Engine up, but signed out — show the sign-in card.
     SignIn,
-    /// Signed in but no organization selected — "Create your workspace".
+    /// Signed in while the hidden Personal organization is being provisioned.
     OrgGate,
     /// Render the shell.
     Ready,
@@ -240,7 +240,7 @@ pub fn group_chats<'a>(chats: impl IntoIterator<Item = &'a Chat>) -> Vec<ChatGro
 }
 
 /// Compact relative time ("now", "5m", "3h", "2d", "1w", …) — no "ago" suffix;
-/// port of comet's `formatTimeAgo`.
+/// port of jolt's `formatTimeAgo`.
 pub fn format_time_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let s = now.signed_duration_since(then).num_seconds().max(0);
     // Under a minute reads as "now" — otherwise 45–59s floors to a bare "0m".
@@ -270,7 +270,7 @@ pub fn format_time_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("{}y", d / 365)
 }
 
-/// Session-row sub-line, "project · branch" (comet `chatLocation`): the repo
+/// Session-row sub-line, "project · branch" (jolt `chatLocation`): the repo
 /// checkout identity. Either part may be missing; empty when both are.
 pub fn chat_location(chat: &Chat) -> Option<String> {
     let project = chat
@@ -315,7 +315,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
-/// Per-kind chip label + one-line detail. Labels match comet's `describeTool`
+/// Per-kind chip label + one-line detail. Labels match jolt's `describeTool`
 /// (tool-chip.tsx) exactly, so the two viewports name a tool identically.
 pub fn tool_chip_content(call: &crate::ToolCall) -> (&'static str, String) {
     let (label, detail) = tool_chip_content_raw(call);
@@ -420,7 +420,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
         segments.push(format!("{failed} failed"));
     }
     let mut summary = segments.join(" · ");
-    // Capitalize the first segment only (comet's style).
+    // Capitalize the first segment only (jolt's style).
     if let Some(first) = summary.get(0..1) {
         let upper = first.to_uppercase();
         summary.replace_range(0..1, &upper);
@@ -432,7 +432,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
 ///
 /// Colors live here rather than in the viewport because the *meaning* of a
 /// dot is part of the protocol, not the presentation — a given status must
-/// read the same on every surface. `comet-ui` has the oklch→sRGB math.
+/// read the same on every surface. `jolt-ui` has the oklch→sRGB math.
 pub mod dot {
     /// Running. Pink, not amber: the harsh yellow read as a warning, and running
     /// is routine (user request).
@@ -473,7 +473,7 @@ pub enum CheckoutPlan {
     CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
-    /// `CreateWorktree` off `base` on send (the engine mints a `comet/<name>`
+    /// `CreateWorktree` off `base` on send (the engine mints a `jolt/<name>`
     /// branch). `base: None` = refs never loaded — send falls back to the space
     /// folder rather than failing.
     NewWorktree { base: Option<String> },
@@ -516,6 +516,8 @@ mod checkout_tests {
     fn plain(name: &str) -> RepoRef {
         RepoRef {
             name: name.into(),
+            revision: None,
+            kind: crate::RepoRefKind::Branch,
             current: false,
             worktree_path: None,
         }
@@ -524,6 +526,8 @@ mod checkout_tests {
     fn materialized(name: &str, path: &str) -> RepoRef {
         RepoRef {
             name: name.into(),
+            revision: None,
+            kind: crate::RepoRefKind::Branch,
             current: false,
             worktree_path: Some(path.into()),
         }

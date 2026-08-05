@@ -9,7 +9,7 @@ use gpui::{
 };
 use std::time::Duration;
 
-use comet_rpc::methods;
+use jolt_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
@@ -177,7 +177,7 @@ impl DevicesPage {
     }
 }
 
-/// Human platform label (comet settings.devices.tsx `platformLabel`).
+/// Human platform label (jolt settings.devices.tsx `platformLabel`).
 pub fn platform_label(platform: &str) -> &str {
     match platform {
         "macos" | "darwin" => "macOS",
@@ -231,7 +231,7 @@ impl Render for DevicesPage {
                 };
                 // Presence lives ON the identity tile: a corner dot (emerald
                 // online with a soft glow, faint offline), ringed by the card
-                // tone so it "cuts" the tile — comet settings.devices.tsx
+                // tone so it "cuts" the tile — jolt settings.devices.tsx
                 // `border-2 border-[var(--card)]` +
                 // `shadow-[0_0_6px_rgba(52,211,153,0.55)]`.
                 let tile = widgets::row_tile(&theme, platform_icon).relative().child(
@@ -280,7 +280,7 @@ impl Render for DevicesPage {
                             .into_any_element(),
                     );
                 }
-                // "Added {time ago}" — always present (comet settings.devices.tsx).
+                // "Added {time ago}" — always present (jolt settings.devices.tsx).
                 if let Some(created) = device.created_at {
                     meta.push(
                         div()
@@ -329,7 +329,7 @@ impl Render for DevicesPage {
                         el.child(widgets::badge(&theme, "This device"))
                     })
                     .child(
-                        // `opacity-70 hover:opacity-100` (comet: also rises on
+                        // `opacity-70 hover:opacity-100` (jolt: also rises on
                         // row hover — gpui has no group-hover, so the button's
                         // own hover carries the reveal).
                         widgets::ghost_action(&theme)

@@ -4,7 +4,9 @@
 //! Methods (feature-inventory §2):
 //! - `ListHarnesses` → `[HarnessDescriptor]`
 //! - `ListModels {harness}` → `[Model]`
+//! - `ListCommands {harness}` → Jolt's built-in `[AgentCommand]` catalog
 //! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
+//! - `ExtractQuestions {chatId, sourceMessageId}` → extracted prose questions
 //! - `WatchDocMessages {chatId}` → stream of joined `SessionMessageEntry[]`,
 //!   re-emitted on every doc change
 //! - `WatchChats` / `WatchDevices` → streams of the workspace doc's entity rows
@@ -13,9 +15,9 @@
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
 //!   setChatArchived, deleteChat, renameDevice, markChatSeen)
 //! - `LocalDevice` → `{deviceId}` — this engine's identity (never forwarded)
-//! - AuthRpc (feature-inventory §2): `AuthStatus` (stream), `SignIn`/`SignInHeadless` →
-//!   `{url}`, `CompleteSignIn {code}`, `SignOut`, `ListOrgs`, `CreateOrg {name}`,
-//!   `SelectOrg {organizationId}`
+//! - AuthRpc: `AuthStatus` (stream), `SignIn`/`SignInHeadless` → `{url}`,
+//!   `CompleteSignIn {code}`, `SignOut`, `ListOrgs`, and automatic provisioning
+//!   of the user's sole hidden "Personal" organization
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
@@ -43,8 +45,8 @@
 //! forward can never loop. Streaming methods are proxied by re-subscribing remotely and
 //! piping items. To make another method device-addressable, nothing per-method is needed
 //! beyond listing it in [`forwardable`] (and [`is_stream_method`] if it streams);
-//! handlers stay transport-agnostic. Currently routed: `ListHarnesses`, `ListModels`,
-//! `QueueCommand`, and `WatchDocMessages`.
+//! handlers stay transport-agnostic. `ListCommands` is routed as well so clients see the
+//! built-in catalog supported by the device that will host the chat.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -54,9 +56,14 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tokio::sync::watch;
 
-use comet_doc::{MessagePart, SessionCommandPayload};
-use comet_proto::{ChatConfig, HarnessId, ToolCall};
-use comet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
+use jolt_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, join_continuation_entries,
+};
+use jolt_proto::{
+    AgentCommand, AgentCommandSource, ChatConfig, ExtractQuestionsResult, HarnessId, SessionStatus,
+    ToolCall,
+};
+use jolt_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
@@ -86,9 +93,42 @@ struct ListModelsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ListCommandsParams {
+    harness: HarnessId,
+}
+
+const ANSWER_QUESTIONS_COMMAND: &str = "answer";
+const BRO_COMMAND: &str = "bro";
+
+fn jolt_commands() -> Vec<AgentCommand> {
+    vec![
+        AgentCommand {
+            name: ANSWER_QUESTIONS_COMMAND.into(),
+            description: Some("Answer questions from the latest assistant response".into()),
+            argument_hint: None,
+            source: AgentCommandSource::Jolt,
+        },
+        AgentCommand {
+            name: BRO_COMMAND.into(),
+            description: Some("Restate the latest assistant response in plain language".into()),
+            argument_hint: None,
+            source: AgentCommandSource::Jolt,
+        },
+    ]
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractQuestionsParams {
+    chat_id: String,
+    source_message_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +207,8 @@ struct OpenTerminalParams {
     chat_id: String,
     cols: u16,
     rows: u16,
+    #[serde(default)]
+    command: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,7 +369,7 @@ enum MutateParams {
     SetChatHost { chat_id: String, device_id: String },
     #[serde(rename_all = "camelCase")]
     SetChatArchived { chat_id: String, archived: bool },
-    /// Full-config replace on the chat row (comet `SetChatConfig`): the
+    /// Full-config replace on the chat row (jolt `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
     #[serde(rename_all = "camelCase")]
@@ -355,11 +397,12 @@ pub struct EngineRpc {
     repos: Repos,
     terminals: Terminals,
     diff_sync: CheckoutDiffSync,
+    spaces_sync: crate::SpacesSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
-    updater: Option<comet_update::Updater>,
+    updater: Option<jolt_update::Updater>,
 }
 
 impl EngineRpc {
@@ -372,6 +415,7 @@ impl EngineRpc {
         repos: Repos,
         terminals: Terminals,
         diff_sync: CheckoutDiffSync,
+        spaces_sync: crate::SpacesSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
     ) -> Self {
@@ -383,6 +427,7 @@ impl EngineRpc {
             repos,
             terminals,
             diff_sync,
+            spaces_sync,
             uploads,
             agent_accounts,
             auth: None,
@@ -404,7 +449,7 @@ impl EngineRpc {
     }
 
     /// Attach the release checker (UpdateStatus stream + ApplyUpdate).
-    pub fn with_updater(mut self, updater: comet_update::Updater) -> Self {
+    pub fn with_updater(mut self, updater: jolt_update::Updater) -> Self {
         self.updater = Some(updater);
         self
     }
@@ -415,7 +460,7 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("auth unavailable".into()))
     }
 
-    fn updater(&self) -> Result<&comet_update::Updater, RpcError> {
+    fn updater(&self) -> Result<&jolt_update::Updater, RpcError> {
         self.updater
             .as_ref()
             .ok_or_else(|| RpcError::Failed("updates unavailable".into()))
@@ -718,8 +763,10 @@ fn forwardable(method: &str) -> bool {
         method,
         methods::LIST_HARNESSES
             | methods::LIST_MODELS
+            | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
+            | methods::EXTRACT_QUESTIONS
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -732,6 +779,8 @@ fn forwardable(method: &str) -> bool {
             | methods::SEARCH_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
+            | methods::VCS_SETTINGS
+            | methods::SET_VCS_BACKEND
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             // Terminals live on the chat's host device.
@@ -789,15 +838,15 @@ where
     .boxed()
 }
 
-/// The transcript watch as delta frames (`comet_doc::transcript_delta`): a
+/// The transcript watch as delta frames (`jolt_doc::transcript_delta`): a
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
 fn doc_messages_stream(
-    rx: watch::Receiver<Vec<comet_doc::SessionMessageEntry>>,
+    rx: watch::Receiver<Vec<jolt_doc::SessionMessageEntry>>,
 ) -> BoxStream<'static, serde_json::Value> {
-    use comet_doc::transcript_delta::{TranscriptFrame, diff_transcript};
+    use jolt_doc::transcript_delta::{TranscriptFrame, diff_transcript};
     futures::stream::unfold(
-        (rx, None::<Vec<comet_doc::SessionMessageEntry>>),
+        (rx, None::<Vec<jolt_doc::SessionMessageEntry>>),
         |(mut rx, mut prev)| async move {
             loop {
                 if prev.is_some() {
@@ -824,8 +873,8 @@ fn doc_messages_stream(
 
 /// Authentication-only RPC surface used while the headed app is waiting for a
 /// production WorkOS session. Keeping this independent from [`EngineRpc`] lets
-/// the UI show its sign-in and organization gates before identity-scoped Loro
-/// stores are opened.
+/// the UI sign in and provision the hidden Personal organization before
+/// identity-scoped stores are opened.
 #[derive(Clone)]
 pub struct AuthRpc {
     auth: Auth,
@@ -845,8 +894,7 @@ impl AuthRpc {
                 | methods::COMPLETE_SIGN_IN
                 | methods::SIGN_OUT
                 | methods::LIST_ORGS
-                | methods::CREATE_ORG
-                | methods::SELECT_ORG
+                | methods::ENSURE_PERSONAL_ORG
         )
     }
 }
@@ -892,27 +940,9 @@ impl RpcService for AuthRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "orgs": orgs }))
             }
-            methods::CREATE_ORG => {
-                #[derive(Deserialize)]
-                struct P {
-                    name: String,
-                }
-                let p: P = parse_params(params)?;
+            methods::ENSURE_PERSONAL_ORG => {
                 self.auth
-                    .create_org(&p.name)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::SELECT_ORG => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct P {
-                    organization_id: String,
-                }
-                let p: P = parse_params(params)?;
-                self.auth
-                    .select_org(&p.organization_id)
+                    .ensure_personal_org()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
@@ -953,6 +983,13 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
+            methods::LIST_COMMANDS => {
+                let p: ListCommandsParams = parse_params(params)?;
+                self.registry
+                    .resolve(p.harness)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&jolt_commands())
+            }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
                 let command_id = self
@@ -971,13 +1008,97 @@ impl RpcService for EngineRpc {
                     handle.watch_messages(),
                 )))
             }
+            methods::EXTRACT_QUESTIONS => {
+                let p: ExtractQuestionsParams = parse_params(params)?;
+                let status = self.sessions.session_status(&p.chat_id);
+                if status.is_some_and(|session| {
+                    matches!(
+                        session.status,
+                        SessionStatus::Working | SessionStatus::AwaitingInput
+                    )
+                }) {
+                    return Err(RpcError::Failed(
+                        "wait for the current run to finish before extracting questions".into(),
+                    ));
+                }
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let entries = handle
+                    .doc()
+                    .read_entries()
+                    .map(join_continuation_entries)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.id == p.source_message_id)
+                    .ok_or_else(|| RpcError::Failed("assistant message no longer exists".into()))?;
+                if entry.role != MessageRole::Assistant
+                    || entry.status != Some(MessageStatus::Complete)
+                {
+                    return Err(RpcError::Failed(
+                        "questions can only be extracted from a completed assistant message".into(),
+                    ));
+                }
+                let assistant_text = entry
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        MessagePart::Text { text, .. } if !text.trim().is_empty() => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if assistant_text.is_empty() {
+                    return Err(RpcError::Failed(
+                        "the assistant message has no text to inspect".into(),
+                    ));
+                }
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("chat no longer exists".into()))?;
+                let prior = self.sessions.last_request(&p.chat_id);
+                let harness = chat
+                    .config
+                    .as_ref()
+                    .map(|config| config.harness)
+                    .ok_or_else(|| RpcError::Failed("chat harness is unavailable".into()))?;
+                let model = chat
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.model.as_deref())
+                    .or_else(|| prior.as_ref().and_then(|request| request.model.as_deref()));
+                let cwd = chat
+                    .cwd
+                    .as_deref()
+                    .or_else(|| prior.as_ref().map(|request| request.cwd.as_str()))
+                    .unwrap_or(".");
+                let questions = crate::question_extraction::extract_questions(
+                    &self.registry,
+                    harness,
+                    model,
+                    cwd,
+                    &assistant_text,
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&ExtractQuestionsResult {
+                    source_message_id: p.source_message_id,
+                    questions,
+                })
+            }
             methods::PROBE_SYNC => {
                 self.workspace.probe();
                 self.doc_host.probe_open_chats();
                 RpcReply::value(&serde_json::json!({}))
             }
             methods::SYNC_STATUS => {
-                fn room_json(s: &comet_sync::RoomStatsSnapshot) -> serde_json::Value {
+                fn room_json(s: &jolt_sync::RoomStatsSnapshot) -> serde_json::Value {
                     serde_json::json!({
                         "connected": s.connected,
                         "lastPushedMs": s.last_pushed_ms,
@@ -1042,7 +1163,25 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
-                Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
+                let stream = watch_stream(self.diff_sync.watch_diffs());
+                self.diff_sync.sync_all();
+                Ok(RpcReply::Stream(stream))
+            }
+            methods::VCS_SETTINGS => RpcReply::value(&self.repos.vcs_settings()),
+            methods::SET_VCS_BACKEND => {
+                #[derive(Deserialize)]
+                struct P {
+                    backend: jolt_proto::VcsKind,
+                }
+                let p: P = parse_params(params)?;
+                let snapshot = self
+                    .repos
+                    .set_vcs(p.backend)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                self.spaces_sync.reconcile_now().await;
+                self.diff_sync.reconcile_now().await;
+                self.diff_sync.sync_all();
+                RpcReply::value(&snapshot)
             }
             methods::LIST_REPOS => RpcReply::value(&self.repos.list().await),
             methods::ADD_REPO => {
@@ -1177,7 +1316,7 @@ impl RpcService for EngineRpc {
                     .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
                 let session = self
                     .terminals
-                    .open(&cwd, p.cols, p.rows)
+                    .open_with_command(&cwd, p.cols, p.rows, p.command.as_deref())
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&session)
             }
@@ -1334,7 +1473,21 @@ mod tests {
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(forwardable(methods::QUEUE_COMMAND));
+        assert!(forwardable(methods::LIST_COMMANDS));
         assert!(forwardable(methods::SEARCH_FILES));
+    }
+
+    #[test]
+    fn command_catalog_contains_only_native_jolt_commands() {
+        let commands = jolt_commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].name, "answer");
+        assert_eq!(commands[1].name, "bro");
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.source == AgentCommandSource::Jolt)
+        );
     }
 
     #[test]

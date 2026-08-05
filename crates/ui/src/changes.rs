@@ -24,8 +24,8 @@ use gpui::{
     Window, div, font, list, prelude::*, px,
 };
 
-use comet_proto::{Chat, CheckoutDiff};
-use comet_rpc::methods;
+use jolt_proto::{Chat, CheckoutDiff};
+use jolt_rpc::methods;
 
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
@@ -418,6 +418,8 @@ fn hash64(parts: &[&str]) -> u64 {
 // ---------------------------------------------------------------------------
 
 struct ParsedDiff {
+    vcs: jolt_proto::VcsKind,
+    label: Option<String>,
     /// `checkout_id:checksum` — identity of the parsed content.
     key: String,
     truncated: bool,
@@ -427,7 +429,7 @@ struct ParsedDiff {
     files: Arc<Vec<FileDiff>>,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct FileFold {
     collapsed: bool,
     /// Bumped per toggle — keys the height tween + chevron transition.
@@ -439,6 +441,18 @@ struct FileFold {
     /// virtualized list a row scrolling back into view is a remount (the
     /// transcript's tool groups had the same flash; user report).
     toggled_at: Option<std::time::Instant>,
+}
+
+impl Default for FileFold {
+    fn default() -> Self {
+        Self {
+            collapsed: true,
+            epoch: 0,
+            from: 0.0,
+            to: 0.0,
+            toggled_at: None,
+        }
+    }
 }
 
 /// Tween arming window after a fold toggle (COLLAPSE's 180ms plus margin).
@@ -479,6 +493,7 @@ pub struct Changes {
     state: Entity<AppState>,
     diffs: Vec<CheckoutDiff>,
     started: bool,
+    enabled: bool,
     error: Option<SharedString>,
     /// Device the running watch targets: `None` = the connected engine itself,
     /// `Some(id)` = a remote chat's host (relay-forwarded). The stream only
@@ -501,6 +516,7 @@ impl Changes {
             state,
             diffs: Vec::new(),
             started: false,
+            enabled: false,
             error: None,
             watch_target: None,
             watch_task: None,
@@ -511,6 +527,13 @@ impl Changes {
             list: ListState::new(0, ListAlignment::Top, px(320.0)),
             _observe: observe,
         }
+    }
+
+    /// Reset file expansion whenever the pane opens. Missing fold entries use
+    /// the collapsed default.
+    pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.folds.clear();
+        cx.notify();
     }
 
     /// The selected chat's host device when it differs from the connected
@@ -528,6 +551,7 @@ impl Changes {
     /// Retries with a flat 2 s delay if the stream fails or ends; the last
     /// content stays visible under an error banner meanwhile.
     pub fn ensure_watch(&mut self, cx: &mut Context<Self>) {
+        self.enabled = true;
         let target = self.desired_target(cx);
         if self.started && self.watch_target == target {
             return;
@@ -545,6 +569,16 @@ impl Changes {
         self.started = true;
         self.watch_target = target.clone();
         self.watch_task = Some(Self::spawn_watch(engine, target, cx));
+    }
+
+    /// Stop producing snapshots while the pane is closed. Reopening creates a
+    /// fresh subscription, which triggers an immediate engine capture.
+    pub fn stop_watch(&mut self, cx: &mut Context<Self>) {
+        self.enabled = false;
+        self.started = false;
+        self.watch_target = None;
+        self.watch_task = None;
+        cx.notify();
     }
 
     fn spawn_watch(
@@ -621,6 +655,9 @@ impl Changes {
     fn sync(&mut self, cx: &mut Context<Self>) {
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
+        if !self.enabled {
+            return;
+        }
         self.ensure_watch(cx);
         let Some(diff) = self.resolved(cx) else {
             if self.parsed.take().is_some() {
@@ -641,6 +678,8 @@ impl Changes {
         let additions = diff.additions;
         let deletions = diff.deletions;
         let file_count = diff.files.len();
+        let vcs = diff.vcs;
+        let label = diff.label.clone();
         self.parse_task = Some(cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
@@ -664,6 +703,8 @@ impl Changes {
                 changes.highlights.clear();
                 changes.parsed = Some(ParsedDiff {
                     key,
+                    vcs,
+                    label,
                     truncated,
                     additions,
                     deletions,
@@ -828,7 +869,7 @@ impl Changes {
         let adds = file.additions;
         let dels = file.deletions;
 
-        // Chevron (comet checkout-diff-sidebar): chevron-right closed,
+        // Chevron (jolt checkout-diff-sidebar): chevron-right closed,
         // chevron-down open; gpui divs have no rotation transform at the
         // pinned rev, so the glyph swap crossfades over the same 200 ms.
         let chevron_icon = if collapsed {
@@ -916,6 +957,20 @@ impl Changes {
 
     fn render_header_strip(&self, theme: &Theme) -> Option<AnyElement> {
         let parsed = self.parsed.as_ref()?;
+        let heading = if parsed.vcs == jolt_proto::VcsKind::Jujutsu {
+            format!(
+                "{} · {} {}",
+                parsed.label.as_deref().unwrap_or("Working copy"),
+                parsed.file_count,
+                if parsed.file_count == 1 {
+                    "file"
+                } else {
+                    "files"
+                }
+            )
+        } else {
+            uncommitted_label(parsed.file_count)
+        };
         Some(
             div()
                 .flex_none()
@@ -931,7 +986,7 @@ impl Changes {
                     div()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from(uncommitted_label(parsed.file_count))),
+                        .child(SharedString::from(heading)),
                 )
                 .child(
                     div()
@@ -984,7 +1039,7 @@ fn diff_token_color(class: crate::markdown::highlight::TokenClass, theme: &Theme
 
 /// The expanded body of one file section: notices, hunk headers, +/-/context
 /// lines with a coloured accent bar, dual line-number gutters, a marker
-/// column, and paint-only syntax runs (comet checkout-diff-sidebar).
+/// column, and paint-only syntax runs (jolt checkout-diff-sidebar).
 fn render_file_body(
     file: &FileDiff,
     highlight: Option<Arc<Vec<Vec<Token>>>>,
@@ -1193,10 +1248,10 @@ impl Render for Changes {
                 .items_center()
                 .justify_center()
                 .gap(px(Theme::SPACE_SM))
-                .child(crate::loaders::gradient_spinner(
+                .child(crate::loaders::activity_orb(
                     "changes-preparing",
                     &theme,
-                    3.0,
+                    16.0,
                     cx.entity_id(),
                     cx,
                 ))
@@ -1214,7 +1269,16 @@ impl Render for Changes {
                 .justify_center()
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
-                .child(SharedString::from("No uncommitted changes"))
+                .child(SharedString::from(
+                    if resolved
+                        .as_ref()
+                        .is_some_and(|diff| diff.vcs == jolt_proto::VcsKind::Jujutsu)
+                    {
+                        "Working copy is clean"
+                    } else {
+                        "No uncommitted changes"
+                    },
+                ))
                 .into_any_element(),
             DiffPhase::List => {
                 if self.parsed.is_some() {
@@ -1237,10 +1301,10 @@ impl Render for Changes {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(crate::loaders::gradient_spinner(
+                        .child(crate::loaders::activity_orb(
                             "changes-parsing",
                             &theme,
-                            3.0,
+                            16.0,
                             cx.entity_id(),
                             cx,
                         ))
@@ -1312,6 +1376,11 @@ similarity index 90%
 rename from old_name.rs
 rename to new_name.rs
 ";
+
+    #[test]
+    fn file_folds_default_to_collapsed() {
+        assert!(FileFold::default().collapsed);
+    }
 
     #[test]
     fn parses_files_hunks_and_lines() {
@@ -1428,6 +1497,8 @@ rename to new_name.rs
             checkout_id: checkout.into(),
             device_id: device.into(),
             cwd: cwd.into(),
+            vcs: jolt_proto::VcsKind::Git,
+            label: None,
             patch: patch.into(),
             files: Vec::new(),
             additions: 0,
@@ -1489,7 +1560,7 @@ rename to new_name.rs
         assert_eq!(diff_phase(Some(&full)), DiffPhase::List);
         // Engine may report files without patch text (truncation edge).
         let mut summarized = diff("co", "d", "/w", "");
-        summarized.files.push(comet_proto::DiffFileSummary {
+        summarized.files.push(jolt_proto::DiffFileSummary {
             path: "x".into(),
             old_path: None,
             status: "modified".into(),

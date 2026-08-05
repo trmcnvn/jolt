@@ -33,6 +33,8 @@ pub(crate) struct SystemFrame {
     pub cwd: String,
     #[serde(default)]
     pub session_id: String,
+    #[serde(default)]
+    pub slash_commands: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

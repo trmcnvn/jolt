@@ -1,12 +1,12 @@
 //! Generates a session-doc snapshot fixture for the cross-language compat check
-//! (`edge/scripts/compat-check.mjs`). Usage: `cargo run -p comet-doc --example gen_fixture -- <out>`
+//! (`edge/scripts/compat-check.mjs`). Usage: `cargo run -p jolt-doc --example gen_fixture -- <out>`
 
-use comet_doc::{
+use jolt_doc::{
     MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
     fold_event_into_parts,
 };
-use comet_proto::{AgentEvent, ToolCall};
+use jolt_proto::{AgentEvent, ToolCall};
 
 fn main() {
     let out = std::env::args()

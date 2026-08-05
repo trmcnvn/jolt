@@ -1,7 +1,7 @@
 //! Terminal paint + input encoding.
 //!
-//! - the ANSI palette on the `#090909` terminal background (feature-inventory
-//!   §1.10) and the 256-color cube/grayscale resolution;
+//! - the ANSI palette on an appearance-aware terminal background and the
+//!   256-color cube/grayscale resolution;
 //! - keystroke → PTY byte encoding (printables, control keys, arrows/nav
 //!   escape sequences, Ctrl- combos, Alt prefixing);
 //! - the 12 ms input coalescer and the 80 ms resize debounce constants (the
@@ -37,9 +37,14 @@ pub const RESIZE_DEBOUNCE_MS: u64 = 80;
 // Palette
 // ---------------------------------------------------------------------------
 
-/// Terminal background — `#090909` (one step below the app's `#0a0a0a`).
-pub fn terminal_bg() -> Hsla {
-    rgb8(0x09, 0x09, 0x09)
+/// Terminal background. Dark keeps the reference `#090909`; light follows the
+/// app's main content surface.
+pub fn terminal_bg(theme: &Theme) -> Hsla {
+    if theme.appearance.is_dark() {
+        rgb8(0x09, 0x09, 0x09)
+    } else {
+        theme.bg
+    }
 }
 
 /// The 16 ANSI colors tuned for the near-black background (indexes 0-7 normal,
@@ -94,7 +99,7 @@ pub fn indexed_rgb(index: u8) -> (u8, u8, u8) {
 pub fn resolve_color(color: CellColor, theme: &Theme) -> Hsla {
     match color {
         CellColor::Foreground => theme.text,
-        CellColor::Background => terminal_bg(),
+        CellColor::Background => terminal_bg(theme),
         CellColor::Indexed(ix) => {
             let (r, g, b) = indexed_rgb(ix);
             rgb8(r, g, b)
@@ -329,7 +334,7 @@ impl gpui::Element for TerminalElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let theme = Theme::of(cx).clone();
-        let mono = font(theme.font_mono.clone());
+        let mono = font(theme.font_terminal.clone());
         // Font probe: measure the actual advance of the resolved mono font so
         // cols/rows track real glyph metrics, not a guessed aspect ratio.
         let font_size = px(TERM_FONT_SIZE);
@@ -466,13 +471,17 @@ fn shape_row(
     font_size: Pixels,
     window: &Window,
 ) -> ShapedLine {
-    let mut text = String::with_capacity(row.len());
+    let mut text = String::with_capacity(row.iter().map(|cell| cell.text.len()).sum());
     let mut runs: Vec<TextRun> = Vec::new();
     for cell in row {
         if cell.wide_spacer {
             continue;
         }
-        let ch = if cell.hidden { ' ' } else { cell.ch };
+        let grapheme = if cell.hidden {
+            if cell.wide { "  " } else { " " }
+        } else {
+            &cell.text
+        };
         let (fg, _) = cell.display_colors();
         let mut color = resolve_color(fg, theme);
         if cell.dim {
@@ -494,8 +503,8 @@ fn shape_row(
             thickness: px(1.0),
             wavy: false,
         });
-        let len = ch.len_utf8();
-        text.push(ch);
+        let len = grapheme.len();
+        text.push_str(grapheme);
         match runs.last_mut() {
             Some(last)
                 if last.color == color && last.font == cell_font && last.underline == underline =>
@@ -717,10 +726,11 @@ mod tests {
     }
 
     #[test]
-    fn terminal_bg_is_090909() {
-        let bg = terminal_bg();
-        assert_eq!(bg.s, 0.0);
-        assert!((bg.l - 9.0 / 255.0).abs() < 1e-4);
+    fn terminal_bg_follows_appearance() {
+        assert_eq!(terminal_bg(&Theme::dark()), rgb8(0x09, 0x09, 0x09));
+
+        let light = Theme::light();
+        assert_eq!(terminal_bg(&light), light.bg);
     }
 
     #[test]

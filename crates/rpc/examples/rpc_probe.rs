@@ -1,10 +1,10 @@
 //! Ad-hoc RPC probe: call or subscribe against a running engine's IPC socket.
 //!
 //! Usage:
-//!   cargo run -p comet-rpc --example rpc_probe -- ws://127.0.0.1:27801 LocalDevice '{}'
-//!   cargo run -p comet-rpc --example rpc_probe -- ws://127.0.0.1:27801 WatchSessions '{}' --stream 3
+//!   cargo run -p jolt-rpc --example rpc_probe -- ws://127.0.0.1:27801 LocalDevice '{}'
+//!   cargo run -p jolt-rpc --example rpc_probe -- ws://127.0.0.1:27801 WatchSessions '{}' --stream 3
 
-use comet_rpc::connect_ws;
+use jolt_rpc::connect_ws;
 
 #[tokio::main]
 async fn main() {

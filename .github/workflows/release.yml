@@ -4,8 +4,8 @@ name: release
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
 # then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served at comet.zeron.sh/releases/* for
-# `curl -fsSL https://comet.zeron.sh/install.sh | sh`), bumping latest.txt.
+# `jolt-releases` R2 bucket (served at jolt.trmcnvn.dev/releases/* for
+# `curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh`), bumping latest.txt.
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
@@ -40,6 +40,9 @@ jobs:
             libvulkan-dev pkg-config cmake
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
       - uses: Swatinem/rust-cache@v2
       - name: package
         run: scripts/package-linux.sh
@@ -59,6 +62,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
       - uses: Swatinem/rust-cache@v2
       - name: package dmg
         run: scripts/package-macos.sh
@@ -78,7 +84,7 @@ jobs:
       # `secrets` is not a valid context in step `if:` expressions — surface
       # the token through job env and gate on that instead.
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: b57dde68ee5964dccc025437b5478a5b
+      CLOUDFLARE_ACCOUNT_ID: 2cd5db709b9369660ed7f1d52527c933
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -88,18 +94,18 @@ jobs:
         run: |
           ver="${GITHUB_REF_NAME#v}"
           ls dist/
-          ls dist/ | grep -q "comet-$ver-" \
+          ls dist/ | grep -q "jolt-$ver-" \
             || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
           echo "VERSION=$ver" >> "$GITHUB_ENV"
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
-      - name: upload to R2 (comet.zeron.sh/releases/*)
+      - name: upload to R2 (jolt.trmcnvn.dev/releases/*)
         if: env.CLOUDFLARE_API_TOKEN != ''
         run: |
           for f in dist/*; do
-            npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
+            npx wrangler@4 r2 object put "jolt-releases/$(basename "$f")" \
               --file "$f" --remote
           done
           # manifest.json: version + per-artifact sha256 — the auto-updater
@@ -112,8 +118,8 @@ jobs:
               '.files[$name] = {sha256: $sha}' <<<"$manifest")
           done
           printf '%s' "$manifest" > manifest.json
-          npx wrangler@4 r2 object put comet-native-releases/manifest.json \
+          npx wrangler@4 r2 object put jolt-releases/manifest.json \
             --file manifest.json --remote
           printf '%s' "$VERSION" > latest.txt
-          npx wrangler@4 r2 object put comet-native-releases/latest.txt \
+          npx wrangler@4 r2 object put jolt-releases/latest.txt \
             --file latest.txt --remote

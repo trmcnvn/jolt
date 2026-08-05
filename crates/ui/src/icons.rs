@@ -1,16 +1,23 @@
 //! Embedded icon assets + the gpui [`AssetSource`] that serves them.
 //!
-//! The set mirrors the original comet's icon usage exactly:
+//! The set mirrors the original jolt's icon usage exactly:
 //! - Most glyphs come from the **Solar Icons** set (Linear weight) by 480 Design,
 //!   the same set the Electron app used via `@solar-icons/react`. Solar Icons is
 //!   licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/);
 //!   attribution: "Solar Icons by 480 Design".
 //! - The terminal tab glyphs (`terminal`, `plus`, `close`) and the stop square
-//!   are ports of the hand-drawn inline SVGs in comet's `terminal-panel.tsx` /
+//!   are ports of the hand-drawn inline SVGs in jolt's `terminal-panel.tsx` /
 //!   `composer-actions.tsx`.
-//! - The harness brand marks (`claude-mark`, `openai-mark`, `cursor-mark`) are
-//!   ports of comet's `icons.tsx`. gpui tints SVGs with the text color, so the
-//!   Claude mark's brand orange is applied at the call site ([`CLAUDE_BRAND`]).
+//! - The inherited harness brand marks (`claude-mark`, `openai-mark`,
+//!   `cursor-mark`) are ports of jolt's `icons.tsx`; `pi-mark` is Pi's official
+//!   mark from https://pi.dev/logo-auto.svg.
+//! - `jj-mark` is Jujutsu's official logo from docs.jj-vcs.dev, © 2025 J.
+//!   Jennings, adapted to SVG by Lucas Garron, licensed CC BY 4.0. Its opaque
+//!   app-icon background is removed because gpui renders SVGs as tinted alpha
+//!   masks and would otherwise show only a solid square.
+//! gpui tints SVGs with the text color, so the Claude mark's brand orange is
+//! applied at the call site
+//!   ([`CLAUDE_BRAND`]).
 //!
 //! Icons render via [`icon`]: `icon(icons::PAPERCLIP).size(px(16.)).text_color(…)`.
 
@@ -60,7 +67,7 @@ icon_assets![
     // terminal/plus/return ports) — the set has no branch icon.
     (GIT_BRANCH, "git-branch"),
     (SIDEBAR_MINIMALISTIC, "sidebar-minimalistic"),
-    // Mirrored variant (comet window-controls.tsx `-scale-x-100`): the LEFT
+    // Mirrored variant (jolt window-controls.tsx `-scale-x-100`): the LEFT
     // sidebar toggle shows the panel line on the left; gpui divs have no
     // scale transform at the pinned rev, so the flip is baked into the asset.
     (SIDEBAR_MINIMALISTIC_LEFT, "sidebar-minimalistic-left"),
@@ -90,6 +97,7 @@ icon_assets![
     (TRASH_BIN_MINIMALISTIC, "trash-bin-minimalistic"),
     (SETTINGS_MINIMALISTIC, "settings-minimalistic"),
     (LOGOUT_2, "logout-2"),
+    (USER, "user"),
     (MAGNIFER, "magnifer"),
     (COMMAND, "command"),
     (DOCUMENT, "document"),
@@ -103,7 +111,7 @@ icon_assets![
     (INFO_CIRCLE, "info-circle"),
     (DANGER_TRIANGLE, "danger-triangle"),
     (CHAT_ROUND_LINE, "chat-round-line"),
-    // Hand-drawn comet glyphs (terminal-panel.tsx / composer-actions.tsx /
+    // Hand-drawn jolt glyphs (terminal-panel.tsx / composer-actions.tsx /
     // menu-check.tsx / logo.tsx).
     (TERMINAL, "terminal"),
     (PLUS, "plus"),
@@ -111,14 +119,16 @@ icon_assets![
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),
-    (COMET_LOGO, "comet-logo"),
-    // Harness brand marks (icons.tsx).
+    (JOLT_LOGO, "jolt-logo"),
+    // Harness brand marks.
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),
+    (PI_MARK, "pi-mark"),
+    (JJ_MARK, "jj-mark"),
     (CURSOR_MARK, "cursor-mark"),
 ];
 
-/// The Claude mark's brand orange (`#D97757`) — comet keeps it even on the
+/// The Claude mark's brand orange (`#D97757`) — jolt keeps it even on the
 /// monochrome surface.
 pub fn claude_brand() -> Hsla {
     gpui::rgb(0xD97757).into()

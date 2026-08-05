@@ -1,18 +1,18 @@
 //! Chat auto-titling — after the first user+assistant exchange completes on an
-//! untitled chat, name it with the harness's cheapest model (port of comet's
+//! untitled chat, name it with the harness's cheapest model (port of jolt's
 //! `generateTitle` in `sessions.ts`).
 //!
 //! Flow (fire-and-forget from the run task; every failure is a silent skip with
 //! tracing — a title must never fail or delay a run):
 //! 1. skip when the chat already has a title (or has no workspace row);
 //! 2. pick the run harness's cheapest model (small-tier name heuristic, else the
-//!    last listed model — comet's `cheapestModel`);
+//!    last listed model — jolt's `cheapestModel`);
 //! 3. run a one-shot, non-streaming-collected titling prompt through the
 //!    [`Harness`] trait (read-only sandbox, minimal reasoning, auto-approve),
-//!    retrying on comet's short backoff ladder; fall back to the prompt's first
+//!    retrying on jolt's short backoff ladder; fall back to the prompt's first
 //!    words when every attempt produces nothing;
 //! 4. re-check the title (a user rename during generation wins);
-//! 5. when the chat sits in a comet worktree (`comet/<name>` branch), rename the
+//! 5. when the chat sits in a jolt worktree (`jolt/<name>` branch), rename the
 //!    branch from the title and update the chat's branch row;
 //! 6. `rename_chat` in the workspace doc.
 
@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
-use comet_harness::{CancellationToken, RunControls, SteerMessage};
-use comet_proto::{
+use jolt_harness::{CancellationToken, RunControls, SteerMessage};
+use jolt_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     UserInputAnswer, UserInputQuestion,
 };
@@ -32,7 +32,7 @@ use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
 
 /// Throwaway title runs are cheap but still cross a process boundary — retry a
-/// couple of times with a short backoff before falling back (comet's ladder).
+/// couple of times with a short backoff before falling back (jolt's ladder).
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
 struct Inner {
@@ -114,9 +114,9 @@ impl TitleGenerator {
         }
 
         // Rename the worktree branch when the chat still sits on its original
-        // comet/<name> branch (guards live inside rename_worktree_branch).
+        // jolt/<name> branch (guards live inside rename_worktree_branch).
         if let (Some(chat_cwd), Some(branch)) = (&latest.cwd, &latest.branch)
-            && branch.starts_with("comet/")
+            && branch.starts_with("jolt/")
         {
             match self
                 .inner
@@ -160,12 +160,20 @@ impl TitleGenerator {
             "Reply with ONLY a concise 3-5 word title in Title Case (no quotes, no punctuation) \
              for a coding session that begins with this request:\n\n{prompt}"
         );
+        let mut model_options = serde_json::Map::new();
+        // Titling never needs repository-provided Pi settings/extensions and
+        // has no interactive input surface. Explicitly ignore project
+        // resources instead of triggering (and auto-cancelling) a trust ask.
+        if harness_id == HarnessId::Pi {
+            model_options.insert("projectTrust".into(), serde_json::json!("ignore"));
+            model_options.insert("toolAccess".into(), serde_json::json!("readOnly"));
+        }
         for attempt in 0..=RETRY_DELAYS_MS.len() {
             let request = RunRequest {
                 prompt: title_prompt.clone(),
                 model: cheap.clone(),
                 reasoning: Some(ReasoningLevel::Minimal),
-                model_options: serde_json::Map::new(),
+                model_options: model_options.clone(),
                 cwd: cwd.to_string(),
                 sandbox: SandboxLevel::ReadOnly,
                 auto_approve: true,
@@ -192,7 +200,7 @@ impl TitleGenerator {
     }
 }
 
-/// The cheapest model a harness offers (comet's `cheapestModel` heuristic):
+/// The cheapest model a harness offers (jolt's `cheapestModel` heuristic):
 /// prefer a small-tier name (haiku/mini/nano/flash/small/lite), else the last
 /// listed model; `None` when the catalog is empty (harness picks its default).
 fn cheapest_model(models: &[Model]) -> Option<String> {
@@ -221,8 +229,8 @@ fn clean_title(raw: &str) -> String {
 
 /// Drive one titling run through the harness: no steering, questions resolved
 /// empty immediately (a titling prompt must never block on input).
-async fn collect_text(
-    harness: &dyn comet_harness::Harness,
+pub(crate) async fn collect_text(
+    harness: &dyn jolt_harness::Harness,
     request: RunRequest,
 ) -> Result<String, EngineError> {
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
@@ -233,6 +241,7 @@ async fn collect_text(
             rx
         }),
         steering: steer_rx,
+        bash: tokio::sync::mpsc::channel(1).1,
         interrupt: CancellationToken::new(),
     };
     let mut stream = harness.run(request, controls).await?;
@@ -262,7 +271,7 @@ async fn collect_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::Model;
+    use jolt_proto::Model;
 
     fn model(id: &str, label: &str) -> Model {
         Model {

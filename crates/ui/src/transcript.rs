@@ -35,9 +35,10 @@ use gpui::{
     Window, canvas, div, img, list, prelude::*, px, quad,
 };
 
-use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-use comet_proto::ToolCall;
+use jolt_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+use jolt_proto::ToolCall;
 
+use crate::markdown::LinkTarget;
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
@@ -60,10 +61,10 @@ pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
 pub const GAP_TURN: f32 = 14.0;
 /// Vertical gap between blocks within a turn.
 pub const GAP_BLOCK: f32 = 8.0;
-/// Transcript column max width (comet 46rem).
+/// Transcript column max width (jolt 46rem).
 pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 /// Tool chip row height / gap — analytic, so fold heights need no measurement.
-/// A row is the guide rail + a 30px chip card centered in it (comet
+/// A row is the guide rail + a 30px chip card centered in it (jolt
 /// tool-chip.tsx: `TOOL_CHIP_HEIGHT = 38`, card `h-[30px]`); rows stack with no
 /// gap so the rail reads continuous.
 pub const CHIP_HEIGHT: f32 = 38.0;
@@ -252,7 +253,7 @@ pub struct Row {
     pub turn_start: bool,
     pub kind: RowKind,
     /// The owning message entry — hover anywhere on the entry's rows reveals
-    /// its timestamp strip (comet chat-view.tsx `group`/`group-hover`).
+    /// its timestamp strip (jolt chat-view.tsx `group`/`group-hover`).
     pub entry_id: SharedString,
     /// Epoch-ms for the 16px hover-timestamp strip UNDER this row: set on the
     /// LAST row of a completed entry (user rows always; assistant rows only
@@ -509,23 +510,23 @@ pub fn rows_for_entry(
     rows
 }
 
-/// `COMET_FRAME_STATS=1` logs live-row render-cost percentiles (p50/p95 µs
+/// `JOLT_FRAME_STATS=1` logs live-row render-cost percentiles (p50/p95 µs
 /// over rolling windows of [`FRAME_STATS_WINDOW`] samples) at `warn` level —
 /// the smoothness measurement knob. Off by default; zero cost when off.
 fn frame_stats_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
-        .get_or_init(|| std::env::var("COMET_FRAME_STATS").is_ok_and(|v| !v.is_empty() && v != "0"))
+        .get_or_init(|| std::env::var("JOLT_FRAME_STATS").is_ok_and(|v| !v.is_empty() && v != "0"))
 }
 
 const FRAME_STATS_WINDOW: usize = 240;
 
-/// `COMET_NO_RENDER_CACHE=1` bypasses the cross-frame flatten cache — the
+/// `JOLT_NO_RENDER_CACHE=1` bypasses the cross-frame flatten cache — the
 /// A/B knob for the frame-cost measurement above.
 fn render_cache_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| {
-        std::env::var("COMET_NO_RENDER_CACHE").is_ok_and(|v| !v.is_empty() && v != "0")
+        std::env::var("JOLT_NO_RENDER_CACHE").is_ok_and(|v| !v.is_empty() && v != "0")
     })
 }
 
@@ -670,19 +671,19 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
 ///
-/// The rule lives in `comet_proto::view` so the terminal viewport reports the
+/// The rule lives in `jolt_proto::view` so the terminal viewport reports the
 /// same summary; this only adapts the row model's [`ToolItem`] to it.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     let pairs: Vec<(ToolCall, bool)> = tools.iter().map(|t| (t.call.clone(), t.is_error)).collect();
-    comet_proto::view::tool_group_summary(&pairs)
+    jolt_proto::view::tool_group_summary(&pairs)
 }
 
 // `single_line` and the per-kind chip label/detail are shared with the terminal
-// viewport (`comet_proto::view`): a tool must be named identically on every
+// viewport (`jolt_proto::view`): a tool must be named identically on every
 // surface, and the one-line collapse is needed for the same reason in both (a
 // literal newline breaks gpui's ellipsis logic and would be a cursor move in a
 // cell grid).
-pub use comet_proto::view::{single_line, tool_chip_content};
+pub use jolt_proto::view::{single_line, tool_chip_content};
 
 /// Analytic expanded-chips height — no measurement needed for the fold tween.
 pub fn chips_height(count: usize) -> f32 {
@@ -696,32 +697,467 @@ pub fn chips_height(count: usize) -> f32 {
 // Working indicator flavour (pure; rendered by the shell strip)
 // ---------------------------------------------------------------------------
 
-/// Rotating flavour vocabulary (20 words / 7s, seeded per chat).
-pub const FLAVOUR_WORDS: [&str; 20] = [
-    "Thinking",
-    "Pondering",
-    "Scheming",
-    "Brewing",
-    "Weaving",
-    "Tinkering",
-    "Musing",
-    "Composing",
-    "Sifting",
-    "Untangling",
-    "Distilling",
-    "Sketching",
-    "Plotting",
-    "Riffing",
+/// Rotating working-message vocabulary sourced from the local Pi
+/// `whimsical.ts` extension (7s per item, seeded per chat). The extension's
+/// trailing ASCII ellipses are omitted because the shell adds one consistently.
+pub const FLAVOUR_WORDS: [&str; 453] = [
+    "Schlepping",
     "Combobulating",
-    "Percolating",
-    "Marinating",
+    "Doing",
+    "Channelling",
+    "Vibing",
+    "Concocting",
+    "Spelunking",
+    "Transmuting",
+    "Imagining",
+    "Pontificating",
+    "Whirring",
+    "Cogitating",
+    "Honking",
+    "Flibbertigibbeting",
     "Noodling",
-    "Puzzling",
-    "Conjuring",
+    "Percolating",
+    "Ruminating",
+    "Simmering",
+    "Marinating",
+    "Fermenting",
+    "Gestating",
+    "Hatching",
+    "Brewing",
+    "Steeping",
+    "Contemplating",
+    "Musing",
+    "Pondering",
+    "Mulling",
+    "Daydreaming",
+    "Woolgathering",
+    "Dithering",
+    "Faffing",
+    "Puttering",
+    "Tinkering",
+    "Fiddling",
+    "Noodging",
+    "Finagling",
+    "Wrangling",
+    "Jiggling",
+    "Wiggling",
+    "Shimmying",
+    "Galumphing",
+    "Perambulating",
+    "Meandering",
+    "Traipsing",
+    "Moseying",
+    "Sauntering",
+    "Ambling",
+    "Pottering",
+    "Bumbling",
+    "Futzing",
+    "Schmalzing",
+    "Kerfuffling",
+    "Bamboozling",
+    "Discombobulating",
+    "Recombobulating",
+    "Unbefuddling",
+    "Defenestrating",
+    "Confabulating",
+    "Persnicketing",
+    "Flummoxing",
+    "Befuddling",
+    "Snorkeling",
+    "Yodeling",
+    "Zigzagging",
+    "Ricocheting",
+    "Somersaulting",
+    "Pirouetting",
+    "Canoodling",
+    "Schmoozing",
+    "Kibbitzing",
+    "Skedaddling",
+    "Scampering",
+    "Skittering",
+    "Sashaying",
+    "Swashbuckling",
+    "Oscillating",
+    "Undulating",
+    "Pulsating",
+    "Effervescing",
+    "Fizzing",
+    "Bubbling",
+    "Perplexing",
+    "Mystifying",
+    "Enchanting",
+    "Bewitching",
+    "Beguiling",
+    "Mesmerizing",
+    "Bedazzling",
+    "Sparkling",
+    "Glittering",
+    "Scintillating",
+    "Coruscating",
+    "Phosphorescing",
+    "Luminescing",
+    "Sublimating",
+    "Synthesizing",
+    "Amalgamating",
+    "Procrastinating",
+    "Dillydallying",
+    "Lollygagging",
+    "Dawdling",
+    "Malingering",
+    "Skulking",
+    "Lurking",
+    "Sleuthing",
+    "Rummaging",
+    "Fossicking",
+    "Foraging",
+    "Scavenging",
+    "Absquatulating",
+    "Vamoosing",
+    "Absconding",
+    "Grooving",
+    "Jamming",
+    "Improvising",
+    "Extemporizing",
+    "Freestyling",
+    "Frolicking",
+    "Gamboling",
+    "Blorping",
+    "Flonking",
+    "Snurfling",
+    "Whomping",
+    "Zorping",
+    "Biffing",
+    "Splunging",
+    "Thwacking",
+    "Gonkulating",
+    "Splorfing",
+    "Wibbling",
+    "Wobbling",
+    "Squonking",
+    "Plonking",
+    "Bonking",
+    "Zonking",
+    "Flumping",
+    "Clomping",
+    "Squelching",
+    "Schlurping",
+    "Glurping",
+    "Burbling",
+    "Gurgling",
+    "Splooshing",
+    "Whooshing",
+    "Swooshing",
+    "Kerplunking",
+    "Thunking",
+    "Clunking",
+    "Clanking",
+    "Rattling",
+    "Jostling",
+    "Rustling",
+    "Bustling",
+    "Hustling",
+    "Miffing",
+    "Boffing",
+    "Snazzifying",
+    "Pizzazzing",
+    "Razzmatazzing",
+    "Bedoodling",
+    "Doodling",
+    "Scribbling",
+    "Squiggling",
+    "Wriggling",
+    "Niggling",
+    "Higgling",
+    "Piggling",
+    "Figgling",
+    "Gibbering",
+    "Jabbering",
+    "Blathering",
+    "Blithering",
+    "Withering",
+    "Slithering",
+    "Tethering",
+    "Feathering",
+    "Weathering",
+    "Leathering",
+    "Heathering",
+    "Smoldering",
+    "Moldering",
+    "Shouldering",
+    "Bouldering",
+    "Tottering",
+    "Teetering",
+    "Tittering",
+    "Flittering",
+    "Jittering",
+    "Frittering",
+    "Twittering",
+    "Nattering",
+    "Chattering",
+    "Clattering",
+    "Splattering",
+    "Battering",
+    "Scattering",
+    "Shattering",
+    "Flattering",
+    "Pattering",
+    "Tattering",
+    "Mattering",
+    "Yammering",
+    "Hammering",
+    "Stammering",
+    "Clamoring",
+    "Glamoring",
+    "Enamoring",
+    "Shimmering",
+    "Glimmering",
+    "Brimming",
+    "Skimming",
+    "Trimming",
+    "Primming",
+    "Whimming",
+    "Humming",
+    "Strumming",
+    "Thrumming",
+    "Drumming",
+    "Plumbing",
+    "Thumbing",
+    "Numbing",
+    "Fumbling",
+    "Grumbling",
+    "Mumbling",
+    "Rumbling",
+    "Stumbling",
+    "Tumbling",
+    "Crumbling",
+    "Jumbling",
+    "Humbling",
+    "Bungling",
+    "Jungling",
+    "Mangling",
+    "Wangling",
+    "Dangling",
+    "Tangling",
+    "Jangling",
+    "Angling",
+    "Struggling",
+    "Mingling",
+    "Tingling",
+    "Jingling",
+    "Singling",
+    "Ringling",
+    "Kingling",
+    "Consulting the void",
+    "Asking the electrons",
+    "Bribing the compiler",
+    "Negotiating with entropy",
+    "Whispering to the bits",
+    "Tickling the stack",
+    "Massaging the heap",
+    "Appeasing the garbage collector",
+    "Summoning semicolons",
+    "Herding pointers",
+    "Untangling spaghetti",
+    "Polishing the algorithms",
+    "Waxing philosophical",
+    "Consulting ancient scrolls",
+    "Reading tea leaves",
+    "Shaking the magic 8-ball",
+    "Sacrificing to the demo gods",
+    "Warming up the hamsters",
+    "Spinning up the squirrels",
+    "Caffeinating",
+    "Existentially questioning",
+    "Having a little think",
+    "Stroking chin thoughtfully",
+    "Squinting at the problem",
+    "Staring into the abyss",
+    "Abyss staring back",
+    "Achieving enlightenment",
+    "Transcending mere computation",
+    "Ascending to a higher plane",
+    "Communing with the machine spirit",
+    "Performing arcane rituals",
+    "Invoking elder functions",
+    "Consulting the oracle",
+    "Divining the answer",
+    "Scrying the codebase",
+    "Dowsing for bugs",
+    "Rearranging deck chairs",
+    "Shuffling bits around",
+    "Aligning the chakras",
+    "Reticulating splines",
+    "Reversing the polarity",
+    "Calibrating the flux capacitor",
+    "Charging the crystals",
+    "Tuning the vibrations",
+    "Adjusting the cosmic frequency",
+    "Waiting for a sign",
+    "Hoping for the best",
+    "Manifesting solutions",
+    "Willing it into existence",
+    "Believing really hard",
+    "Politely asking the CPU",
+    "Bribing the runtime",
+    "Flirting with the database",
+    "Sweet-talking the API",
+    "Negotiating with deadlines",
+    "Having words with the cache",
+    "Reasoning with the memory",
+    "Pleading with the logs",
+    "Bargaining with fate",
+    "Making offerings to the CI",
+    "Praying to the uptime gods",
+    "Consulting the rubber duck",
+    "Interrogating the stack trace",
+    "Cross-examining the debugger",
+    "Petitioning the kernel",
+    "Lobbying the scheduler",
+    "Schmoozing the network",
+    "Buttering up the firewall",
+    "Wining and dining the servers",
+    "Taking the bytes out for lunch",
+    "Giving the code a pep talk",
+    "Reading the room",
+    "Checking under the hood",
+    "Kicking the tires",
+    "Shaking loose the cobwebs",
+    "Dusting off the neurons",
+    "Greasing the gears",
+    "Oiling the cogs",
+    "Winding up the clockwork",
+    "Stoking the furnace",
+    "Feeding the machine",
+    "Watering the logic tree",
+    "Pruning the decision branches",
+    "Harvesting the outputs",
+    "Planting computational seeds",
+    "Nurturing the algorithm",
+    "Raising the exceptions",
+    "Taming wild pointers",
+    "Herding cats in memory",
+    "Teaching old code new tricks",
+    "Whispering sweet nothings to the compiler",
+    "Serenading the syntax",
+    "Dancing with dependencies",
+    "Waltzing through the codebase",
+    "Tangoing with type errors",
+    "Doing the deployment dance",
+    "Having a moment of clarity",
+    "Experiencing a flash of insight",
+    "Channeling the ancient developers",
+    "Receiving transmissions from the cloud",
+    "Asking the hamsters to run faster",
+    "Convincing the pixels to cooperate",
+    "Teaching electrons new tricks",
+    "Bribing the byte fairies",
+    "Whispering passwords to the void",
+    "Negotiating with cosmic rays",
+    "Flattering the floating points",
+    "Seducing the semicolons",
+    "Wooing the while loops",
+    "Charming the curly braces",
+    "Hypnotizing the hash tables",
+    "Mesmerizing the memory banks",
+    "Enchanting the error handlers",
+    "Bewitching the boolean logic",
+    "Spellbinding the stack frames",
+    "Hexing the hexadecimals",
+    "Jinxing the JSON parsers",
+    "Cursing the cache misses",
+    "Blessing the build process",
+    "Anointing the algorithms",
+    "Consecrating the callbacks",
+    "Sanctifying the source code",
+    "Exorcising the exceptions",
+    "Purifying the parameters",
+    "Cleansing the closures",
+    "Baptizing the binary",
+    "Absolving the abstractions",
+    "Redeeming the recursion",
+    "Forgiving the for loops",
+    "Pardoning the pointers",
+    "Liberating the lambdas",
+    "Emancipating the enums",
+    "Freeing the functions",
+    "Releasing the references",
+    "Unbinding the variables",
+    "Untying the type knots",
+    "Unraveling the regex",
+    "Decoding the mysteries",
+    "Cracking the conundrums",
+    "Solving the riddles of RAM",
+    "Unlocking the secrets of silicon",
+    "Discovering hidden semicolons",
+    "Unearthing buried bugs",
+    "Excavating ancient APIs",
+    "Archeologically analyzing the architecture",
+    "Fossil hunting in the functions",
+    "Spelunking through the stack",
+    "Scuba diving in the data",
+    "Snorkeling through the streams",
+    "Parasailing past the parameters",
+    "Hang gliding through the heap",
+    "Bungee jumping into the backend",
+    "Skydiving through the source",
+    "Surfing the syntax waves",
+    "Skateboarding down the stack trace",
+    "Snowboarding through the schemas",
+    "Mountain climbing the modules",
+    "Hiking through the headers",
+    "Trekking through the trees",
+    "Backpacking through the binaries",
+    "Camping in the codebase",
+    "Glamping in the globals",
+    "Picnicking with the processes",
+    "Barbecuing the bugs",
+    "Roasting the race conditions",
+    "Grilling the glitches",
+    "Sautéing the syntax errors",
+    "Flambéing the failures",
+    "Caramelizing the callbacks",
+    "Braising the breakpoints",
+    "Poaching the pointers",
+    "Blanching the branches",
+    "Searing the segments",
+    "Smoking the subroutines",
+    "Curing the code smells",
+    "Pickling the packages",
+    "Preserving the protocols",
+    "Canning the constants",
+    "Bottling the buffers",
+    "Jarring the JavaScript",
+    "Decanting the data structures",
+    "Aerating the arrays",
+    "Letting the logic breathe",
+    "Aging the algorithms gracefully",
+    "Maturing the methods",
+    "Ripening the results",
+    "Seasoning the solutions",
+    "Spicing up the specs",
+    "Garnishing the getters",
+    "Plating the output nicely",
+    "Presenting with pizzazz",
+    "Adding a dash of elegance",
+    "Sprinkling some magic dust",
+    "Drizzling debug sauce",
+    "Folding in the features",
+    "Whisking the widgets",
+    "Kneading the namespaces",
+    "Rolling out the runtime",
+    "Proofing the promises",
+    "Letting the dough rise",
+    "Baking at 350 kilobytes",
+    "Frosting the functions",
+    "Decorating the deployment",
+    "Icing the interfaces",
+    "Glazing the graphics",
+    "Topping with tests",
+    "Cherry-picking the commits",
 ];
 pub const FLAVOUR_ROTATE_SECS: i64 = 7;
 
-/// The flavour word for a seed at an elapsed time.
+/// The whimsical working message for a seed at an elapsed time.
 pub fn flavour_word(seed: u64, elapsed_secs: i64) -> &'static str {
     let step = (elapsed_secs.max(0) / FLAVOUR_ROTATE_SECS) as u64;
     FLAVOUR_WORDS[((seed.wrapping_add(step)) % FLAVOUR_WORDS.len() as u64) as usize]
@@ -914,7 +1350,7 @@ pub struct Transcript {
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
-    /// strip (comet chat-view.tsx `group-hover`; the rows report hover
+    /// strip (jolt chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
     /// clear the reveal when the old row's leave event arrives after the new
     /// row's enter (enter/leave order across rows is not guaranteed).
@@ -1345,7 +1781,7 @@ impl Transcript {
     // ---- attachment read-back (user-attachments.tsx + transcript cache) ----
 
     /// Devices that may own a user message's attachment files: the chat's host
-    /// device (uploads targeted it) plus this device (comet's
+    /// device (uploads targeted it) plus this device (jolt's
     /// `uniqueIds([attachmentDeviceId, m.device_id])`).
     fn attachment_device_ids(&self, cx: &Context<Self>) -> Vec<String> {
         let state = self.state.read(cx);
@@ -1527,7 +1963,7 @@ impl Transcript {
                     .opacity(
                         0.35 + 0.4
                             * motion::pulse_wave(motion::pulse_delta(
-                                &motion::COMET_PULSE,
+                                &motion::JOLT_PULSE,
                                 cx.entity_id(),
                                 cx,
                             )),
@@ -1608,6 +2044,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    open_link: Some(self.open_link_for(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -1650,6 +2087,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    open_link: Some(self.open_link_for(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -1694,7 +2132,7 @@ impl Transcript {
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
         };
 
-        // Hover-revealed timestamp strip (comet chat-view.tsx `Timestamp`):
+        // Hover-revealed timestamp strip (jolt chat-view.tsx `Timestamp`):
         // a RESERVED 16px lane under the entry's last row — the label only
         // flips opacity, so revealing it never shifts the virtualizer's
         // layout. User entries align end (under the bubble), assistant start.
@@ -1770,7 +2208,7 @@ impl Transcript {
             .justify_center()
             .pt(px(top_gap))
             .pb(px(bottom_pad))
-            // Wide gutters (comet `px-4 @3xl:px-12`) around the 46rem column.
+            // Wide gutters (jolt `px-4 @3xl:px-12`) around the 46rem column.
             .px(px(48.0))
             .child(
                 div()
@@ -1819,6 +2257,23 @@ impl Transcript {
         render::CopyUi { handler, copied_ix }
     }
 
+    fn open_link_for(&self, cx: &mut Context<Self>) -> render::OpenLinkFn {
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.as_deref())
+            .map(std::path::PathBuf::from);
+        Rc::new(move |raw, _window, cx| {
+            let target = LinkTarget::parse(raw, cwd.as_deref());
+            if let Some(url) = target.open_url() {
+                cx.open_url(&url);
+            } else {
+                tracing::warn!(destination = raw, "could not convert link target to URL");
+            }
+        })
+    }
+
     /// Request highlights for the code blocks of a tree. `only` limits to one
     /// block index (split rows); `None` covers the whole tree (live rows).
     fn code_highlight_for(
@@ -1860,7 +2315,7 @@ impl Transcript {
 
         let toggle_id = row_id.clone();
         let tool_count = tools.len();
-        // Header (comet tool-group.tsx): a small chevron tile centered over the
+        // Header (jolt tool-group.tsx): a small chevron tile centered over the
         // chips' guide rail, then the quiet 12px summary.
         let header = div()
             .id(SharedString::from(format!("{row_id}-hdr")))
@@ -1875,7 +2330,7 @@ impl Transcript {
             // Quiet even when children failed: agents routinely have failed
             // probes mid-work, and a red HEADER read as "this whole step
             // broke" (user report). Failures still show on the individual
-            // chips (destructive tint, comet tool-chip.tsx) and in the
+            // chips (destructive tint, jolt tool-chip.tsx) and in the
             // summary's "· N failed" count.
             .text_color(theme.text_muted)
             .hover(|s| s.text_color(theme.text))
@@ -2024,7 +2479,7 @@ fn user_mention_text(
         .into_any_element()
 }
 
-/// The transcript ErrorChip — an exact port of comet chat-view.tsx
+/// The transcript ErrorChip — an exact port of jolt chat-view.tsx
 /// `ErrorChip`: a 34px row (`rounded-[10px] border border-red-400/[0.16]
 /// bg-red-400/[0.05] px-2 text-[12px]`) with a 20px red-washed tile holding a
 /// 12px DangerTriangle (`bg-red-400/[0.12] text-red-300/80`), a medium
@@ -2148,9 +2603,9 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
         .into_any_element()
 }
 
-/// A small glyph standing in for the tool's icon (comet uses an icon set; a
+/// A small glyph standing in for the tool's icon (jolt uses an icon set; a
 /// quiet monochrome character keeps the tile without shipping SVGs).
-/// The glyph for a tool call (comet tool-chip.tsx `toolIcon`, Solar set).
+/// The glyph for a tool call (jolt tool-chip.tsx `toolIcon`, Solar set).
 fn tool_icon_path(call: &ToolCall) -> &'static str {
     match call {
         ToolCall::Exec { .. } => crate::icons::COMMAND,
@@ -2167,7 +2622,7 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 
 /// One tool chip row: a guide rail on the left (continuous across stacked
 /// chips — the rail spans the row's full height) threading the chips to their
-/// group toggle, then the chip card (comet tool-chip.tsx).
+/// group toggle, then the chip card (jolt tool-chip.tsx).
 fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
     let (label, detail) = tool_chip_content(&tool.call);
     let tint = if tool.is_error {
@@ -2340,7 +2795,7 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_doc::MessagePart;
+    use jolt_doc::MessagePart;
 
     // ---- streaming parse wiring (the transcript side, not the parser) ----
 
@@ -2755,7 +3210,7 @@ mod tests {
     /// the RAW text either way, so projection never perturbs the diff key.
     #[test]
     fn user_rows_project_file_mentions_into_chips() {
-        let raw = "look at [composer.rs](comet-file:crates/ui/src/composer.rs) please";
+        let raw = "look at [composer.rs](jolt-file:crates/ui/src/composer.rs) please";
         let mut entry = assistant("u3", MessageStatus::Complete, vec![]);
         entry.role = MessageRole::User;
         entry.status = None;
@@ -2765,7 +3220,7 @@ mod tests {
             panic!("expected a user row");
         };
         assert!(
-            !text.contains("comet-file:"),
+            !text.contains("jolt-file:"),
             "raw link left visible: {text}"
         );
         assert!(text.contains("composer.rs"));
@@ -2913,11 +3368,11 @@ mod tests {
         );
         let todo = ToolCall::Todo {
             items: vec![
-                comet_proto::TodoItem {
+                jolt_proto::TodoItem {
                     text: "a".into(),
                     done: true,
                 },
-                comet_proto::TodoItem {
+                jolt_proto::TodoItem {
                     text: "b".into(),
                     done: false,
                 },
@@ -3015,6 +3470,10 @@ mod tests {
 
     #[test]
     fn flavour_words_rotate_every_seven_seconds() {
+        assert_eq!(FLAVOUR_WORDS.len(), 453);
+        assert_eq!(FLAVOUR_WORDS.first(), Some(&"Schlepping"));
+        assert_eq!(FLAVOUR_WORDS.last(), Some(&"Cherry-picking the commits"));
+        assert!(FLAVOUR_WORDS.iter().all(|item| !item.ends_with("...")));
         let seed = flavour_seed("chat-1");
         assert_eq!(flavour_word(seed, 0), flavour_word(seed, 6));
         assert_ne!(flavour_word(seed, 0), flavour_word(seed, 7));

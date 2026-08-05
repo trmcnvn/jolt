@@ -1,13 +1,45 @@
-# Rust harness integration: Claude Code + Codex (2026-07)
+# Rust harness integration: Claude Code + Codex + Pi (2026-08)
 
 ## Decision
 - Claude Code: spawn installed `claude` CLI, speak stream-json directly. NO crates.io SDK dep
   (crate "claude-agent-sdk" is name-squatted w/ fake anthropics repo; `claude-codes` 2.1.x is a
   reasonable serde-types reference to vendor from). Python SDK source = authoritative wire spec.
-- Codex: spawn `codex app-server`, JSON-RPC 2.0 over stdio — port comet's codex.ts (which already
+- Codex: spawn `codex app-server`, JSON-RPC 2.0 over stdio — port jolt's codex.ts (which already
   bypasses the SDK). Only option with token deltas + turn/steer + turn/interrupt + thread/resume +
   model/list + approval requests. codex-rs crates are NOT published (git dep not recommended).
   `codex exec --json` = CI-only surface (no deltas/steer/approvals).
+- Pi: spawn the installed `pi --mode rpc` CLI and speak its official bidirectional LF-delimited
+  JSON protocol. The Rust app does not embed the Node SDK. RPC supports live model discovery,
+  text/reasoning/tool events, extension UI, sessions, direct bash execution, steering, and abort.
+
+## Pi RPC protocol
+- Start `pi --mode rpc` in the run cwd. Select models with separate `--provider` and `--model`
+  arguments; Jolt stores the catalog key as `provider/model-id` because Pi spans providers.
+- Discover authenticated models with `get_available_models`; select each in the ephemeral
+  discovery process and query `get_available_thinking_levels` for its exact ladder.
+- Run setup calls `get_state` for the provider-qualified model and session id, then sends
+  `prompt {message, images?}`. Resume uses Pi's cwd-scoped `--session-id`.
+- Composer `!command` / `!!command` work with every harness. Pi uses its `bash` RPC with
+  `excludeFromContext: false` / `true`; a warm persistent process handles the command directly,
+  while an idle reaped session is resumed in a short-lived RPC process. Claude, Codex, and other
+  harnesses use host-side Bash; Jolt prepends single-bang results as hidden context to the next
+  agent turn, while double-bang results remain transcript-only. Only one- and two-bang prefixes
+  enter Bash mode; three or more fall through as regular agent prompts. The composer shows an
+  agent-context or local-only Bash chip, and sending immediately inserts an
+  optimistic transcript entry whose output remains pending until execution completes.
+- Events: `message_update` text/thinking deltas, `message_end` usage and assistant boundary,
+  `tool_execution_start|end`, `extension_ui_request`, and `agent_settled`. Completion keys off
+  `agent_settled`, not `agent_end`, because retry/compaction/queued continuations may follow.
+- Active steering uses `steer`; idle continuation uses `prompt`. Interrupt sends `abort`, then
+  escalates SIGTERM to SIGKILL like the other subprocess adapters.
+- RPC mode never displays Pi's project-trust prompt. Jolt exposes a project-resources model
+  option and uses its existing input panel when trust-requiring resources exist with no saved
+  Pi decision. The prompt supports run-only or saved canonical-folder decisions in Pi's trust
+  store; `--approve`/`--no-approve` apply the resulting decision for the run.
+- Pi has no sandbox. Jolt exposes full local tool access or a read-only built-in tool set; full
+  access runs with the local user's permissions. Pi provider auth remains owned by
+  `~/.pi/agent/auth.json`; configure it with Pi's `/login`, not Jolt's single-provider account
+  switcher.
 
 ## Claude CLI protocol
 - One-shot: `claude -p "<prompt>" --output-format stream-json --verbose --include-partial-messages [--bare]`
@@ -30,7 +62,7 @@
   - CLI->client: can_use_tool {tool_name, input, permission_suggestions...} — reply
     {"behavior":"allow","updatedInput":{...}} or {"behavior":"deny","message":...}.
     AskUserQuestion ALWAYS reaches can_use_tool -> intercept, requestInput UI, allow with
-    updatedInput.answers. (Same mechanism as comet claude.ts.)
+    updatedInput.answers. (Same mechanism as jolt claude.ts.)
   - interrupt: control request; >=2.1.205 response carries {still_queued:[uuids]}.
 - Resume: --resume=<session_id> (equals form; cwd-scoped), --continue, --fork-session.
 - One-shot interrupt: SIGTERM (kills bash trees, runs SessionEnd hooks, exit 143).
@@ -57,7 +89,7 @@
   clean exit, EPIPE swallowing.
 
 ## Shared shape
-Both reduce to: spawn child, frame JSONL stdout (+ id-multiplexing), write stdin lines, map to one
+All three reduce to: spawn child, frame JSONL stdout (+ id-multiplexing), write stdin lines, map to one
 AgentEvent enum, mpsc steering mailbox, cancellation token kills child.
 
 ## Capability matrix to replicate (from packages/harness)
@@ -69,4 +101,5 @@ steering (step-boundary via stdin / turn/steer with expectedTurnId + turn/start 
 subagent frame filtering; error-code mapping.
 (Citations in agent transcript: code.claude.com/docs/en/headless, agent-sdk/typescript,
 claude-code#24594, claude-agent-sdk-python query.py/subprocess_cli.py, Codex app-server docs +
-README, openai.com "Unlocking the Codex harness", codex#5028.)
+README, openai.com "Unlocking the Codex harness", codex#5028, Pi `docs/rpc.md`,
+`docs/security.md`, and `docs/session-format.md`.)

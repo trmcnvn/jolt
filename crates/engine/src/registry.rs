@@ -1,5 +1,5 @@
 //! HarnessRegistry — the engine's harness catalog: eager instances (mock) plus lazy
-//! slots resolved on first use (claude-code spawns subprocess discovery; codex/cursor
+//! slots resolved on first use (Claude Code, Codex, and Pi spawn subprocess discovery; Cursor
 //! later). Lazy slots carry a static descriptor so `ListHarnesses` never forces a spawn.
 
 use std::collections::HashMap;
@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use comet_harness::{Harness, HarnessError, mock::MockHarness};
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, ReasoningLevel, SteeringMode};
+use jolt_harness::{Harness, HarnessError, mock::MockHarness};
+use jolt_proto::{AgentEvent, DoneStatus, HarnessId, ReasoningLevel, SteeringMode};
 
 /// What `ListHarnesses` reports per harness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,12 +121,12 @@ impl HarnessRegistry {
 }
 
 /// The production registry: MockHarness (hidden from production pickers) plus a lazy
-/// `claude-code` slot resolved through `comet_harness` on first use (subprocess
+/// `claude-code` slot resolved through `jolt_harness` on first use (subprocess
 /// discovery only happens when a run/model call actually needs it).
 pub fn default_registry() -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
     // claude/codex resolve doesn't pay the shell-startup latency inline.
-    comet_harness::shell_env::prewarm();
+    jolt_harness::shell_env::prewarm();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(MockHarness {
         script: vec![
@@ -138,7 +138,7 @@ pub fn default_registry() -> HarnessRegistry {
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-1".into(),
-                call: comet_proto::ToolCall::Exec {
+                call: jolt_proto::ToolCall::Exec {
                     command: "cargo test --workspace".into(),
                 },
             },
@@ -148,7 +148,7 @@ pub fn default_registry() -> HarnessRegistry {
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-2".into(),
-                call: comet_proto::ToolCall::Exec {
+                call: jolt_proto::ToolCall::Exec {
                     command: "git log -5 --oneline --decorate && git merge-base HEAD origin/main"
                         .into(),
                 },
@@ -184,13 +184,13 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
         },
-        Box::new(|| Ok(Arc::new(comet_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
+        Box::new(|| Ok(Arc::new(jolt_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
     );
     // Codex, same lazy pattern: the static descriptor mirrors CodexHarness
     // exactly (`describe()` after the first resolve must not change the
     // catalog entry) — "Codex" per the original HARNESS_LABEL, StepBoundary
     // steering via native `turn/steer`, and the unified reasoning ladder from
-    // comet_harness::codex::catalog. CLI discovery only happens when a
+    // jolt_harness::codex::catalog. CLI discovery only happens when a
     // run/model call actually resolves the slot.
     registry.register_lazy(
         HarnessDescriptor {
@@ -208,7 +208,24 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Ultra,
             ],
         },
-        Box::new(|| Ok(Arc::new(comet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
+        Box::new(|| Ok(Arc::new(jolt_harness::CodexHarness::new()) as Arc<dyn Harness>)),
+    );
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Pi,
+            name: "Pi".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+        },
+        Box::new(|| Ok(Arc::new(jolt_harness::PiHarness::new()) as Arc<dyn Harness>)),
     );
     registry
 }
@@ -249,12 +266,17 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_and_codex_slots() {
+    fn default_registry_lists_mock_claude_codex_and_pi_slots() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
             ids,
-            vec![HarnessId::Mock, HarnessId::ClaudeCode, HarnessId::Codex]
+            vec![
+                HarnessId::Mock,
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Pi,
+            ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
@@ -262,6 +284,28 @@ mod tests {
         // cheap; CLI discovery is deferred to models()/run()).
         let codex = registry.resolve(HarnessId::Codex).unwrap();
         assert_eq!(codex.id(), HarnessId::Codex);
+        let pi = registry.resolve(HarnessId::Pi).unwrap();
+        assert_eq!(pi.id(), HarnessId::Pi);
+    }
+
+    #[test]
+    fn pi_lazy_descriptor_matches_resolved_harness() {
+        let registry = default_registry();
+        let before = registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HarnessId::Pi)
+            .unwrap();
+        registry.resolve(HarnessId::Pi).unwrap();
+        let after = registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HarnessId::Pi)
+            .unwrap();
+        assert_eq!(before.name, after.name);
+        assert_eq!(before.supports_steering, after.supports_steering);
+        assert_eq!(before.steering_mode, after.steering_mode);
+        assert_eq!(before.reasoning_levels, after.reasoning_levels);
     }
 
     /// The Codex lazy descriptor must be indistinguishable from `describe()`

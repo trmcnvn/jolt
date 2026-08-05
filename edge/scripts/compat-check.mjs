@@ -1,8 +1,8 @@
-// Cross-language compat gate: a snapshot written by the Rust `comet-doc` crate must load in
+// Cross-language compat gate: a snapshot written by the Rust `jolt-doc` crate must load in
 // loro-crdt JS and materialize the same tail shape the edge serves.
 //
 // Usage: node scripts/compat-check.mjs <snapshot-path>
-// (Generate the snapshot with: cargo run -p comet-doc --example gen_fixture -- /tmp/fixture.loro)
+// (Generate the snapshot with: cargo run -p jolt-doc --example gen_fixture -- /tmp/fixture.loro)
 
 import { readFileSync } from "node:fs";
 import { LoroDoc } from "loro-crdt";
@@ -52,9 +52,9 @@ check(
 check(
   "tool part shape",
   parts[1]?.kind === "tool" &&
-    parts[1].call?.kind === "exec" &&
-    parts[1].call?.command === "cargo test" &&
-    parts[1].isError === false,
+  parts[1].call?.kind === "exec" &&
+  parts[1].call?.command === "cargo test" &&
+  parts[1].isError === false,
   JSON.stringify(parts[1])
 );
 check("post-tool text", parts[2]?.kind === "text" && parts[2].text === "All green.");

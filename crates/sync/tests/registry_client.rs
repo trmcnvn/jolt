@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use comet_doc::{REGISTRY_DOC_ID, RegistryDoc};
-use comet_proto::{Chat, Device, Session, SessionStatus};
-use comet_sync::registry::mock_server::MockRegistryServer;
-use comet_sync::{DocsStore, RegistryClient, RegistryEvent};
+use jolt_doc::{REGISTRY_DOC_ID, RegistryDoc};
+use jolt_proto::{Chat, Device, Session, SessionStatus};
+use jolt_sync::registry::mock_server::MockRegistryServer;
+use jolt_sync::{DocsStore, RegistryClient, RegistryEvent};
 
 fn ts(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)

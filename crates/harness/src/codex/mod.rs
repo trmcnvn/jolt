@@ -1,6 +1,6 @@
 //! Codex harness: spawns the installed `codex` CLI as `codex app-server` and
 //! speaks JSON-RPC 2.0 over stdio — the same interface the Codex IDE extension
-//! uses (spec: docs/research/harness.md; behavior ported from comet's
+//! uses (spec: docs/research/harness.md; behavior ported from jolt's
 //! `packages/harness/src/codex.ts`).
 //!
 //! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`) then
@@ -42,9 +42,9 @@ use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+use jolt_proto::{
+    AgentCommand, AgentCommandSource, AgentEvent, CommandContext, DoneStatus, HarnessId, Model,
+    ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -184,7 +184,7 @@ impl Harness for CodexHarness {
         HarnessId::Codex
     }
     fn display_name(&self) -> &str {
-        // "Codex" (not "Codex CLI") — comet composer/defaults.ts
+        // "Codex" (not "Codex CLI") — jolt composer/defaults.ts
         // HARNESS_LABEL; must also match the registry's lazy descriptor so
         // the catalog entry doesn't change after the first resolve.
         "Codex"
@@ -209,6 +209,45 @@ impl Harness for CodexHarness {
         self.resolve_executable()?;
         Ok(static_models())
     }
+    async fn commands(&self, context: CommandContext) -> Result<Vec<AgentCommand>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let mut cmd = Command::new(&exe);
+        cmd.arg("app-server");
+        crate::compose_child_path(&mut cmd, &exe);
+        if !context.cwd.is_empty() {
+            cmd.current_dir(&context.cwd);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("codex child has no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("codex child has no stdout".into()))?;
+        let (client, mut incoming) = RpcClient::new(stdin, stdout);
+        let drain = tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+        initialize(&client).await?;
+        let result = list_skills(&client, &context.cwd).await.map(|skills| {
+            skills
+                .into_iter()
+                .map(|skill| AgentCommand {
+                    name: skill.invocation,
+                    description: skill.description,
+                    argument_hint: None,
+                    source: AgentCommandSource::Skill,
+                })
+                .collect()
+        });
+        shutdown_child(&mut child, self.kill_grace).await;
+        drain.abort();
+        result
+    }
 
     async fn run(
         &self,
@@ -224,7 +263,7 @@ impl Harness for CodexHarness {
         // works). Escalate that exact shape instead of shipping a session
         // where nothing can run — parity note: the Claude adapter effectively
         // grants full access anyway (auto-approved can_use_tool).
-        if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
+        if request.sandbox == jolt_proto::SandboxLevel::WorkspaceWrite
             && worktree_on_slashed_branch(&request.cwd)
         {
             tracing::warn!(
@@ -232,7 +271,7 @@ impl Harness for CodexHarness {
                 "codex sandbox escalated to danger-full-access: linked worktree on a \
                  slash-named branch trips codex's worktree-mount derivation"
             );
-            request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
+            request.sandbox = jolt_proto::SandboxLevel::DangerFullAccess;
         }
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
@@ -266,7 +305,7 @@ impl Harness for CodexHarness {
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "comet_harness::codex", "stderr: {line}");
+                    tracing::debug!(target: "jolt_harness::codex", "stderr: {line}");
                     tail.push(&line);
                 }
             });
@@ -368,6 +407,87 @@ fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+#[derive(Debug, Clone)]
+struct CodexSkill {
+    /// App-server's canonical (possibly plugin-qualified) metadata name.
+    name: String,
+    /// User-facing `$name`, and therefore Jolt's `/name` alias.
+    invocation: String,
+    description: Option<String>,
+    path: String,
+}
+
+async fn initialize(client: &RpcClient) -> Result<(), HarnessError> {
+    client
+        .request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "jolt",
+                    "title": "Jolt",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": { "experimentalApi": true },
+            }),
+        )
+        .await?;
+    client.notify("initialized", None);
+    Ok(())
+}
+
+async fn list_skills(client: &RpcClient, cwd: &str) -> Result<Vec<CodexSkill>, HarnessError> {
+    let response = client
+        .request("skills/list", json!({ "cwds": [cwd] }))
+        .await?;
+    let skills = response
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+        .and_then(|entry| entry.get("skills"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|skill| skill.get("enabled").and_then(Value::as_bool) != Some(false))
+        .filter_map(|skill| {
+            let name = skill.get("name")?.as_str()?.to_owned();
+            let path = skill.get("path")?.as_str()?.to_owned();
+            let invocation = name.rsplit(':').next().unwrap_or(&name).to_owned();
+            (!name.is_empty() && !invocation.is_empty() && !path.is_empty()).then(|| CodexSkill {
+                name,
+                invocation,
+                description: skill
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                path,
+            })
+        })
+        .collect();
+    Ok(skills)
+}
+
+fn codex_input(text: &str, skills: &[CodexSkill]) -> Value {
+    let Some(command) = text.strip_prefix('/') else {
+        return json!([{ "type": "text", "text": text }]);
+    };
+    let command_end = command.find(char::is_whitespace).unwrap_or(command.len());
+    let name = &command[..command_end];
+    let Some(skill) = skills
+        .iter()
+        .find(|skill| skill.invocation == name || skill.name == name)
+    else {
+        return json!([{ "type": "text", "text": text }]);
+    };
+    let suffix = &command[command_end..];
+    let invocation = &skill.invocation;
+    json!([
+        { "type": "text", "text": format!("${invocation}{suffix}") },
+        { "type": "skill", "name": skill.name, "path": skill.path },
+    ])
+}
+
 /// Rotate the assistant message id; returns (previous, next).
 fn rotate(id: &mut String) -> (String, String) {
     let prev = std::mem::replace(id, new_message_id());
@@ -401,13 +521,14 @@ async fn run_session(session: Session) {
     let RunControls {
         request_input,
         mut steering,
+        bash: _,
         interrupt,
     } = controls;
     let request_input = Arc::new(request_input);
 
     // ---- wire params ------------------------------------------------------
     // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (comet sessions run unattended; the sandbox
+    // regardless of `auto_approve` (jolt sessions run unattended; the sandbox
     // is the guardrail): never surface wire approvals. "on-request" turned
     // every command into a yes/no question (user report: "asking me for
     // approval at every step"). The approval-as-input plumbing below stays for
@@ -439,20 +560,14 @@ async fn run_session(session: Session) {
 
     // ---- handshake + thread + first turn (interruptible) ------------------
     let setup = async {
-        client
-            .request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "comet-native",
-                        "title": "Comet",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": { "experimentalApi": true },
-                }),
-            )
-            .await?;
-        client.notify("initialized", None);
+        initialize(&client).await?;
+        let skills = match list_skills(&client, &request.cwd).await {
+            Ok(skills) => skills,
+            Err(error) => {
+                tracing::debug!(target: "jolt_harness::codex", %error, "skill discovery failed");
+                Vec::new()
+            }
+        };
 
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
@@ -462,7 +577,7 @@ async fn run_session(session: Session) {
                 // A missing/foreign rollout falls back to a fresh thread.
                 Err(e) => {
                     tracing::debug!(
-                        target: "comet_harness::codex",
+                        target: "jolt_harness::codex",
                         "thread/resume failed (starting fresh): {e}"
                     );
                     client
@@ -476,11 +591,11 @@ async fn run_session(session: Session) {
                 .await?
         };
         let thread_id = thread["thread"]["id"].as_str().unwrap_or("").to_owned();
-        Ok::<String, HarnessError>(thread_id)
+        Ok::<(String, Vec<CodexSkill>), HarnessError>((thread_id, skills))
     };
     let thread_id = tokio::select! {
         res = setup => match res {
-            Ok(thread_id) => thread_id,
+            Ok(value) => value,
             Err(e) => {
                 let _ = event_tx
                     .send(Ok(AgentEvent::Done {
@@ -507,11 +622,12 @@ async fn run_session(session: Session) {
             return;
         }
     };
+    let (thread_id, skills) = thread_id;
 
     let turn_params = |text: &str| -> Value {
         let mut p = serde_json::Map::new();
         p.insert("threadId".into(), Value::String(thread_id.clone()));
-        p.insert("input".into(), json!([{ "type": "text", "text": text }]));
+        p.insert("input".into(), codex_input(text, &skills));
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert(
             "sandboxPolicy".into(),
@@ -803,7 +919,7 @@ async fn run_session(session: Session) {
                         let steer_params = json!({
                             "threadId": thread_id,
                             "expectedTurnId": expected,
-                            "input": [{ "type": "text", "text": text }],
+                            "input": codex_input(&text, &skills),
                         });
                         match client.request("turn/steer", steer_params).await {
                             Ok(_) => {
@@ -828,7 +944,7 @@ async fn run_session(session: Session) {
                             // fallback for older Codex without steering).
                             Err(e) => {
                                 tracing::debug!(
-                                    target: "comet_harness::codex",
+                                    target: "jolt_harness::codex",
                                     "turn/steer rejected (queued as next turn): {e}"
                                 );
                                 if router.active.as_deref() == Some(expected.as_str())
@@ -885,7 +1001,7 @@ async fn run_session(session: Session) {
                             .await
                         {
                             tracing::debug!(
-                                target: "comet_harness::codex",
+                                target: "jolt_harness::codex",
                                 "turn/interrupt failed (escalation will reap): {e}"
                             );
                         }
@@ -988,7 +1104,7 @@ async fn steer_as_new_turn(
 }
 
 // ---------------------------------------------------------------------------
-// Approvals (approval-as-input parity with comet's UX)
+// Approvals (approval-as-input parity with jolt's UX)
 // ---------------------------------------------------------------------------
 
 type RequestInputFn = Box<
@@ -1016,7 +1132,7 @@ fn handle_server_request(
     );
     if !is_approval {
         tracing::debug!(
-            target: "comet_harness::codex",
+            target: "jolt_harness::codex",
             "unhandled server request: {method}"
         );
         client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
@@ -1177,6 +1293,21 @@ mod tests {
         assert!(!worktree_on_slashed_branch(&detached));
         assert!(!worktree_on_slashed_branch(""));
         assert!(!worktree_on_slashed_branch("/nonexistent/path"));
+    }
+
+    #[test]
+    fn slash_skill_input_is_structured_and_unknown_commands_are_plain_text() {
+        let skills = vec![CodexSkill {
+            name: "review".into(),
+            invocation: "review".into(),
+            description: None,
+            path: "/tmp/review/SKILL.md".into(),
+        }];
+        let input = codex_input("/review staged changes", &skills);
+        assert_eq!(input[0]["text"], "$review staged changes");
+        assert_eq!(input[1]["type"], "skill");
+        assert_eq!(input[1]["path"], "/tmp/review/SKILL.md");
+        assert_eq!(codex_input("/unknown", &skills)[0]["text"], "/unknown");
     }
 
     #[test]

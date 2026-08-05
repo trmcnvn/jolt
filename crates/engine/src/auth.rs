@@ -1,5 +1,5 @@
 //! Auth — the engine owns the WorkOS session for its device (feature-inventory §3.7,
-//! ARCHITECTURE §5). Port of comet's `apps/backend/src/auth.ts`.
+//! ARCHITECTURE §5). Port of jolt's `apps/backend/src/auth.ts`.
 //!
 //! The engine is a public client: it builds the AuthKit authorize URL itself but
 //! delegates the secret-bearing **code exchange** and **refresh** to the edge Worker
@@ -15,8 +15,9 @@
 //!   dir; access tokens are cached with dual-clock expiry (monotonic AND wall, whichever
 //!   aged more — see [`AccessEntry`]) and refreshed on demand plus by a background loop,
 //!   so the device-room relay and room clients always dial with a live `?token=`, even
-//!   on the first redial after a laptop wakes from sleep. Org onboarding: an org-less session is `NeedsOrganization`; `SelectOrg`
-//!   runs an org-scoped refresh and the state follows the returned token's `org_id`.
+//!   on the first redial after a laptop wakes from sleep. An org-less session is
+//!   `NeedsOrganization`; setup adopts the sole membership or creates the hidden
+//!   "Personal" organization, then scopes the session to it automatically.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ use tokio::sync::watch;
 use crate::EngineError;
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
+const PERSONAL_ORG_NAME: &str = "Personal";
 /// Refresh when the cached token has less than this much life left.
 const TOKEN_SLACK: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -59,7 +61,7 @@ pub struct OrgMembership {
 }
 
 /// AuthStatus stream payload (`SignedOut | NeedsOrganization{user} |
-/// SignedIn{user, orgId?}`). Serializes as the canonical [`comet_proto::AuthState`]
+/// SignedIn{user, orgId?}`). Serializes as the canonical [`jolt_proto::AuthState`]
 /// wire shape (`{"state": "signedIn", …}`) so every client parses one form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthState {
@@ -93,18 +95,18 @@ impl AuthState {
     }
 
     /// The proto wire twin — the one shape the engine emits over AuthStatus.
-    pub fn to_proto(&self) -> comet_proto::AuthState {
-        let profile = |user: &AuthUser| comet_proto::UserProfile {
+    pub fn to_proto(&self) -> jolt_proto::AuthState {
+        let profile = |user: &AuthUser| jolt_proto::UserProfile {
             id: user.id.clone(),
             email: user.email.clone(),
             name: user.name.clone(),
         };
         match self {
-            AuthState::SignedOut => comet_proto::AuthState::SignedOut,
-            AuthState::NeedsOrganization { user } => comet_proto::AuthState::NeedsOrganization {
+            AuthState::SignedOut => jolt_proto::AuthState::SignedOut,
+            AuthState::NeedsOrganization { user } => jolt_proto::AuthState::NeedsOrganization {
                 user: profile(user),
             },
-            AuthState::SignedIn { user, org_id } => comet_proto::AuthState::SignedIn {
+            AuthState::SignedIn { user, org_id } => jolt_proto::AuthState::SignedIn {
                 user: profile(user),
                 org_id: org_id.clone(),
             },
@@ -132,7 +134,7 @@ pub struct AuthConfig {
     pub workos_client_id: Option<String>,
     /// WorkOS API base (authorize URL host).
     pub workos_api_base: String,
-    /// Dev-mode bearer/user id (mirrors the old `COMET_EDGE_TOKEN` behavior).
+    /// Dev-mode bearer/user id (mirrors the old `JOLT_EDGE_TOKEN` behavior).
     pub dev_user_id: String,
     /// Loopback callback port; `None` = ephemeral.
     pub callback_port: Option<u16>,
@@ -217,6 +219,9 @@ struct AuthInner {
     /// Single-flight refresh: WorkOS refresh tokens are single-use (rotated per
     /// exchange); two concurrent refreshes would race and could revoke the session.
     refresh_gate: tokio::sync::Mutex<()>,
+    /// Automatic one-time organization provisioning. Multiple attached viewports
+    /// may observe `NeedsOrganization` together; only one may list/create/select.
+    onboarding_gate: tokio::sync::Mutex<()>,
     /// Loopback callback listener port, bound lazily on the first headed sign-in.
     loopback: tokio::sync::Mutex<Option<u16>>,
 }
@@ -269,6 +274,7 @@ impl Auth {
                 access: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 refresh_gate: tokio::sync::Mutex::new(()),
+                onboarding_gate: tokio::sync::Mutex::new(()),
                 loopback: tokio::sync::Mutex::new(None),
             }),
         }
@@ -360,7 +366,7 @@ impl Auth {
                 return;
             }
             let mut state_rx = auth.watch_state();
-            let mut wake = comet_sync::wake::subscribe();
+            let mut wake = jolt_sync::wake::subscribe();
             loop {
                 if !state_rx.borrow().is_signed_in() {
                     if state_rx.changed().await.is_err() {
@@ -451,6 +457,32 @@ impl Auth {
 
     // -- organizations ------------------------------------------------------
 
+    /// Ensure the signed-in user has Jolt's single hidden organization.
+    /// Existing users keep their sole membership; first-time users receive a
+    /// private organization named "Personal". More than one membership is an
+    /// explicit error rather than silently opening an arbitrary identity store.
+    pub async fn ensure_personal_org(&self) -> Result<(), EngineError> {
+        if self.inner.workos.is_none() || self.state().is_signed_in() {
+            return Ok(());
+        }
+        let _gate = self.inner.onboarding_gate.lock().await;
+        if self.state().is_signed_in() {
+            return Ok(());
+        }
+        if !matches!(self.state(), AuthState::NeedsOrganization { .. }) {
+            return Err(EngineError::Other("not signed in".into()));
+        }
+        let orgs = self.list_orgs().await?;
+        match orgs.as_slice() {
+            [] => self.create_org(PERSONAL_ORG_NAME).await,
+            [org] => self.select_org(&org.organization_id).await,
+            _ => Err(EngineError::Other(
+                "this account belongs to multiple organizations; remove the extras before continuing"
+                    .into(),
+            )),
+        }
+    }
+
     pub async fn list_orgs(&self) -> Result<Vec<OrgMembership>, EngineError> {
         if self.inner.workos.is_none() {
             return Ok(Vec::new());
@@ -467,7 +499,7 @@ impl Auth {
     }
 
     /// Create an org (the edge makes us its first admin member) and scope to it.
-    pub async fn create_org(&self, name: &str) -> Result<(), EngineError> {
+    async fn create_org(&self, name: &str) -> Result<(), EngineError> {
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -488,7 +520,7 @@ impl Auth {
 
     /// Scope the session to an org: one refresh with `organizationId`; the state follows
     /// the returned token's `org_id` claim.
-    pub async fn select_org(&self, organization_id: &str) -> Result<(), EngineError> {
+    async fn select_org(&self, organization_id: &str) -> Result<(), EngineError> {
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -620,12 +652,16 @@ impl Auth {
         {
             return Ok(Some(entry.token.clone()));
         }
-        let Some(refresh_token) = lock(&self.inner.stored)
+        let Some((refresh_token, current_org_id)) = lock(&self.inner.stored)
             .as_ref()
-            .map(|s| s.refresh_token.clone())
+            .map(|s| (s.refresh_token.clone(), s.org_id.clone()))
         else {
             return Ok(None);
         };
+        // WorkOS does not guarantee that an unscoped refresh preserves the
+        // session's current organization. Pin routine refreshes explicitly so
+        // every fresh bearer still authorizes the already-open workspace.
+        let requested_org_id = organization_id.map(str::to_string).or(current_org_id);
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct RefreshBody<'a> {
@@ -643,7 +679,7 @@ impl Auth {
             .post(&url)
             .json(&RefreshBody {
                 refresh_token: &refresh_token,
-                organization_id,
+                organization_id: requested_org_id.as_deref(),
             })
             .send()
             .await;
@@ -682,6 +718,36 @@ impl Auth {
             .await
             .map_err(|e| EngineError::Other(format!("malformed refresh response: {e}")))?;
         let org_id = jwt_claims(&tokens.access_token).and_then(|c| c.org_id);
+        if let Some(expected_org) = requested_org_id.as_deref()
+            && org_id.as_deref() != Some(expected_org)
+        {
+            tracing::warn!(
+                expected_org,
+                actual_org = org_id.as_deref().unwrap_or("<none>"),
+                "auth: refreshed token changed workspace scope"
+            );
+            // Refresh tokens rotate. Preserve the returned credential, but
+            // clear the invalid scope and access token so reconnecting rooms
+            // cannot present a bearer for the wrong workspace. The auth gate
+            // asks the user to select a workspace again.
+            let user = {
+                let mut stored = lock(&self.inner.stored);
+                let Some(session) = stored.as_mut() else {
+                    return Ok(None);
+                };
+                session.refresh_token = tokens.refresh_token;
+                session.org_id = None;
+                session.user.clone()
+            };
+            *lock(&self.inner.access) = None;
+            self.persist(lock(&self.inner.stored).as_ref());
+            self.inner
+                .state_tx
+                .send_replace(AuthState::NeedsOrganization { user });
+            return Err(EngineError::Other(format!(
+                "token refresh changed workspace scope (expected {expected_org})"
+            )));
+        }
         let entry = AccessEntry::fresh(tokens.access_token.clone());
         tracing::info!(ttl_s = entry.ttl.as_secs(), "auth: access token refreshed");
         *lock(&self.inner.access) = Some(entry);
@@ -802,10 +868,10 @@ fn state_for(user: AuthUser, org_id: Option<String>) -> AuthState {
     }
 }
 
-/// The relay/room token seam: `Auth` IS a [`comet_rpc::TokenSource`], so the host relay
+/// The relay/room token seam: `Auth` IS a [`jolt_rpc::TokenSource`], so the host relay
 /// and link cache always dial with a fresh bearer after refreshes.
 #[async_trait::async_trait]
-impl comet_rpc::TokenSource for Auth {
+impl jolt_rpc::TokenSource for Auth {
     async fn token(&self) -> Option<String> {
         if self.inner.workos.is_some() && !self.state().is_signed_in() {
             return None;
@@ -873,21 +939,21 @@ async fn handle_loopback_conn(
                         auth.finish_sign_in(result);
                         (
                             "200 OK",
-                            page("Signed in. You can close this tab and return to Comet."),
+                            page("Signed in. You can close this tab and return to Jolt."),
                         )
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "auth: loopback code exchange failed");
                         (
                             "502 Bad Gateway",
-                            page("Sign-in failed during token exchange — check the Comet logs."),
+                            page("Sign-in failed during token exchange — check the Jolt logs."),
                         )
                     }
                 }
             }
             _ => (
                 "400 Bad Request",
-                page("Invalid or expired sign-in link. Start again from Comet."),
+                page("Invalid or expired sign-in link. Start again from Jolt."),
             ),
         }
     };
@@ -1085,8 +1151,8 @@ mod tests {
             })
         );
         // The proto type itself round-trips the emitted value.
-        let parsed: comet_proto::AuthState = serde_json::from_value(value).expect("proto parse");
-        assert!(matches!(parsed, comet_proto::AuthState::SignedIn { .. }));
+        let parsed: jolt_proto::AuthState = serde_json::from_value(value).expect("proto parse");
+        assert!(matches!(parsed, jolt_proto::AuthState::SignedIn { .. }));
         assert_eq!(
             serde_json::to_value(AuthState::SignedOut).expect("json"),
             serde_json::json!({"state": "signedOut"})

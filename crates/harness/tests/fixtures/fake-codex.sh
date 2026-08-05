@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fake Codex app-server for comet-harness tests.
+# Fake Codex app-server for jolt-harness tests.
 #
 # Speaks scripted JSON-RPC 2.0 over stdio: initialize handshake, thread
 # start/resume, then a scenario picked from the turn/start prompt text. Driven
@@ -18,11 +18,16 @@ fail_turn() { # $1 = request id, $2 = message
 read -r line || exit 1 # initialize
 has "$line" '"method":"initialize"' || exit 1
 has "$line" '"experimentalApi":true' || exit 1
-has "$line" '"name":"comet-native"' || exit 1
+has "$line" '"name":"jolt"' || exit 1
 emit "{\"id\":$(rid "$line"),\"result\":{\"userAgent\":\"fake-codex\"}}"
 
 read -r line || exit 1 # initialized notification (no reply)
 has "$line" '"method":"initialized"' || exit 1
+
+# Command discovery happens before every run and is also used standalone.
+read -r line || exit 1
+has "$line" '"method":"skills/list"' || exit 1
+emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"cwd\":\"/tmp\",\"skills\":[{\"name\":\"review\",\"description\":\"Review changes\",\"path\":\"/tmp/review/SKILL.md\",\"enabled\":true}]}]}}"
 
 # ---- thread start / resume -------------------------------------------------
 read -r line || exit 1

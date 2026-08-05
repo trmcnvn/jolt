@@ -1,6 +1,6 @@
-# Comet — Complete Feature Inventory (parity checklist for the native rewrite)
+# Jolt — Complete Feature Inventory (parity checklist for the native rewrite)
 
-Source: exploration of ~/github/comet on 2026-07-19. Rewrite keeps ONLY the Loro path; token-usage
+Source: exploration of ~/github/jolt on 2026-07-19. Rewrite keeps ONLY the Loro path; token-usage
 display EXCLUDED. File paths refer to the reference repo.
 
 ## 0. Architecture orientation
@@ -9,22 +9,22 @@ display EXCLUDED. File paths refer to the reference repo.
 - Two transports, one contract: UI<->backend = IPC (UiRpc); backend<->backend = device-room relay
   DO on the edge (ControlRpc). WebRTC mesh is GONE (replaced by relay).
 - KEEP (Loro/DO): transcripts = per-chat Loro docs via session-room DO; commands
-  (run/steer/interrupt/respondInput) = durable doc entries executed by the chat's host.
+  (run/bash/steer/interrupt/respondInput) = durable doc entries executed by the chat's host.
 - DROP: messages sync over Postgres logical replication, device-addressed run RPCs,
   WatchMessages, WebRTC + signaling.
-- NOTE: chats/sessions/devices/checkout-diffs entity sync is STILL Postgres-based in comet — the rewrite
+- NOTE: chats/sessions/devices/checkout-diffs entity sync is STILL Postgres-based in jolt — the rewrite
   must re-home it (decision: per-org workspace Loro doc, see ARCHITECTURE.md).
 
 ## 1. Desktop app
 ### 1.1 Window shell
 - 1320x880 (min 900x600), frameless-inset title bar, traffic lights {14,15}, opaque #0a0a0a bg.
 - External links open in OS browser; single-instance lock; dev vs packaged ports (26634/26654) and
-  data dirs (.comet-dev/.comet). Fullscreen hides traffic lights -> cluster reflows.
+  data dirs (.jolt-dev/.jolt). Fullscreen hides traffic lights -> cluster reflows.
 
 ### 1.2 App phases (App.tsx)
-- Three phases with crossfade: Gate (loading/reconnect/login card over bg-grid), OrgGate ("Create
-  your workspace" + existing org memberships + "Use a different account"), app (router).
-- Boot Splash: comet-wave loader, fades out (splash-out) once connected && authReady (15s cap),
+- Three phases with crossfade: Gate (loading/reconnect/login card over bg-grid), automatic hidden
+  organization setup (first sign-in creates `Personal`; no picker/creation UI), app (router).
+- Boot Splash: jolt-wave loader, fades out (splash-out) once connected && authReady (15s cap),
   never returns mid-session.
 
 ### 1.3 Shell layout (__root.tsx)
@@ -75,7 +75,7 @@ display EXCLUDED. File paths refer to the reference repo.
 - Pickers: HarnessModelPicker (harness rail + models, harness locked once chat exists),
   TraitsPicker (reasoning + advertised model options; trigger shows non-defaults "High · 1M · Fast"),
   RepoPicker (search, Open folder… in-app browser w/ breadcrumbs + keys + skeletons, Clone from
-  URL…, Create new repo…), BranchPicker (search + isolated-worktree toggle ~/.comet/worktrees/…).
+  URL…, Create new repo…), BranchPicker (search + isolated-worktree toggle ~/.jolt/worktrees/…).
 
 ### 1.8 Conversation / transcript
 - ONE transcript source = doc projection. Optimistic echoes until first doc frame.
@@ -99,7 +99,7 @@ display EXCLUDED. File paths refer to the reference repo.
 ### 1.10 Terminal panel
 - xterm.js equivalent needed. Session-scoped tabs, restored on return; PTYs on owning device
   (detach != close). Tab drag-reorder (sliding transforms 150ms), middle-click close, new-tab,
-  hide (Cmd+J). Height drag 160px-55vh, 200ms transition.
+  hide (Cmd+`). Height drag 160px-55vh, 200ms transition.
 - Input coalescing 12ms, resize debounce 80ms, reconnect backoff, "[process exited N]",
   #090909 bg + full ANSI palette. Bounded 1MB replay window.
 
@@ -114,7 +114,7 @@ display EXCLUDED. File paths refer to the reference repo.
   elapsed; "Sending…" bridge; staleness-checked; survives reload; shows for remote runs.
 - fade-in 0.5s cubic-bezier(0.16,1,0.3,1) translateY 4->0 (entrances)
 - splash-out 0.5s opacity+translateY -6, 0.15s delay
-- comet-pulse 2.4s infinite staggered cell opacity 0.08->1 scale 0.9->1
+- jolt-pulse 2.4s infinite staggered cell opacity 0.08->1 scale 0.9->1
 - gradient-spin-pulse per-cell phase wave, 750ms
 - menu-in 0.14s scale 0.96 + translateY -2 (popovers, transform-origin tracks anchor)
 - dialog-in 0.18s scale 0.96->1
@@ -149,7 +149,7 @@ display EXCLUDED. File paths refer to the reference repo.
   MarkChatSeen
 ### AuthRpc (IPC-only)
 - AuthStatus -> stream (SignedOut|NeedsOrganization{user}|SignedIn{user,orgId?})
-- SignIn->{url}; SignInHeadless->{url}; CompleteSignIn{code}; SignOut; ListOrgs; CreateOrg; SelectOrg
+- SignIn->{url}; SignInHeadless->{url}; CompleteSignIn{code}; SignOut; EnsurePersonalOrg
 ### Wire types
 - AgentEvent: SessionStarted, TextDelta, ReasoningDelta, ToolCall, ToolResult, Usage(kept as event,
   not displayed), Error, InputRequested, InputResolved, Steered, Done
@@ -174,12 +174,12 @@ display EXCLUDED. File paths refer to the reference repo.
   presence; warm-opens recent chats (14d, cap 30); cold via device-room nudge; L2 tail GET.
 - 3.4 Terminals: pty; bounded 1MB replay; owner re-checked; live shells survive detach; exited
   buffers 30min TTL; max 32; SubscribeTerminal replays then tails.
-- 3.5 Repos/diffs: list/add/clone/create; branches; worktrees ~/.comet/worktrees/<repo>/<name>;
+- 3.5 Repos/diffs: list/add/clone/create; branches; worktrees ~/.jolt/worktrees/<repo>/<name>;
   checkoutIdentity; CheckoutDiffSync: fs watchers + 2min repair, git diff (name-status + numstat +
   patch incl untracked), 3MiB cap, sha256; publishes DiffSidecar to chat DOs; GitMetadataSync
   watches HEAD -> chat.branch; folder listing in disposable worker w/ 6s timeout.
-- 3.7 Auth: WorkOS auth-code + loopback callback; headless paste-code; refresh persisted; org
-  gate; dev mode bearer. Uploads: chunked staging -> durable file. Agent accounts: claude-swap
+- 3.7 Auth: WorkOS auth-code + loopback callback; headless paste-code; refresh persisted;
+  sole hidden organization auto-provisioned as `Personal`; dev mode bearer. Uploads: chunked staging -> durable file. Agent accounts: claude-swap
   (Keychain "Claude Code-credentials" / ~/.claude/.credentials.json + ~/.claude.json; Codex
   $CODEX_HOME/auth.json); detect live, swap to activate, plan labels, usage probes, OAuth flows.
   Device-room host: one wss to device DO; serves full ControlRpc via virtual sockets over

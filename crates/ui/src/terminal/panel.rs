@@ -3,13 +3,13 @@
 //! Feature-inventory §1.10: tabs are per selected chat and restored on return
 //! (emulators — and their server-side PTYs — survive navigation; detach is not
 //! close). Tab bar supports pointer drag-reorder with 150 ms sliding
-//! transforms, middle-click close, and a "+" new-tab button; Cmd/Ctrl+J
+//! transforms, middle-click close, and a "+" new-tab button; Cmd/Ctrl+`
 //! toggles the panel (the shell owns the height animation + persistence).
 //!
 //! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
 //! (base64) feed the [`Emulator`]; query responses write back; the stream
-//! reconnects with exponential backoff resuming from `afterSeq`; Exit appends
-//! the "[process exited N]" line and stops. Keyboard bytes coalesce for 12 ms
+//! reconnects with exponential backoff resuming from `afterSeq`; Exit removes
+//! the tab and releases its engine-side replay buffer. Keyboard bytes coalesce for 12 ms
 //! before `WriteTerminal`; viewport-driven resizes debounce 80 ms before
 //! `ResizeTerminal` (the emulator resizes immediately).
 
@@ -18,12 +18,13 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton, Render,
-    ScrollDelta, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyBinding, KeyDownEvent,
+    MouseButton, Render, ScrollDelta, SharedString, Subscription, Task, Window, actions, div,
+    prelude::*, px,
 };
 
-use comet_proto::{TerminalEvent, TerminalSession};
-use comet_rpc::methods;
+use jolt_proto::{TerminalEvent, TerminalSession};
+use jolt_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
@@ -42,12 +43,17 @@ pub const TAB_BAR_HEIGHT: f32 = 40.0;
 
 actions!(terminal, [ToggleTerminal]);
 
-/// Bind the terminal keymap (global): Cmd+J on macOS, Ctrl+J elsewhere.
+#[derive(Debug, Clone)]
+pub enum TerminalPanelEvent {
+    ChatEmptied(String),
+}
+
+/// Bind the terminal keymap (global): Cmd+` on macOS, Ctrl+` elsewhere.
 pub fn init(cx: &mut App) {
     let toggle = if cfg!(target_os = "macos") {
-        "cmd-j"
+        "cmd-`"
     } else {
-        "ctrl-j"
+        "ctrl-`"
     };
     cx.bind_keys([KeyBinding::new(toggle, ToggleTerminal, None)]);
 }
@@ -133,11 +139,6 @@ pub fn active_after_close(active: usize, closed: usize, len_after: usize) -> usi
     } else {
         shifted.min(len_after - 1)
     }
-}
-
-/// The `[process exited N]` trailer, dimmed (§1.10).
-pub fn exit_message(code: i32) -> Vec<u8> {
-    format!("\r\n\x1b[90m[process exited {code}]\x1b[0m\r\n").into_bytes()
 }
 
 /// Tab title from the session's shell path ("/bin/zsh" → "zsh").
@@ -236,6 +237,7 @@ impl Render for TabGhost {
 pub struct TerminalPanel {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
+    launch_command: String,
     chats: HashMap<String, ChatTabs>,
     /// Shell-driven visibility gate: no RPC happens while closed (lazy).
     open: bool,
@@ -245,12 +247,15 @@ pub struct TerminalPanel {
     _observe: Subscription,
 }
 
+impl EventEmitter<TerminalPanelEvent> for TerminalPanel {}
+
 impl TerminalPanel {
-    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, launch_command: String, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         Self {
             state,
             focus_handle: cx.focus_handle(),
+            launch_command,
             chats: HashMap::new(),
             open: false,
             tab_seq: 0,
@@ -262,6 +267,13 @@ impl TerminalPanel {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// Update the command used by subsequently opened tabs. Existing PTYs keep
+    /// running unchanged.
+    pub fn set_launch_command(&mut self, command: String, cx: &mut Context<Self>) {
+        self.launch_command = command;
+        cx.notify();
     }
 
     /// Shell toggle hook. Opening lazily creates the first tab for the
@@ -334,6 +346,11 @@ impl TerminalPanel {
         let tabs = self.chats.get(&chat)?;
         tabs.tabs.get(tabs.active)
     }
+    fn active_tab_mut(&mut self, cx: &App) -> Option<&mut TerminalTab> {
+        let chat = self.state.read(cx).selected_chat.clone()?;
+        let tabs = self.chats.get_mut(&chat)?;
+        tabs.tabs.get_mut(tabs.active)
+    }
 
     // ---- open / stream lifecycle ----
 
@@ -360,7 +377,8 @@ impl TerminalPanel {
         entry.active = entry.tabs.len() - 1;
 
         let target = self.chat_target(&chat, cx);
-        let run = Self::spawn_session(chat.clone(), key, engine, target, cx);
+        let command = self.launch_command.trim().to_string();
+        let run = Self::spawn_session(chat.clone(), key, engine, target, command, cx);
         if let Some(tab) = self.tab_mut(&chat, key) {
             tab._run = Some(run);
         }
@@ -373,6 +391,7 @@ impl TerminalPanel {
         key: u64,
         engine: EngineHandle,
         target: Option<String>,
+        command: String,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -390,7 +409,12 @@ impl TerminalPanel {
                 .call_as::<TerminalSession>(
                     methods::OPEN_TERMINAL,
                     with_target(
-                        serde_json::json!({ "chatId": chat, "cols": cols, "rows": rows }),
+                        serde_json::json!({
+                            "chatId": chat,
+                            "cols": cols,
+                            "rows": rows,
+                            "command": command,
+                        }),
                         &target,
                     ),
                 )
@@ -515,11 +539,11 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> StreamDisposition {
         let target = self.chat_target(chat, cx);
-        let Some(tab) = self.tab_mut(chat, key) else {
-            return StreamDisposition::Stop;
-        };
         match event {
             TerminalEvent::Data { seq, data } => {
+                let Some(tab) = self.tab_mut(chat, key) else {
+                    return StreamDisposition::Stop;
+                };
                 tab.last_seq = seq;
                 let responses = tab.emulator.feed(&decode_base64(&data));
                 if !responses.is_empty()
@@ -545,10 +569,32 @@ impl TerminalPanel {
                 cx.notify();
                 StreamDisposition::Continue
             }
-            TerminalEvent::Exit { seq, exit_code, .. } => {
-                tab.last_seq = seq;
-                tab.exited = Some(exit_code);
-                tab.emulator.feed(&exit_message(exit_code));
+            TerminalEvent::Exit { .. } => {
+                let Some((terminal_id, now_empty)) = self.remove_tab(chat, key) else {
+                    return StreamDisposition::Stop;
+                };
+                if let Some(terminal_id) = terminal_id {
+                    let engine = engine.clone();
+                    cx.spawn(async move |_, _| {
+                        let _ = engine
+                            .client()
+                            .call(
+                                methods::CLOSE_TERMINAL,
+                                with_target(
+                                    serde_json::json!({ "terminalId": terminal_id }),
+                                    &target,
+                                ),
+                            )
+                            .await;
+                    })
+                    .detach();
+                }
+                if now_empty {
+                    if self.selected_chat(cx).as_deref() == Some(chat) {
+                        self.open = false;
+                    }
+                    cx.emit(TerminalPanelEvent::ChatEmptied(chat.to_string()));
+                }
                 cx.notify();
                 StreamDisposition::Stop
             }
@@ -714,12 +760,10 @@ impl TerminalPanel {
     }
 
     /// Snapshot for the paint element.
-    pub fn active_grid_snapshot(&self, cx: &App) -> Option<GridSnapshot> {
-        let tab = self.active_tab(cx)?;
-        Some(GridSnapshot {
-            lines: tab.emulator.lines(),
-            cursor: tab.emulator.cursor(),
-        })
+    pub fn active_grid_snapshot(&mut self, cx: &App) -> Option<GridSnapshot> {
+        let tab = self.active_tab_mut(cx)?;
+        let (lines, cursor) = tab.emulator.snapshot();
+        Some(GridSnapshot { lines, cursor })
     }
 
     fn scroll_active(&mut self, delta_lines: i32, cx: &mut Context<Self>) {
@@ -750,25 +794,28 @@ impl TerminalPanel {
         }
     }
 
-    fn close_tab(&mut self, chat: &str, key: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let engine = self.engine(cx);
-        let target = self.chat_target(chat, cx);
-        let Some(tabs) = self.chats.get_mut(chat) else {
-            return;
-        };
-        let Some(ix) = tabs.tabs.iter().position(|t| t.key == key) else {
-            return;
-        };
+    fn remove_tab(&mut self, chat: &str, key: u64) -> Option<(Option<String>, bool)> {
+        let tabs = self.chats.get_mut(chat)?;
+        let ix = tabs.tabs.iter().position(|tab| tab.key == key)?;
         let tab = tabs.tabs.remove(ix);
         tabs.active = active_after_close(tabs.active, ix, tabs.tabs.len());
         let now_empty = tabs.tabs.is_empty();
         self.drag = None;
+        Some((tab.terminal_id, now_empty))
+    }
+
+    fn close_tab(&mut self, chat: &str, key: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let engine = self.engine(cx);
+        let target = self.chat_target(chat, cx);
+        let Some((terminal_id, now_empty)) = self.remove_tab(chat, key) else {
+            return;
+        };
         // Closing the LAST terminal closes the drawer too — an empty dock is
         // dead space (user request). Same path as the collapse chevron.
         if now_empty && self.open {
             window.dispatch_action(Box::new(ToggleTerminal), cx);
         }
-        if let (Some(engine), Some(id)) = (engine, tab.terminal_id.clone()) {
+        if let (Some(engine), Some(id)) = (engine, terminal_id) {
             cx.spawn(async move |_, _| {
                 let _ = engine
                     .client()
@@ -834,7 +881,7 @@ impl TerminalPanel {
                     .map(|(ix, tab)| {
                         let selected = ix == active;
                         let key = tab.key;
-                        // Fixed sequential label (comet: "Terminal N") — the
+                        // Fixed sequential label (jolt: "Terminal N") — the
                         // OSC title never replaces it.
                         let title = tab.title.clone();
                         let exited = tab.exited.is_some();
@@ -846,7 +893,7 @@ impl TerminalPanel {
 
         let bar_chat = chat_owned.clone();
         let drop_chat = chat_owned.clone();
-        // Comet terminal-panel.tsx: `flex h-10 items-center border-b
+        // Jolt terminal-panel.tsx: `flex h-10 items-center border-b
         // border-white/[0.07] pl-2 pr-1.5` on the #090909 panel — no separate
         // bar fill.
         div()
@@ -892,7 +939,7 @@ impl TerminalPanel {
                         let chat_close2 = chat_owned.clone();
                         let chat_drag = chat_owned.clone();
                         let ghost_title = title.clone();
-                        // Comet tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
+                        // Jolt tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
                         // terminal glyph + label + close; active = white/8 wash.
                         let (text_color, bg, glyph_alpha) = if selected {
                             (theme.text, crate::theme::ink(0.08), 0.8)
@@ -935,7 +982,7 @@ impl TerminalPanel {
                             .pl(px(8.0))
                             .pr(px(4.0))
                             .rounded(px(8.0))
-                            // comet terminal-panel.tsx tab: `transition-colors`.
+                            // jolt terminal-panel.tsx tab: `transition-colors`.
                             .bg(motion::hover_blend(
                                 &format!("term-tab-{key}"),
                                 bg,
@@ -1013,7 +1060,7 @@ impl TerminalPanel {
                     .justify_center()
                     .rounded(px(8.0))
                     .cursor_pointer()
-                    // comet terminal-panel.tsx icon buttons: `transition-colors`.
+                    // jolt terminal-panel.tsx icon buttons: `transition-colors`.
                     .bg(motion::hover_blend(
                         "term-new-tab",
                         gpui::transparent_black(),
@@ -1031,7 +1078,7 @@ impl TerminalPanel {
                             .text_color(theme.text_muted.opacity(0.6)),
                     ),
             )
-            // Collapse chevron pinned right (comet "Hide terminal" ⌘J).
+            // Collapse chevron pinned right ("Hide terminal" ⌘`).
             .child(div().flex_1())
             .child(
                 div()
@@ -1076,7 +1123,7 @@ impl Render for TerminalPanel {
         let Some(chat) = self.selected_chat(cx) else {
             return div()
                 .size_full()
-                .bg(terminal_bg())
+                .bg(terminal_bg(&theme))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1091,7 +1138,7 @@ impl Render for TerminalPanel {
             .size_full()
             .flex()
             .flex_col()
-            .bg(terminal_bg())
+            .bg(terminal_bg(&theme))
             .child(self.render_tab_bar(&chat, cx))
             .child(
                 div()
@@ -1210,16 +1257,6 @@ mod tests {
     }
 
     #[test]
-    fn exit_message_format() {
-        let text = String::from_utf8(exit_message(0)).unwrap();
-        assert!(text.contains("[process exited 0]"));
-        let text = String::from_utf8(exit_message(137)).unwrap();
-        assert!(text.contains("[process exited 137]"));
-        assert!(text.starts_with("\r\n"));
-        assert!(text.ends_with("\r\n"));
-    }
-
-    #[test]
     fn shell_titles() {
         assert_eq!(shell_title("/bin/zsh"), "zsh");
         assert_eq!(shell_title("/usr/local/bin/fish"), "fish");
@@ -1269,13 +1306,5 @@ mod tests {
             "garbage decodes to nothing"
         );
         assert_eq!(encode_base64(b"hi"), "aGk=");
-    }
-
-    #[test]
-    fn exit_message_feeds_cleanly_through_the_emulator() {
-        let mut emulator = Emulator::new(40, 4);
-        emulator.feed(b"$ done");
-        emulator.feed(&exit_message(1));
-        assert_eq!(emulator.row_text(1), "[process exited 1]");
     }
 }

@@ -8,12 +8,12 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
-use comet_harness::{
+use jolt_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
-use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
-    ToolCall, UserInputAnswer, UserInputQuestion,
+use jolt_proto::{
+    AgentCommandSource, AgentEvent, CommandContext, DoneStatus, HarnessId, ReasoningLevel,
+    RunRequest, SandboxLevel, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -31,6 +31,20 @@ fn fixture_path() -> PathBuf {
 
 fn harness() -> CodexHarness {
     CodexHarness::new().with_executable(fixture_path())
+}
+
+#[tokio::test]
+async fn enabled_skills_are_discovered_as_commands() {
+    let commands = harness()
+        .commands(CommandContext {
+            cwd: "/tmp".into(),
+            model_options: serde_json::Map::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].name, "review");
+    assert_eq!(commands[0].source, AgentCommandSource::Skill);
 }
 
 fn request(prompt: &str) -> RunRequest {
@@ -67,6 +81,7 @@ fn controls(
             rx
         }),
         steering: steer_rx,
+        bash: mpsc::channel(1).1,
         interrupt: token.clone(),
     };
     (controls, steer_tx, token)
@@ -376,6 +391,7 @@ async fn approvals_round_trip_as_input_requests() {
             rx
         }),
         steering: steer_rx,
+        bash: mpsc::channel(1).1,
         interrupt: token.clone(),
     };
     let mut req = request("scenario:approve");
@@ -583,7 +599,7 @@ async fn models_returns_curated_catalog() {
     // caller's path, so only the default resolution can report NotInstalled —
     // exercise the harness identity surface instead.
     assert_eq!(missing.id(), HarnessId::Codex);
-    // "Codex" — comet composer/defaults.ts HARNESS_LABEL (and the registry's
+    // "Codex" — jolt composer/defaults.ts HARNESS_LABEL (and the registry's
     // lazy descriptor must stay in lockstep).
     assert_eq!(missing.display_name(), "Codex");
     assert_eq!(missing.reasoning_levels().len(), 7);

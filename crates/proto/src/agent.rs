@@ -7,9 +7,39 @@ use serde::{Deserialize, Serialize};
 pub enum HarnessId {
     ClaudeCode,
     Codex,
+    Pi,
     Cursor,
     /// Test harness; never shown in production pickers.
     Mock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentCommandSource {
+    Jolt,
+    Extension,
+    Prompt,
+    Skill,
+    Harness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommand {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    pub source: AgentCommandSource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandContext {
+    pub cwd: String,
+    #[serde(default)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -94,7 +124,7 @@ pub struct RunRequest {
     /// Absolute paths of image attachments already staged on the run device
     /// (composer uploads: UploadChunk/UploadCommit → durable path). The same
     /// paths also ride the prompt text as `Attached images (local files …)`
-    /// refs (comet's `withAttachments` transport — that's what persists in the
+    /// refs (jolt's `withAttachments` transport — that's what persists in the
     /// doc); this field additionally lets a harness inline the bytes as image
     /// content blocks. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -186,6 +216,23 @@ pub struct UserInputAnswer {
     pub labels: Vec<String>,
 }
 
+/// A prose question extracted from a completed assistant response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractedQuestion {
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+/// Questions extracted from one exact assistant message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractQuestionsResult {
+    pub source_message_id: String,
+    pub questions: Vec<ExtractedQuestion>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DoneStatus {
@@ -196,7 +243,7 @@ pub enum DoneStatus {
 
 /// The normalized streaming event every harness emits.
 ///
-/// Mirrors comet's `AgentEvent` tagged enum.
+/// Mirrors jolt's `AgentEvent` tagged enum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AgentEvent {
@@ -304,5 +351,6 @@ mod tests {
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
         );
+        assert_eq!(serde_json::to_string(&HarnessId::Pi).unwrap(), "\"pi\"");
     }
 }

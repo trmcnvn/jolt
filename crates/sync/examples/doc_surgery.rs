@@ -4,8 +4,8 @@
 //!   inspect-workspace <data_dir> <chat_id>
 //!   inspect-chat      <data_dir> <chat_id>
 //!   cut-chat          <data_dir> <chat_id> <from_index>
-use comet_doc::SessionDoc;
-use comet_sync::DocsStore;
+use jolt_doc::SessionDoc;
+use jolt_sync::DocsStore;
 use loro::{LoroDoc, ToJson};
 
 fn load_doc(store: &DocsStore, doc_id: &str) -> LoroDoc {

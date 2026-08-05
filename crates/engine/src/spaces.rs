@@ -1,13 +1,13 @@
-//! SpacesSync — owner-side upkeep of space rows (git presence) plus the
+//! SpacesSync — owner-side upkeep of space rows (active VCS presence) plus the
 //! orphan-chat repair sweep.
 //!
-//! A space is a synced (device, folder) pair; the folder need NOT be a git
+//! A space is a synced (device, folder) pair; the folder need NOT be a VCS
 //! repo. This service watches the workspace `spaces` rows owned by THIS device
 //! and keeps their `gitDetected`/`checkoutId` stamps truthful:
 //!
 //! - recheck on boot / when a space row is first observed;
-//! - a non-recursive `notify` watcher on the space folder — `.git` appearing or
-//!   vanishing (git init / de-git) kicks a recheck;
+//! - a non-recursive `notify` watcher on the space folder — `.git`/`.jj`
+//!   appearing or vanishing kicks a recheck;
 //! - a slow 2-minute repair tick (native watchers coalesce/drop events).
 //!
 //! Stamps are written ONLY on change, so steady state never grows the oplog.
@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 
-use comet_proto::Space;
+use jolt_proto::Space;
 
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
@@ -103,7 +103,7 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
             continue; // deviceId/path are immutable — nothing to refresh
         }
         let (kick_tx, kick_rx) = mpsc::unbounded_channel();
-        // Non-recursive watcher on the space folder: `.git` appearing/vanishing
+        // Non-recursive watcher on the space folder: `.git`/`.jj` appearing/vanishing
         // among the direct children is exactly the signal we need. Watch
         // failures are fine — the repair tick still converges.
         let watcher = {
@@ -111,11 +111,10 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
             let result =
                 notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
                     let Ok(event) = event else { return };
-                    if event
-                        .paths
-                        .iter()
-                        .any(|p| p.file_name().is_some_and(|n| n == ".git"))
-                    {
+                    if event.paths.iter().any(|p| {
+                        p.file_name()
+                            .is_some_and(|name| name == ".git" || name == ".jj")
+                    }) {
                         let _ = tx.send(());
                     }
                 });
@@ -153,7 +152,7 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
     }
 }
 
-/// Per-space task: trailing-debounce kicks, then recheck git presence.
+/// Per-space task: trailing-debounce kicks, then recheck active VCS presence.
 async fn entry_task(
     inner: Weak<SpacesSyncInner>,
     space_id: String,
@@ -175,7 +174,7 @@ async fn entry_task(
     }
 }
 
-/// Probe git presence and stamp the row — write only on change.
+/// Probe active VCS presence and stamp the row — write only on change.
 async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) {
     let detected = inner.repos.is_repo(path).await;
     let checkout_id = if detected {

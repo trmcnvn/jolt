@@ -1,7 +1,7 @@
 //! Frame → [`AgentEvent`] normalization, ported from claude.ts's `normalize`
 //! (init dedupe, subagent filtering, tool decoding, error-code mapping).
 
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use jolt_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
 use serde_json::Value;
 
 use super::wire::{ContentBlock, Frame};
@@ -303,7 +303,7 @@ impl Normalizer {
                         .partition(|m| is_internal_diagnostic(m));
                     for diagnostic in &diagnostics {
                         tracing::debug!(
-                            target: "comet_harness::claude",
+                            target: "jolt_harness::claude",
                             "internal CLI diagnostic (not surfaced): {diagnostic}"
                         );
                     }

@@ -4,7 +4,7 @@
 //! reconnect with exponential backoff.
 //!
 //! The client owns no row semantics: everything applies through the shared
-//! [`comet_doc::RegistryDoc`] under a lock. Wire frames are JSON text —
+//! [`jolt_doc::RegistryDoc`] under a lock. Wire frames are JSON text —
 //! byte-compatible with `edge/src/registry-room.ts`.
 //!
 //! Liveness discipline is inherited from `room.rs` and its incidents: the
@@ -25,7 +25,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use comet_doc::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
+use jolt_doc::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
 
 use crate::room::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
@@ -90,7 +90,7 @@ enum ClientFrame<'a> {
     },
     Push {
         batch: &'a str,
-        ops: &'a [comet_doc::RowOp],
+        ops: &'a [jolt_doc::RowOp],
     },
     Presence {
         at: i64,
@@ -185,7 +185,7 @@ async fn pump(
         tokio::select! {
             frame = out_rx.recv() => match frame {
                 Some(text) => {
-                    if sink.send(WsMessage::Text(text)).await.is_err() {
+                    if sink.send(WsMessage::Text(text.into())).await.is_err() {
                         break;
                     }
                 }
@@ -220,7 +220,7 @@ async fn pump(
     }
 }
 
-// ── stats (RoomStatsSnapshot-compatible so SyncStatus/`comet sync` render it) ─
+// ── stats (RoomStatsSnapshot-compatible so SyncStatus/`jolt sync` render it) ─
 
 #[derive(Default)]
 struct Stats {
@@ -449,14 +449,23 @@ struct Actor {
 enum SessionEnd {
     /// Transport died / probe deadline / requested redial: back off, redial.
     Reconnect,
+    /// System resumed from suspend: discard the half-open socket and redial now.
+    Wake,
     /// Shutdown requested: stop the actor.
     Stop,
+}
+
+enum ReconnectWait {
+    Elapsed,
+    Wake,
+    Shutdown,
 }
 
 impl Actor {
     async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
         let mut ready = Some(ready);
         let mut backoff = BACKOFF_BASE;
+        let mut wake = crate::wake::subscribe();
         loop {
             if *self.shutdown.borrow() {
                 return;
@@ -470,10 +479,13 @@ impl Actor {
                         return; // first join failed: caller owns the retry
                     }
                     tracing::warn!(error = %err, "registry dial failed; backing off");
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
+                    match self.wait_to_reconnect(backoff, &mut wake).await {
+                        ReconnectWait::Shutdown => return,
+                        ReconnectWait::Wake => backoff = BACKOFF_BASE,
+                        ReconnectWait::Elapsed => {
+                            backoff = (backoff * 2).min(BACKOFF_CAP);
+                        }
                     }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
                     continue;
                 }
                 Err(_) => {
@@ -482,17 +494,21 @@ impl Actor {
                         return;
                     }
                     tracing::warn!("registry dial timed out; backing off");
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
+                    match self.wait_to_reconnect(backoff, &mut wake).await {
+                        ReconnectWait::Shutdown => return,
+                        ReconnectWait::Wake => backoff = BACKOFF_BASE,
+                        ReconnectWait::Elapsed => {
+                            backoff = (backoff * 2).min(BACKOFF_CAP);
+                        }
                     }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
                     continue;
                 }
             };
 
-            match self.run_session(pipe, &mut ready).await {
+            match self.run_session(pipe, &mut wake, &mut ready).await {
                 SessionEnd::Stop => return,
-                SessionEnd::Reconnect => {
+                end @ (SessionEnd::Reconnect | SessionEnd::Wake) => {
+                    let woke = matches!(end, SessionEnd::Wake);
                     lock(&self.doc).mark_disconnected();
                     self.stats
                         .connected
@@ -509,8 +525,17 @@ impl Actor {
                         }
                         return;
                     }
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
+                    if woke {
+                        backoff = BACKOFF_BASE;
+                        continue;
+                    }
+                    match self.wait_to_reconnect(backoff, &mut wake).await {
+                        ReconnectWait::Shutdown => return,
+                        ReconnectWait::Wake => {
+                            backoff = BACKOFF_BASE;
+                            continue;
+                        }
+                        ReconnectWait::Elapsed => {}
                     }
                     backoff = (backoff * 2).min(BACKOFF_CAP);
                 }
@@ -518,17 +543,23 @@ impl Actor {
         }
     }
 
-    /// True = shutdown observed.
-    async fn sleep_or_shutdown(&mut self, wait: Duration) -> bool {
+    /// Wait out reconnect backoff unless shutdown or system wake arrives first.
+    async fn wait_to_reconnect(
+        &mut self,
+        wait: Duration,
+        wake: &mut broadcast::Receiver<()>,
+    ) -> ReconnectWait {
         tokio::select! {
-            _ = tokio::time::sleep(wait) => false,
-            _ = self.shutdown.changed() => *self.shutdown.borrow(),
+            _ = tokio::time::sleep(wait) => ReconnectWait::Elapsed,
+            _ = wake.recv() => ReconnectWait::Wake,
+            _ = self.shutdown.changed() => ReconnectWait::Shutdown,
         }
     }
 
     async fn run_session(
         &mut self,
         mut pipe: TextPipe,
+        wake: &mut broadcast::Receiver<()>,
         ready: &mut Option<oneshot::Sender<Result<(), SyncError>>>,
     ) -> SessionEnd {
         use std::sync::atomic::Ordering::Relaxed;
@@ -551,22 +582,24 @@ impl Actor {
         if pipe.tx.send(hello).await.is_err() {
             return SessionEnd::Reconnect;
         }
-        let state = tokio::time::timeout(HELLO_DEADLINE, async {
-            loop {
-                match pipe.rx.recv().await {
-                    Some(text) => match serde_json::from_str::<ServerFrame>(&text) {
-                        Ok(frame @ ServerFrame::State { .. }) => return Some(frame),
-                        Ok(_) => continue, // stale broadcast before our state
-                        Err(err) => {
-                            tracing::warn!(error = %err, "registry: bad frame during handshake");
-                            return None;
-                        }
-                    },
-                    None => None?,
+        let state = tokio::select! {
+            _ = wake.recv() => return SessionEnd::Wake,
+            state = tokio::time::timeout(HELLO_DEADLINE, async {
+                loop {
+                    match pipe.rx.recv().await {
+                        Some(text) => match serde_json::from_str::<ServerFrame>(&text) {
+                            Ok(frame @ ServerFrame::State { .. }) => return Some(frame),
+                            Ok(_) => continue, // stale broadcast before our state
+                            Err(err) => {
+                                tracing::warn!(error = %err, "registry: bad frame during handshake");
+                                return None;
+                            }
+                        },
+                        None => None?,
+                    }
                 }
-            }
-        })
-        .await;
+            }) => state,
+        };
         let Ok(Some(ServerFrame::State {
             seq,
             full,
@@ -619,6 +652,10 @@ impl Actor {
             let deadline_at = probe_deadline
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
             tokio::select! {
+                _ = wake.recv() => {
+                    tracing::warn!("registry connection lost: system woke from suspend; reconnecting");
+                    return SessionEnd::Wake;
+                }
                 frame = pipe.rx.recv() => {
                     let Some(text) = frame else {
                         return SessionEnd::Reconnect;

@@ -1,7 +1,7 @@
-//! The app shell (comet `__root.tsx`): sidebar column + main panel + optional
+//! The app shell (jolt `__root.tsx`): sidebar column + main panel + optional
 //! right "Changes" pane, plus the boot splash and the connection gate.
 //!
-//! Layout is comet's: collapsible drag-resizable sidebar (208–400px, default
+//! Layout is jolt's: collapsible drag-resizable sidebar (208–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
 //! content outlet, and a reserved h-6 status strip so later content never
 //! shifts; right pane scaffold (360–760px, default 520), hidden by default.
@@ -21,11 +21,13 @@ use gpui::{
     Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
-use comet_rpc::methods;
 use gpui_tokio::Tokio;
+use jolt_rpc::methods;
 
 use crate::changes::Changes;
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+#[cfg(any(debug_assertions, feature = "debug-ui"))]
+use crate::debug::{PerformanceHud, TogglePerformanceHud};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT};
@@ -36,15 +38,19 @@ use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::terminal::{TerminalPage, TerminalSettingsEvent};
+use crate::settings::vcs::VcsPage;
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
+    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, ShortcutId, TERMINAL_DEFAULT_HEIGHT, UiSettings,
+    platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, OrgRow, format_time_ago,
-    org_name_valid, parse_orgs, sort_memberships,
+    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, format_time_ago,
 };
-use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
+use crate::terminal::panel::{
+    TerminalPanel, TerminalPanelEvent, ToggleTerminal, clamp_terminal_height,
+};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 
@@ -53,14 +59,31 @@ mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
-actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette]);
+actions!(
+    shell,
+    [
+        NewSession,
+        ClearInput,
+        ArchiveCurrentSession,
+        OpenSettings,
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette
+    ]
+);
+
+const SESSION_SHORTCUT_COUNT: usize = 9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, gpui::Action)]
+#[action(namespace = shell, no_json, no_register)]
+struct SelectSession(usize);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
 
 /// Where the top-left window-control cluster starts, in px from the window's
-/// left edge (comet window-controls.tsx: `left: fullscreen ? 12 : 88`). The
+/// left edge (jolt window-controls.tsx: `left: fullscreen ? 12 : 88`). The
 /// frameless hiddenInset chrome puts the macOS traffic lights at {14,15};
 /// fullscreen hides them and the cluster reclaims the inset.
 pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
@@ -118,24 +141,84 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     crate::app_menus::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new(
-            &valid_or_default(&keymap.toggle_sidebar, "mod-s"),
+            &valid_or_default(&keymap.new_session, ShortcutId::NewSession.default_combo()),
+            NewSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.clear_input, ShortcutId::ClearInput.default_combo()),
+            ClearInput,
+            Some("Composer"),
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.archive_session,
+                ShortcutId::ArchiveSession.default_combo(),
+            ),
+            ArchiveCurrentSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.open_settings,
+                ShortcutId::OpenSettings.default_combo(),
+            ),
+            OpenSettings,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.toggle_sidebar,
+                ShortcutId::ToggleSidebar.default_combo(),
+            ),
             ToggleSidebar,
             None,
         ),
         KeyBinding::new(
-            &valid_or_default(&keymap.toggle_changes, "mod-b"),
+            &valid_or_default(
+                &keymap.toggle_changes,
+                ShortcutId::ToggleChanges.default_combo(),
+            ),
             ToggleChanges,
             None,
         ),
         KeyBinding::new(
-            &valid_or_default(&keymap.toggle_terminal, "mod-j"),
+            &valid_or_default(
+                &keymap.toggle_terminal,
+                ShortcutId::ToggleTerminal.default_combo(),
+            ),
             ToggleTerminal,
             None,
         ),
-        // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
-        // bar); pressing it again dismisses.
-        KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
+        // The add-space command center reflects this customizable binding in
+        // its leading shortcut chip; pressing it again dismisses.
+        KeyBinding::new(
+            &valid_or_default(&keymap.add_space, ShortcutId::AddSpace.default_combo()),
+            AddSpacePalette,
+            None,
+        ),
     ]);
+    cx.bind_keys(session_key_bindings());
+    #[cfg(any(debug_assertions, feature = "debug-ui"))]
+    cx.bind_keys([KeyBinding::new(
+        &platform_combo("mod-shift-f12"),
+        TogglePerformanceHud,
+        None,
+    )]);
+}
+
+/// Fixed primary-modifier shortcuts for selecting sessions by their position
+/// in the global sidebar list (Cmd+1…9 on macOS, Ctrl+1…9 elsewhere).
+fn session_key_bindings() -> Vec<KeyBinding> {
+    (0..SESSION_SHORTCUT_COUNT)
+        .map(|index| {
+            KeyBinding::new(
+                &platform_combo(&format!("mod-{}", index + 1)),
+                SelectSession(index),
+                None,
+            )
+        })
+        .collect()
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -143,26 +226,32 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 pub enum SettingsSection {
     Devices,
     Agents,
+    VersionControl,
+    Terminal,
     Appearance,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 7] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
+        SettingsSection::VersionControl,
+        SettingsSection::Terminal,
         SettingsSection::Appearance,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
     ];
 
-    /// Sidebar + header label (comet settings-sidebar.tsx SECTIONS / __root.tsx
+    /// Sidebar + header label (jolt settings-sidebar.tsx SECTIONS / __root.tsx
     /// `settingsTitle` — the same strings in both places).
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
             SettingsSection::Agents => "Accounts",
+            SettingsSection::VersionControl => "Version control",
+            SettingsSection::Terminal => "Terminal",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
@@ -177,7 +266,7 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// Per-chat panel open flags (comet parity: `sessionPanels` — the terminal and
+/// Per-chat panel open flags (jolt parity: `sessionPanels` — the terminal and
 /// changes panels open *per session*, in memory only; heights and every other
 /// persisted setting stay global). New/unknown chats default to closed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +294,12 @@ impl SessionPanels {
         entry.terminal_open
     }
 
+    /// Close the terminal for `key`; returns whether it had been open.
+    pub fn close_terminal(&mut self, key: &str) -> bool {
+        let entry = self.map.entry(key.to_string()).or_default();
+        std::mem::replace(&mut entry.terminal_open, false)
+    }
+
     /// Flip the changes flag for `key`; returns the new value.
     pub fn toggle_changes(&mut self, key: &str) -> bool {
         let entry = self.map.entry(key.to_string()).or_default();
@@ -213,7 +308,7 @@ impl SessionPanels {
     }
 }
 
-/// One route-history entry (comet parity: the renderer's TanStack memory
+/// One route-history entry (jolt parity: the renderer's TanStack memory
 /// history — every route the user visited, browser-style).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavEntry {
@@ -223,7 +318,7 @@ pub enum NavEntry {
 }
 
 /// Browser-style navigation history for the titlebar back/forward buttons
-/// (comet window-controls.tsx semantics): every route change pushes an entry;
+/// (jolt window-controls.tsx semantics): every route change pushes an entry;
 /// Back/Forward walk the stack without changing it; pushing while behind the
 /// tip truncates the entries ahead (a new branch, exactly like a browser).
 #[derive(Debug)]
@@ -257,7 +352,7 @@ impl NavHistory {
     }
 
     /// Swap the current entry in place without growing the stack — the native
-    /// equivalent of a `replace: true` navigation (comet's boot redirect from
+    /// equivalent of a `replace: true` navigation (jolt's boot redirect from
     /// `/` into the last-used chat leaves no dead Back target behind).
     pub fn replace(&mut self, entry: NavEntry) {
         self.entries[self.index] = entry;
@@ -268,7 +363,7 @@ impl NavHistory {
     }
 
     /// Memory history keeps every entry, so "behind the last entry" is exactly
-    /// "can go forward" (comet window-controls.tsx).
+    /// "can go forward" (jolt window-controls.tsx).
     pub fn can_forward(&self) -> bool {
         self.index + 1 < self.entries.len()
     }
@@ -406,14 +501,11 @@ enum UpdateFlow {
     Failed(SharedString),
 }
 
-/// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
+/// Transient automatic setup for the user's hidden Personal organization.
 struct OrgGateUi {
-    name_input: Entity<ComposerInput>,
-    orgs: Loadable<Vec<OrgRow>>,
     submitting: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
-    _events: Subscription,
 }
 
 pub struct Shell {
@@ -427,6 +519,8 @@ pub struct Shell {
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     changes: Option<Entity<Changes>>,
+    #[cfg(any(debug_assertions, feature = "debug-ui"))]
+    performance_hud: Option<Entity<PerformanceHud>>,
     /// Chat outlet vs settings pages.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -436,7 +530,11 @@ pub struct Shell {
     appearance_page: Option<Entity<AppearancePage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
+    vcs_page: Option<Entity<VcsPage>>,
+    terminal_page: Option<Entity<TerminalPage>>,
     shortcuts_sub: Option<Subscription>,
+    terminal_settings_sub: Option<Subscription>,
+    terminal_panel_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: Option<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
@@ -447,8 +545,8 @@ pub struct Shell {
     rename_space_dialog: Option<RenameSpaceDialog>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
     delete_space_confirm: Option<String>,
-    /// The add-space palette (⌘K-style; device tabs + folder search), `Some`
-    /// while open.
+    /// The add-space command center (device tabs + folder search), `Some`
+    /// while open. Its summon shortcut is configurable.
     add_space: Option<AddSpaceFlow>,
     /// Last selected chat per space (in-memory, like [`SessionPanels`]) — a
     /// space switch lands back on the tab you left.
@@ -471,7 +569,7 @@ pub struct Shell {
     space_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
-    sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
+    sound_prev: std::collections::HashMap<String, jolt_proto::SessionStatus>,
     user_menu_open: bool,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
@@ -488,7 +586,7 @@ pub struct Shell {
     update_dismissed: Option<String>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
-    install: comet_update::InstallKind,
+    install: jolt_update::InstallKind,
     org: Option<OrgGateUi>,
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
@@ -513,7 +611,7 @@ pub struct Shell {
     /// Last observed `window.is_window_active()` — rising edge fires a
     /// ProbeSync so a broadcast-deaf room heals as the user looks at the app.
     was_window_active: bool,
-    /// Dev/testing knobs (`COMET_OPEN_DIALOG`, `COMET_FORCE_GATE`) — see
+    /// Dev/testing knobs (`JOLT_OPEN_DIALOG`, `JOLT_FORCE_GATE`) — see
     /// [`Shell::new`].
     debug_dialog: Option<String>,
     debug_gate: Option<GatePhase>,
@@ -595,14 +693,16 @@ impl Shell {
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable shortcuts from the persisted keymap.
         apply_keymap(cx, &settings.keymap);
-        // Dev/testing knob: `COMET_OPEN_ROUTE=settings[/<section>]` boots
+        // Dev/testing knob: `JOLT_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
-        let route = match std::env::var("COMET_OPEN_ROUTE").ok().as_deref() {
+        let route = match std::env::var("JOLT_OPEN_ROUTE").ok().as_deref() {
             Some("settings") | Some("settings/devices") => {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/vcs") => Route::Settings(SettingsSection::VersionControl),
+            Some("settings/terminal") => Route::Settings(SettingsSection::Terminal),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -613,17 +713,17 @@ impl Shell {
             }
             _ => Route::Chat,
         };
-        // More capture knobs of the same kind: `COMET_OPEN_DIALOG=rename|delete`
+        // More capture knobs of the same kind: `JOLT_OPEN_DIALOG=rename|delete`
         // opens that dialog for the first chat once chats land; `=model` pops
         // the combined harness/model menu once the shell is Ready;
-        // `COMET_FORCE_GATE=signin|org|failed` renders that gate regardless of
+        // `JOLT_FORCE_GATE=signin|org|failed` renders that gate regardless of
         // real auth state (display-only — for styling passes).
-        let debug_dialog = std::env::var("COMET_OPEN_DIALOG").ok();
-        let debug_gate = match std::env::var("COMET_FORCE_GATE").ok().as_deref() {
+        let debug_dialog = std::env::var("JOLT_OPEN_DIALOG").ok();
+        let debug_gate = match std::env::var("JOLT_FORCE_GATE").ok().as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
             Some("failed") => Some(GatePhase::Failed(
-                "Could not reach the comet engine on port 27901".into(),
+                "Could not reach the Jolt engine on port 27901".into(),
             )),
             _ => None,
         };
@@ -631,6 +731,9 @@ impl Shell {
             Route::Chat => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
         });
+        #[cfg(any(debug_assertions, feature = "debug-ui"))]
+        let performance_hud =
+            crate::debug::performance_hud_requested().then(|| cx.new(PerformanceHud::new));
         Self {
             state,
             transcript,
@@ -638,6 +741,8 @@ impl Shell {
             file_drag_active: false,
             terminal: None,
             changes: None,
+            #[cfg(any(debug_assertions, feature = "debug-ui"))]
+            performance_hud,
             route,
             nav,
             devices_page: None,
@@ -645,7 +750,11 @@ impl Shell {
             appearance_page: None,
             shortcuts_page: None,
             accounts_page: None,
+            vcs_page: None,
+            terminal_page: None,
             shortcuts_sub: None,
+            terminal_settings_sub: None,
+            terminal_panel_sub: None,
             chat_menu: None,
             rename_dialog: None,
             delete_confirm: None,
@@ -668,7 +777,7 @@ impl Shell {
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
-            install: comet_update::detect_install(),
+            install: jolt_update::detect_install(),
             org: None,
             mutate_task: None,
             auth_task: None,
@@ -707,6 +816,12 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        if !matches!(
+            state.read(cx).auth.as_ref(),
+            Some(jolt_proto::AuthState::NeedsOrganization { .. })
+        ) {
+            self.org = None;
+        }
         // Capture knob: the add-space palette needs only the device registry.
         if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
             self.debug_dialog = None;
@@ -741,17 +856,17 @@ impl Shell {
         // by the identical clock.
         {
             let now = Utc::now();
-            let sessions: Vec<(String, comet_proto::SessionStatus)> = state
+            let sessions: Vec<(String, jolt_proto::SessionStatus)> = state
                 .read(cx)
                 .sessions
                 .iter()
                 .map(|s| {
-                    use comet_proto::view::Indicator;
-                    let status = match comet_proto::view::effective_indicator(Some(s), now) {
-                        Indicator::Working => comet_proto::SessionStatus::Working,
-                        Indicator::AwaitingInput => comet_proto::SessionStatus::AwaitingInput,
-                        Indicator::Errored => comet_proto::SessionStatus::Errored,
-                        Indicator::None => comet_proto::SessionStatus::Idle,
+                    use jolt_proto::view::Indicator;
+                    let status = match jolt_proto::view::effective_indicator(Some(s), now) {
+                        Indicator::Working => jolt_proto::SessionStatus::Working,
+                        Indicator::AwaitingInput => jolt_proto::SessionStatus::AwaitingInput,
+                        Indicator::Errored => jolt_proto::SessionStatus::Errored,
+                        Indicator::None => jolt_proto::SessionStatus::Idle,
                     };
                     (s.chat_id.clone(), status)
                 })
@@ -805,7 +920,7 @@ impl Shell {
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
-            // comet's `/` route redirected into the last-used chat, leaving no
+            // jolt's `/` route redirected into the last-used chat, leaving no
             // dead Back target. Walking history lands here too, but the
             // destination already equals `current()`, so the push dedups.
             if matches!(self.route, Route::Chat) {
@@ -823,9 +938,9 @@ impl Shell {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
             }
             if panels.changes_open {
-                let changes = self.changes_pane(cx);
-                changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+                self.changes_pane(cx).update(cx, Changes::collapse_all);
             }
+            self.sync_changes_watch(cx);
         }
         match state.read(cx).connection {
             ConnectionStatus::Ready => {
@@ -923,7 +1038,12 @@ impl Shell {
             // Lazy: the Changes entity (and its WatchCheckoutDiffs) exists only
             // once the pane has been opened.
             let changes = self.changes_pane(cx);
-            changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+            changes.update(cx, |changes, cx| {
+                changes.collapse_all(cx);
+                changes.ensure_watch(cx);
+            });
+        } else if let Some(changes) = self.changes.clone() {
+            changes.update(cx, Changes::stop_watch);
         }
         cx.notify();
     }
@@ -936,12 +1056,30 @@ impl Shell {
         self.changes = Some(changes.clone());
         changes
     }
+    fn sync_changes_watch(&mut self, cx: &mut Context<Self>) {
+        let visible =
+            matches!(self.route, Route::Chat) && self.panels.get(&self.panel_key(cx)).changes_open;
+        if visible {
+            self.changes_pane(cx).update(cx, Changes::ensure_watch);
+        } else if let Some(changes) = self.changes.clone() {
+            changes.update(cx, Changes::stop_watch);
+        }
+    }
 
     fn terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
         if let Some(terminal) = &self.terminal {
             return terminal.clone();
         }
-        let terminal = cx.new(|cx| TerminalPanel::new(self.state.clone(), cx));
+        let command = self.settings.terminal_command.clone();
+        let terminal = cx.new(|cx| TerminalPanel::new(self.state.clone(), command, cx));
+        self.terminal_panel_sub = Some(cx.subscribe(
+            &terminal,
+            |this: &mut Shell, _, event: &TerminalPanelEvent, cx| match event {
+                TerminalPanelEvent::ChatEmptied(chat_id) => {
+                    this.close_terminal_for_exited_chat(chat_id, cx);
+                }
+            },
+        ));
         self.terminal = Some(terminal.clone());
         terminal
     }
@@ -954,31 +1092,20 @@ impl Shell {
         }
     }
 
-    /// Cmd/Ctrl+J and the header button (feature-inventory §1.10). Height
-    /// animates 200 ms; closing detaches (PTYs stay alive), opening restores.
-    /// The flag is per chat (comet `sessionPanels`).
-    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.terminal_target(cx);
-        let key = self.panel_key(cx);
-        let open = self.panels.toggle_terminal(&key);
-        self.terminal_tween = Some(WidthTween::new(from, self.terminal_target(cx)));
-        let panel = self.terminal_panel(cx);
-        panel.update(cx, |panel, cx| panel.set_open(open, cx));
-        if open {
-            // Opening lands keyboard focus IN the shell — typing goes straight
-            // to the prompt, no click needed (comet terminal-panel.tsx: the
-            // visible+active effect calls `terminal.focus()` on every open).
-            // The handle is focusable before the panel's first paint; once the
-            // terminal body mounts with `track_focus` it receives the keys.
-            window.focus(&panel.read(cx).focus_handle(), cx);
-        } else {
-            // Hiding the panel removes the (likely focused) terminal view;
-            // with nothing focused, window key bindings stop dispatching, so
-            // hand focus to the composer. (Cmd+J is a pure toggle — a second
-            // press closes even while the terminal is focused, as in comet's
-            // `useHotkey(toggleShortcut, ... setOpenScoped(!open))`.)
-            window.focus(&self.composer.focus_handle(cx), cx);
+    fn close_terminal_for_exited_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let current = self.active_chat == chat_id;
+        let from = current.then(|| self.terminal_target(cx));
+        if !self.panels.close_terminal(chat_id) {
+            return;
         }
+        if let Some(from) = from {
+            self.terminal_tween = Some(WidthTween::new(from, 0.0));
+            self.schedule_terminal_tween_cleanup(cx);
+            cx.notify();
+        }
+    }
+
+    fn schedule_terminal_tween_cleanup(&mut self, cx: &mut Context<Self>) {
         self.terminal_tween_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(RESIZE.total().mul_f32(motion::speed_scale()) + Duration::from_millis(30))
@@ -989,6 +1116,34 @@ impl Shell {
             })
             .ok();
         }));
+    }
+
+    /// Cmd/Ctrl+` and the header button (feature-inventory §1.10). Height
+    /// animates 200 ms; closing detaches (PTYs stay alive), opening restores.
+    /// The flag is per chat (jolt `sessionPanels`).
+    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.terminal_target(cx);
+        let key = self.panel_key(cx);
+        let open = self.panels.toggle_terminal(&key);
+        self.terminal_tween = Some(WidthTween::new(from, self.terminal_target(cx)));
+        let panel = self.terminal_panel(cx);
+        panel.update(cx, |panel, cx| panel.set_open(open, cx));
+        if open {
+            // Opening lands keyboard focus IN the shell — typing goes straight
+            // to the prompt, no click needed (jolt terminal-panel.tsx: the
+            // visible+active effect calls `terminal.focus()` on every open).
+            // The handle is focusable before the panel's first paint; once the
+            // terminal body mounts with `track_focus` it receives the keys.
+            window.focus(&panel.read(cx).focus_handle(), cx);
+        } else {
+            // Hiding the panel removes the (likely focused) terminal view;
+            // with nothing focused, window key bindings stop dispatching, so
+            // hand focus to the composer. (Cmd+` is a pure toggle — a second
+            // press closes even while the terminal is focused, as in jolt's
+            // `useHotkey(toggleShortcut, ... setOpenScoped(!open))`.)
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
+        self.schedule_terminal_tween_cleanup(cx);
         cx.notify();
     }
 
@@ -1031,7 +1186,7 @@ impl Shell {
     ) {
         let viewport = f32::from(window.viewport_size().width);
         let width = viewport - f32::from(event.event.position.x);
-        // comet caps the pane at 52% of the window on top of the absolute range.
+        // jolt caps the pane at 52% of the window on top of the absolute range.
         let max = RIGHT_PANE_MAX.min(viewport * 0.52);
         self.settings.right_pane_width = width.clamp(RIGHT_PANE_MIN, max.max(RIGHT_PANE_MIN));
         self.right_tween = None;
@@ -1055,6 +1210,10 @@ impl Shell {
             // choice.
             let Ok(snapshot) = this.update(cx, |shell, cx| {
                 shell.settings.appearance = crate::appearance::mode(cx);
+                let (ui_font, code_font, terminal_font) = crate::appearance::font_families(cx);
+                shell.settings.ui_font = ui_font.to_string();
+                shell.settings.code_font = code_font.to_string();
+                shell.settings.terminal_font = terminal_font.to_string();
                 shell.settings.clone()
             }) else {
                 return;
@@ -1078,14 +1237,28 @@ impl Shell {
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
+        self.sync_changes_watch(cx);
         self.user_menu_open = false;
         self.chat_menu = None;
+        cx.notify();
+    }
+
+    /// Open the unmaterialized new-session tab. This is shared by the tab-strip
+    /// `+` button and the customizable New session shortcut.
+    fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        self.nav.push(NavEntry::Chat(String::new()));
+        self.user_menu_open = false;
+        self.chat_menu = None;
+        self.state.update(cx, |s, cx| s.select_chat(None, cx));
+        self.sync_changes_watch(cx);
         cx.notify();
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+        self.sync_changes_watch(cx);
         cx.notify();
     }
 
@@ -1119,6 +1292,7 @@ impl Shell {
                 self.route = Route::Settings(section);
             }
         }
+        self.sync_changes_watch(cx);
         self.user_menu_open = false;
         self.chat_menu = None;
         cx.notify();
@@ -1143,6 +1317,40 @@ impl Shell {
                     self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
                 }
                 match &self.accounts_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::VersionControl => {
+                if self.vcs_page.is_none() {
+                    let state = self.state.clone();
+                    self.vcs_page = Some(cx.new(|cx| VcsPage::new(state, cx)));
+                }
+                match &self.vcs_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Terminal => {
+                if self.terminal_page.is_none() {
+                    let command = self.settings.terminal_command.clone();
+                    let page = cx.new(|cx| TerminalPage::new(command, cx));
+                    self.terminal_settings_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &TerminalSettingsEvent, cx| {
+                            let TerminalSettingsEvent::Changed(command) = event;
+                            this.settings.terminal_command = command.clone();
+                            if let Some(panel) = this.terminal.clone() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.set_launch_command(command.clone(), cx);
+                                });
+                            }
+                            this.schedule_save(cx);
+                        },
+                    ));
+                    self.terminal_page = Some(page);
+                }
+                match &self.terminal_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -1320,55 +1528,21 @@ impl Shell {
         }));
     }
 
-    // ---- org gate ----
+    // ---- automatic organization setup ----
 
     fn ensure_org_ui(&mut self, cx: &mut Context<Self>) {
         if self.org.is_some() {
             return;
         }
-        let name_input = cx.new(|cx| ComposerInput::new("Workspace name", cx));
-        let events = cx.subscribe(&name_input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.create_org(cx);
-            }
-        });
         self.org = Some(OrgGateUi {
-            name_input,
-            orgs: Loadable::Idle,
             submitting: false,
             error: None,
             task: None,
-            _events: events,
         });
-        self.load_orgs(cx);
+        self.provision_personal_org(cx);
     }
 
-    fn load_orgs(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(org) = self.org.as_mut() else { return };
-        org.orgs = Loadable::Loading;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_ORGS, serde_json::json!({}))
-                .await;
-            this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.orgs = match result {
-                        Ok(value) => Loadable::Ready(sort_memberships(parse_orgs(&value))),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    };
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn create_org(&mut self, cx: &mut Context<Self>) {
+    fn provision_personal_org(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -1376,55 +1550,18 @@ impl Shell {
         if org.submitting {
             return;
         }
-        let name = org.name_input.read(cx).text().trim().to_string();
-        if !org_name_valid(&name) {
-            org.error = Some("Enter a workspace name".into());
-            cx.notify();
-            return;
-        }
         org.submitting = true;
         org.error = None;
         org.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::CREATE_ORG, serde_json::json!({ "name": name }))
+                .call(methods::ENSURE_PERSONAL_ORG, serde_json::json!({}))
                 .await;
             this.update(cx, |shell, cx| {
                 if let Some(org) = shell.org.as_mut() {
                     org.submitting = false;
                     if let Err(err) = result {
-                        org.error = Some(format!("{err}").into());
-                    }
-                    // Success: the AuthStatus stream flips to SignedIn and the
-                    // gate falls away on its own.
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn select_org(&mut self, organization_id: String, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(org) = self.org.as_mut() else { return };
-        org.submitting = true;
-        org.error = None;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::SELECT_ORG,
-                    serde_json::json!({ "organizationId": organization_id }),
-                )
-                .await;
-            this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.submitting = false;
-                    if let Err(err) = result {
-                        org.error = Some(format!("{err}").into());
+                        org.error = Some(err.to_string().into());
                     }
                 }
                 cx.notify();
@@ -1439,7 +1576,7 @@ impl Shell {
     /// Evaluate a width tween at "now" (manual drive — see [`WidthTween`]).
     /// Mid-flight: eased 200ms lerp, and `motion_active` is flagged so render
     /// schedules the next animation frame. Finished, stale, absent, or under
-    /// reduced motion: exactly `target`. Honors `COMET_MOTION_SCALE`.
+    /// reduced motion: exactly `target`. Honors `JOLT_MOTION_SCALE`.
     fn eval_tween(&self, tween: Option<WidthTween>, target: f32) -> f32 {
         let Some(WidthTween { from, to, started }) = tween else {
             return target;
@@ -1490,11 +1627,11 @@ impl Shell {
     }
 
     /// The header's content row with the animated left inset — the native port
-    /// of comet __root.tsx `transition-[padding-left] duration-200 ease-out` +
+    /// of jolt __root.tsx `transition-[padding-left] duration-200 ease-out` +
     /// `style={{ paddingLeft: headerInset }}`: on sidebar toggles (and macOS
     /// fullscreen flips) the SAME element's padding tweens, so the title
     /// glides to its new x-position. Route changes SNAP: the tween is killed
-    /// by every route transition (comet remounts the keyed header variants —
+    /// by every route transition (jolt remounts the keyed header variants —
     /// instant swap, zero horizontal motion).
     /// Where unified-titlebar content (tabs / the settings label) starts: past
     /// the traffic lights + control cluster, riding the fullscreen inset tween.
@@ -1533,7 +1670,7 @@ impl Shell {
     }
 
     /// Make a titlebar strip drag the window — zed's platform-titlebar
-    /// pattern (comet's `.drag` region): mark it a [`WindowControlArea::Drag`]
+    /// pattern (jolt's `.drag` region): mark it a [`WindowControlArea::Drag`]
     /// (macOS app-owned titlebar), hand the drag to the compositor once the
     /// pointer moves with the button down, and double-click zooms.
     fn titlebar_drag_region(
@@ -1585,7 +1722,7 @@ impl Shell {
     }
 
     /// The ONE top-left window-control cluster (sidebar toggle + back/forward —
-    /// comet window-controls.tsx): rendered once, in a paint-only overlay layer
+    /// jolt window-controls.tsx): rendered once, in a paint-only overlay layer
     /// pinned at the window's top-left, ABOVE the sidebar and headers. The
     /// sidebar width animates *beneath* it, so the buttons keep their element
     /// identity and never move or remount on collapse/expand; only the
@@ -1631,7 +1768,7 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Native Windows caption controls integrated into Comet's unified
+    /// Native Windows caption controls integrated into Jolt's unified
     /// titlebar. `WindowControlArea` maps these hit targets to HTMINBUTTON,
     /// HTMAXBUTTON, and HTCLOSE, so Windows owns their behavior (including
     /// Snap Layouts) while GPUI renders the system Segoe caption glyphs.
@@ -1697,7 +1834,7 @@ impl Shell {
         )
     }
 
-    /// Settings-mode sidebar (comet settings-sidebar.tsx): window-control
+    /// Settings-mode sidebar (jolt settings-sidebar.tsx): window-control
     /// strip, "Settings" heading, icon section rows styled like session rows,
     /// and a Back row pinned to the bottom.
     fn render_settings_nav(
@@ -1709,6 +1846,8 @@ impl Shell {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::VersionControl => icons::GIT_BRANCH,
+            SettingsSection::Terminal => icons::TERMINAL,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
@@ -1774,7 +1913,7 @@ impl Shell {
                         }),
                     )),
             )
-            // Back pinned to the bottom (comet settings-sidebar.tsx).
+            // Back pinned to the bottom (jolt settings-sidebar.tsx).
             .child(
                 div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
                     div()
@@ -1792,7 +1931,7 @@ impl Shell {
                         .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
-                            // AltArrowLeft chevron (comet settings-sidebar.tsx),
+                            // AltArrowLeft chevron (jolt settings-sidebar.tsx),
                             // not the straight history arrow.
                             icon(icons::ALT_ARROW_LEFT)
                                 .size(px(16.0))
@@ -1804,8 +1943,8 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session row (comet session-row.tsx): status rail on the left
-    /// (a live 2×3 mini spinner while working, a dot otherwise), title +
+    /// One session row (jolt session-row.tsx): status rail on the left
+    /// (a live dotted orb while working, a dot otherwise), title +
     /// relative time on the first line, "folder · device" underneath aligned
     /// to the title. Click selects; right-click opens the context menu.
     #[allow(clippy::too_many_arguments)]
@@ -1816,26 +1955,27 @@ impl Shell {
         time_ago: SharedString,
         space_name: SharedString,
         branch: Option<SharedString>,
-        harness: Option<comet_proto::HarnessId>,
-        status: comet_proto::ChatIndicator,
+        harness: Option<jolt_proto::HarnessId>,
+        status: jolt_proto::ChatIndicator,
         selected: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Status is a rail, not a word (comet session-row.tsx): always present
-        // so rows align and state changes read in place. Working animates (the
-        // composer-strip spinner, miniaturized); every other status is a dot.
+        // Status is a rail, not a word (jolt session-row.tsx): always present
+        // so rows align and state changes read in place. Working animates as a
+        // compact dotted orb; every other status is a dot.
         let dot_color = spaces::status_dot_color(status, theme);
-        let status_rail: AnyElement = if status == comet_proto::ChatIndicator::Working {
+        let status_rail: AnyElement = if status == jolt_proto::ChatIndicator::Working {
             div()
                 .w(px(6.0))
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(loaders::mini_gradient_spinner(
+                .child(loaders::activity_orb(
                     format!("chat-working-{id}"),
-                    2.0,
+                    theme,
+                    16.0,
                     cx.entity_id(),
                     cx,
                 ))
@@ -1853,7 +1993,7 @@ impl Shell {
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
         let menu_id = id.clone();
-        // Hover fades over transition-colors (comet session-row.tsx) — both
+        // Hover fades over transition-colors (jolt session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
         let rest_bg = if selected {
@@ -2178,7 +2318,7 @@ impl Shell {
     /// UpdateStatus stream reports a newer release. On a macOS bundle install
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`comet update`); click dismisses it for that version.
+    /// (`jolt update`); click dismisses it for that version.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
@@ -2188,7 +2328,7 @@ impl Shell {
         if self.update_dismissed.as_deref() == Some(latest.as_str()) {
             return None;
         }
-        let mac_app = matches!(self.install, comet_update::InstallKind::MacApp { .. });
+        let mac_app = matches!(self.install, jolt_update::InstallKind::MacApp { .. });
 
         let (label, clickable): (SharedString, bool) = if mac_app {
             match &self.update_flow {
@@ -2199,7 +2339,7 @@ impl Shell {
             }
         } else {
             (
-                format!("Update available — v{latest} · run `comet update`").into(),
+                format!("Update available — v{latest} · run `jolt update`").into(),
                 true,
             )
         };
@@ -2252,7 +2392,7 @@ impl Shell {
     /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
     /// installs → dismiss for this version.
     fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.install, comet_update::InstallKind::MacApp { .. }) {
+        if !matches!(self.install, jolt_update::InstallKind::MacApp { .. }) {
             self.update_dismissed = self
                 .state
                 .read(cx)
@@ -2269,15 +2409,15 @@ impl Shell {
         }
     }
 
-    /// Fetch the manifest and stage the new `Comet.app` under the data dir
+    /// Fetch the manifest and stage the new `Jolt.app` under the data dir
     /// (tokio — reqwest); the strip flips to "restart to apply" when done.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
         let edge_url = self.boot.edge_url.clone();
         let data_dir = self.data_dir.clone();
         self.update_flow = UpdateFlow::Downloading;
         let download = Tokio::spawn(cx, async move {
-            let manifest = comet_update::fetch_latest(&edge_url).await?;
-            comet_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
+            let manifest = jolt_update::fetch_latest(&edge_url).await?;
+            jolt_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let outcome = match download.await {
@@ -2304,12 +2444,12 @@ impl Shell {
     /// relauncher, and quit — the relauncher `open`s the new bundle once this
     /// process (and its engine lock / IPC port) is gone.
     fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
-        let comet_update::InstallKind::MacApp { bundle } = self.install.clone() else {
+        let jolt_update::InstallKind::MacApp { bundle } = self.install.clone() else {
             return;
         };
-        match comet_update::apply_mac_app(&staged, &bundle) {
+        match jolt_update::apply_mac_app(&staged, &bundle) {
             Ok(()) => {
-                comet_update::relaunch_app_after_exit(&bundle);
+                jolt_update::relaunch_app_after_exit(&bundle);
                 cx.quit();
             }
             Err(err) => {
@@ -2320,8 +2460,7 @@ impl Shell {
         }
     }
 
-    /// UserMenu (§1.6): name/email trigger row; menu with plan badge, Open
-    /// settings, Sign out.
+    /// User menu: account identity, settings, and sign out.
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
@@ -2330,14 +2469,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.user_menu_open;
-        // Bottom-of-sidebar identity (comet user-menu.tsx): avatar circle +
-        // name with the plan label underneath, Alpha badge chip on the right.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
         let mut trigger = div()
             .id("user-menu")
             .flex_none()
@@ -2347,7 +2478,7 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.0))
+            .gap(px(Theme::SPACE_SM))
             .cursor_pointer()
             // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
             // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
@@ -2373,43 +2504,30 @@ impl Shell {
                 cx.notify();
             }))
             .child(
-                // Avatar: white circle, initial in near-black (comet user-menu.tsx).
                 div()
-                    .size(px(28.0))
+                    .size(px(24.0))
                     .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
+                    .rounded_full()
+                    .bg(theme.element_hover)
+                    .child(
+                        icon(icons::USER)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    ),
             )
             .child(
-                // Name with the plan label underneath — no chip on the right.
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .truncate()
-                            .child(user_line.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(15.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from("Alpha")),
-                    ),
+                    .text_size(px(13.0))
+                    .line_height(px(17.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .truncate()
+                    .child(user_line.clone()),
             );
         if open {
             // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
@@ -2721,7 +2839,7 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
+                            icon(icons::JOLT_LOGO)
                                 .w(px(41.9))
                                 .h(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
@@ -2752,7 +2870,7 @@ impl Shell {
                 ))
                 .into_any_element()
         } else {
-            // New-chat canvas (comet index.tsx): the dim comet mark watermark
+            // New-chat canvas (jolt index.tsx): the dim jolt mark watermark
             // (`h-12 text-foreground/[0.09]`) over the centered helper line —
             // now naming the space the session will start in.
             let helper: SharedString = if space_name.is_empty() {
@@ -2773,7 +2891,7 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
+                            icon(icons::JOLT_LOGO)
                                 .w(px(41.9))
                                 .h(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
@@ -2846,7 +2964,7 @@ impl Shell {
             )
             // Reserved status strip (h-6) — the WorkingIndicator lives here so
             // the composer below never shifts. Both live INSIDE the
-            // conversation region, ABOVE the terminal dock (comet __root.tsx:
+            // conversation region, ABOVE the terminal dock (jolt __root.tsx:
             // the terminal panel sits below the whole conversation column).
             .child(status)
             .when(has_spaces, |el| el.child(self.composer.clone()))
@@ -3005,7 +3123,7 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Working indicator strip: gradient spinner + rotating flavour word (7s,
+    /// Working indicator strip: dotted orb + rotating flavour word (7s,
     /// seeded per chat) + elapsed, staleness-gated via [`Indicator`]; falls back
     /// to a "Sending…" bridge and then the engine mode line.
     fn render_status_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3014,7 +3132,7 @@ impl Shell {
         let state = self.state.read(cx);
 
         // Aligned with the composer column: centered, same max width, small
-        // inner gutter (comet's `mx-auto h-6 max-w-3xl px-2`).
+        // inner gutter (jolt's `mx-auto h-6 max-w-3xl px-2`).
         let strip = div()
             .h(px(Theme::STATUS_STRIP_HEIGHT))
             .flex_none()
@@ -3043,10 +3161,10 @@ impl Shell {
                 let word =
                     transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
                 strip
-                    .child(loaders::gradient_spinner(
+                    .child(loaders::activity_orb(
                         "working-indicator",
                         &theme,
-                        2.5,
+                        14.0,
                         cx.entity_id(),
                         cx,
                     ))
@@ -3071,10 +3189,10 @@ impl Shell {
                 .child(SharedString::from("Run failed"))
                 .into_any_element(),
             Indicator::None if sending => strip
-                .child(loaders::gradient_spinner(
+                .child(loaders::activity_orb(
                     "sending-indicator",
                     &theme,
-                    2.5,
+                    14.0,
                     cx.entity_id(),
                     cx,
                 ))
@@ -3149,7 +3267,7 @@ impl Shell {
     fn render_gate_card(&mut self, phase: &GatePhase, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let content: AnyElement = match phase {
-            // Backend unreachable: quiet centered copy (comet Gate `Failed`),
+            // Backend unreachable: quiet centered copy (jolt Gate `Failed`),
             // plus a Retry affordance (the native engine doesn't self-redial).
             GatePhase::Failed(error) => div()
                 .flex()
@@ -3178,8 +3296,8 @@ impl Shell {
                         .child(SharedString::from("Retry")),
                 )
                 .into_any_element(),
-            // Login card (comet App.tsx Gate): centered card on the grid —
-            // logo, "Log in to Comet", copy, full-width white Log in button.
+            // Login card (jolt App.tsx Gate): centered card on the grid —
+            // logo, "Log in to Jolt", copy, full-width white Log in button.
             _ => div()
                 .w(px(360.0))
                 .px(px(32.0))
@@ -3194,7 +3312,7 @@ impl Shell {
                 .items_center()
                 .text_center()
                 .child(
-                    icon(icons::COMET_LOGO)
+                    icon(icons::JOLT_LOGO)
                         .w(px(31.4))
                         .h(px(36.0))
                         .text_color(theme.text),
@@ -3205,7 +3323,7 @@ impl Shell {
                         .text_size(px(18.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(SharedString::from("Log in to Comet")),
+                        .child(SharedString::from("Log in to Jolt")),
                 )
                 .child(
                     div()
@@ -3250,7 +3368,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    // Keyed per phase (comet App.tsx `<div key={phase}
+                    // Keyed per phase (jolt App.tsx `<div key={phase}
                     // className="animate-in">`): every gate swap replays the
                     // 0.5s entrance instead of mutating one animated element.
                     .child(motion::fade_in(
@@ -3264,109 +3382,15 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The OrgGate ("Create your workspace"): name form + existing memberships
-    /// + "Use a different account" (feature-inventory §1.2).
+    /// Automatic first-sign-in setup. The organization is an internal tenancy
+    /// detail, so the UI only reports progress or a retryable failure.
     fn render_org_gate(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.ensure_org_ui(cx);
         let theme = Theme::of(cx).clone();
         let Some(org) = self.org.as_ref() else {
             return Empty.into_any_element();
         };
-        let submitting = org.submitting;
         let error = org.error.clone();
-        let name_input = org.name_input.clone();
-        let orgs = org.orgs.clone();
-
-        let email: Option<SharedString> = self
-            .state
-            .read(cx)
-            .auth_user()
-            .map(|u| u.email.clone().into());
-
-        let memberships: AnyElement =
-            match &orgs {
-                Loadable::Idle | Loadable::Loading => div()
-                    .mt(px(24.0))
-                    .child(popover::skeleton_rows(
-                        "org-skeleton",
-                        &theme,
-                        2,
-                        cx.entity_id(),
-                        cx,
-                    ))
-                    .into_any_element(),
-                Loadable::Error(message) => div()
-                    .mt(px(24.0))
-                    .child(
-                        popover::error_row(&theme, message).child(
-                            div()
-                                .id("orgs-retry")
-                                .px(px(Theme::SPACE_SM))
-                                .py(px(3.0))
-                                .rounded(px(Theme::CONTROL_RADIUS))
-                                .border_1()
-                                .border_color(theme.border)
-                                .text_color(theme.text)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme.glass_hover()))
-                                .on_click(cx.listener(|this, _, _, cx| this.load_orgs(cx)))
-                                .child(SharedString::from("Retry")),
-                        ),
-                    )
-                    .into_any_element(),
-                Loadable::Ready(rows) if rows.is_empty() => Empty.into_any_element(),
-                Loadable::Ready(rows) => div()
-                    .mt(px(24.0))
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .pb(px(8.0))
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from(
-                                "Or continue in a workspace you belong to",
-                            )),
-                    )
-                    .child(div().flex().flex_col().gap(px(4.0)).children(
-                        rows.iter().enumerate().map(|(ix, row)| {
-                            let org_id = row.organization_id.clone();
-                            div()
-                                .id(("org-row", ix))
-                                .px(px(12.0))
-                                .py(px(8.0))
-                                .rounded(px(8.0))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.bg)
-                                .text_size(px(13.0))
-                                .text_color(theme.text)
-                                .when(submitting, |el| el.opacity(0.5))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(crate::theme::wash(0.11)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_org(org_id.clone(), cx);
-                                }))
-                                .child(SharedString::from(row.name.clone()))
-                        }),
-                    ))
-                    .into_any_element(),
-            };
-
-        // comet App.tsx OrgGate: w-400 card on the grid — logo, headline,
-        // explainer (+ signed-in email), name form with a white Create button,
-        // then existing memberships and the account escape hatch.
-        let blurb: SharedString = match email {
-            Some(email) => format!(
-                "Comet is organized around workspaces — create one for yourself or your team. Signed in as {email}."
-            )
-            .into(),
-            None => {
-                "Comet is organized around workspaces — create one for yourself or your team."
-                    .into()
-            }
-        };
         let card = div()
             .w(px(400.0))
             .px(px(32.0))
@@ -3379,7 +3403,7 @@ impl Shell {
             .flex()
             .flex_col()
             .child(
-                icon(icons::COMET_LOGO)
+                icon(icons::JOLT_LOGO)
                     .w(px(24.4))
                     .h(px(28.0))
                     .text_color(theme.text),
@@ -3390,73 +3414,57 @@ impl Shell {
                     .text_size(px(18.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
-                    .child(SharedString::from("Create your workspace")),
+                    .child(SharedString::from("Setting up Jolt")),
             )
-            .child(
-                div()
-                    .mt(px(6.0))
-                    .mb(px(24.0))
-                    .text_size(px(13.0))
-                    .line_height(px(19.0))
-                    .text_color(theme.text_muted)
-                    .child(blurb),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(8.0))
+            .child(div().mt(px(10.0)).flex().items_center().gap(px(8.0)).when(
+                error.is_none(),
+                |el| {
+                    el.child(loaders::activity_orb(
+                        "account-setup-indicator",
+                        &theme,
+                        14.0,
+                        cx.entity_id(),
+                        cx,
+                    ))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .h(px(36.0))
-                            .flex()
-                            .items_center()
-                            .px(px(12.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.bg)
                             .text_size(px(13.0))
-                            .child(name_input),
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("Finishing account setup…")),
                     )
-                    .child(
-                        div()
-                            .id("create-org")
-                            .h(px(36.0))
-                            .px(px(16.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(6.0))
-                            .bg(theme.text)
-                            .text_size(px(14.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.on_solid)
-                            .when(submitting, |el| el.opacity(0.5))
-                            .cursor_pointer()
-                            .hover(|s| s.opacity(0.9))
-                            .on_click(cx.listener(|this, _, _, cx| this.create_org(cx)))
-                            .child(SharedString::from(if submitting {
-                                "Creating…"
-                            } else {
-                                "Create"
-                            })),
-                    ),
-            )
-            .child(memberships)
+                },
+            ))
             .when_some(error, |el, message| {
                 el.child(
                     div()
-                        .mt(px(16.0))
+                        .mt(px(10.0))
                         .text_size(px(12.0))
                         .line_height(px(17.0))
-                        .text_color(theme.danger_muted.opacity(0.9)) // red-300
+                        .text_color(theme.danger_muted)
                         .child(message),
+                )
+                .child(
+                    div()
+                        .id("account-setup-retry")
+                        .mt(px(16.0))
+                        .h(px(36.0))
+                        .px(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .bg(theme.text)
+                        .text_size(px(14.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.on_solid)
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.9))
+                        .on_click(cx.listener(|this, _, _, cx| this.provision_personal_org(cx)))
+                        .child(SharedString::from("Retry")),
                 )
             })
             .child(
-                div().mt(px(24.0)).flex().flex_row().child(
+                div().mt(px(24.0)).child(
                     div()
                         .id("org-signout")
                         .text_size(px(12.0))
@@ -3486,7 +3494,7 @@ impl Shell {
     }
 }
 
-/// The sign-in gate's faint grid backdrop (comet styles.css `.bg-grid`):
+/// The sign-in gate's faint grid backdrop (jolt styles.css `.bg-grid`):
 /// 44px hairlines at white 3.5%, with the radial mask approximated by edge
 /// gradients back into the page background (gpui has no mask-image).
 fn grid_backdrop(theme: &Theme) -> AnyElement {
@@ -3575,7 +3583,7 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A size-6 icon button for the titlebar strip (comet window-controls.tsx:
+/// A size-6 icon button for the titlebar strip (jolt window-controls.tsx:
 /// `grid size-6 place-items-center rounded-md text-muted-foreground`).
 fn window_control_button(
     id: &'static str,
@@ -3594,7 +3602,7 @@ fn window_control_button(
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
-        // comet window-controls.tsx: `transition-colors` — the wash fades.
+        // jolt window-controls.tsx: `transition-colors` — the wash fades.
         .bg(motion::hover_blend(
             &fade_key,
             theme.glass_hover().opacity(0.0),
@@ -3675,7 +3683,7 @@ fn windows_caption_button(
         .child(glyph)
 }
 
-/// A titlebar history button (comet window-controls.tsx): enabled it is a
+/// A titlebar history button (jolt window-controls.tsx): enabled it is a
 /// normal window-control button; disabled it dims to 35% opacity and ignores
 /// the pointer (`disabled:pointer-events-none disabled:opacity-35`).
 fn nav_history_button(
@@ -3705,7 +3713,7 @@ fn nav_history_button(
     window_control_button(id, icon_path, theme, on_click).into_any_element()
 }
 
-/// A size-7 icon button for the main-panel header (comet __root.tsx:
+/// A size-7 icon button for the main-panel header (jolt __root.tsx:
 /// `grid size-7 place-items-center rounded-md text-muted-foreground`).
 fn header_icon_button(
     id: &'static str,
@@ -3724,7 +3732,7 @@ fn header_icon_button(
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
-        // comet __root.tsx header buttons: `transition-colors`.
+        // jolt __root.tsx header buttons: `transition-colors`.
         .bg(motion::hover_blend(
             &fade_key,
             crate::theme::wash(0.0),
@@ -3746,7 +3754,7 @@ fn header_icon_button(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        // The shell tone (comet `.frost`): the surface the sidebar sits on and
+        // The shell tone (jolt `.frost`): the surface the sidebar sits on and
         // the main panel floats over as an inset rounded card. On macOS the
         // window background is the blurred desktop (lib.rs `Blurred`), so the
         // frost paints translucent — the sidebar and card margins read as
@@ -3774,7 +3782,7 @@ impl Render for Shell {
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);
 
-        // Keyboard shortcuts (mod-s/b/j) dispatch through the window focus
+        // Keyboard shortcuts (mod-e/b/`) dispatch through the window focus
         // chain — with nothing focused they go dead. Land initial focus on the
         // composer, and whenever focus is lost with no successor (e.g. the
         // focused element unmounted), route it back there.
@@ -3811,7 +3819,7 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
             // The panel shortcuts are chat-scoped chrome: in Settings they are
-            // no-ops (comet __root.tsx gates the hotkey on `!isSettings`, and
+            // no-ops (jolt __root.tsx gates the hotkey on `!isSettings`, and
             // the terminal panel is only mounted on session routes). The
             // sidebar toggle stays live everywhere, as in the original.
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
@@ -3820,6 +3828,28 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
+            .on_action(cx.listener(|this, _: &ClearInput, _, cx| {
+                this.composer
+                    .update(cx, |composer, cx| composer.clear_input(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ArchiveCurrentSession, _, cx| {
+                if matches!(this.route, Route::Chat)
+                    && let Some(chat_id) = this.state.read(cx).selected_chat.clone()
+                {
+                    this.close_session_tab(chat_id, cx);
+                } else {
+                    // Preserve the fixed Cmd+W Close Window binding when there
+                    // is no current session to archive.
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, action: &SelectSession, _, cx| {
+                this.select_session_at_list_index(action.0, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+                this.open_settings(SettingsSection::Devices, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx)
@@ -3833,6 +3863,16 @@ impl Render for Shell {
                     this.open_add_space(cx);
                 }
             }));
+
+        #[cfg(any(debug_assertions, feature = "debug-ui"))]
+        let root = root.on_action(cx.listener(|this, _: &TogglePerformanceHud, _, cx| {
+            if this.performance_hud.is_some() {
+                this.performance_hud = None;
+            } else {
+                this.performance_hud = Some(cx.new(PerformanceHud::new));
+            }
+            cx.notify();
+        }));
 
         let root = match &gate {
             GatePhase::Ready => {
@@ -3863,7 +3903,7 @@ impl Render for Shell {
                             .update(cx, |s, cx| s.mark_chat_seen(&chat_id, cx));
                     }
                 }
-                // Capture knob: `COMET_OPEN_DIALOG=model` pops the combined
+                // Capture knob: `JOLT_OPEN_DIALOG=model` pops the combined
                 // harness/model menu (needs `window`, so it fires here rather
                 // than in `on_state_changed`).
                 if self.debug_dialog.as_deref() == Some("model") {
@@ -3887,7 +3927,7 @@ impl Render for Shell {
                 );
                 let main = self.render_main(cx);
                 // The Changes pane is chat-scoped chrome: the Settings route
-                // never renders it (comet __root.tsx `!isSettings && activeChat`
+                // never renders it (jolt __root.tsx `!isSettings && activeChat`
                 // around the diff column) — the per-session open flags stay
                 // intact for the return trip.
                 let on_chat = matches!(self.route, Route::Chat);
@@ -3903,7 +3943,7 @@ impl Render for Shell {
                 // changes card is built inside `render_right_pane`).
                 let theme = Theme::of(cx);
                 // Margins, radius, and border-color MELT over the same 200ms
-                // ease-out as the sidebar width (comet __root.tsx `<main>`
+                // ease-out as the sidebar width (jolt __root.tsx `<main>`
                 // `transition-[margin,border-radius,border-color]`; collapsed
                 // is `m-0 rounded-none border-transparent` — the border WIDTH
                 // stays, only its color fades, so layout never jumps by the
@@ -3949,7 +3989,7 @@ impl Render for Shell {
                     .rounded(px(12.0))
                     .border_color(border_color)
                     .into_any_element();
-                // The whole app page is one keyed `animate-in` entrance (comet
+                // The whole app page is one keyed `animate-in` entrance (jolt
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
                 // arriving from the splash or any gate fades the page in; the
                 // splash-out crossfades over it on boot.
@@ -4053,7 +4093,14 @@ impl Render for Shell {
                     .window_control_area(WindowControlArea::Drag),
             )
         };
-        root.children(self.render_windows_caption_controls(window, cx))
+        let root = root.children(self.render_windows_caption_controls(window, cx));
+        #[cfg(any(debug_assertions, feature = "debug-ui"))]
+        let root = if let Some(hud) = self.performance_hud.clone() {
+            root.child(hud)
+        } else {
+            root
+        };
+        root
     }
 }
 
@@ -4062,8 +4109,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn titlebar_cluster_matches_comet_window_controls() {
-        // comet window-controls.tsx: `left: fullscreen ? 12 : 88` — the
+    fn titlebar_cluster_matches_jolt_window_controls() {
+        // jolt window-controls.tsx: `left: fullscreen ? 12 : 88` — the
         // cluster clears the {14,15} traffic lights, and reclaims the inset
         // when fullscreen hides them.
         assert_eq!(titlebar_cluster_start(false), 88.0);
@@ -4091,6 +4138,33 @@ mod tests {
         assert_eq!(titlebar_right_padding(false, 16.0), 16.0);
     }
 
+    #[cfg(any(debug_assertions, feature = "debug-ui"))]
+    #[test]
+    fn performance_hud_shortcut_parses_for_the_current_platform() {
+        assert!(Keystroke::parse(&platform_combo("mod-shift-f12")).is_ok());
+    }
+
+    #[test]
+    fn number_shortcuts_cover_the_first_nine_sessions() {
+        let bindings = session_key_bindings();
+        assert_eq!(bindings.len(), SESSION_SHORTCUT_COUNT);
+
+        for (index, binding) in bindings.iter().enumerate() {
+            let expected = Keystroke::parse(&platform_combo(&format!("mod-{}", index + 1)))
+                .expect("number shortcut must parse");
+            let actual = binding
+                .keystrokes()
+                .iter()
+                .map(|keystroke| keystroke.inner().clone())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, vec![expected]);
+            assert_eq!(
+                binding.action().as_any().downcast_ref::<SelectSession>(),
+                Some(&SelectSession(index))
+            );
+        }
+    }
+
     #[test]
     fn cluster_clearance_clears_the_overlay_buttons() {
         // Linux: buttons at 10..86; a 16px-padded header needs 78 more px to
@@ -4109,7 +4183,7 @@ mod tests {
         );
     }
 
-    // ---- per-session panel flags (§1.10/1.11 parity: comet sessionPanels) ----
+    // ---- per-session panel flags (§1.10/1.11 parity: jolt sessionPanels) ----
 
     #[test]
     fn session_panels_default_closed_per_chat() {
@@ -4139,6 +4213,18 @@ mod tests {
         // Toggling off round-trips.
         assert!(!panels.toggle_terminal("a"));
         assert!(!panels.get("a").terminal_open);
+    }
+
+    #[test]
+    fn closing_an_exited_terminal_only_changes_its_chat() {
+        let mut panels = SessionPanels::default();
+        panels.toggle_terminal("a");
+        panels.toggle_terminal("b");
+
+        assert!(panels.close_terminal("a"));
+        assert!(!panels.get("a").terminal_open);
+        assert!(panels.get("b").terminal_open);
+        assert!(!panels.close_terminal("a"), "closing is idempotent");
     }
 
     #[test]
@@ -4271,7 +4357,7 @@ mod tests {
     #[test]
     fn nav_push_truncates_the_forward_branch() {
         // a → b → c, back to a, then push d: the b/c branch is gone (browser
-        // semantics — comet's memory history PUSH truncates entries ahead).
+        // semantics — jolt's memory history PUSH truncates entries ahead).
         let mut nav = NavHistory::new(chat("a"));
         nav.push(chat("b"));
         nav.push(chat("c"));

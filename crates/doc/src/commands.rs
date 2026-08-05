@@ -1,6 +1,6 @@
 //! Durable command ledger — port of `packages/session-doc/src/commands.ts`.
 //!
-//! Rules (verbatim from comet's design):
+//! Rules (verbatim from jolt's design):
 //! 1. Each device inserts only its own entries; entries are append-only and immutable.
 //! 2. The chat's HOST is the sole writer of command outcomes; a composer may only set
 //!    `cancelled` on its own still-pending entries.
@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{RunRequest, UserInputAnswer};
+use jolt_proto::{RunRequest, UserInputAnswer};
 
 use crate::constants::COMMAND_DEFAULT_TTL_MS;
 
@@ -18,6 +18,7 @@ use crate::constants::COMMAND_DEFAULT_TTL_MS;
 #[serde(rename_all = "camelCase")]
 pub enum SessionCommandKind {
     Run,
+    Bash,
     Steer,
     Interrupt,
     RespondInput,
@@ -43,6 +44,21 @@ pub enum SessionCommandPayload {
         /// Client-minted message id for the optimistic user entry (dedup key).
         message_id: String,
     },
+    /// An agent turn whose prompt is sent to the harness but omitted from the
+    /// user-visible transcript. Native Jolt commands use this for control
+    /// prompts that should produce only an assistant response.
+    #[serde(rename_all = "camelCase")]
+    HiddenPrompt {
+        request: RunRequest,
+    },
+    #[serde(rename_all = "camelCase")]
+    Bash {
+        command: String,
+        exclude_from_context: bool,
+        cwd: String,
+        /// Client-minted id for the resulting system transcript entry.
+        message_id: String,
+    },
     #[serde(rename_all = "camelCase")]
     Steer {
         prompt: String,
@@ -59,7 +75,10 @@ pub enum SessionCommandPayload {
 impl SessionCommandPayload {
     pub fn kind(&self) -> SessionCommandKind {
         match self {
-            SessionCommandPayload::Run { .. } => SessionCommandKind::Run,
+            SessionCommandPayload::Run { .. } | SessionCommandPayload::HiddenPrompt { .. } => {
+                SessionCommandKind::Run
+            }
+            SessionCommandPayload::Bash { .. } => SessionCommandKind::Bash,
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
@@ -308,7 +327,7 @@ mod tests {
             reasoning: None,
             model_options: Default::default(),
             cwd: "/tmp".into(),
-            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            sandbox: jolt_proto::SandboxLevel::WorkspaceWrite,
             auto_approve: false,
             attachments: Vec::new(),
             resume: None,

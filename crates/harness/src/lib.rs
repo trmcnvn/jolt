@@ -1,4 +1,4 @@
-//! comet-harness — one interface over Claude Code / Codex (and a mock for tests).
+//! jolt-harness — one interface over Claude Code, Codex, and Pi (plus a mock for tests).
 //!
 //! Integration decisions (docs/research/harness.md):
 //! - Claude Code: spawn the installed `claude` CLI with
@@ -7,15 +7,17 @@
 //!   requestInput, interrupt, set_model), steer by writing user lines mid-run.
 //! - Codex: spawn `codex app-server`, JSON-RPC 2.0 over stdio (thread/start, turn/start,
 //!   turn/steer{expectedTurnId}, turn/interrupt, item/* + delta notifications).
+//! - Pi: spawn `pi --mode rpc`, use its LF-delimited command/event protocol for dynamic
+//!   provider models, persistent sessions, steering, extension input, and abort.
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
-use comet_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+use jolt_proto::{
+    AgentCommand, AgentEvent, CommandContext, HarnessId, Model, ReasoningLevel, RunRequest,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -34,14 +36,44 @@ pub struct SteerMessage {
     pub message_id: Option<String>,
 }
 
+/// A user-invoked shell command (`!` / `!!`) executed without starting an
+/// agent turn. Native harnesses consume this directly; Jolt provides the
+/// fallback for others.
+#[derive(Debug, Clone)]
+pub struct BashRequest {
+    pub command: String,
+    pub cwd: String,
+    pub resume: Option<String>,
+    pub model_options: serde_json::Map<String, serde_json::Value>,
+    pub exclude_from_context: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashResult {
+    pub output: String,
+    pub exit_code: Option<i32>,
+    pub cancelled: bool,
+    pub truncated: bool,
+    pub full_output_path: Option<String>,
+    pub session_id: Option<String>,
+}
+
+pub struct BashMessage {
+    pub request: BashRequest,
+    pub response: oneshot::Sender<Result<BashResult, HarnessError>>,
+}
+
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
-    /// The run sends questions and awaits answers (blocks the agent, mirrors comet).
+    /// The run sends questions and awaits answers (blocks the agent, mirrors jolt).
     pub request_input: Box<
         dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
     >,
     /// Steer prompts consumed at step/turn boundaries.
     pub steering: mpsc::Receiver<SteerMessage>,
+    /// Harness-native shell commands consumed independently of agent turns.
+    /// Harnesses without native support may leave the receiver unread.
+    pub bash: mpsc::Receiver<BashMessage>,
     /// Cancel to interrupt the live run: the harness sends its protocol-level
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
@@ -53,9 +85,25 @@ pub trait Harness: Send + Sync {
     fn id(&self) -> HarnessId;
     fn display_name(&self) -> &str;
     fn supports_steering(&self) -> bool;
+    /// Whether shell execution is native and records included output in the
+    /// harness session. Other harnesses use Jolt's local fallback.
+    fn supports_native_bash(&self) -> bool {
+        false
+    }
     fn steering_mode(&self) -> SteeringMode;
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
+    /// Commands available in this harness for the given project directory.
+    /// Discovery is lazy because loading harness resources may execute startup code.
+    async fn commands(&self, _context: CommandContext) -> Result<Vec<AgentCommand>, HarnessError> {
+        Ok(Vec::new())
+    }
+    async fn bash(&self, _request: BashRequest) -> Result<BashResult, HarnessError> {
+        Err(HarnessError::Protocol(format!(
+            "{} does not support direct shell commands",
+            self.display_name()
+        )))
+    }
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,
@@ -67,6 +115,7 @@ pub trait Harness: Send + Sync {
 pub mod claude;
 pub mod codex;
 pub mod mock;
+pub mod pi;
 pub mod shell_env;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
@@ -136,7 +185,7 @@ pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::p
 /// Rolling tail of a child's stderr, shared between the reader task and the
 /// crash-message composer: an unexpected exit surfaces "<name> exited
 /// unexpectedly (<status>): <last stderr lines>" instead of a bare shrug —
-/// the proper background-crash message old comet showed (user requirement).
+/// the proper background-crash message old jolt showed (user requirement).
 #[derive(Clone, Default)]
 pub(crate) struct StderrTail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
 
@@ -208,3 +257,4 @@ pub(crate) fn crash_message(
 
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
+pub use pi::PiHarness;

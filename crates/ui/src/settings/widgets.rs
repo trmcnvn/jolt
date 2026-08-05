@@ -1,7 +1,7 @@
 //! Shared scaffolding for the settings pages — the original's page rhythm
 //! (`mx-auto max-w-3xl px-6 pb-16 pt-8`), section cards, row layout, badges
 //! and small buttons, so every page reads as the same product surface
-//! (comet settings.devices.tsx / settings.agents.tsx / settings.archived.tsx).
+//! (jolt settings.devices.tsx / settings.agents.tsx / settings.archived.tsx).
 
 use gpui::{AnyElement, SharedString, div, prelude::*, px};
 
@@ -21,7 +21,7 @@ pub fn page_column() -> gpui::Div {
 }
 
 /// Page headline row: `flex items-baseline gap-2.5` — `text-base font-semibold`
-/// title + `text-[13px]` count sharing a baseline (comet settings.devices.tsx).
+/// title + `text-[13px]` count sharing a baseline (jolt settings.devices.tsx).
 pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Div {
     div()
         .flex()
@@ -153,7 +153,7 @@ pub fn option_card(
 }
 
 /// Section card: `mt-6 overflow-hidden rounded-xl border border-border bg-card`
-/// — the opaque raised-card tone (comet `--card`), not a translucent wash.
+/// — the opaque raised-card tone (jolt `--card`), not a translucent wash.
 pub fn section_card(theme: &Theme) -> gpui::Div {
     div()
         .mt(px(24.0))

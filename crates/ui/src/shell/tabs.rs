@@ -15,7 +15,7 @@
 use super::*;
 use crate::motion::TAB_SLIDE;
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
-use comet_proto::ChatIndicator;
+use jolt_proto::ChatIndicator;
 
 /// Fixed tab width (terminal tabs use 118; session titles get a bit more).
 pub(super) const SESSION_TAB_WIDTH: f32 = 140.0;
@@ -109,7 +109,7 @@ pub(super) fn next_after_close(order: &[String], closed: &str) -> Option<String>
 
 impl Shell {
     /// The space's tabs in VISUAL order (manual drag order over creation order).
-    fn tab_ids(&self, space_id: &str, cx: &App) -> Vec<String> {
+    pub(super) fn tab_ids(&self, space_id: &str, cx: &App) -> Vec<String> {
         let created: Vec<String> = self
             .state
             .read(cx)
@@ -121,6 +121,28 @@ impl Shell {
             Some(manual) => resolve_tab_order(&created, manual),
             None => created,
         }
+    }
+
+    /// Select a session by its zero-based position in the global sidebar list.
+    pub(super) fn select_session_at_list_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        let chat_id = {
+            let state = self.state.read(cx);
+            state
+                .overview_chats(Utc::now())
+                .get(index)
+                .map(|(_, chat)| chat.id.clone())
+        };
+        let Some(chat_id) = chat_id else {
+            return;
+        };
+
+        self.route = Route::Chat;
+        self.nav.push(NavEntry::Chat(chat_id.clone()));
+        self.user_menu_open = false;
+        self.chat_menu = None;
+        self.state
+            .update(cx, |state, cx| state.select_chat(Some(chat_id), cx));
+        cx.notify();
     }
 
     /// Close a tab = archive the session. Selection moves to a neighbor; the
@@ -194,7 +216,7 @@ impl Shell {
         let tabs: Vec<(
             String,
             SharedString,
-            Option<comet_proto::HarnessId>,
+            Option<jolt_proto::HarnessId>,
             ChatIndicator,
         )> = {
             let state = self.state.read(cx);
@@ -288,8 +310,8 @@ impl Shell {
                             )
                             .into_any_element()
                     } else {
-                        // Working animates (the sidebar's miniaturized gradient
-                        // spinner) instead of a static pink dot; every other
+                        // Working animates as the sidebar's compact dotted orb
+                        // instead of a static pink dot; every other
                         // non-idle status stays a dot.
                         let dot = spaces::status_dot_color(status, &theme);
                         div()
@@ -299,9 +321,10 @@ impl Shell {
                             .items_center()
                             .justify_center()
                             .when(status == ChatIndicator::Working, |el| {
-                                el.child(loaders::mini_gradient_spinner(
+                                el.child(loaders::activity_orb(
                                     format!("tab-working-{id}"),
-                                    2.0,
+                                    &theme,
+                                    8.0,
                                     cx.entity_id(),
                                     cx,
                                 ))
@@ -446,9 +469,7 @@ impl Shell {
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.route = Route::Chat;
-                this.state.update(cx, |s, cx| s.select_chat(None, cx));
-                cx.notify();
+                this.open_new_session(cx);
             }))
             .child(
                 icon(icons::PLUS)

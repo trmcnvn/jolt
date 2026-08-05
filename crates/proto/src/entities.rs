@@ -1,6 +1,6 @@
 //! Synced entity rows (workspace doc) and local projections.
 //!
-//! In comet these were synced Postgres rows; in comet-native they live in the per-org
+//! In jolt these were synced Postgres rows; in jolt-native they live in the per-org
 //! workspace Loro doc (see ARCHITECTURE.md §2.2) with the same field surface.
 
 use chrono::{DateTime, Utc};
@@ -15,7 +15,7 @@ pub struct Device {
     pub name: String,
     pub platform: String,
     pub last_seen_at: Option<DateTime<Utc>>,
-    /// First registration time (comet devices.created_at — the Devices page
+    /// First registration time (jolt devices.created_at — the Devices page
     /// "Added …" fragment). Optional so pre-existing docs stay readable.
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
@@ -100,7 +100,7 @@ pub struct Chat {
     pub last_message_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// Harness-native session id of the chat's latest run — engine-owned resume
-    /// continuity across engine restarts (comet's `chats.harness_session_id`).
+    /// continuity across engine restarts (jolt's `chats.harness_session_id`).
     /// Empty string = explicit
     /// "do not resume" tombstone after a rejected resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +179,51 @@ pub struct Session {
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VcsKind {
+    #[default]
+    Git,
+    Jujutsu,
+}
+
+impl VcsKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Git => "Git",
+            Self::Jujutsu => "Jujutsu",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsBackendStatus {
+    pub kind: VcsKind,
+    pub available: bool,
+    pub selected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsSettingsSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<VcsKind>,
+    pub backends: Vec<VcsBackendStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RepoRefKind {
+    #[default]
+    Branch,
+    Bookmark,
+    WorkingCopy,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -196,6 +241,12 @@ pub struct Repo {
 #[serde(rename_all = "camelCase")]
 pub struct RepoRef {
     pub name: String,
+    /// Backend-specific revision passed back to switch/create operations. The
+    /// display name is used when absent (legacy Git peers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub kind: RepoRefKind,
     /// Checked out in the repo's MAIN folder right now.
     #[serde(default)]
     pub current: bool,
@@ -210,7 +261,7 @@ pub struct Worktree {
     pub repo_path: String,
     pub path: String,
     pub branch: String,
-    /// Generated worktree folder name (`comet/<name>` is its branch).
+    /// Generated worktree folder name (`jolt/<name>` is its branch).
     #[serde(default)]
     pub name: String,
     /// Canonical checkout identity (device-scoped hash of the git dir).
@@ -267,6 +318,11 @@ pub struct CheckoutDiff {
     pub checkout_id: String,
     pub device_id: String,
     pub cwd: String,
+    #[serde(default)]
+    pub vcs: VcsKind,
+    /// VCS-specific checkout label (for example `Working copy · zlztoplq`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub patch: String,
     pub files: Vec<DiffFileSummary>,
     pub additions: u32,

@@ -1,5 +1,5 @@
 /**
- * Comet-native edge Worker (design §2, ARCHITECTURE §6): JWT auth at the
+ * Jolt edge Worker (design §2, ARCHITECTURE §6): JWT auth at the
  * edge, then forwarding into per-session, per-workspace, and per-device
  * Durable Objects. Also serves content-addressed R2 attachments (§1.2) and
  * the absorbed WorkOS auth routes (formerly apps/server).
@@ -85,6 +85,27 @@ const deviceParam = (url: URL): string => {
   return ID_RE.test(device) ? `&device=${device}` : "";
 };
 
+const orgMismatch = ({
+  route,
+  requestedOrgId,
+  tokenOrgId,
+  url
+}: {
+  route: "workspace" | "registry";
+  requestedOrgId: string;
+  tokenOrgId: string | undefined;
+  url: URL;
+}): Response => {
+  const device = url.searchParams.get("device");
+  console.warn("organization claim mismatch", {
+    route,
+    requestedOrgId,
+    tokenOrgId: tokenOrgId ?? null,
+    device: device && ID_RE.test(device) ? device : null
+  });
+  return json({ error: "forbidden", code: "org_mismatch" }, 403);
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -94,7 +115,7 @@ export default {
       return json({ ok: true, auth: env.AUTH_MODE === "dev" ? "dev" : "workos" });
     }
 
-    // ── public install surface (also routed from comet.zeron.sh): the
+    // ── public install surface (also routed from jolt.trmcnvn.dev): the
     //    `curl | sh` installer and the release artifacts it downloads ───────
     if (url.pathname === "/install.sh" && (request.method === "GET" || request.method === "HEAD")) {
       return new Response(request.method === "HEAD" ? null : installSh, {
@@ -178,7 +199,9 @@ export default {
     //    in the same org can never address each other's rooms. ──────────────
     if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];
-      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
+      if (auth.orgId !== orgId) {
+        return orgMismatch({ route: "workspace", requestedOrgId: orgId, tokenOrgId: auth.orgId, url });
+      }
       // `ws4` = the 2026-08-04 incident break: the ws3 instance's storage was
       // left with causally-broken update rows by the abort-thrash loop (acks
       // outran the debounced flush) and could not be trusted again even after
@@ -239,7 +262,9 @@ export default {
     //    trusts the stamped header. `reg1` = first registry generation. ─────
     if (parts[0] === "registry" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];
-      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
+      if (auth.orgId !== orgId) {
+        return orgMismatch({ route: "registry", requestedOrgId: orgId, tokenOrgId: auth.orgId, url });
+      }
       const room = `reg1/${orgId}/${auth.userId}`;
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {

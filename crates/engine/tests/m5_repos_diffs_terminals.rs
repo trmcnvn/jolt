@@ -8,9 +8,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use comet_engine::{EngineCore, HarnessRegistry, Repos, Terminals, capture_diff};
-use comet_proto::TerminalEvent;
-use comet_rpc::methods;
+use jolt_engine::{EngineCore, HarnessRegistry, Repos, Terminals, capture_diff};
+use jolt_proto::TerminalEvent;
+use jolt_rpc::methods;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -50,13 +50,17 @@ fn test_repos(data_dir: &Path) -> Repos {
 
 fn assemble(dir: &Path) -> EngineCore {
     std::fs::create_dir_all(dir).expect("data dir");
-    EngineCore::assemble(
+    let core = EngineCore::assemble(
         dir,
         Arc::new(HarnessRegistry::new()),
-        comet_proto::HarnessId::Mock,
+        jolt_proto::HarnessId::Mock,
         None,
     )
-    .expect("engine assembles")
+    .expect("engine assembles");
+    core.repos
+        .set_vcs(jolt_proto::VcsKind::Git)
+        .expect("Git test backend");
+    core
 }
 
 fn decoded(events: &[TerminalEvent]) -> String {
@@ -128,13 +132,13 @@ async fn repos_round_trip_add_branches_worktrees() {
     assert_eq!(branches[0], "main", "default branch first: {branches:?}");
     assert!(branches.contains(&"feature/x".to_string()));
 
-    // Worktree add: comet/<name> branch, isolated dir under the test root.
+    // Worktree add: jolt/<name> branch, isolated dir under the test root.
     let worktree = repos
         .create_worktree(&repo_dir, "main")
         .await
         .expect("worktree");
     assert!(
-        worktree.branch.starts_with("comet/"),
+        worktree.branch.starts_with("jolt/"),
         "branch: {}",
         worktree.branch
     );
@@ -152,7 +156,7 @@ async fn repos_round_trip_add_branches_worktrees() {
     assert!(branches.contains(&worktree.branch));
 
     // Refs carry checkout state: `main` is current (main folder), the
-    // worktree's comet/<name> branch maps to its linked-checkout path, and
+    // worktree's jolt/<name> branch maps to its linked-checkout path, and
     // a plain branch has neither.
     let refs = repos.refs(&repo_dir).await.expect("refs");
     let by_name = |name: &str| refs.iter().find(|r| r.name == name).expect("ref row");
@@ -179,7 +183,7 @@ async fn repos_round_trip_add_branches_worktrees() {
         .expect("wt identity");
     assert_ne!(main_identity.id, wt_identity.id);
 
-    // Delete: dir removed, comet branch removed, refs pruned.
+    // Delete: dir removed, jolt branch removed, refs pruned.
     repos
         .delete_worktree(&repo_dir, Path::new(&worktree.path))
         .await
@@ -191,7 +195,7 @@ async fn repos_round_trip_add_branches_worktrees() {
         .expect("branches after delete");
     assert!(
         !branches.contains(&worktree.branch),
-        "comet branch deleted: {branches:?}"
+        "jolt branch deleted: {branches:?}"
     );
 
     // CreateRepo: sanitized name, initialized on main.
@@ -363,7 +367,7 @@ async fn diff_capture_truncates_at_patch_cap() {
     let snapshot = capture_diff(&repos, &repo_dir).await.expect("capture");
     assert!(snapshot.truncated, "patch cap hit");
     assert!(snapshot.patch.len() <= 3 * 1024 * 1024 + 64);
-    assert!(snapshot.patch.contains("# Comet diff truncated"));
+    assert!(snapshot.patch.contains("# Jolt diff truncated"));
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +649,40 @@ async fn terminal_e2e_replay_live_resize_exit() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_launch_command_runs_in_the_session_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let terminals = Terminals::new();
+    let session = terminals
+        .open_with_command(
+            &tmp.path().to_string_lossy(),
+            80,
+            24,
+            Some("printf 'custom-launch:'; pwd; exit 7"),
+        )
+        .expect("open custom command");
+    let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
+    let mut events = Vec::new();
+    drain_until(&mut rx, &mut events, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::Exit { .. }))
+    })
+    .await;
+    let cwd = tmp.path().canonicalize().expect("canonical cwd");
+    let output = decoded(&events);
+    assert!(
+        output.contains(&format!("custom-launch:{}", cwd.display())),
+        "launch command runs from the terminal cwd; got {output:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(TerminalEvent::Exit { exit_code: 7, .. })
+    ));
+    terminals.close(&session.id).expect("close");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_guards_input_size_and_cwd() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -654,6 +692,18 @@ async fn terminal_guards_input_size_and_cwd() {
             .open_with_shell("/definitely/not/a/dir", 80, 24, Some("/bin/sh"))
             .is_err(),
         "bad cwd rejected"
+    );
+    let oversized_command = "x".repeat(8 * 1024 + 1);
+    assert!(
+        terminals
+            .open_with_command(
+                &tmp.path().to_string_lossy(),
+                80,
+                24,
+                Some(&oversized_command),
+            )
+            .is_err(),
+        "oversized launch command rejected"
     );
     let session = terminals
         .open_with_shell(&tmp.path().to_string_lossy(), 80, 24, Some("/bin/sh"))
@@ -675,9 +725,9 @@ async fn rpc_dispatch_for_m5_methods() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // EngineCore's Repos resolves the worktree root from the env; keep test
     // worktrees out of $HOME. (Process-global — this is the only test that sets it.)
-    unsafe { std::env::set_var("COMET_WORKTREES_DIR", tmp.path().join("worktrees")) };
+    unsafe { std::env::set_var("JOLT_WORKTREES_DIR", tmp.path().join("worktrees")) };
     let core = assemble(&tmp.path().join("data"));
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = jolt_rpc::memory_client(core.rpc_service());
 
     // CreateRepo → ListRepos.
     let created = client
@@ -691,6 +741,17 @@ async fn rpc_dispatch_for_m5_methods() {
         .await
         .expect("ListRepos");
     assert_eq!(listed.as_array().map(Vec::len), Some(1));
+
+    let vcs = client
+        .call(methods::VCS_SETTINGS, serde_json::Value::Null)
+        .await
+        .expect("VcsSettings");
+    assert_eq!(vcs["selected"], "git");
+    assert!(
+        vcs["backends"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
 
     // AddRepo (idempotent re-add of the same path).
     let added = client
@@ -804,7 +865,7 @@ async fn rpc_dispatch_for_m5_methods() {
         worktree["branch"]
             .as_str()
             .expect("branch")
-            .starts_with("comet/")
+            .starts_with("jolt/")
     );
     assert!(worktree["checkoutId"].is_string());
     let deleted = client

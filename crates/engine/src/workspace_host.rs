@@ -25,9 +25,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use chrono::Utc;
 use tokio::sync::watch;
 
-use comet_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
-use comet_proto::{Chat, ChatConfig, Device, Session, Space};
-use comet_sync::{DocsStore, RegistryClient, RegistryTuning};
+use jolt_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
+use jolt_proto::{Chat, ChatConfig, Device, Session, Space};
+use jolt_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
 use crate::{EngineError, now_ms};
@@ -287,10 +287,10 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(comet_sync::StaticUrl(url.to_string())));
+        self.spawn_join(Arc::new(jolt_sync::StaticUrl(url.to_string())));
     }
 
-    fn spawn_join(&self, url: Arc<dyn comet_sync::UrlProvider>) {
+    fn spawn_join(&self, url: Arc<dyn jolt_sync::UrlProvider>) {
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
@@ -331,16 +331,16 @@ impl WorkspaceHost {
                         // client is dropped at host teardown.
                         loop {
                             match events.recv().await {
-                                Ok(comet_sync::RegistryEvent::Applied)
-                                | Ok(comet_sync::RegistryEvent::Connected) => {
+                                Ok(jolt_sync::RegistryEvent::Applied)
+                                | Ok(jolt_sync::RegistryEvent::Connected) => {
                                     let Some(inner) = weak.upgrade() else { return };
                                     inner.bump_changed();
                                 }
-                                Ok(comet_sync::RegistryEvent::Presence) => {
+                                Ok(jolt_sync::RegistryEvent::Presence) => {
                                     let Some(inner) = weak.upgrade() else { return };
                                     inner.publish();
                                 }
-                                Ok(comet_sync::RegistryEvent::Disconnected) => {}
+                                Ok(jolt_sync::RegistryEvent::Disconnected) => {}
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
@@ -387,9 +387,9 @@ impl WorkspaceHost {
         }
     }
 
-    /// Registry room introspection for SyncStatus / `comet sync`.
+    /// Registry room introspection for SyncStatus / `jolt sync`.
     /// `None` = no room yet (edge-less, or the initial join is still retrying).
-    pub fn sync_status(&self) -> Option<comet_sync::RoomStatsSnapshot> {
+    pub fn sync_status(&self) -> Option<jolt_sync::RoomStatsSnapshot> {
         lock(&self.inner.room).as_ref().map(|room| room.stats())
     }
 
@@ -790,7 +790,7 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived))?)
     }
 
-    /// LWW full-config replace on the chat row (comet `SetChatConfig` — the
+    /// LWW full-config replace on the chat row (jolt `SetChatConfig` — the
     /// composer's mid-session model/reasoning/options changes). Returns false
     /// when the chat doesn't exist.
     pub fn set_chat_config(&self, chat_id: &str, config: &ChatConfig) -> Result<bool, EngineError> {

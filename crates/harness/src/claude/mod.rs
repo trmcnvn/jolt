@@ -1,6 +1,6 @@
 //! Claude Code harness: spawns the installed `claude` CLI and speaks its
 //! stream-json protocol directly (spec: docs/research/harness.md; behavior
-//! ported from comet's `packages/harness/src/claude.ts`).
+//! ported from jolt's `packages/harness/src/claude.ts`).
 //!
 //! - stdout JSONL frames are normalized into [`AgentEvent`]s (init dedupe,
 //!   subagent filtering, typed tool decoding, error-code mapping).
@@ -29,9 +29,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
-use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+use jolt_proto::{
+    AgentCommand, AgentCommandSource, AgentEvent, CommandContext, DoneStatus, HarnessId, Model,
+    ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -248,6 +248,69 @@ impl Harness for ClaudeHarness {
         self.resolve_executable()?;
         Ok(static_models())
     }
+    async fn commands(&self, context: CommandContext) -> Result<Vec<AgentCommand>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let mut cmd = Command::new(&exe);
+        crate::compose_child_path(&mut cmd, &exe);
+        cmd.args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+        ]);
+        if !context.cwd.is_empty() {
+            cmd.current_dir(&context.cwd);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("claude child has no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("claude child has no stdout".into()))?;
+        stdin
+            .write_all(wire::user_message_line("/context").as_bytes())
+            .await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        let mut lines = BufReader::new(stdout).lines();
+        let discovery = async {
+            while let Some(line) = lines.next_line().await? {
+                if let Ok(Frame::System(frame)) = wire::parse_frame(&line)
+                    && frame.subtype == "init"
+                {
+                    return Ok(frame
+                        .slash_commands
+                        .into_iter()
+                        .map(|name| AgentCommand {
+                            name: name.trim_start_matches('/').to_owned(),
+                            description: None,
+                            argument_hint: None,
+                            source: AgentCommandSource::Harness,
+                        })
+                        .filter(|command| !command.name.is_empty())
+                        .collect());
+                }
+            }
+            Err(HarnessError::Protocol(
+                "Claude exited before reporting slash commands".into(),
+            ))
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), discovery)
+            .await
+            .map_err(|_| HarnessError::Protocol("Claude command discovery timed out".into()))?;
+        shutdown_child(&mut child, self.kill_grace).await;
+        result
+    }
 
     async fn run(
         &self,
@@ -278,7 +341,7 @@ impl Harness for ClaudeHarness {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "comet_harness::claude", "stderr: {line}");
+                    tracing::debug!(target: "jolt_harness::claude", "stderr: {line}");
                     tail.push(&line);
                 }
             });
@@ -380,16 +443,16 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
         let bytes = match tokio::fs::read(path).await {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::warn!(target: "comet_harness::claude", %path, error = %err, "attachment unreadable; path ref only");
+                tracing::warn!(target: "jolt_harness::claude", %path, error = %err, "attachment unreadable; path ref only");
                 continue;
             }
         };
         if bytes.len() as u64 > MAX_INLINE_IMAGE_BYTES {
-            tracing::debug!(target: "comet_harness::claude", %path, "attachment over inline cap; path ref only");
+            tracing::debug!(target: "jolt_harness::claude", %path, "attachment over inline cap; path ref only");
             continue;
         }
         let Some(media_type) = image_media_type(std::path::Path::new(path), &bytes) else {
-            tracing::debug!(target: "comet_harness::claude", %path, "attachment not an inline-supported image; path ref only");
+            tracing::debug!(target: "jolt_harness::claude", %path, "attachment not an inline-supported image; path ref only");
             continue;
         };
         blocks.push(wire::ImageBlock {
@@ -412,7 +475,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
                     stdin.flush().await
                 };
                 if let Err(e) = write.await {
-                    tracing::debug!(target: "comet_harness::claude", "stdin write failed (tolerated): {e}");
+                    tracing::debug!(target: "jolt_harness::claude", "stdin write failed (tolerated): {e}");
                     return;
                 }
             }
@@ -454,6 +517,7 @@ async fn run_session(session: Session) {
     let RunControls {
         request_input,
         mut steering,
+        bash: _,
         interrupt,
     } = controls;
     let request_input = Arc::new(request_input);
@@ -477,7 +541,7 @@ async fn run_session(session: Session) {
                     let frame = match wire::parse_frame(line) {
                         Ok(frame) => frame,
                         Err(e) => {
-                            tracing::debug!(target: "comet_harness::claude", "unparseable frame (skipped): {e}");
+                            tracing::debug!(target: "jolt_harness::claude", "unparseable frame (skipped): {e}");
                             continue;
                         }
                     };
@@ -640,7 +704,7 @@ fn handle_control_request(
 ) {
     if req.request.subtype != "can_use_tool" {
         tracing::debug!(
-            target: "comet_harness::claude",
+            target: "jolt_harness::claude",
             "unhandled control_request subtype: {}", req.request.subtype
         );
         return;

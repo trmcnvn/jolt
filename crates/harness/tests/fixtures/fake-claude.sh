@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fake Claude Code CLI for comet-harness tests.
+# Fake Claude Code CLI for jolt-harness tests.
 #
 # Reads the first stream-json user line from stdin, picks a scenario from the
 # prompt text, and plays a scripted stream-json transcript on stdout —
@@ -11,6 +11,10 @@ read -r first || exit 1
 emit() { printf '%s\n' "$1"; }
 
 case "$first" in
+
+*'/context'*)
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-discovery","slash_commands":["compact","review"]}'
+  ;;
 
 *scenario:happy*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash","Read"],"cwd":"/tmp","session_id":"sess-1"}'

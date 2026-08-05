@@ -10,12 +10,12 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | 1.1 Window shell | partial | gpui window, always-dark theme, external links via OS browser. Deferred: frameless-inset/traffic-light chrome (macOS packaging not executed), single-instance lock, dev-vs-packaged port split (env vars instead). |
-| 1.2 App phases | done | Gate / OrgGate ("Create your workspace" + memberships) / app with crossfade; boot splash with fade-out cap (`ui/src/shell.rs`). |
+| 1.2 App phases | done | Sign-in gate / automatic hidden-organization setup / app with crossfade; first-time setup creates a private organization named `Personal`; boot splash has a fade-out cap (`ui/src/shell.rs`). |
 | 1.3 Shell layout | done | Collapsible drag-resizable sidebar (208–400), right Changes pane (360–760, 52% cap), header variants, widths persisted to `ui-settings.json`. |
 | 1.4 Keyboard shortcuts | done | Customizable keymap, click-to-record with conflict detection, per-row reset (`ui/src/settings/shortcuts.rs`); persisted with UI settings. |
 | 1.5 Routes | partial | Native navigation instead of URL routes; devices / agents / shortcuts / archived settings pages exist. Profile page (heatmap) is an §8 exclusion. |
 | 1.6 Sidebar | done | Device switcher, new session, grouped-by-project or flat, status dots (staleness-checked), row context menu (rename/archive/delete), resort glide. |
-| 1.7 Composer | done | Send/Steer/Stop morph, compact↔expanded flip, per-chat drafts, optimistic echo with failure return-to-draft, QuestionPanel (paged, auto-advance, number keys), all four pickers (harness/model, traits, repo with folder browser + clone/create, branch with worktree toggle), image attachments (paste/drop/picker → strip → chunked upload to host device → `withAttachments` refs in prompt text + inline image blocks for the Claude harness; per-chat stash, failure hand-back, lightbox — `ui/src/attachments.rs`). |
+| 1.7 Composer | done | Send/Steer/Stop morph, compact↔expanded flip, per-chat drafts, optimistic echo with failure return-to-draft, QuestionPanel (paged, auto-advance, number keys), all four pickers (harness/model, traits, repo with folder browser + clone/create, branch with worktree toggle), image attachments (paste/drop/picker → strip → chunked upload to host device → `withAttachments` refs in prompt text + inline image blocks for Claude and Pi; per-chat stash, failure hand-back, lightbox — `ui/src/attachments.rs`). |
 | 1.8 Transcript | done | Doc-projection source, virtualized, markdown + syntax highlight, tool folding (ToolGroup/ToolChip), input/error chips, stick-to-bottom band, MessageRail minimap (hover preview, hidden < 48rem), user-bubble attachment thumbnails (112×80, read-back from owning device, 2s→15s retry ladder, seeded cache, click-to-expand lightbox). |
 | 1.9 Accounts settings | done | Provider cards, usage meters with 80/95% thresholds + reset time, Switch/Forget, paste-code and browser-poll add flows, device switcher (`targetDeviceId`). |
 | 1.10 Terminal panel | done | Session-scoped tabs, drag-reorder, middle-click close, height drag, replay-then-tail streams, input coalescing, ANSI emulator (`ui/src/terminal/`). |
@@ -28,7 +28,7 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | ListHarnesses / ListModels | done | Relay-forwardable. |
-| Run/Subscribe/Interrupt/Steer/RespondInput RPCs | done (changed shape) | Deliberate redesign: these ride the durable doc command queue (`QueueCommand {run|steer|interrupt|respondInput}`) instead of device-addressed RPCs — same capability, offline-tolerant. |
+| Run/Bash/Subscribe/Interrupt/Steer/RespondInput RPCs | done (changed shape) | Deliberate redesign: these ride the durable doc command queue (`QueueCommand {run|bash|steer|interrupt|respondInput}`) instead of device-addressed RPCs — same capability, offline-tolerant. |
 | Repos/folders/worktrees RPCs | done | All eight methods, relay-forwardable. |
 | Uploads / ReadAttachmentChunk | done | Chunked staging → durable file; path-jailed reads; R2 mirror. |
 | Terminals RPCs | done | Open/Subscribe/Write/Resize/Close, forwardable. |
@@ -36,19 +36,19 @@ not built yet).
 | LocalDevice | done | `{deviceId}`; IPC-only (never forwarded). |
 | DataRpc watches + QueueCommand | done | — |
 | Mutate ops | partial | createChat/renameChat/setChatArchived/deleteChat/renameDevice done; markChatSeen accepted as a no-op (unseen markers UI-local); `SetChatConfig` exists on the doc layer but is not yet exposed as a Mutate op. |
-| AuthRpc | done | AuthStatus emits the canonical proto shape (`{"state": "signedIn", …}`); SignIn/SignInHeadless/CompleteSignIn/SignOut/ListOrgs/CreateOrg/SelectOrg. |
-| Wire types | done | `comet-proto`: AgentEvent, ToolCall kinds, models/options, entities, AuthState. |
+| AuthRpc | done | AuthStatus emits the canonical proto shape (`{"state": "signedIn", …}`); SignIn/SignInHeadless/CompleteSignIn/SignOut plus `EnsurePersonalOrg`. Organization creation/selection is hidden and automatic. |
+| Wire types | done | `jolt-proto`: AgentEvent, ToolCall kinds, models/options, entities, AuthState. |
 
 ## §3 Backend engine
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock. CLI auth decoupled from the daemon: `comet login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `comet login` first"; `comet daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, crash shield, parent-PID watchdog. |
+| 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock. CLI auth decoupled from the daemon: `jolt login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `jolt login` first"; `jolt daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, crash shield, parent-PID watchdog. |
 | 3.2 Sessions engine | partial | Run journal on disk with crash recovery (aborted stamps), steering mailbox at step boundaries, doc hooks at boundaries, streamed part folding at STREAM_COMMIT_MS. Gaps: idle reaper + 10-min stall watchdog for persistent harness sessions. |
 | 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
 | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. |
-| 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256, sidecar publish); chat.branch upkeep from HEAD watch; folder listing with timeout. |
-| 3.7 Auth / uploads / accounts / device-room | done | WorkOS code+loopback and paste-code flows, refresh persistence (0600), org gate, dev mode; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
+| 3.5 Repos/diffs | done | Per-device Git/Jujutsu CLI backend selection; list/add/clone/create, branches/bookmarks, worktrees/JJ workspaces, checkout identity; CheckoutDiffSync (open-pane refresh + 5s polling, bounded Git-format patch, 3MiB cap, sha256, sidecar publish); checkout-label upkeep; folder listing with timeout. |
+| 3.7 Auth / uploads / accounts / device-room | done | WorkOS code+loopback and paste-code flows, refresh persistence (0600), automatic sole-org provisioning (`Personal`), dev mode; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
 
 ## §4 Harness
 
@@ -56,6 +56,7 @@ not built yet).
 | --- | --- | --- |
 | Claude Code adapter | done | stream-json, model discovery/effort ladders, AskUserQuestion → requestInput, steering via persistent input, init dedup, subagent filtering. **Live-verified against the real `claude` CLI 2.1.215**: doc-queued run → host executor → subprocess → streamed reply landed complete in the doc. |
 | Codex adapter | done | `codex app-server` JSON-RPC (thread/start/resume, sandbox policy). |
+| Pi adapter | done | `pi --mode rpc`: authenticated provider/model discovery, exact thinking ladders, text/reasoning/tools/usage normalization, images, cwd-scoped resume, native steering, extension input, project-trust UI with saved folder decisions, read-only tool mode, abort and process escalation. Provider auth stays in Pi and is configured with `/login`. |
 | Cursor adapter | deferred | Parity item scheduled after Codex; no CLI surface settled. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
@@ -103,6 +104,6 @@ not built yet).
 
 ## Summary
 
-Table rows above: **39 done · 6 partial · 1 deferred** (Cursor harness), plus
+Table rows above: **40 done · 6 partial · 1 deferred** (Cursor harness), plus
 the cross-cutting deferrals (mobile, E2EE, macOS packaging execution,
 engine hardening) — the last overlaps the named gaps in the partial rows.

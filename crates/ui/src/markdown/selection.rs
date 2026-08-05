@@ -2,7 +2,7 @@
 //!
 //! gpui has no built-in selection for plain text elements. Zed's markdown
 //! selects continuously because its whole document is ONE element over one
-//! text model; comet renders a TREE of text elements inside a virtualized
+//! text model; jolt renders a TREE of text elements inside a virtualized
 //! list, so this module rebuilds that continuity: every frame the renderer
 //! registers each painted text element in paint order (= document order),
 //! and a drag anchored in one element resolves against that registry into
@@ -142,6 +142,11 @@ pub fn clear_if_owner(key: &str) -> bool {
     false
 }
 
+/// Clear the transcript selection. Returns true when a selection claim existed.
+pub fn clear() -> bool {
+    state().lock().unwrap().take().is_some()
+}
+
 /// The wash range for `key` this frame (empty ⇒ nothing to paint).
 pub fn wash_range(key: &str) -> Option<Range<usize>> {
     let guard = state().lock().unwrap();
@@ -266,6 +271,15 @@ mod tests {
         assert!(!clear_if_owner("p2"));
         assert!(clear_if_owner("p1"));
         assert_eq!(selected_text(), None);
+    }
+
+    #[test]
+    fn clear_drops_the_active_selection_claim() {
+        let _state = state_lock();
+        begin_with_span("p1", "hello world", 0..5);
+        assert!(clear());
+        assert_eq!(selected_text(), None);
+        assert!(!clear());
     }
 
     #[test]

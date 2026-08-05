@@ -21,14 +21,14 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
 
-use comet_doc::SessionCommandPayload;
-use comet_engine::{EngineCore, HarnessRegistry};
-use comet_harness::{Harness, HarnessError, RunControls};
-use comet_proto::{
+use jolt_doc::SessionCommandPayload;
+use jolt_engine::{EngineCore, HarnessRegistry};
+use jolt_harness::{Harness, HarnessError, RunControls};
+use jolt_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SteeringMode,
 };
-use comet_rpc::{
+use jolt_rpc::{
     DeviceFrameHeader, LinkCache, LinkCacheConfig, StaticToken, decode_device_frame,
     encode_device_frame, methods,
 };
@@ -88,7 +88,7 @@ async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
                 }
                 let writer = tokio::spawn(async move {
                     while let Some(bytes) = rx.recv().await {
-                        if sink.send(WsMessage::Binary(bytes)).await.is_err() {
+                        if sink.send(WsMessage::Binary(bytes.into())).await.is_err() {
                             break;
                         }
                     }
@@ -214,7 +214,7 @@ async fn target_device_id_routes_over_the_relay() {
         .write_user_message("m-b-1", "hello from B", 1_000)
         .expect("write user message");
 
-    let client = comet_rpc::memory_client(core_a.rpc_service());
+    let client = jolt_rpc::memory_client(core_a.rpc_service());
 
     // Our own id in targetDeviceId: handled locally, no forward.
     let local = client
@@ -372,7 +372,7 @@ async fn terminal_stream_proxies_over_the_relay() {
         LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
     link_config.probe_timeout = Duration::from_secs(5);
     core_a.set_links(LinkCache::new(link_config));
-    let client = comet_rpc::memory_client(core_a.rpc_service());
+    let client = jolt_rpc::memory_client(core_a.rpc_service());
 
     // OpenTerminal forwards to B once the relay session is up.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -459,7 +459,7 @@ async fn terminal_stream_proxies_over_the_relay() {
 async fn remote_target_without_links_fails_clearly() {
     let dirs = tempfile::tempdir().expect("tempdir");
     let core = assemble(&dirs.path().join("solo"), "device-solo");
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = jolt_rpc::memory_client(core.rpc_service());
     let err = client
         .call(
             methods::LIST_HARNESSES,

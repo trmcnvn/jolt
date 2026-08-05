@@ -15,7 +15,7 @@ use gpui::{
     Anchor, AnyElement, ElementId, IntoElement, Pixels, Point, SharedString, div, prelude::*, px,
 };
 
-use crate::motion::{self, COMET_PULSE};
+use crate::motion::{self, JOLT_PULSE};
 use crate::theme::{Theme, hairline, ink};
 
 // ---------------------------------------------------------------------------
@@ -137,7 +137,7 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 // Elements
 // ---------------------------------------------------------------------------
 
-/// The floating-menu surface (comet `.glass-surface` + `menuSurface`):
+/// The floating-menu surface (jolt `.glass-surface` + `menuSurface`):
 /// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint.
 /// gpui has no backdrop blur at the pinned rev, so the glass
 /// (`oklch(0.33 0 0 / 34%)` over blurred dark content) is approximated with
@@ -204,6 +204,32 @@ pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElemen
         .priority(1)
         .into_any_element(),
     )
+}
+
+/// Open a submenu to the right of its relative menu-row trigger. The gap is
+/// part of the deferred hit region so moving from the row into the submenu
+/// does not expose or activate content underneath it.
+pub fn anchored_submenu(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
+    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+    div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .size_0()
+        .child(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(motion::menu_in(
+                        id,
+                        div().occlude().pl(px(6.0)).child(content),
+                    )),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
+        .into_any_element()
 }
 
 /// [`anchored_menu`] opening UPWARD from the trigger (composer pickers, the
@@ -329,7 +355,7 @@ pub fn modal(
     .into_any_element()
 }
 
-/// One menu row (comet `menuItem`): `gap-2.5 rounded-lg px-2 py-1.5
+/// One menu row (jolt `menuItem`): `gap-2.5 rounded-lg px-2 py-1.5
 /// text-[13px]`, active = `bg-white/10 text-foreground`, hover wash
 /// `white/[0.08]` fading over `transition-colors` (floating-styles.ts) via the
 /// per-`fade_key` [`motion::hover_blend`]. The caller adds the id/click
@@ -372,7 +398,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
 
 /// [`menu_row`] with a distinct keyboard-navigation highlight: a selected row
 /// carries the full `bg-white/10` wash, the keyboard cursor the lighter
-/// `bg-white/[0.08]` (comet's `data-[highlighted]` styling) — two selected-
+/// `bg-white/[0.08]` (jolt's `data-[highlighted]` styling) — two selected-
 /// looking rows never appear at once.
 pub fn menu_row_nav(
     theme: &Theme,
@@ -389,7 +415,7 @@ pub fn menu_row_nav(
     }
 }
 
-/// Small uppercase section heading inside a floating menu (comet
+/// Small uppercase section heading inside a floating menu (jolt
 /// `MenuHeading`): `px-2 pb-1 pt-1.5 text-[10px] font-medium uppercase
 /// tracking-[0.1em] text-muted-foreground/60`. gpui has no letter-spacing at
 /// the pinned rev; the tracking is approximated with hair spaces.
@@ -419,15 +445,21 @@ pub fn tracked_upper(label: &str) -> String {
     out
 }
 
-/// Hairline divider between menu sections (comet `MenuSeparator`:
+/// Hairline divider between menu sections (jolt `MenuSeparator`:
 /// `mx-1 my-1 h-px bg-white/[0.07]`).
 pub fn menu_separator() -> gpui::Div {
     // Full-bleed: negative margins cancel the card's p-1 inset so the hairline
     // runs border to border (user request).
-    div().h(px(1.0)).mx(px(-4.0)).my(px(4.0)).bg(hairline(0.07))
+    div()
+        .w_full()
+        .flex_none()
+        .h(px(1.0))
+        .mx(px(-4.0))
+        .my(px(4.0))
+        .bg(hairline(0.07))
 }
 
-/// The trailing check on the selected row (comet `MenuCheck`): 14px,
+/// The trailing check on the selected row (jolt `MenuCheck`): 14px,
 /// `text-foreground/70`, pushed to the row end by the caller's flex.
 pub fn menu_check(theme: &Theme) -> impl IntoElement {
     crate::icons::icon(crate::icons::CHECK)
@@ -448,7 +480,7 @@ pub fn band() -> gpui::Hsla {
 
 /// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
 /// children — the base of [`key_hint`]/[`key_hint_pair`] and the search-bar
-/// chips ("⌘K", "esc").
+/// shortcut chips (for example, "Cmd+K" and "esc").
 pub fn key_cap(_theme: &Theme) -> gpui::Div {
     div()
         .h(px(22.0))
@@ -532,7 +564,7 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .child(SharedString::from(label.to_string()))
 }
 
-/// The search/text input frame at the top of a picker popover (comet
+/// The search/text input frame at the top of a picker popover (jolt
 /// `searchInput`: `w-full rounded-lg bg-white/[0.04] px-2.5 py-1.5
 /// text-[13px]` + `mb-1`, borderless — full width inside the card's own
 /// p-1, only a 4px bottom margin).
@@ -547,7 +579,7 @@ pub fn search_input_frame(_theme: &Theme, input: AnyElement) -> gpui::Div {
         .child(input)
 }
 
-/// A bordered trailing menu section (comet picker action groups /
+/// A bordered trailing menu section (jolt picker action groups /
 /// branch-picker worktree block: `mt-1 flex flex-col gap-0.5 border-t
 /// border-white/[0.06] pt-1` — the hairline runs edge-to-edge of the card's
 /// p-1 inset, unlike [`menu_separator`]'s mx-1).
@@ -563,7 +595,7 @@ pub fn menu_section() -> gpui::Div {
 }
 
 // ---------------------------------------------------------------------------
-// Dialog primitives (comet dialog.tsx / sidebar dialogs.tsx)
+// Dialog primitives (jolt dialog.tsx / sidebar dialogs.tsx)
 // ---------------------------------------------------------------------------
 
 /// The centered dialog card (`dialog-pop`): `w-[360px] rounded-2xl border
@@ -616,7 +648,7 @@ pub fn dialog_field(input: AnyElement) -> gpui::Div {
 }
 
 /// Ghost button (`btnGhost`): quiet text, hover wash fading over
-/// `transition-colors` (comet dialogs.tsx). Caller adds id + click; `fade_key`
+/// `transition-colors` (jolt dialogs.tsx). Caller adds id + click; `fade_key`
 /// as in [`menu_row`].
 pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) -> gpui::Div {
     let fade_key = fade_key.into();
@@ -668,7 +700,7 @@ pub fn btn_danger(theme: &Theme, label: &str) -> gpui::Div {
         .child(SharedString::from(label.to_string()))
 }
 
-/// Pulsing skeleton rows shown while a list loads (comet:
+/// Pulsing skeleton rows shown while a list loads (jolt:
 /// `h-7 animate-pulse rounded-md bg-white/[0.04]`).
 pub fn skeleton_rows(
     _id: &'static str,
@@ -678,7 +710,7 @@ pub fn skeleton_rows(
     cx: &mut gpui::App,
 ) -> AnyElement {
     let wash = ink(0.04);
-    let delta = motion::pulse_delta(&COMET_PULSE, view, cx);
+    let delta = motion::pulse_delta(&JOLT_PULSE, view, cx);
     div()
         .flex()
         .flex_col()

@@ -1,18 +1,18 @@
 #!/bin/sh
-# Comet (native) headless installer.
+# Jolt headless installer.
 #
-#   curl -fsSL https://comet.zeron.sh/install.sh | sh
+#   curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh
 #
 # Installs the self-contained native binary (no runtime deps) to
-# ~/.comet-native/app, puts `comet` on PATH, and — once you've signed in —
+# ~/.jolt/app, puts `jolt` on PATH, and — once you've signed in —
 # runs it as a systemd user service that survives reboots. Re-running
-# upgrades in place; ~/.comet-native state is preserved.
+# upgrades in place; ~/.jolt state is preserved.
 #
-# The binary ships with production endpoints baked in: no COMET_EDGE_URL or
-# client-id configuration needed. Overrides (if any) go in ~/.comet-native/env.
+# The binary ships with production endpoints baked in: no JOLT_EDGE_URL or
+# client-id configuration needed. Overrides (if any) go in ~/.jolt/env.
 set -eu
 
-BASE="${COMET_BASE_URL:-https://comet.zeron.sh}"
+BASE="${JOLT_BASE_URL:-https://jolt.trmcnvn.dev}"
 
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"
@@ -20,12 +20,12 @@ arch="$(uname -m)"
 case "$os" in
   Linux) plat=linux ;;
   Darwin)
-    echo "comet install: on macOS, download the desktop app instead:" >&2
-    echo "  $BASE/releases/latest.txt → $BASE/releases/comet-<version>-macos-arm64.dmg" >&2
+    echo "jolt install: on macOS, download the desktop app instead:" >&2
+    echo "  $BASE/releases/latest.txt → $BASE/releases/jolt-<version>-macos-arm64.dmg" >&2
     exit 1
     ;;
   *)
-    echo "comet install: unsupported OS '$os' — only Linux for now." >&2
+    echo "jolt install: unsupported OS '$os' — only Linux for now." >&2
     exit 1
     ;;
 esac
@@ -33,25 +33,25 @@ case "$arch" in
   x86_64 | amd64) arch=x86_64 ;;
   aarch64 | arm64) arch=aarch64 ;;
   *)
-    echo "comet install: unsupported architecture '$arch'." >&2
+    echo "jolt install: unsupported architecture '$arch'." >&2
     exit 1
     ;;
 esac
 
 # --- download ----------------------------------------------------------------
 ver="$(curl -fsSL "$BASE/releases/latest.txt" | tr -d '[:space:]')"
-[ -n "$ver" ] || { echo "comet install: could not resolve latest version" >&2; exit 1; }
-file="comet-$ver-$plat-$arch.tar.gz"
-data_root="$HOME/.comet-native"
+[ -n "$ver" ] || { echo "jolt install: could not resolve latest version" >&2; exit 1; }
+file="jolt-$ver-$plat-$arch.tar.gz"
+data_root="$HOME/.jolt"
 app_root="$data_root/app"
 dest="$app_root/$ver"
 
-if [ -x "$dest/comet" ]; then
-  echo "comet $ver already downloaded — relinking."
+if [ -x "$dest/jolt" ]; then
+  echo "jolt $ver already downloaded — relinking."
 else
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
-  echo "downloading comet $ver ($plat-$arch)…"
+  echo "downloading jolt $ver ($plat-$arch)…"
   curl -fSL --progress-bar "$BASE/releases/$file" -o "$tmp/$file"
   mkdir -p "$dest"
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
@@ -59,11 +59,11 @@ fi
 
 ln -sfn "$dest" "$app_root/current"
 mkdir -p "$HOME/.local/bin"
-ln -sf "$app_root/current/comet" "$HOME/.local/bin/comet"
+ln -sf "$app_root/current/jolt" "$HOME/.local/bin/jolt"
 
 # --- service -----------------------------------------------------------------
-# Auth is decoupled from the daemon: `comet login` persists the session and a
-# service-managed `comet headless` loads it (exiting with "run comet login
+# Auth is decoupled from the daemon: `jolt login` persists the session and a
+# service-managed `jolt headless` loads it (exiting with "run jolt login
 # first" otherwise) — so the service starts only after first sign-in.
 signed_in=no
 [ -f "$data_root/session.json" ] && signed_in=yes
@@ -71,26 +71,26 @@ signed_in=no
 service=manual
 if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
   mkdir -p "$HOME/.config/systemd/user"
-  cat >"$HOME/.config/systemd/user/comet-native.service" <<'UNIT'
+  cat >"$HOME/.config/systemd/user/jolt.service" <<'UNIT'
 [Unit]
-Description=Comet native headless engine
+Description=Jolt headless engine
 After=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-ExecStart=%h/.comet-native/app/current/comet headless
+ExecStart=%h/.jolt/app/current/jolt headless
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=-%h/.comet-native/env
+EnvironmentFile=-%h/.jolt/env
 
 [Install]
 WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
-  systemctl --user enable comet-native >/dev/null 2>&1 || true
+  systemctl --user enable jolt >/dev/null 2>&1 || true
   if [ "$signed_in" = yes ]; then
-    systemctl --user restart comet-native
+    systemctl --user restart jolt
     service=running
   else
     service=ready
@@ -100,7 +100,7 @@ UNIT
     || sudo -n loginctl enable-linger "$USER" 2>/dev/null \
     || echo "warn: could not enable linger — the engine stops when you log out (run: sudo loginctl enable-linger $USER)"
 else
-  echo "warn: systemd user session not available — run the engine manually with: comet headless"
+  echo "warn: systemd user session not available — run the engine manually with: jolt headless"
 fi
 
 # --- agent CLIs ---------------------------------------------------------------
@@ -113,19 +113,19 @@ case ":$PATH:" in
 esac
 
 echo ""
-echo "✓ comet $ver installed$path_hint"
+echo "✓ jolt $ver installed$path_hint"
 echo ""
 case "$service" in
   running)
     echo "the engine restarted with the new version."
-    echo "  systemctl --user status comet-native    check the service"
+    echo "  systemctl --user status jolt    check the service"
     ;;
   ready)
     echo "next steps:"
-    echo "  comet login                              sign in (paste-code) and exit"
-    echo "  systemctl --user start comet-native      then start the engine"
+    echo "  jolt login                               sign in (paste-code) and exit"
+    echo "  systemctl --user start jolt              then start the engine"
     ;;
   manual)
-    echo "next: \`comet login\` to sign in, then run the engine with \`comet headless\`."
+    echo "next: \`jolt login\` to sign in, then run the engine with \`jolt headless\`."
     ;;
 esac

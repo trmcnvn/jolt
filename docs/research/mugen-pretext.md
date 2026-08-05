@@ -1,6 +1,6 @@
 # Mugen + Pretext: Techniques for a Rust/gpui Transcript Reimplementation
 
-(Report from exploration of comet's node_modules + app wiring. NOTE: "pretext" is NOT markdown —
+(Report from exploration of jolt's node_modules + app wiring. NOTE: "pretext" is NOT markdown —
 it's the text-measurement/line-break kernel. Markdown is @wingleeio/mugen-markdown.)
 
 ## 0. Package map

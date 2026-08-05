@@ -9,7 +9,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use comet_engine::{Auth, AuthConfig, AuthState};
+use jolt_engine::{Auth, AuthConfig, AuthState, EngineConfig, EngineSupervisor, HarnessId};
+use jolt_rpc::{connect_ws, methods};
 
 // ---------------------------------------------------------------------------
 // Fake JWTs
@@ -56,10 +57,20 @@ struct StubState {
     refreshes: AtomicUsize,
     /// Refresh tokens seen by /auth/refresh, in order.
     refresh_tokens: Mutex<Vec<String>>,
+    /// Organization scopes requested by /auth/refresh, in order.
+    refresh_orgs: Mutex<Vec<Option<String>>>,
     /// TTL (seconds) for minted access tokens.
     token_ttl: AtomicUsize,
     /// org_id claim for exchange-minted tokens ("" = none).
     exchange_org: Mutex<String>,
+    /// Org WorkOS chooses when a refresh omits `organizationId`.
+    default_refresh_org: Mutex<Option<String>>,
+    /// Test-only simulation of WorkOS returning a scope other than requested.
+    refresh_org_override: Mutex<Option<String>>,
+    /// Active organization memberships returned by /auth/orgs.
+    orgs: Mutex<Vec<serde_json::Value>>,
+    /// Names requested through organization creation.
+    created_org_names: Mutex<Vec<String>>,
 }
 
 struct StubEdge {
@@ -80,6 +91,9 @@ impl StubEdge {
         let port = listener.local_addr().expect("addr").port();
         let state = Arc::new(StubState::default());
         state.token_ttl.store(3600, Ordering::SeqCst);
+        state.orgs.lock().expect("lock").push(serde_json::json!({
+            "id": "om_1", "organizationId": "org_1", "name": "Personal"
+        }));
         let handler_state = state.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -187,27 +201,47 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
                 .lock()
                 .expect("lock")
                 .push(refresh_token.to_string());
+            let requested_org = parsed
+                .get("organizationId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            state
+                .refresh_orgs
+                .lock()
+                .expect("lock")
+                .push(requested_org.clone());
             if refresh_token == "dead" {
                 respond(&mut stream, "401 Unauthorized", r#"{"error":"revoked"}"#).await;
                 return;
             }
             let n = state.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
-            let org = parsed.get("organizationId").and_then(|v| v.as_str());
+            let default_org = state.default_refresh_org.lock().expect("lock").clone();
+            let override_org = state.refresh_org_override.lock().expect("lock").clone();
+            let org = override_org.or(requested_org).or(default_org);
             let response = serde_json::json!({
-                "accessToken": fake_jwt(ttl, org),
+                "accessToken": fake_jwt(ttl, org.as_deref()),
                 "refreshToken": format!("rotated-{n}"),
             });
             respond(&mut stream, "200 OK", &response.to_string()).await;
         }
         ("GET", "/auth/orgs") => {
+            let orgs = state.orgs.lock().expect("lock").clone();
             respond(
                 &mut stream,
                 "200 OK",
-                r#"{"orgs":[{"id":"om_1","organizationId":"org_1","name":"Acme"}]}"#,
+                &serde_json::json!({ "orgs": orgs }).to_string(),
             )
             .await;
         }
         ("POST", "/auth/orgs") => {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            if let Some(name) = parsed.get("name").and_then(|value| value.as_str()) {
+                state
+                    .created_org_names
+                    .lock()
+                    .expect("lock")
+                    .push(name.to_string());
+            }
             respond(&mut stream, "200 OK", r#"{"organizationId":"org_new"}"#).await;
         }
         _ => respond(&mut stream, "404 Not Found", r#"{"error":"not_found"}"#).await,
@@ -319,12 +353,8 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
         assert_eq!(mode & 0o777, 0o600, "session file must be private");
     }
 
-    // Org onboarding: list, then select — an org-scoped refresh; state follows the
-    // returned token's org claim.
-    let orgs = auth.list_orgs().await.expect("list orgs");
-    assert_eq!(orgs.len(), 1);
-    assert_eq!(orgs[0].organization_id, "org_1");
-    auth.select_org("org_1").await.expect("select org");
+    // Setup adopts the sole membership and scopes the session without asking.
+    auth.ensure_personal_org().await.expect("automatic setup");
     assert!(
         matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "org_1")
     );
@@ -352,11 +382,66 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
 }
 
 #[tokio::test]
+async fn first_sign_in_creates_a_personal_org_automatically() {
+    let edge = StubEdge::start().await;
+    edge.state.orgs.lock().expect("lock").clear();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
+    let url = auth.start_headless_sign_in();
+    let state = query_param(&url, "state").expect("state");
+    auth.complete_sign_in(&format!("{state}.codeX"))
+        .await
+        .expect("sign in");
+
+    auth.ensure_personal_org().await.expect("automatic setup");
+
+    assert_eq!(
+        edge.state
+            .created_org_names
+            .lock()
+            .expect("lock")
+            .as_slice(),
+        ["Personal"]
+    );
+    assert!(matches!(
+        auth.state(),
+        AuthState::SignedIn { org_id: Some(org), .. } if org == "org_new"
+    ));
+}
+
+#[tokio::test]
+async fn automatic_setup_rejects_ambiguous_multiple_orgs() {
+    let edge = StubEdge::start().await;
+    edge.state
+        .orgs
+        .lock()
+        .expect("lock")
+        .push(serde_json::json!({
+            "id": "om_2", "organizationId": "org_2", "name": "Old"
+        }));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
+    let url = auth.start_headless_sign_in();
+    let state = query_param(&url, "state").expect("state");
+    auth.complete_sign_in(&format!("{state}.codeX"))
+        .await
+        .expect("sign in");
+
+    let err = auth
+        .ensure_personal_org()
+        .await
+        .expect_err("multiple orgs must not be selected arbitrarily");
+    assert!(err.to_string().contains("multiple organizations"));
+    assert!(matches!(auth.state(), AuthState::NeedsOrganization { .. }));
+}
+
+#[tokio::test]
 async fn short_lived_tokens_refresh_on_demand() {
     let edge = StubEdge::start().await;
     // Tokens live 20s < the 30s slack → every access_token() call refreshes.
     edge.state.token_ttl.store(20, Ordering::SeqCst);
     *edge.state.exchange_org.lock().expect("lock") = "org_1".into();
+    *edge.state.default_refresh_org.lock().expect("lock") = Some("org_2".into());
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
 
@@ -380,9 +465,43 @@ async fn short_lived_tokens_refresh_on_demand() {
         "still under slack → refreshed"
     );
     assert_eq!(first, second, "same claims → same fake token bytes");
+    assert!(
+        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "org_1"),
+        "routine refresh must preserve the selected workspace"
+    );
     // Rotated refresh tokens are chained: refresh N presents rotation N-1's token.
     let seen = edge.state.refresh_tokens.lock().expect("lock").clone();
     assert_eq!(seen, vec!["refresh-1".to_string(), "rotated-1".to_string()]);
+    let orgs = edge.state.refresh_orgs.lock().expect("lock").clone();
+    assert_eq!(orgs, vec![Some("org_1".into()), Some("org_1".into())]);
+}
+
+#[tokio::test]
+async fn mismatched_refresh_scope_stops_room_tokens_and_preserves_rotation() {
+    let edge = StubEdge::start().await;
+    edge.state.token_ttl.store(20, Ordering::SeqCst);
+    *edge.state.exchange_org.lock().expect("lock") = "org_1".into();
+    *edge.state.refresh_org_override.lock().expect("lock") = Some("org_2".into());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
+
+    let url = auth.start_headless_sign_in();
+    let state = query_param(&url, "state").expect("state");
+    auth.complete_sign_in(&format!("{state}.codeX"))
+        .await
+        .expect("sign in");
+
+    assert_eq!(auth.access_token().await, None);
+    assert!(matches!(auth.state(), AuthState::NeedsOrganization { .. }));
+    let raw = std::fs::read_to_string(dir.path().join("session.json")).expect("session persisted");
+    assert!(
+        raw.contains("rotated-1"),
+        "rotation must be preserved: {raw}"
+    );
+    assert!(
+        !raw.contains("org_1"),
+        "invalid scope must be cleared: {raw}"
+    );
 }
 
 #[tokio::test]
@@ -466,4 +585,64 @@ async fn detect_probes_edge_dev_mode() {
     assert!(!auth.workos_enabled(), "edge dev mode wins");
     assert_eq!(auth.access_token().await.as_deref(), Some("dev-w"));
     task.abort();
+}
+
+#[tokio::test]
+async fn supervisor_provisions_the_hidden_personal_org_before_runtime_boot() {
+    let edge = StubEdge::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
+    let url = auth.start_headless_sign_in();
+    let state = query_param(&url, "state").expect("state param");
+    auth.complete_sign_in(&format!("{state}.code123"))
+        .await
+        .expect("sign in");
+
+    let supervisor = EngineSupervisor::new(
+        EngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            edge_url: edge.url(),
+            edge_token: None,
+            ipc_port: 0,
+            default_harness: HarnessId::Mock,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+        },
+        auth.clone(),
+    );
+    let boot = supervisor.spawn_when_ready();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind supervisor RPC");
+    let address = listener.local_addr().expect("supervisor address");
+    let server = tokio::spawn(jolt_rpc::serve_ws_listener(listener, supervisor.clone()));
+    let client = connect_ws(&format!("ws://{address}"))
+        .await
+        .expect("connect remote client");
+    client
+        .call(methods::ENSURE_PERSONAL_ORG, serde_json::json!({}))
+        .await
+        .expect("ensure personal org");
+    assert!(matches!(
+        auth.state(),
+        AuthState::SignedIn { org_id: Some(org), .. } if org == "org_1"
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if client
+                .call(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime serves data RPCs");
+    assert!(dir.path().join("orgs/org_1/user_1").is_dir());
+    supervisor.shutdown().await;
+    boot.abort();
+    server.abort();
 }
