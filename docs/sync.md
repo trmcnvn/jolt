@@ -109,7 +109,7 @@ The per-chat Durable Object keeps:
 - ephemeral presence;
 - daily R2 backups.
 
-Dirty update rows flush on a short cadence. When the update log reaches the configured threshold, the room folds it losslessly into the snapshot. Daily checkpoint-based trimming discards history beyond the three-day retention frontier while preserving current state.
+Dirty update rows flush on a short cadence. Logical updates larger than Durable Object SQLite's row limit are split across continuation rows and reassembled before replay. When the update log reaches the configured threshold, the room folds it losslessly into the snapshot. Daily checkpoint-based trimming discards history beyond the three-day retention frontier while preserving current state. A joining client behind a shallow snapshot's retained frontier receives the full snapshot instead of an unusable partial diff.
 
 The host engine keeps local snapshots and an LRU of open documents. A viewport watch receives a full reset frame first, then entry upserts/text appends rather than a full transcript on each stream commit.
 

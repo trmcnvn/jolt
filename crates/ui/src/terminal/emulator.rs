@@ -10,13 +10,17 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use libghostty_vt::fmt::Format;
 use libghostty_vt::render::{CellIterator, RowIterator};
-use libghostty_vt::screen::CellWide;
+use libghostty_vt::screen::{CellWide, TrackedGridRef};
+use libghostty_vt::selection::{
+    FormatOptions, SelectLineOptions, SelectWordBetweenOptions, Selection,
+};
 use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::terminal::{
     ColorScheme, ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
-    PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
-    TertiaryDeviceAttributes,
+    Point, PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
+    SizeReportSize, TertiaryDeviceAttributes,
 };
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 
@@ -79,6 +83,8 @@ pub struct CellSnapshot {
     pub wide: bool,
     /// The spacer half of a wide grapheme — never shaped, only background-painted.
     pub wide_spacer: bool,
+    /// Whether the cell belongs to the active text selection.
+    pub selected: bool,
 }
 
 impl CellSnapshot {
@@ -106,6 +112,13 @@ struct EffectCapture {
     bell: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionKind {
+    Cell,
+    Word,
+    Line,
+}
+
 /// The emulator: a pure fold of PTY bytes into a renderable grid.
 pub struct Emulator {
     term: Terminal<'static, 'static>,
@@ -113,6 +126,8 @@ pub struct Emulator {
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
     effects: Rc<RefCell<EffectCapture>>,
+    selection_anchor: Option<TrackedGridRef>,
+    selection_kind: SelectionKind,
 }
 
 impl Emulator {
@@ -174,6 +189,8 @@ impl Emulator {
             cell_iterator: CellIterator::new()
                 .expect("libghostty-vt cell iterator should initialize"),
             effects,
+            selection_anchor: None,
+            selection_kind: SelectionKind::Cell,
         }
     }
 
@@ -268,6 +285,100 @@ impl Emulator {
         self.term.scroll_viewport(ScrollViewport::Bottom);
     }
 
+    // ---- selection ----
+
+    fn viewport_point(&self, row: usize, col: usize) -> Point {
+        Point::Viewport(PointCoordinate {
+            x: col.min(self.cols().saturating_sub(1)) as u16,
+            y: row.min(self.rows().saturating_sub(1)) as u32,
+        })
+    }
+
+    /// Start a cell, word, or line selection from a pointer press. A single
+    /// click records only the anchor; the first drag update creates the
+    /// selection so focus clicks do not highlight a stray cell.
+    pub fn start_selection(&mut self, row: usize, col: usize, click_count: usize) {
+        self.clear_selection();
+        let point = self.viewport_point(row, col);
+        let Ok(anchor) = self.term.track_grid_ref(point) else {
+            return;
+        };
+        self.selection_anchor = Some(anchor);
+        self.selection_kind = match click_count {
+            2 => SelectionKind::Word,
+            3.. => SelectionKind::Line,
+            _ => SelectionKind::Cell,
+        };
+        if self.selection_kind != SelectionKind::Cell {
+            self.update_selection(row, col);
+        }
+    }
+
+    /// Extend the active selection to a viewport cell. The tracked anchor
+    /// follows its text through output, scrollback pruning, and resize.
+    pub fn update_selection(&mut self, row: usize, col: usize) {
+        let Some(anchor) = self.selection_anchor.as_ref() else {
+            return;
+        };
+        let Ok(Some(anchor)) = anchor.snapshot(&self.term) else {
+            return;
+        };
+        let Ok(current) = self.term.grid_ref(self.viewport_point(row, col)) else {
+            return;
+        };
+        let selection = match self.selection_kind {
+            SelectionKind::Cell => Selection::new(anchor, current, false),
+            SelectionKind::Word => {
+                let Ok(Some(start)) = self.term.select_word_between(SelectWordBetweenOptions::new(
+                    anchor.clone(),
+                    current.clone(),
+                )) else {
+                    return;
+                };
+                let Ok(Some(end)) = self
+                    .term
+                    .select_word_between(SelectWordBetweenOptions::new(current, anchor))
+                else {
+                    return;
+                };
+                Selection::new(start.start(), end.end(), false)
+            }
+            SelectionKind::Line => {
+                let Ok(Some(start)) = self.term.select_line(SelectLineOptions::new(anchor)) else {
+                    return;
+                };
+                let Ok(Some(end)) = self.term.select_line(SelectLineOptions::new(current)) else {
+                    return;
+                };
+                Selection::new(start.start(), end.end(), false)
+            }
+        };
+        let _ = self.term.set_selection(Some(&selection));
+    }
+
+    pub fn clear_selection(&mut self) {
+        let _ = self.term.set_selection(None);
+        self.selection_anchor = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection_text().is_some()
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        let options = FormatOptions::new()
+            .with_emit_format(Format::Plain)
+            .with_unwrap(true)
+            .with_trim(true);
+        let bytes = self
+            .term
+            .format_selection_alloc(None, options)
+            .ok()
+            .flatten()?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Snapshot the visible grid and cursor together from one render-state update.
     pub fn snapshot(&mut self) -> (Vec<Vec<CellSnapshot>>, Option<CursorSnapshot>) {
         let snapshot = self
@@ -355,6 +466,7 @@ impl Emulator {
                     hidden: style.invisible,
                     wide: wide == CellWide::Wide,
                     wide_spacer: matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead),
+                    selected: cell.is_selected().unwrap_or(false),
                 });
             }
             lines.push(line);
@@ -544,6 +656,42 @@ mod tests {
         e.scroll_to_bottom();
         assert_eq!(e.display_offset(), 0);
         assert_eq!(e.row_text(0), "line7");
+    }
+
+    #[test]
+    fn simple_selection_yields_text_and_marks_cells() {
+        let mut e = emu(20, 3);
+        e.feed(b"hello world");
+        e.start_selection(0, 0, 1);
+        assert!(!e.has_selection(), "a focus click alone selects nothing");
+        e.update_selection(0, 4);
+        assert_eq!(e.selection_text().as_deref(), Some("hello"));
+        let line = e.line(0);
+        assert!(line[..5].iter().all(|cell| cell.selected));
+        assert!(!line[5].selected);
+        e.clear_selection();
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn word_and_line_selection_use_terminal_boundaries() {
+        let mut e = emu(30, 3);
+        e.feed(b"alpha beta gamma\r\nsecond row");
+        e.start_selection(0, 7, 2);
+        assert_eq!(e.selection_text().as_deref(), Some("beta"));
+        e.start_selection(1, 3, 3);
+        assert_eq!(e.selection_text().as_deref(), Some("second row"));
+    }
+
+    #[test]
+    fn selection_anchor_follows_scrolling_output() {
+        let mut e = emu(10, 3);
+        e.feed(b"target\r\n");
+        e.start_selection(0, 0, 1);
+        e.update_selection(0, 5);
+        assert_eq!(e.selection_text().as_deref(), Some("target"));
+        e.feed(b"a\r\nb\r\nc\r\n");
+        assert_eq!(e.selection_text().as_deref(), Some("target"));
     }
 
     #[test]

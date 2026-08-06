@@ -19,8 +19,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyBinding, KeyDownEvent,
-    MouseButton, Render, ScrollDelta, SharedString, Subscription, Task, Window, actions, div,
-    prelude::*, px,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta,
+    SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
 use jolt_proto::{TerminalEvent, TerminalSession};
@@ -33,8 +33,8 @@ use crate::theme::Theme;
 
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator};
 use super::view::{
-    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, TerminalElement, keystroke_bytes, paste_bytes,
-    terminal_bg,
+    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
+    cell_at, keystroke_bytes, paste_bytes, terminal_bg,
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
@@ -175,6 +175,17 @@ pub struct GridSnapshot {
     pub cursor: Option<CursorSnapshot>,
 }
 
+/// Grid placement from the current prepaint, used to map pointer events onto
+/// the exact cells painted in that frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridGeometry {
+    pub origin: gpui::Point<Pixels>,
+    pub cell_w: f32,
+    pub line_h: f32,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 struct TerminalTab {
     key: u64,
     title: SharedString,
@@ -203,6 +214,12 @@ struct DragState {
     over: usize,
     epoch: usize,
     prev_over: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectionDrag {
+    origin: gpui::Point<Pixels>,
+    armed: bool,
 }
 
 /// The dragged-tab payload (gpui drag-and-drop).
@@ -246,6 +263,8 @@ pub struct TerminalPanel {
     tab_seq: u64,
     drag: Option<DragState>,
     last_selected: Option<String>,
+    geometry: Option<GridGeometry>,
+    selection_drag: Option<SelectionDrag>,
     _observe: Subscription,
 }
 
@@ -263,6 +282,8 @@ impl TerminalPanel {
             tab_seq: 0,
             drag: None,
             last_selected: None,
+            geometry: None,
+            selection_drag: None,
             _observe: observe,
         }
     }
@@ -294,6 +315,7 @@ impl TerminalPanel {
         if switched {
             self.last_selected = selected;
             self.drag = None;
+            self.selection_drag = None;
         }
         if self.open {
             // Returning to a chat with tabs restores them; a fresh chat (or an
@@ -694,6 +716,14 @@ impl TerminalPanel {
             cx.stop_propagation();
             return;
         }
+        // Copy selected terminal text without swallowing Ctrl+C interrupts.
+        if ks.key == "c"
+            && (mods.platform || (mods.control && mods.shift))
+            && self.copy_selection(cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         let app_cursor = self
             .active_tab(cx)
             .map(|tab| tab.emulator.app_cursor_mode())
@@ -706,9 +736,11 @@ impl TerminalPanel {
 
     // ---- grid metrics / element hooks ----
 
-    /// Called from element prepaint with the measured cols×rows. Resizes the
-    /// emulator immediately; the `ResizeTerminal` RPC debounces 80 ms.
-    pub fn on_grid_metrics(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
+    /// Called from element prepaint with measured dimensions and placement.
+    /// Resizes the emulator immediately; the RPC debounces 80 ms.
+    pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
+        self.geometry = Some(geometry);
+        let (cols, rows) = (geometry.cols, geometry.rows);
         let Some(chat) = self.selected_chat(cx) else {
             return;
         };
@@ -766,6 +798,99 @@ impl TerminalPanel {
         let tab = self.active_tab_mut(cx)?;
         let (lines, cursor) = tab.emulator.snapshot();
         Some(GridSnapshot { lines, cursor })
+    }
+
+    // ---- selection ----
+
+    fn grid_cell_at(&self, position: gpui::Point<Pixels>) -> Option<super::view::CellHit> {
+        let geometry = self.geometry?;
+        Some(cell_at(
+            f32::from(position.x - geometry.origin.x),
+            f32::from(position.y - geometry.origin.y),
+            geometry.cell_w,
+            geometry.line_h,
+            usize::from(geometry.cols),
+            usize::from(geometry.rows),
+        ))
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let Some(hit) = self.grid_cell_at(event.position) else {
+            return;
+        };
+        let click_count = event.click_count;
+        let extend = event.modifiers.shift
+            && self
+                .active_tab(cx)
+                .is_some_and(|tab| tab.emulator.has_selection());
+        if let Some(tab) = self.active_tab_mut(cx) {
+            if extend {
+                tab.emulator.update_selection(hit.row, hit.col);
+            } else {
+                tab.emulator.start_selection(hit.row, hit.col, click_count);
+            }
+        }
+        self.selection_drag = Some(SelectionDrag {
+            origin: event.position,
+            armed: extend || click_count > 1,
+        });
+        cx.notify();
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(mut drag) = self.selection_drag else {
+            return;
+        };
+        if !drag.armed {
+            let dx = f32::from(event.position.x - drag.origin.x);
+            let dy = f32::from(event.position.y - drag.origin.y);
+            if dx.hypot(dy) < SELECTION_DRAG_THRESHOLD {
+                return;
+            }
+            drag.armed = true;
+            self.selection_drag = Some(drag);
+        }
+        let Some(hit) = self.grid_cell_at(event.position) else {
+            return;
+        };
+        if let Some(tab) = self.active_tab_mut(cx) {
+            tab.emulator.update_selection(hit.row, hit.col);
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.selection_drag = None;
+    }
+
+    fn copy_selection(&self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self
+            .active_tab(cx)
+            .and_then(|tab| tab.emulator.selection_text())
+        else {
+            return false;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        true
     }
 
     fn scroll_active(&mut self, delta_lines: f32, cx: &mut Context<Self>) {
@@ -1158,12 +1283,10 @@ impl Render for TerminalPanel {
                     .key_context("Terminal")
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(Self::on_key_down))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window: &mut Window, cx| {
-                            window.focus(&this.focus_handle, cx);
-                        }),
-                    )
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                         let lines = match event.delta {
                             ScrollDelta::Lines(delta) => delta.y,

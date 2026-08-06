@@ -17,7 +17,7 @@ use gpui::{
     SharedString, Style, TextRun, Window, fill, font, outline, point, px, relative, size,
 };
 
-use crate::theme::{Theme, rgb_to_hsl};
+use crate::theme::{Appearance, Theme, rgb_to_hsl};
 
 use super::emulator::{CellColor, CellSnapshot};
 use super::panel::TerminalPanel;
@@ -37,19 +37,30 @@ pub const RESIZE_DEBOUNCE_MS: u64 = 80;
 // Palette
 // ---------------------------------------------------------------------------
 
-/// Terminal background. Dark keeps the reference `#090909`; light follows the
-/// app's main content surface.
+/// Terminal background for an appearance. Dark keeps the reference `#090909`;
+/// light steps down from the white content plane to `#fafafa`.
+pub fn terminal_bg_for(appearance: Appearance) -> Hsla {
+    match appearance {
+        Appearance::Dark => rgb8(0x09, 0x09, 0x09),
+        Appearance::Light => rgb8(0xfa, 0xfa, 0xfa),
+    }
+}
+
 pub fn terminal_bg(theme: &Theme) -> Hsla {
-    if theme.appearance.is_dark() {
-        rgb8(0x09, 0x09, 0x09)
-    } else {
-        theme.bg
+    terminal_bg_for(theme.appearance)
+}
+
+/// Neutral selection wash that preserves ANSI hue while changing lightness.
+pub fn terminal_selection_for(appearance: Appearance) -> Hsla {
+    match appearance {
+        Appearance::Dark => gpui::hsla(0.0, 0.0, 1.0, 0.22),
+        Appearance::Light => gpui::hsla(0.0, 0.0, 0.0, 0.16),
     }
 }
 
 /// The 16 ANSI colors tuned for the near-black background (indexes 0-7 normal,
 /// 8-15 bright).
-const ANSI16: [(u8, u8, u8); 16] = [
+const ANSI16_DARK: [(u8, u8, u8); 16] = [
     (0x24, 0x24, 0x24), // black — visible against #090909
     (0xf8, 0x71, 0x71), // red
     (0x4a, 0xde, 0x80), // green
@@ -68,6 +79,27 @@ const ANSI16: [(u8, u8, u8); 16] = [
     (0xfa, 0xfa, 0xfa), // bright white
 ];
 
+/// The same named slots tuned for a light background. Bright variants move
+/// darker, not lighter, so they remain more prominent on near-white.
+const ANSI16_LIGHT: [(u8, u8, u8); 16] = [
+    (0x1f, 0x1f, 0x1f),
+    (0xdc, 0x26, 0x26),
+    (0x16, 0xa3, 0x4a),
+    (0xb4, 0x53, 0x09),
+    (0x25, 0x63, 0xeb),
+    (0x93, 0x33, 0xea),
+    (0x0e, 0x74, 0x90),
+    (0x3f, 0x3f, 0x46),
+    (0x71, 0x71, 0x7a),
+    (0xb9, 0x1c, 0x1c),
+    (0x15, 0x80, 0x3d),
+    (0x92, 0x40, 0x0e),
+    (0x1d, 0x4e, 0xd8),
+    (0x7e, 0x22, 0xce),
+    (0x15, 0x5e, 0x75),
+    (0x18, 0x18, 0x1b),
+];
+
 fn rgb8(r: u8, g: u8, b: u8) -> Hsla {
     let (h, s, l) = rgb_to_hsl(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
     gpui::hsla(h, s, l, 1.0)
@@ -76,10 +108,15 @@ fn rgb8(r: u8, g: u8, b: u8) -> Hsla {
 /// xterm 256-color cube component levels.
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
-/// Resolve an indexed color (0-255) to RGB components.
-pub fn indexed_rgb(index: u8) -> (u8, u8, u8) {
+/// Resolve an indexed color (0-255) for an appearance. Named ANSI colors use
+/// appearance-specific tables; the literal color cube stays unchanged; the
+/// grayscale ramp reverses in light mode so its dim end remains dim.
+pub fn indexed_rgb(appearance: Appearance, index: u8) -> (u8, u8, u8) {
     match index {
-        0..=15 => ANSI16[index as usize],
+        0..=15 => match appearance {
+            Appearance::Dark => ANSI16_DARK[index as usize],
+            Appearance::Light => ANSI16_LIGHT[index as usize],
+        },
         16..=231 => {
             let n = index as usize - 16;
             (
@@ -89,8 +126,13 @@ pub fn indexed_rgb(index: u8) -> (u8, u8, u8) {
             )
         }
         232..=255 => {
-            let v = 8 + 10 * (index - 232);
-            (v, v, v)
+            let step = index - 232;
+            let step = match appearance {
+                Appearance::Dark => step,
+                Appearance::Light => 23 - step,
+            };
+            let value = 8 + 10 * step;
+            (value, value, value)
         }
     }
 }
@@ -99,12 +141,38 @@ pub fn indexed_rgb(index: u8) -> (u8, u8, u8) {
 pub fn resolve_color(color: CellColor, theme: &Theme) -> Hsla {
     match color {
         CellColor::Foreground => theme.text,
-        CellColor::Background => terminal_bg(theme),
+        CellColor::Background => terminal_bg_for(theme.appearance),
         CellColor::Indexed(ix) => {
-            let (r, g, b) = indexed_rgb(ix);
+            let (r, g, b) = indexed_rgb(theme.appearance, ix);
             rgb8(r, g, b)
         }
         CellColor::Rgb(r, g, b) => rgb8(r, g, b),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pointer → cell
+// ---------------------------------------------------------------------------
+
+pub const SELECTION_DRAG_THRESHOLD: f32 = 2.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellHit {
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Map a position relative to the first grid glyph onto the nearest cell.
+pub fn cell_at(x: f32, y: f32, cell_w: f32, line_h: f32, cols: usize, rows: usize) -> CellHit {
+    let usable = |value: f32| value.is_finite() && value > 0.0;
+    if cols == 0 || rows == 0 || !usable(cell_w) || !usable(line_h) {
+        return CellHit { row: 0, col: 0 };
+    }
+    let x = if x.is_finite() { x } else { 0.0 };
+    let y = if y.is_finite() { y } else { 0.0 };
+    CellHit {
+        row: ((y / line_h).floor().max(0.0) as usize).min(rows - 1),
+        col: ((x / cell_w).floor().max(0.0) as usize).min(cols - 1),
     }
 }
 
@@ -288,6 +356,7 @@ impl TerminalElement {
 
 pub struct TerminalPrepaint {
     bg_quads: Vec<PaintQuad>,
+    selection_quads: Vec<PaintQuad>,
     lines: Vec<ShapedLine>,
     cursor: Option<PaintQuad>,
 }
@@ -350,29 +419,58 @@ impl gpui::Element for TerminalElement {
         let cols = ((inner_w / f32::from(cell_w)).floor() as i64).clamp(2, 500) as u16;
         let rows = ((inner_h / f32::from(line_h)).floor() as i64).clamp(1, 500) as u16;
 
-        // Report the measured grid, then snapshot for painting. Safe: the
-        // panel entity is not borrowed during element prepaint.
+        // Report the measured grid and its current window placement, then
+        // snapshot for painting. Pointer selection consumes the same metrics.
+        let origin = point(
+            bounds.left() + px(TERM_PADDING),
+            bounds.top() + px(TERM_PADDING),
+        );
         let snapshot = self.panel.update(cx, |panel, cx| {
-            panel.on_grid_metrics(cols, rows, cx);
+            panel.on_grid_metrics(
+                super::panel::GridGeometry {
+                    origin,
+                    cell_w: f32::from(cell_w),
+                    line_h: f32::from(line_h),
+                    cols,
+                    rows,
+                },
+                cx,
+            );
             panel.active_grid_snapshot(cx)
         });
         let Some(snapshot) = snapshot else {
             return TerminalPrepaint {
                 bg_quads: Vec::new(),
+                selection_quads: Vec::new(),
                 lines: Vec::new(),
                 cursor: None,
             };
         };
 
-        let origin = point(
-            bounds.left() + px(TERM_PADDING),
-            bounds.top() + px(TERM_PADDING),
-        );
         let mut bg_quads = Vec::new();
+        let mut selection_quads = Vec::new();
         let mut lines = Vec::with_capacity(snapshot.lines.len());
 
         for (row_ix, row) in snapshot.lines.iter().enumerate() {
             let y = origin.y + line_h * row_ix as f32;
+            let mut selection_start = None;
+            for col in 0..=row.len() {
+                let selected = row.get(col).is_some_and(|cell| cell.selected);
+                match (selection_start, selected) {
+                    (None, true) => selection_start = Some(col),
+                    (Some(start), false) => {
+                        selection_quads.push(fill(
+                            Bounds::new(
+                                point(origin.x + cell_w * start as f32, y),
+                                size(cell_w * (col - start) as f32, line_h),
+                            ),
+                            terminal_selection_for(theme.appearance),
+                        ));
+                        selection_start = None;
+                    }
+                    _ => {}
+                }
+            }
             // Merge consecutive non-default background cells into quads.
             let mut run_start: Option<(usize, Hsla)> = None;
             for (col, color) in row
@@ -421,6 +519,7 @@ impl gpui::Element for TerminalElement {
 
         TerminalPrepaint {
             bg_quads,
+            selection_quads,
             lines,
             cursor,
         }
@@ -443,6 +542,9 @@ impl gpui::Element for TerminalElement {
         );
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             for quad in prepaint.bg_quads.drain(..) {
+                window.paint_quad(quad);
+            }
+            for quad in prepaint.selection_quads.drain(..) {
                 window.paint_quad(quad);
             }
             for (ix, line) in prepaint.lines.iter().enumerate() {
@@ -710,27 +812,67 @@ mod tests {
     }
 
     #[test]
-    fn cube_and_grayscale_resolution() {
-        // 16 = cube origin (0,0,0); 231 = cube max (255,255,255).
-        assert_eq!(indexed_rgb(16), (0, 0, 0));
-        assert_eq!(indexed_rgb(231), (255, 255, 255));
-        // 196 = pure red corner: 16 + 36*5.
-        assert_eq!(indexed_rgb(196), (255, 0, 0));
-        // 21 = pure blue corner.
-        assert_eq!(indexed_rgb(21), (0, 0, 255));
-        // Grayscale ramp: 232 → 8, 255 → 238.
-        assert_eq!(indexed_rgb(232), (8, 8, 8));
-        assert_eq!(indexed_rgb(255), (238, 238, 238));
-        // ANSI range hits the palette table.
-        assert_eq!(indexed_rgb(1), ANSI16[1]);
+    fn cube_is_appearance_independent() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            assert_eq!(indexed_rgb(appearance, 16), (0, 0, 0));
+            assert_eq!(indexed_rgb(appearance, 231), (255, 255, 255));
+            assert_eq!(indexed_rgb(appearance, 196), (255, 0, 0));
+            assert_eq!(indexed_rgb(appearance, 21), (0, 0, 255));
+        }
+    }
+
+    #[test]
+    fn grayscale_ramp_mirrors_in_light() {
+        assert_eq!(indexed_rgb(Appearance::Dark, 232), (8, 8, 8));
+        assert_eq!(indexed_rgb(Appearance::Dark, 255), (238, 238, 238));
+        assert_eq!(indexed_rgb(Appearance::Light, 232), (238, 238, 238));
+        assert_eq!(indexed_rgb(Appearance::Light, 255), (8, 8, 8));
+    }
+
+    #[test]
+    fn ansi_range_uses_the_appearance_palette() {
+        assert_eq!(indexed_rgb(Appearance::Dark, 1), ANSI16_DARK[1]);
+        assert_eq!(indexed_rgb(Appearance::Light, 1), ANSI16_LIGHT[1]);
+        assert_ne!(ANSI16_DARK, ANSI16_LIGHT);
     }
 
     #[test]
     fn terminal_bg_follows_appearance() {
         assert_eq!(terminal_bg(&Theme::dark()), rgb8(0x09, 0x09, 0x09));
+        assert_eq!(terminal_bg(&Theme::light()), rgb8(0xfa, 0xfa, 0xfa));
+    }
 
-        let light = Theme::light();
-        assert_eq!(terminal_bg(&light), light.bg);
+    #[test]
+    fn pointer_positions_map_and_clamp_to_grid_cells() {
+        assert_eq!(
+            cell_at(0.0, 0.0, 10.0, 20.0, 8, 4),
+            CellHit { row: 0, col: 0 }
+        );
+        assert_eq!(
+            cell_at(25.0, 45.0, 10.0, 20.0, 8, 4),
+            CellHit { row: 2, col: 2 }
+        );
+        assert_eq!(
+            cell_at(9_999.0, 9_999.0, 10.0, 20.0, 8, 4),
+            CellHit { row: 3, col: 7 }
+        );
+        assert_eq!(
+            cell_at(-50.0, -50.0, 10.0, 20.0, 8, 4),
+            CellHit { row: 0, col: 0 }
+        );
+        assert_eq!(
+            cell_at(5.0, 5.0, 0.0, 20.0, 8, 4),
+            CellHit { row: 0, col: 0 }
+        );
+    }
+
+    #[test]
+    fn selection_wash_is_neutral_and_translucent() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let wash = terminal_selection_for(appearance);
+            assert_eq!(wash.s, 0.0);
+            assert!(wash.a > 0.0 && wash.a < 0.5);
+        }
     }
 
     #[test]

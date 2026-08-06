@@ -28,7 +28,7 @@ Version-control executable overrides are documented in [Environment variables](e
 
 ## Claude Code
 
-Jolt launches Claude Code with streaming JSON input/output and keeps stdin open for steering. It normalizes text and reasoning deltas, tool calls/results, usage, rate-limit events, and final status. Claude's `AskUserQuestion` control request becomes Jolt's question panel.
+Jolt launches Claude Code with streaming JSON input/output and keeps stdin open for steering. It normalizes text and reasoning deltas, tool calls/results, usage, rate-limit events, and final status. Claude's `AskUserQuestion` control request becomes Jolt's question panel. Coding tools are auto-approved for unattended full-access operation.
 
 Harness session IDs are stored on the chat row and resumed only from the same working directory. Interrupt begins with the CLI's control path and escalates process termination if the child does not exit.
 
@@ -36,9 +36,9 @@ Harness session IDs are stored on the chat row and resumed only from the same wo
 
 ## Codex
 
-Jolt speaks JSON-RPC to `codex app-server`. It starts or resumes a thread, starts turns with the selected model, effort, sandbox, and approval policy, and maps item/delta notifications into the common transcript model.
+Jolt speaks JSON-RPC to `codex app-server`. It starts or resumes a thread, starts turns with the selected model and effort, forces `danger-full-access` with approval policy `never`, and maps item/delta notifications into the common transcript model.
 
-Command and file-change approval requests are answered through Jolt's harness policy. Steering and interrupts use Codex's native turn methods. Unexpected exits include a bounded stderr tail in the surfaced error.
+Command and file-change approval requests are auto-approved for unattended operation. Steering and interrupts use Codex's native turn methods. Unexpected exits include a bounded stderr tail in the surfaced error.
 
 **Accounts:** **Settings → Accounts** can manage Codex login slots on a selected device. Codex login completes through the browser and Jolt polls until the CLI writes the new session.
 
@@ -69,7 +69,7 @@ Pi extension UI requests are bridged into Jolt's input surface. Native Pi bash h
 
 Model catalogs are fetched from the device that will run the session, so every viewport presents the host's installed models.
 
-The composer persists a concrete model, reasoning level, sandbox, and harness-specific option map on the chat. Harness-specific examples include context-window, service-tier, tool-access, or project-trust choices. Unsupported or newly added wire fields are treated as additive where possible.
+The composer persists a concrete model, reasoning level, and harness-specific option map on the chat. Jolt defaults coding harnesses to unattended full access; Pi can additionally expose a read-only tool set. Harness-specific examples include context-window, service-tier, tool-access, or project-trust choices. Unsupported or newly added wire fields are treated as additive where possible.
 
 ## Steering and continuation
 

@@ -24,10 +24,11 @@ Local engine RPC binds only `127.0.0.1`. It has no additional IPC authentication
 
 ## Agent execution
 
-Harness subprocesses inherit the engine user's filesystem and process permissions, subject to harness-specific sandbox controls:
+Harness subprocesses inherit the engine user's filesystem and process permissions. Jolt intentionally defaults coding harnesses to unattended full-access operation:
 
-- Claude Code and Codex receive the selected sandbox/approval policy.
-- Pi uses either full local tools or a Jolt-selected read-only built-in tool set; execution inherits the engine process's operating-system isolation.
+- Claude Code tools are auto-approved.
+- Codex runs with `danger-full-access` and approval policy `never`.
+- Pi defaults to full local tools and can expose a read-only built-in tool set; execution inherits the engine process's operating-system isolation.
 - Project-local Pi extensions and settings can execute code after trust is granted.
 
 Use operating-system isolation, containers, or a dedicated user account when a repository is not trusted. A remote viewport does not make execution remote-safe; it asks the host engine to act with that host user's authority.
