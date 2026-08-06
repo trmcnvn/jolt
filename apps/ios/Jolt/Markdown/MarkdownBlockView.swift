@@ -139,6 +139,9 @@ struct MarkdownBlockView: View {
     let block: MDBlock
     /// Identity for async highlight caching (row id).
     var cacheKey: String = ""
+    /// Assistant rows fill the transcript column; user-bubble blocks keep
+    /// their intrinsic width up to the bubble's cap.
+    var fillsWidth = true
 
     var body: some View {
         switch block {
@@ -147,7 +150,7 @@ struct MarkdownBlockView: View {
                 .textRenderer(InlineCodeRenderer())
                 .lineSpacing(MD.lineHeight - MD.textSize - 4)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
                 .tint(Theme.text)
 
         case .heading(let level, let runs):
@@ -156,7 +159,7 @@ struct MarkdownBlockView: View {
                 .textRenderer(InlineCodeRenderer())
                 .lineSpacing(m.line - m.size - 4)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
 
         case .codeBlock(let language, let code):
             CodeBlockView(language: language, code: code, cacheKey: cacheKey)

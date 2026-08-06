@@ -68,6 +68,7 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        persist_session: true,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -99,6 +100,21 @@ async fn run_to_end(
     )
     .await
     .expect("run finished in time")
+}
+
+#[tokio::test]
+async fn ephemeral_run_disables_session_persistence() {
+    let (mut controls, _steer, _token) = controls("Yes");
+    controls.persist_session = false;
+    let events = run_to_end(&harness(), request("scenario:ephemeral"), controls).await;
+
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]
@@ -381,6 +397,7 @@ async fn approvals_round_trip_as_input_requests() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
+        persist_session: true,
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();

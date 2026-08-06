@@ -158,7 +158,8 @@ final class WorkspaceStore {
                              name: f["name"]?.stringValue ?? id,
                              platform: f["platform"]?.stringValue ?? "",
                              lastSeenAt: f["lastSeenAt"]?.int64Value,
-                             createdAt: f["createdAt"]?.int64Value)
+                             createdAt: f["createdAt"]?.int64Value,
+                             version: f["version"]?.stringValue)
         }.sorted { $0.name < $1.name }
 
         spaces = doc.overlayRows(kind: "spaces").compactMap { row in
@@ -181,6 +182,7 @@ final class WorkspaceStore {
                 chatConfig = ChatConfig(harness: c["harness"]?.stringValue ?? "claude-code",
                                         model: c["model"]?.stringValue,
                                         reasoning: c["reasoning"]?.stringValue,
+                                        modelOptions: c["modelOptions"]?.objectValue ?? [:],
                                         sandbox: c["sandbox"]?.stringValue)
             }
             return Chat(id: f["id"]?.stringValue ?? row.id, deviceId: deviceId,
@@ -205,6 +207,7 @@ final class WorkspaceStore {
                   let statusStr = f["status"]?.stringValue,
                   let status = SessionStatus(rawValue: statusStr) else { continue }
             rows[chatId] = SessionRow(chatId: chatId, deviceId: deviceId, status: status,
+                                      compacting: f["compacting"]?.boolValue ?? false,
                                       startedAt: f["startedAt"]?.int64Value,
                                       updatedAt: f["updatedAt"]?.int64Value ?? 0)
         }
@@ -272,10 +275,29 @@ final class WorkspaceStore {
         return try await relay(for: deviceId).call(method: "ListFolders", params: params)
     }
 
-    /// ListRefs on the target device — branches with current/worktree markers
-    /// (default branch first, per the engine's ordering).
+    /// ListRefs on the target device — Git branches or Jujutsu working
+    /// copies/bookmarks with isolated-checkout markers.
     func listRefs(deviceId: String, repoPath: String) async -> [RepoRef]? {
         try? await relay(for: deviceId).call(method: "ListRefs", params: ["repoPath": repoPath])
+    }
+
+    /// Search one verified space checkout. `path` may name only an existing
+    /// linked worktree/workspace; the host returns relative paths, never bytes.
+    func searchFiles(deviceId: String, spaceId: String, path: String?, query: String) async throws -> [FileSearchMatch] {
+        var params: [String: Any] = ["spaceId": spaceId, "query": query]
+        if let path { params["path"] = path }
+        return try await relay(for: deviceId).call(method: "SearchFiles", params: params)
+    }
+
+    /// Harness integrations registered by the target engine.
+    func listHarnesses(deviceId: String) async -> [HarnessInfo]? {
+        struct WireHarness: Decodable {
+            var id: String
+            var name: String
+        }
+        let wire: [WireHarness]? = try? await relay(for: deviceId)
+            .call(method: "ListHarnesses", params: [:])
+        return wire?.filter { $0.id != "mock" }.map { HarnessInfo(id: $0.id, label: $0.name) }
     }
 
     /// ListModels — the target device's live harness catalog (the desktop
@@ -288,7 +310,7 @@ final class WorkspaceStore {
             var reasoningLevels: [String]?
         }
         let wire: [WireModel]? = try? await relay(for: deviceId)
-            .call(method: "ListModels", params: ["harness": harness])
+            .call(method: "ListModels", params: ["harness": harness], timeoutSeconds: 30)
         return wire.map { models in
             models.map {
                 ModelInfo(id: $0.id, label: $0.label, description: $0.description,
@@ -297,8 +319,8 @@ final class WorkspaceStore {
         }
     }
 
-    /// SwitchRef — `git checkout` in the given folder on the target device.
-    /// Returns git's error message on failure (dirty tree, held ref, …).
+    /// SwitchRef through the target's active VCS backend.
+    /// Returns the backend's error message on failure.
     func switchRef(deviceId: String, repoPath: String, refName: String) async -> String? {
         struct Reply: Decodable { var branch: String? }
         do {
@@ -310,13 +332,17 @@ final class WorkspaceStore {
         }
     }
 
-    /// CreateWorktree — a fresh isolated worktree off the base ref; returns
-    /// its path.
-    func createWorktree(deviceId: String, repoPath: String, branch: String) async -> String? {
-        struct Reply: Decodable { var path: String }
-        let reply: Reply? = try? await relay(for: deviceId)
-            .call(method: "CreateWorktree", params: ["repoPath": repoPath, "branch": branch])
-        return reply?.path
+    /// CreateWorktree — a fresh isolated Git worktree or Jujutsu workspace.
+    func createWorktree(deviceId: String, repoPath: String, revision: String) async -> Worktree? {
+        try? await relay(for: deviceId)
+            .call(method: "CreateWorktree", params: ["repoPath": repoPath, "branch": revision])
+    }
+
+    /// Upload an attachment into the chat's edge-scoped artifact prefix.
+    func uploadAttachment(deviceId: String, chatId: String,
+                          name: String, data: Data) async throws -> String {
+        try await uploadAttachmentChunked(relay: relay(for: deviceId), chatId: chatId,
+                                          name: name, data: data)
     }
 
     /// Retarget a session onto another checkout (the desktop's

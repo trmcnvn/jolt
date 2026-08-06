@@ -33,7 +33,7 @@
 //!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
 //!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
 //! - Uploads: `UploadChunk {uploadId, data, seq?}`,
-//!   `UploadCommit {uploadId, fileName}` → `{path}`,
+//!   `UploadCommit {uploadId, fileName, chatId}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
 //!   done}` (path-jailed to the uploads dir + workspace-known chat cwds).
 //!
@@ -199,7 +199,7 @@ struct FileSearchParams {
 
 fn tool_file_path(call: &ToolCall) -> Option<&str> {
     match call {
-        ToolCall::ReadFile { path }
+        ToolCall::ReadFile { path, .. }
         | ToolCall::WriteFile { path, .. }
         | ToolCall::EditFile { path, .. } => Some(path),
         ToolCall::ApplyPatch { path } | ToolCall::Search { path, .. } => path.as_deref(),
@@ -320,6 +320,7 @@ struct UploadChunkParams {
 struct UploadCommitParams {
     upload_id: String,
     file_name: String,
+    chat_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -410,6 +411,9 @@ enum MutateParams {
     DeleteChat { chat_id: String },
     #[serde(rename_all = "camelCase")]
     RenameDevice { device_id: String, name: String },
+    /// Remove a device and cascade through its spaces and sessions.
+    #[serde(rename_all = "camelCase")]
+    DeleteDevice { device_id: String },
     /// Synced seen marker (LWW + monotonic guard): clears the "completed"
     /// badge on every device. `at` is epoch ms; default = now.
     #[serde(rename_all = "camelCase")]
@@ -776,6 +780,20 @@ impl EngineRpc {
                 .rename_device(&device_id, &name)
                 .map_err(failed)
                 .map(drop),
+            MutateParams::DeleteDevice { device_id } => {
+                let deleted = self.workspace.delete_device(&device_id).map_err(failed)?;
+                let sessions = self.sessions.clone();
+                let doc_host = self.doc_host.clone();
+                tokio::spawn(async move {
+                    for chat_id in deleted.chat_ids {
+                        if let Err(err) = sessions.interrupt(&chat_id).await {
+                            tracing::debug!(chat = %chat_id, error = %err, "deleteDevice interrupt skipped");
+                        }
+                        doc_host.purge_chat(&chat_id);
+                    }
+                });
+                Ok(())
+            }
             MutateParams::MarkChatSeen { chat_id, at } => {
                 let at = at
                     .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
@@ -885,7 +903,7 @@ fn is_stream_method(method: &str) -> bool {
 }
 
 /// A watch receiver as a stream: current value first, then every change.
-fn watch_stream<T>(rx: watch::Receiver<T>) -> BoxStream<'static, serde_json::Value>
+pub(crate) fn watch_stream<T>(rx: watch::Receiver<T>) -> BoxStream<'static, serde_json::Value>
 where
     T: serde::Serialize + Clone + Send + Sync + 'static,
 {
@@ -1537,7 +1555,7 @@ impl RpcService for EngineRpc {
                 let p: UploadCommitParams = parse_params(params)?;
                 let path = self
                     .uploads
-                    .commit(&p.upload_id, &p.file_name)
+                    .commit(&p.upload_id, &p.file_name, &p.chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "path": path }))
             }

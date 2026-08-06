@@ -17,6 +17,7 @@ DELAY=""
 
 echo "▸ building (first run takes a few minutes)…"
 cargo build -p jolt -q
+scripts/target-cache.sh warn || true
 
 echo "▸ starting engine daemon on :$IPC"
 env JOLT_DATA_DIR="$DAEMON_DIR" JOLT_IPC_PORT=$IPC JOLT_HARNESS=mock \

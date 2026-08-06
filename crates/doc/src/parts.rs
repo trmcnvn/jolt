@@ -185,7 +185,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
 
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
-/// Keeps: command / path / pattern / url / query / todo items / server+tool names.
+/// Keeps: command / path + read range / pattern / url / query / todo items / server+tool names.
 /// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {

@@ -46,6 +46,15 @@ pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
 const FILE_NAME: &str = "ui-settings.json";
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ScopeNavigation {
+    pub last_space_id: Option<String>,
+    pub open_tabs: Option<Vec<String>>,
+    pub active_tab_id: Option<String>,
+    pub space_filter: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -54,15 +63,28 @@ pub struct UiSettings {
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
     /// folder inherently). Kept for file compatibility; no longer read.
     pub sidebar_grouped: bool,
-    /// The last selected space — restored on boot when the row still exists.
+    /// The last active space — restored on boot and used as the new-session
+    /// fallback when the sidebar filter is "All spaces".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
-    /// Manual session-tab order per space (drag-reorder; device-local).
-    /// Missing chats are skipped; new chats append in creation order.
+    /// Device-local open session tabs in drag order. `None` identifies a
+    /// pre-tabs settings file and triggers a one-time legacy-order migration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_tabs: Option<Vec<String>>,
+    /// Last active session tab, restored when it is still open and live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_tab_id: Option<String>,
+    /// Sidebar session filter (`None` = All spaces).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_filter: Option<String>,
+    /// Navigation snapshots partitioned by Local/Account scope. The top-level
+    /// fields above are the currently active snapshot for compatibility.
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub scope_navigation: std::collections::HashMap<String, ScopeNavigation>,
+    /// Legacy per-space tab order. Read only by the open-tabs migration.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub tab_order: std::collections::HashMap<String, Vec<String>>,
-    /// Manual sidebar space order (drag-reorder; device-local). Missing spaces
-    /// are skipped; new spaces append in creation order.
+    /// Legacy manual space order; retained for settings-file compatibility.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
     /// Deliver app-wide alerts through the operating system instead of in-app
@@ -82,10 +104,21 @@ pub struct UiSettings {
     pub appearance: crate::appearance::AppearanceMode,
     /// Font family for application chrome, prose, and controls.
     pub ui_font: String,
-    /// Font family for code, diffs, and shortcut chips.
+    /// Font family used only by the chat composer.
+    #[serde(default)]
+    pub prompt_font: String,
+    /// Font family for code, diffs, and hotkey chips.
     pub code_font: String,
     /// Font family used by terminal grids.
     pub terminal_font: String,
+    /// Interface and prose font size in logical pixels.
+    pub font_size_interface: u8,
+    /// Composer input font size in logical pixels.
+    pub font_size_prompt: u8,
+    /// Code block and diff font size in logical pixels.
+    pub font_size_code: u8,
+    /// Terminal grid font size in logical pixels.
+    pub font_size_terminal: u8,
     /// Shell command run when a new terminal opens. Empty uses the default
     /// interactive login shell.
     pub terminal_command: String,
@@ -98,6 +131,10 @@ impl Default for UiSettings {
             sidebar_collapsed: false,
             sidebar_grouped: false,
             last_space_id: None,
+            open_tabs: None,
+            active_tab_id: None,
+            space_filter: None,
+            scope_navigation: std::collections::HashMap::new(),
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             system_notifications_enabled: false,
@@ -108,53 +145,126 @@ impl Default for UiSettings {
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
             ui_font: crate::theme::DEFAULT_UI_FONT.into(),
+            prompt_font: crate::theme::DEFAULT_UI_FONT.into(),
             code_font: crate::theme::DEFAULT_CODE_FONT.into(),
             terminal_font: crate::theme::DEFAULT_CODE_FONT.into(),
+            font_size_interface: crate::theme::DEFAULT_INTERFACE_FONT_SIZE,
+            font_size_prompt: crate::theme::DEFAULT_PROMPT_FONT_SIZE,
+            font_size_code: crate::theme::DEFAULT_CODE_FONT_SIZE,
+            font_size_terminal: crate::theme::DEFAULT_TERMINAL_FONT_SIZE,
             terminal_command: String::new(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Keymap (customizable shortcuts, §1.4)
+// Keymap (customizable hotkeys, §1.4)
 // ---------------------------------------------------------------------------
 
-/// The rebindable app shortcuts.
+/// A customizable app hotkey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
     NewSession,
     ClearInput,
-    ArchiveSession,
+    CloseTab,
     OpenSettings,
     AddSpace,
+    SearchSessions,
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
+    NewTerminalTab,
+    CloseTerminalTab,
+    SelectTab1,
+    SelectTab2,
+    SelectTab3,
+    SelectTab4,
+    SelectTab5,
+    SelectTab6,
+    SelectTab7,
+    SelectTab8,
+    SelectLastTab,
+    Quit,
+    Hide,
+    HideOthers,
+    Minimize,
+    CloseWindow,
+    PerformanceHud,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 8] = [
-        ShortcutId::NewSession,
-        ShortcutId::ClearInput,
-        ShortcutId::ArchiveSession,
-        ShortcutId::OpenSettings,
-        ShortcutId::AddSpace,
-        ShortcutId::ToggleSidebar,
-        ShortcutId::ToggleChanges,
-        ShortcutId::ToggleTerminal,
+    pub const TAB_SELECTION: [ShortcutId; 9] = [
+        ShortcutId::SelectTab1,
+        ShortcutId::SelectTab2,
+        ShortcutId::SelectTab3,
+        ShortcutId::SelectTab4,
+        ShortcutId::SelectTab5,
+        ShortcutId::SelectTab6,
+        ShortcutId::SelectTab7,
+        ShortcutId::SelectTab8,
+        ShortcutId::SelectLastTab,
     ];
+
+    /// Hotkeys available in this build and on this platform.
+    pub fn all() -> Vec<ShortcutId> {
+        let mut ids = vec![
+            ShortcutId::NewSession,
+            ShortcutId::ClearInput,
+            ShortcutId::CloseTab,
+            ShortcutId::OpenSettings,
+            ShortcutId::AddSpace,
+            ShortcutId::SearchSessions,
+            ShortcutId::ToggleSidebar,
+            ShortcutId::ToggleChanges,
+            ShortcutId::ToggleTerminal,
+            ShortcutId::NewTerminalTab,
+            ShortcutId::CloseTerminalTab,
+        ];
+        ids.extend(Self::TAB_SELECTION);
+        if cfg!(target_os = "macos") {
+            ids.extend([
+                ShortcutId::Quit,
+                ShortcutId::Hide,
+                ShortcutId::HideOthers,
+                ShortcutId::Minimize,
+                ShortcutId::CloseWindow,
+            ]);
+        }
+        if cfg!(any(debug_assertions, feature = "debug-ui")) {
+            ids.push(ShortcutId::PerformanceHud);
+        }
+        ids
+    }
 
     /// Row label.
     pub fn label(self) -> &'static str {
         match self {
             ShortcutId::NewSession => "New session",
             ShortcutId::ClearInput => "Clear input",
-            ShortcutId::ArchiveSession => "Archive current session",
+            ShortcutId::CloseTab => "Close current tab",
             ShortcutId::OpenSettings => "Open settings",
             ShortcutId::AddSpace => "Add space",
+            ShortcutId::SearchSessions => "Search sessions",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
+            ShortcutId::NewTerminalTab => "New terminal tab",
+            ShortcutId::CloseTerminalTab => "Close terminal tab",
+            ShortcutId::SelectTab1 => "Select tab 1",
+            ShortcutId::SelectTab2 => "Select tab 2",
+            ShortcutId::SelectTab3 => "Select tab 3",
+            ShortcutId::SelectTab4 => "Select tab 4",
+            ShortcutId::SelectTab5 => "Select tab 5",
+            ShortcutId::SelectTab6 => "Select tab 6",
+            ShortcutId::SelectTab7 => "Select tab 7",
+            ShortcutId::SelectTab8 => "Select tab 8",
+            ShortcutId::SelectLastTab => "Select last tab",
+            ShortcutId::Quit => "Quit Jolt",
+            ShortcutId::Hide => "Hide Jolt",
+            ShortcutId::HideOthers => "Hide other applications",
+            ShortcutId::Minimize => "Minimize window",
+            ShortcutId::CloseWindow => "Close window",
+            ShortcutId::PerformanceHud => "Toggle performance HUD",
         }
     }
 
@@ -162,29 +272,66 @@ impl ShortcutId {
         match self {
             ShortcutId::NewSession => "mod-n",
             ShortcutId::ClearInput => "mod-c",
-            ShortcutId::ArchiveSession => "mod-w",
+            ShortcutId::CloseTab => "mod-w",
             ShortcutId::OpenSettings => "mod-,",
             ShortcutId::AddSpace => "mod-k",
+            ShortcutId::SearchSessions => "mod-shift-f",
             ShortcutId::ToggleSidebar => "mod-e",
             ShortcutId::ToggleChanges => "mod-b",
             ShortcutId::ToggleTerminal => "mod-`",
+            ShortcutId::NewTerminalTab => "mod-t",
+            ShortcutId::CloseTerminalTab => "mod-shift-w",
+            ShortcutId::SelectTab1 => "mod-1",
+            ShortcutId::SelectTab2 => "mod-2",
+            ShortcutId::SelectTab3 => "mod-3",
+            ShortcutId::SelectTab4 => "mod-4",
+            ShortcutId::SelectTab5 => "mod-5",
+            ShortcutId::SelectTab6 => "mod-6",
+            ShortcutId::SelectTab7 => "mod-7",
+            ShortcutId::SelectTab8 => "mod-8",
+            ShortcutId::SelectLastTab => "mod-9",
+            ShortcutId::Quit => "mod-q",
+            ShortcutId::Hide => "mod-h",
+            ShortcutId::HideOthers => "mod-alt-h",
+            ShortcutId::Minimize => "mod-m",
+            ShortcutId::CloseWindow => "mod-w",
+            ShortcutId::PerformanceHud => "mod-shift-f12",
         }
     }
 }
 
-/// Persisted shortcut combos. Stored platform-neutral (for example, "mod-e");
-/// translated to "cmd-e"/"ctrl-e" at bind time by [`platform_combo`].
+/// Persisted hotkey combinations. Stored platform-neutral (for example,
+/// "mod-e"); translated to "cmd-e"/"ctrl-e" at bind time by
+/// [`platform_combo`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
     pub new_session: String,
     pub clear_input: String,
-    pub archive_session: String,
+    pub close_tab: String,
     pub open_settings: String,
     pub add_space: String,
+    pub search_sessions: String,
     pub toggle_sidebar: String,
     pub toggle_changes: String,
     pub toggle_terminal: String,
+    pub new_terminal_tab: String,
+    pub close_terminal_tab: String,
+    pub select_tab_1: String,
+    pub select_tab_2: String,
+    pub select_tab_3: String,
+    pub select_tab_4: String,
+    pub select_tab_5: String,
+    pub select_tab_6: String,
+    pub select_tab_7: String,
+    pub select_tab_8: String,
+    pub select_last_tab: String,
+    pub quit: String,
+    pub hide: String,
+    pub hide_others: String,
+    pub minimize: String,
+    pub close_window: String,
+    pub performance_hud: String,
 }
 
 impl Default for KeymapConfig {
@@ -192,12 +339,30 @@ impl Default for KeymapConfig {
         Self {
             new_session: ShortcutId::NewSession.default_combo().into(),
             clear_input: ShortcutId::ClearInput.default_combo().into(),
-            archive_session: ShortcutId::ArchiveSession.default_combo().into(),
+            close_tab: ShortcutId::CloseTab.default_combo().into(),
             open_settings: ShortcutId::OpenSettings.default_combo().into(),
             add_space: ShortcutId::AddSpace.default_combo().into(),
+            search_sessions: ShortcutId::SearchSessions.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
+            new_terminal_tab: ShortcutId::NewTerminalTab.default_combo().into(),
+            close_terminal_tab: ShortcutId::CloseTerminalTab.default_combo().into(),
+            select_tab_1: ShortcutId::SelectTab1.default_combo().into(),
+            select_tab_2: ShortcutId::SelectTab2.default_combo().into(),
+            select_tab_3: ShortcutId::SelectTab3.default_combo().into(),
+            select_tab_4: ShortcutId::SelectTab4.default_combo().into(),
+            select_tab_5: ShortcutId::SelectTab5.default_combo().into(),
+            select_tab_6: ShortcutId::SelectTab6.default_combo().into(),
+            select_tab_7: ShortcutId::SelectTab7.default_combo().into(),
+            select_tab_8: ShortcutId::SelectTab8.default_combo().into(),
+            select_last_tab: ShortcutId::SelectLastTab.default_combo().into(),
+            quit: ShortcutId::Quit.default_combo().into(),
+            hide: ShortcutId::Hide.default_combo().into(),
+            hide_others: ShortcutId::HideOthers.default_combo().into(),
+            minimize: ShortcutId::Minimize.default_combo().into(),
+            close_window: ShortcutId::CloseWindow.default_combo().into(),
+            performance_hud: ShortcutId::PerformanceHud.default_combo().into(),
         }
     }
 }
@@ -207,12 +372,30 @@ impl KeymapConfig {
         match id {
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::ClearInput => &self.clear_input,
-            ShortcutId::ArchiveSession => &self.archive_session,
+            ShortcutId::CloseTab => &self.close_tab,
             ShortcutId::OpenSettings => &self.open_settings,
             ShortcutId::AddSpace => &self.add_space,
+            ShortcutId::SearchSessions => &self.search_sessions,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
+            ShortcutId::NewTerminalTab => &self.new_terminal_tab,
+            ShortcutId::CloseTerminalTab => &self.close_terminal_tab,
+            ShortcutId::SelectTab1 => &self.select_tab_1,
+            ShortcutId::SelectTab2 => &self.select_tab_2,
+            ShortcutId::SelectTab3 => &self.select_tab_3,
+            ShortcutId::SelectTab4 => &self.select_tab_4,
+            ShortcutId::SelectTab5 => &self.select_tab_5,
+            ShortcutId::SelectTab6 => &self.select_tab_6,
+            ShortcutId::SelectTab7 => &self.select_tab_7,
+            ShortcutId::SelectTab8 => &self.select_tab_8,
+            ShortcutId::SelectLastTab => &self.select_last_tab,
+            ShortcutId::Quit => &self.quit,
+            ShortcutId::Hide => &self.hide,
+            ShortcutId::HideOthers => &self.hide_others,
+            ShortcutId::Minimize => &self.minimize,
+            ShortcutId::CloseWindow => &self.close_window,
+            ShortcutId::PerformanceHud => &self.performance_hud,
         }
     }
 
@@ -220,12 +403,30 @@ impl KeymapConfig {
         match id {
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::ClearInput => self.clear_input = combo,
-            ShortcutId::ArchiveSession => self.archive_session = combo,
+            ShortcutId::CloseTab => self.close_tab = combo,
             ShortcutId::OpenSettings => self.open_settings = combo,
             ShortcutId::AddSpace => self.add_space = combo,
+            ShortcutId::SearchSessions => self.search_sessions = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
+            ShortcutId::NewTerminalTab => self.new_terminal_tab = combo,
+            ShortcutId::CloseTerminalTab => self.close_terminal_tab = combo,
+            ShortcutId::SelectTab1 => self.select_tab_1 = combo,
+            ShortcutId::SelectTab2 => self.select_tab_2 = combo,
+            ShortcutId::SelectTab3 => self.select_tab_3 = combo,
+            ShortcutId::SelectTab4 => self.select_tab_4 = combo,
+            ShortcutId::SelectTab5 => self.select_tab_5 = combo,
+            ShortcutId::SelectTab6 => self.select_tab_6 = combo,
+            ShortcutId::SelectTab7 => self.select_tab_7 = combo,
+            ShortcutId::SelectTab8 => self.select_tab_8 = combo,
+            ShortcutId::SelectLastTab => self.select_last_tab = combo,
+            ShortcutId::Quit => self.quit = combo,
+            ShortcutId::Hide => self.hide = combo,
+            ShortcutId::HideOthers => self.hide_others = combo,
+            ShortcutId::Minimize => self.minimize = combo,
+            ShortcutId::CloseWindow => self.close_window = combo,
+            ShortcutId::PerformanceHud => self.performance_hud = combo,
         }
     }
 
@@ -267,16 +468,27 @@ pub fn combo_from_keystroke(
     Some(parts.join("-"))
 }
 
-/// Shortcut ids whose combos collide with another shortcut (conflict detection).
+/// Whether two actions intentionally share one hotkey. Cmd+W closes the
+/// current tab in chat mode and falls through to Close Window in Settings.
+pub fn hotkeys_can_overlap(first: ShortcutId, second: ShortcutId) -> bool {
+    matches!(
+        (first, second),
+        (ShortcutId::CloseTab, ShortcutId::CloseWindow)
+            | (ShortcutId::CloseWindow, ShortcutId::CloseTab)
+    )
+}
+
+/// Hotkey ids whose combinations collide with another action.
 pub fn conflicted_shortcuts(keymap: &KeymapConfig) -> Vec<ShortcutId> {
-    ShortcutId::ALL
-        .into_iter()
+    let ids = ShortcutId::all();
+    ids.iter()
+        .copied()
         .filter(|&id| {
             let combo = keymap.get(id);
             !combo.is_empty()
-                && ShortcutId::ALL
-                    .into_iter()
-                    .any(|other| other != id && keymap.get(other) == combo)
+                && ids.iter().copied().any(|other| {
+                    other != id && !hotkeys_can_overlap(id, other) && keymap.get(other) == combo
+                })
         })
         .collect()
 }
@@ -295,14 +507,14 @@ pub fn platform_combo(combo: &str) -> String {
         .join("-")
 }
 
-/// Human-readable combo for the shortcuts table ("mod-e" → "Cmd+E"/"Ctrl+E").
+/// Human-readable combo for hotkey chips ("mod-e" → "⌘+E"/"Ctrl+E").
 pub fn display_combo(combo: &str) -> String {
     combo
         .split('-')
         .map(|part| match part {
             "mod" => {
                 if cfg!(target_os = "macos") {
-                    "Cmd".to_string()
+                    "⌘".to_string()
                 } else {
                     "Ctrl".to_string()
                 }
@@ -342,7 +554,24 @@ impl UiSettings {
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        if self.prompt_font.trim().is_empty() {
+            self.prompt_font = self.ui_font.clone();
+        }
+        let sizes = self.font_sizes().clamped();
+        self.font_size_interface = sizes.interface;
+        self.font_size_prompt = sizes.prompt;
+        self.font_size_code = sizes.code;
+        self.font_size_terminal = sizes.terminal;
         self
+    }
+
+    pub fn font_sizes(&self) -> crate::theme::FontSizes {
+        crate::theme::FontSizes {
+            interface: self.font_size_interface,
+            prompt: self.font_size_prompt,
+            code: self.font_size_code,
+            terminal: self.font_size_terminal,
+        }
     }
 
     /// Load from `{data_dir}/ui-settings.json`; defaults on any failure.
@@ -395,6 +624,16 @@ mod tests {
             sidebar_collapsed: true,
             sidebar_grouped: true,
             last_space_id: Some("space-1".into()),
+            open_tabs: Some(vec!["b".into(), "a".into()]),
+            active_tab_id: Some("a".into()),
+            space_filter: Some("space-1".into()),
+            scope_navigation: std::collections::HashMap::from([(
+                "account".into(),
+                ScopeNavigation {
+                    active_tab_id: Some("a".into()),
+                    ..ScopeNavigation::default()
+                },
+            )]),
             tab_order: std::collections::HashMap::from([(
                 "space-1".to_string(),
                 vec!["b".to_string(), "a".to_string()],
@@ -411,8 +650,13 @@ mod tests {
             },
             appearance: crate::appearance::AppearanceMode::Light,
             ui_font: "Avenir Next".into(),
+            prompt_font: "Iosevka".into(),
             code_font: "Menlo".into(),
             terminal_font: "Berkeley Mono".into(),
+            font_size_interface: 16,
+            font_size_prompt: 15,
+            font_size_code: 14,
+            font_size_terminal: 12,
             terminal_command: "exec fish".into(),
         };
         settings.save(dir.path()).unwrap();
@@ -427,14 +671,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             UiSettings::path(dir.path()),
-            r#"{"sidebarWidth": 300, "systemNotificationsEnabled": true}"#,
+            r#"{
+                "sidebarWidth": 300,
+                "systemNotificationsEnabled": true,
+                "uiFont": "Avenir Next"
+            }"#,
         )
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
-        assert_eq!(loaded.ui_font, crate::theme::DEFAULT_UI_FONT);
+        assert_eq!(loaded.ui_font, "Avenir Next");
+        assert_eq!(loaded.prompt_font, "Avenir Next");
         assert_eq!(loaded.code_font, crate::theme::DEFAULT_CODE_FONT);
         assert_eq!(loaded.terminal_font, crate::theme::DEFAULT_CODE_FONT);
+        assert_eq!(loaded.font_sizes(), crate::theme::FontSizes::default());
         assert!(loaded.terminal_command.is_empty());
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(
@@ -456,12 +706,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             UiSettings::path(dir.path()),
-            r#"{"sidebarWidth": 10000, "rightPaneWidth": 1}"#,
+            r#"{
+                "sidebarWidth": 10000,
+                "rightPaneWidth": 1,
+                "fontSizeInterface": 255,
+                "fontSizePrompt": 1,
+                "fontSizeCode": 255,
+                "fontSizeTerminal": 1
+            }"#,
         )
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.sidebar_width, SIDEBAR_MAX);
         assert_eq!(loaded.right_pane_width, RIGHT_PANE_MIN);
+        assert_eq!(
+            loaded.font_size_interface,
+            crate::theme::MAX_INTERFACE_FONT_SIZE
+        );
+        assert_eq!(loaded.font_size_prompt, crate::theme::MIN_PROMPT_FONT_SIZE);
+        assert_eq!(loaded.font_size_code, crate::theme::MAX_CODE_FONT_SIZE);
+        assert_eq!(
+            loaded.font_size_terminal,
+            crate::theme::MIN_TERMINAL_FONT_SIZE
+        );
     }
 
     #[test]
@@ -482,8 +749,10 @@ mod tests {
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
         assert_eq!(d.ui_font, crate::theme::DEFAULT_UI_FONT);
+        assert_eq!(d.prompt_font, crate::theme::DEFAULT_UI_FONT);
         assert_eq!(d.code_font, crate::theme::DEFAULT_CODE_FONT);
         assert_eq!(d.terminal_font, crate::theme::DEFAULT_CODE_FONT);
+        assert_eq!(d.font_sizes(), crate::theme::FontSizes::default());
         assert!(d.terminal_command.is_empty());
         assert!(!d.system_notifications_enabled);
     }
@@ -491,22 +760,29 @@ mod tests {
     #[test]
     fn keymap_defaults_and_reset() {
         let mut keymap = KeymapConfig::default();
+        for id in ShortcutId::all() {
+            assert_eq!(keymap.get(id), id.default_combo());
+            assert!(gpui::Keystroke::parse(&platform_combo(keymap.get(id))).is_ok());
+        }
         assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
         assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
-        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-w");
+        assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-w");
         assert_eq!(keymap.get(ShortcutId::OpenSettings), "mod-,");
         assert_eq!(keymap.get(ShortcutId::AddSpace), "mod-k");
+        assert_eq!(keymap.get(ShortcutId::SearchSessions), "mod-shift-f");
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-e");
         assert_eq!(keymap.get(ShortcutId::ToggleChanges), "mod-b");
         assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-`");
+        assert_eq!(keymap.get(ShortcutId::NewTerminalTab), "mod-t");
+        assert_eq!(keymap.get(ShortcutId::CloseTerminalTab), "mod-shift-w");
         keymap.set(ShortcutId::ClearInput, "mod-shift-c".into());
         assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-shift-c");
         keymap.reset(ShortcutId::ClearInput);
         assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
-        keymap.set(ShortcutId::ArchiveSession, "mod-shift-w".into());
-        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-w");
-        keymap.reset(ShortcutId::ArchiveSession);
-        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-w");
+        keymap.set(ShortcutId::CloseTab, "mod-shift-w".into());
+        assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-shift-w");
+        keymap.reset(ShortcutId::CloseTab);
+        assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-w");
         keymap.set(ShortcutId::ToggleSidebar, "mod-shift-x".into());
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
         keymap.reset(ShortcutId::ToggleSidebar);
@@ -555,10 +831,11 @@ mod tests {
         assert!(conflicts.contains(&ShortcutId::ToggleChanges));
         assert!(!conflicts.contains(&ShortcutId::ToggleTerminal));
         assert!(!conflicts.contains(&ShortcutId::AddSpace));
+        assert!(!conflicts.contains(&ShortcutId::SearchSessions));
         assert!(!conflicts.contains(&ShortcutId::OpenSettings));
         assert!(!conflicts.contains(&ShortcutId::NewSession));
         assert!(!conflicts.contains(&ShortcutId::ClearInput));
-        assert!(!conflicts.contains(&ShortcutId::ArchiveSession));
+        assert!(!conflicts.contains(&ShortcutId::CloseTab));
         keymap.reset(ShortcutId::ToggleChanges);
         assert!(conflicted_shortcuts(&keymap).is_empty());
     }
@@ -577,7 +854,7 @@ mod tests {
         assert!(gpui::Keystroke::parse(&platform_combo("mod-`")).is_ok());
         assert_eq!(platform_combo("alt-f4"), "alt-f4");
         let display_primary = if cfg!(target_os = "macos") {
-            "Cmd"
+            "⌘"
         } else {
             "Ctrl"
         };
@@ -601,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn old_keymap_gains_new_shortcut_defaults() {
+    fn old_keymap_gains_new_hotkey_defaults() {
         let keymap: KeymapConfig = serde_json::from_str(
             r#"{
                 "toggleSidebar": "mod-shift-e",
@@ -612,10 +889,16 @@ mod tests {
         .unwrap();
         assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
         assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
-        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-w");
+        assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-w");
         assert_eq!(keymap.get(ShortcutId::OpenSettings), "mod-,");
         assert_eq!(keymap.get(ShortcutId::AddSpace), "mod-k");
+        assert_eq!(keymap.get(ShortcutId::SearchSessions), "mod-shift-f");
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-e");
+        assert_eq!(keymap.get(ShortcutId::NewTerminalTab), "mod-t");
+        assert_eq!(keymap.get(ShortcutId::CloseTerminalTab), "mod-shift-w");
+        assert_eq!(keymap.get(ShortcutId::SelectTab1), "mod-1");
+        assert_eq!(keymap.get(ShortcutId::SelectLastTab), "mod-9");
+        assert_eq!(keymap.get(ShortcutId::Quit), "mod-q");
     }
 
     #[test]

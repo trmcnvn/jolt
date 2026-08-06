@@ -31,9 +31,9 @@ pub const MD_BLOCK_GAP: f32 = 12.0;
 /// Body text size / line height (jolt: 14px / 22px).
 pub const MD_TEXT_SIZE: f32 = 14.0;
 pub const MD_LINE_HEIGHT: f32 = 22.0;
-/// Code block metrics — height is `lines × CODE_LINE_HEIGHT + padding + header`.
-pub const CODE_TEXT_SIZE: f32 = 12.5;
-pub const CODE_LINE_HEIGHT: f32 = 18.0;
+/// Default code-block metrics; configured sizes preserve the same leading.
+pub const CODE_TEXT_SIZE: f32 = 13.0;
+pub const CODE_LINE_HEIGHT: f32 = 18.5;
 pub const CODE_PADDING_X: f32 = 12.0;
 pub const CODE_PADDING_Y: f32 = 10.0;
 
@@ -209,8 +209,8 @@ pub fn render_block(
     match block {
         Block::Paragraph { runs } => text_element(
             runs,
-            MD_TEXT_SIZE,
-            MD_LINE_HEIGHT,
+            f32::from(theme.font_sizes.interface),
+            theme.font_sizes.interface_line_height(),
             false,
             top_ix,
             ix,
@@ -218,7 +218,7 @@ pub fn render_block(
             theme,
         ),
         Block::Heading { level, runs } => {
-            let (size, line) = heading_metrics(*level);
+            let (size, line) = heading_metrics(*level, theme.font_sizes.interface);
             text_element(runs, size, line, true, top_ix, ix, opts, theme)
         }
         Block::CodeBlock { language, code } => render_code_block(
@@ -264,8 +264,8 @@ pub fn render_block(
                     Some(start) => div()
                         .flex_none()
                         .min_w(px(18.0))
-                        .text_size(px(MD_TEXT_SIZE))
-                        .line_height(px(MD_LINE_HEIGHT))
+                        .text_size(px(f32::from(theme.font_sizes.interface)))
+                        .line_height(px(theme.font_sizes.interface_line_height()))
                         .text_color(theme.accent.opacity(0.85))
                         .child(SharedString::from(format!("{}.", start + item_ix as u64)))
                         .into_any_element(),
@@ -273,7 +273,7 @@ pub fn render_block(
                         .flex_none()
                         .min_w(px(18.0))
                         // Center the disc on the first text line's cap band.
-                        .h(px(MD_LINE_HEIGHT))
+                        .h(px(theme.font_sizes.interface_line_height()))
                         .flex()
                         .items_center()
                         .child(
@@ -322,12 +322,13 @@ pub fn render_block(
 
 /// Tight monochrome heading scale (jolt: h2 ≈ 16px semibold; headings step
 /// down quickly toward body size).
-fn heading_metrics(level: u8) -> (f32, f32) {
+fn heading_metrics(level: u8, interface_size: u8) -> (f32, f32) {
+    let scale = f32::from(interface_size) / MD_TEXT_SIZE;
     match level {
-        1 => (19.0, 27.0),
-        2 => (16.0, 24.0),
-        3 => (15.0, 22.0),
-        _ => (14.0, 22.0),
+        1 => (19.0 * scale, 27.0 * scale),
+        2 => (16.0 * scale, 24.0 * scale),
+        3 => (15.0 * scale, 22.0 * scale),
+        _ => (14.0 * scale, 22.0 * scale),
     }
 }
 
@@ -426,7 +427,12 @@ fn render_table(
                 };
                 let width = f32::from(
                     text_system
-                        .shape_line(line, px(MD_TEXT_SIZE), &flat.runs, None)
+                        .shape_line(
+                            line,
+                            px(f32::from(theme.font_sizes.interface)),
+                            &flat.runs,
+                            None,
+                        )
                         .width(),
                 );
                 if width > *natural {
@@ -461,8 +467,8 @@ fn render_table(
                 .flex_basis(px(0.0))
                 .min_w(px(geo.minimums[c]))
                 .p(px(TABLE_CELL_PADDING))
-                .text_size(px(MD_TEXT_SIZE))
-                .line_height(px(MD_LINE_HEIGHT));
+                .text_size(px(f32::from(theme.font_sizes.interface)))
+                .line_height(px(theme.font_sizes.interface_line_height()));
             cell = match align.get(c).copied().unwrap_or_default() {
                 TableAlign::Left => cell,
                 TableAlign::Center => cell.text_center(),
@@ -1188,8 +1194,8 @@ fn render_code_block(
                 .px(px(CODE_PADDING_X))
                 .py(px(CODE_PADDING_Y))
                 .font_family(theme.font_mono.clone())
-                .text_size(px(CODE_TEXT_SIZE))
-                .line_height(px(CODE_LINE_HEIGHT))
+                .text_size(px(f32::from(theme.font_sizes.code)))
+                .line_height(px(theme.font_sizes.code_line_height()))
                 .whitespace_nowrap()
                 .flex()
                 .flex_col()
@@ -1203,7 +1209,7 @@ fn render_code_block(
                     let selection_key = format!("{selection_row_key}:code{ix}:{li}").into();
                     Some(
                         div()
-                            .h(px(CODE_LINE_HEIGHT))
+                            .h(px(theme.font_sizes.code_line_height()))
                             .flex_none()
                             .child(selectable_styled_text(
                                 selection_key,

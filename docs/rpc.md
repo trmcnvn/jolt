@@ -109,6 +109,16 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | `ListOrgs` | unary | Read memberships during automatic setup |
 | `EnsurePersonalOrg` | unary | Adopt the sole membership or create `Personal` |
 
+### Local and Account scopes
+
+| Method | Reply | Purpose |
+| --- | --- | --- |
+| `ScopeStatus` | stream | Active scope, account availability, and pending Local merge state |
+| `SwitchScope` | unary | Route the local viewport to Local or Account without stopping either runtime |
+| `ResolveAccountLink` | unary | Keep non-empty Local data separate or move it into the signed-in account |
+
+These methods are local IPC only. DeviceRoom relay traffic is permanently routed to Account.
+
 ### Repositories and files
 
 | Method | Reply | Remote target |

@@ -67,6 +67,9 @@ pub struct BashMessage {
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
+    /// Whether the harness should retain this run in its native session store.
+    /// Disable only for internal one-shot work such as title generation.
+    pub persist_session: bool,
     /// The run sends questions and awaits answers (blocks the agent, mirrors jolt).
     pub request_input: Box<
         dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
@@ -106,7 +109,8 @@ pub trait Harness: Send + Sync {
             self.display_name()
         )))
     }
-    /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
+    /// Run one session; the stream ends with `AgentEvent::Done`. Persistence is
+    /// controlled by [`RunControls::persist_session`].
     async fn run(
         &self,
         request: RunRequest,
@@ -120,6 +124,7 @@ pub mod environment;
 pub mod mock;
 pub mod pi;
 pub mod shell_env;
+mod simd_base64;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell

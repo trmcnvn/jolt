@@ -13,8 +13,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use gpui::{
     AnyElement, BackgroundExecutor, Image, ImageFormat, ObjectFit, SharedString, Size,
     StyledImage as _, div, img, prelude::*, px,
@@ -288,15 +286,16 @@ async fn call_with_timeout(
 
 /// Chunked upload: base64 the bytes, `UploadChunk{uploadId,seq,data}` per 60KB
 /// slice (positional `seq` makes the cheap retry idempotent), then
-/// `UploadCommit{uploadId,fileName}` → the durable absolute path on the target
-/// device. Errors return the raw cause (the composer shows friendly copy).
+/// `UploadCommit{uploadId,fileName,chatId}` → the durable absolute path on the
+/// target device. Errors return the raw cause (the composer shows friendly copy).
 pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
+    chat_id: &str,
     attachment: &StagedAttachment,
 ) -> Result<String, String> {
-    let b64 = BASE64.encode(attachment.bytes());
+    let b64 = crate::simd_base64::encode(attachment.bytes());
     let upload_id = uuid::Uuid::new_v4().to_string();
     let mut start = 0usize;
     let mut seq = 0u64;
@@ -340,7 +339,11 @@ pub async fn upload_attachment(
         }
     }
     let params = with_target(
-        serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name }),
+        serde_json::json!({
+            "uploadId": upload_id,
+            "fileName": attachment.name,
+            "chatId": chat_id,
+        }),
         target_device_id,
     );
     let reply = call_with_timeout(
@@ -407,7 +410,7 @@ pub async fn read_attachment_image(
     if !done || b64.is_empty() {
         return None;
     }
-    let bytes = BASE64.decode(b64.as_bytes()).ok()?;
+    let bytes = crate::simd_base64::decode(b64.as_bytes()).ok()?;
     let format = ImageFormat::from_mime_type(&mime).unwrap_or(ImageFormat::Png);
     Some(LoadedAttachmentImage {
         name: if name.is_empty() {

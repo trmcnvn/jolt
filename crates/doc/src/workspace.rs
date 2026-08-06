@@ -58,6 +58,14 @@ pub struct DeletedSpace {
     pub chat_ids: Vec<String>,
 }
 
+/// Result of a `delete_device` cascade.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeletedDevice {
+    pub existed: bool,
+    pub space_ids: Vec<String>,
+    pub chat_ids: Vec<String>,
+}
+
 /// A workspace doc handle: typed access over a LoroDoc with the schema above.
 pub struct WorkspaceDoc {
     doc: LoroDoc,

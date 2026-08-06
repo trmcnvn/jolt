@@ -8,6 +8,13 @@ import Foundation
 import Loro
 import Observation
 
+private let pendingSendOverlayTtlMs: Int64 = 30_000
+
+private struct PendingSendOverlay {
+    let messageId: String
+    let startedAt: Int64
+}
+
 @MainActor
 @Observable
 final class SessionStore {
@@ -33,6 +40,8 @@ final class SessionStore {
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
+    /// Latest command awaiting a matching host-written transcript entry.
+    private var pendingSendOverlay: PendingSendOverlay?
 
     let doc = LoroDoc()
     private var room: RoomClient?
@@ -55,18 +64,37 @@ final class SessionStore {
 
     @ObservationIgnored private var hostRelay: (deviceId: String, client: DeviceRelayClient)?
 
+    private func relayToHost() throws -> DeviceRelayClient {
+        guard let hostDeviceId else { throw RelayError.hostOffline }
+        if let hostRelay, hostRelay.deviceId == hostDeviceId {
+            return hostRelay.client
+        }
+        let relay = DeviceRelayClient(deviceId: hostDeviceId, config: config)
+        hostRelay = (hostDeviceId, relay)
+        return relay
+    }
+
     /// Chunked upload of one staged image to the host device; returns the
     /// durable absolute path on that device (what the refs trailer carries).
     func uploadAttachment(name: String, data: Data) async throws -> String {
-        guard let hostDeviceId else { throw RelayError.hostOffline }
-        let relay: DeviceRelayClient
-        if let hostRelay, hostRelay.deviceId == hostDeviceId {
-            relay = hostRelay.client
-        } else {
-            relay = DeviceRelayClient(deviceId: hostDeviceId, config: config)
-            hostRelay = (hostDeviceId, relay)
-        }
-        return try await uploadAttachmentChunked(relay: relay, name: name, data: data)
+        try await uploadAttachmentChunked(relay: relayToHost(), chatId: chatId,
+                                          name: name, data: data)
+    }
+
+    func extractQuestions(sourceMessageId: String) async throws -> ExtractQuestionsResult {
+        try await relayToHost().call(
+            method: "ExtractQuestions",
+            params: ["chatId": chatId, "sourceMessageId": sourceMessageId]
+        )
+    }
+
+    /// Search the chat's verified checkout on its host. Results contain only
+    /// workspace-relative paths; the harness reads contents when needed.
+    func searchFiles(query: String) async throws -> [FileSearchMatch] {
+        try await relayToHost().call(
+            method: "SearchFiles",
+            params: ["chatId": chatId, "query": query]
+        )
     }
 
     /// Demo-mode injection point (also used by previews).
@@ -186,6 +214,9 @@ final class SessionStore {
         // Drop echoes the host has materialized.
         let ids = Set(entries.map(\.id))
         pendingSends.removeAll { ids.contains($0.messageId) }
+        if let pendingSendOverlay, ids.contains(pendingSendOverlay.messageId) {
+            self.pendingSendOverlay = nil
+        }
         revision &+= 1
         // If no transcript view is open, settle the parses now (off-main) so
         // the eventual open is memo hits all the way down.
@@ -273,6 +304,11 @@ final class SessionStore {
 
     var lastEntryId: String? { entries.last?.id }
 
+    func sendPending(now: Int64 = nowMs()) -> Bool {
+        guard let pendingSendOverlay else { return false }
+        return now - pendingSendOverlay.startedAt <= pendingSendOverlayTtlMs
+    }
+
     var liveEntry: MessageEntry? {
         entries.last(where: { $0.status == .streaming })
     }
@@ -300,19 +336,47 @@ final class SessionStore {
             return
         }
         let messageId = UUID().uuidString.lowercased()
-        let request = RunRequest(prompt: prompt,
-                                 model: chat.config?.model,
-                                 reasoning: chat.config?.reasoning,
-                                 cwd: chat.cwd ?? "",
-                                 sandbox: chat.config?.sandbox ?? "workspace-write",
-                                 attachments: attachments)
+        let sentAt = nowMs()
+        let request = runRequest(prompt: prompt, chat: chat, attachments: attachments)
         queueCommand(kind: "run", payload: [
             "kind": "run",
             "request": encodableJSON(request),
             "messageId": messageId,
         ])
-        pendingSends.append((messageId, prompt, nowMs()))
+        pendingSends.append((messageId, prompt, sentAt))
+        beginPendingSend(messageId: messageId, at: sentAt)
         revision &+= 1
+    }
+
+    func sendHiddenPrompt(prompt: String, chat: Chat) {
+        let request = runRequest(prompt: prompt, chat: chat)
+        queueCommand(kind: "run", payload: [
+            "kind": "hiddenPrompt",
+            "request": encodableJSON(request),
+        ])
+    }
+
+    func sendBash(command: String, excludeFromContext: Bool, chat: Chat) {
+        let messageId = UUID().uuidString.lowercased()
+        queueCommand(kind: "bash", payload: [
+            "kind": "bash",
+            "command": command,
+            "excludeFromContext": excludeFromContext,
+            "cwd": chat.cwd ?? "",
+            "messageId": messageId,
+        ])
+        beginPendingSend(messageId: messageId, at: nowMs())
+    }
+
+    private func runRequest(prompt: String, chat: Chat,
+                            attachments: [String] = []) -> RunRequest {
+        RunRequest(prompt: prompt,
+                   model: chat.config?.model,
+                   reasoning: chat.config?.reasoning,
+                   modelOptions: chat.config?.modelOptions ?? [:],
+                   cwd: chat.cwd ?? "",
+                   sandbox: chat.config?.sandbox ?? "workspace-write",
+                   attachments: attachments)
     }
 
     func sendSteer(prompt: String) {
@@ -321,13 +385,24 @@ final class SessionStore {
             return
         }
         let messageId = UUID().uuidString.lowercased()
+        let sentAt = nowMs()
         queueCommand(kind: "steer", payload: [
             "kind": "steer",
             "prompt": prompt,
             "messageId": messageId,
         ])
-        pendingSends.append((messageId, prompt, nowMs()))
+        pendingSends.append((messageId, prompt, sentAt))
+        beginPendingSend(messageId: messageId, at: sentAt)
         revision &+= 1
+    }
+
+    private func beginPendingSend(messageId: String, at: Int64) {
+        pendingSendOverlay = PendingSendOverlay(messageId: messageId, startedAt: at)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(pendingSendOverlayTtlMs) * 1_000_000)
+            guard self?.pendingSendOverlay?.messageId == messageId else { return }
+            self?.pendingSendOverlay = nil
+        }
     }
 
     func sendInterrupt() {

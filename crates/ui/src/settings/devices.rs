@@ -1,6 +1,6 @@
 //! Settings → Devices: the device registry — name,
 //! platform, last-seen, presence dot, a "This device" badge, click-to-copy id,
-//! and a Rename dialog (Mutate renameDevice).
+//! and Rename/Remove dialogs (workspace mutations).
 
 use chrono::{DateTime, Utc};
 use gpui::{
@@ -24,6 +24,15 @@ pub const DEVICE_ONLINE_WINDOW_SECS: i64 = 70;
 pub fn device_online(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     last_seen
         .is_some_and(|at| now.signed_duration_since(at).num_seconds() <= DEVICE_ONLINE_WINDOW_SECS)
+}
+
+fn device_row_online(
+    device_id: &str,
+    local_device_id: Option<&str>,
+    last_seen: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    local_device_id == Some(device_id) || device_online(last_seen, now)
 }
 
 /// Compact last-seen line. Pure.
@@ -52,6 +61,7 @@ struct RenameDialog {
 pub struct DevicesPage {
     state: Entity<AppState>,
     rename: Option<RenameDialog>,
+    delete_confirm: Option<String>,
     /// Device id whose id-chip shows "Copied" right now.
     copied: Option<String>,
     error: Option<SharedString>,
@@ -66,6 +76,7 @@ impl DevicesPage {
         Self {
             state,
             rename: None,
+            delete_confirm: None,
             copied: None,
             error: None,
             task: None,
@@ -75,6 +86,7 @@ impl DevicesPage {
     }
 
     fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
+        self.delete_confirm = None;
         let input = cx.new(|cx| ComposerInput::new("Device name", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
@@ -112,6 +124,30 @@ impl DevicesPage {
             this.update(cx, |page, cx| {
                 if let Err(err) = result {
                     page.error = Some(format!("Rename failed: {err}").into());
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn delete_device(&mut self, cx: &mut Context<Self>) {
+        let Some(device_id) = self.delete_confirm.take() else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = serde_json::json!({
+            "op": "deleteDevice",
+            "deviceId": device_id,
+        });
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::MUTATE, params).await;
+            this.update(cx, |page, cx| {
+                if let Err(err) = result {
+                    page.error = Some(format!("Remove failed: {err}").into());
                 }
                 cx.notify();
             })
@@ -175,6 +211,70 @@ impl DevicesPage {
             .into_any_element();
         Some(popover::modal("rename-device-dialog", viewport, card))
     }
+
+    fn render_delete_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let device_id = self.delete_confirm.as_deref()?;
+        let state = self.state.read(cx);
+        let device = state.devices.iter().find(|device| device.id == device_id)?;
+        let spaces: Vec<&str> = state
+            .spaces
+            .iter()
+            .filter(|space| space.device_id == device_id)
+            .map(|space| space.id.as_str())
+            .collect();
+        let session_count = state
+            .chats
+            .iter()
+            .filter(|chat| {
+                chat.space_id
+                    .as_deref()
+                    .is_some_and(|space_id| spaces.contains(&space_id))
+            })
+            .count();
+        let copy = format!(
+            "Removing “{}” permanently deletes its {} {} and {} {}. Folders and local files aren’t affected.",
+            device.name,
+            spaces.len(),
+            if spaces.len() == 1 { "space" } else { "spaces" },
+            session_count,
+            if session_count == 1 {
+                "session"
+            } else {
+                "sessions"
+            },
+        );
+        let card = popover::dialog_card(&theme)
+            .child(popover::dialog_title(&theme, "Remove device?"))
+            .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "delete-device-cancel")
+                            .id("delete-device-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.delete_confirm = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        popover::btn_danger(&theme, "Remove")
+                            .id("delete-device-confirm")
+                            .on_click(cx.listener(|this, _, _, cx| this.delete_device(cx))),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("delete-device-dialog", viewport, card))
+    }
 }
 
 /// Human-readable platform label.
@@ -209,7 +309,8 @@ impl Render for DevicesPage {
             (state.devices.clone(), state.local_device_id.clone())
         };
         let copied = self.copied.clone();
-        let dialog = self.render_rename_dialog(window.viewport_size(), cx);
+        let rename_dialog = self.render_rename_dialog(window.viewport_size(), cx);
+        let delete_dialog = self.render_delete_dialog(window.viewport_size(), cx);
         let emerald = theme.success; // emerald-400
         let count = devices.len();
 
@@ -217,12 +318,14 @@ impl Render for DevicesPage {
             .into_iter()
             .enumerate()
             .map(|(ix, device)| {
-                let online = device_online(device.last_seen_at, now);
                 let is_local = local_id.as_deref() == Some(device.id.as_str());
+                let online =
+                    device_row_online(&device.id, local_id.as_deref(), device.last_seen_at, now);
                 let id_copied = copied.as_deref() == Some(device.id.as_str());
                 let copy_id = device.id.clone();
                 let rename_id = device.id.clone();
                 let rename_name = device.name.clone();
+                let delete_id = device.id.clone();
                 let platform_icon = match device.platform.as_str() {
                     "macos" | "darwin" => crate::icons::LAPTOP,
                     "web" => crate::icons::GLOBAL,
@@ -349,6 +452,29 @@ impl Render for DevicesPage {
                             )
                             .child(SharedString::from("Rename")),
                     )
+                    .child(
+                        widgets::ghost_action(&theme)
+                            .id(("device-remove", ix))
+                            .opacity(0.7)
+                            .text_color(theme.danger)
+                            .hover(|style| {
+                                style
+                                    .opacity(1.0)
+                                    .bg(theme.danger.opacity(0.08))
+                                    .text_color(theme.danger)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.rename = None;
+                                this.delete_confirm = Some(delete_id.clone());
+                                cx.notify();
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                    .size(px(14.0))
+                                    .text_color(theme.danger),
+                            )
+                            .child(SharedString::from("Remove")),
+                    )
                     .into_any_element()
             })
             .collect();
@@ -396,7 +522,8 @@ impl Render for DevicesPage {
                     })
                     .child(card),
             )
-            .when_some(dialog, |el, dialog| el.child(dialog))
+            .when_some(rename_dialog, |element, dialog| element.child(dialog))
+            .when_some(delete_dialog, |element, dialog| element.child(dialog))
     }
 }
 
@@ -414,6 +541,13 @@ mod tests {
         assert!(!device_online(None, now));
         // Clock skew (future) counts as online.
         assert!(device_online(Some(now + TimeDelta::seconds(30)), now));
+    }
+
+    #[test]
+    fn local_device_is_online_without_fresh_presence() {
+        let now = Utc::now();
+        assert!(device_row_online("local", Some("local"), None, now));
+        assert!(!device_row_online("remote", Some("local"), None, now));
     }
 
     #[test]

@@ -3,8 +3,10 @@
 //! Tabs are per selected chat and restored on return
 //! (emulators — and their server-side PTYs — survive navigation; detach is not
 //! close). Tab bar supports pointer drag-reorder with 150 ms sliding
-//! transforms, middle-click close, and a "+" new-tab button; Cmd/Ctrl+`
-//! toggles the panel (the shell owns the height animation + persistence).
+//! transforms, middle-click close, and a "+" new-tab button. While the pane is
+//! focused, Cmd/Ctrl+T opens a tab and Cmd/Ctrl+Shift+W closes the active tab;
+//! Cmd/Ctrl+` toggles the panel (the shell owns the height animation and
+//! persistence).
 //!
 //! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
 //! (base64) feed the [`Emulator`]; query responses write back; the stream
@@ -16,11 +18,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use base64::Engine as _;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyBinding, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta,
-    SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, SharedString,
+    Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
 use jolt_proto::{TerminalEvent, TerminalSession};
@@ -41,21 +42,11 @@ use super::view::{
 pub const TAB_WIDTH: f32 = 118.0;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
 
-actions!(terminal, [ToggleTerminal]);
+actions!(terminal, [ToggleTerminal, NewTerminalTab, CloseTerminalTab]);
 
 #[derive(Debug, Clone)]
 pub enum TerminalPanelEvent {
     ChatEmptied(String),
-}
-
-/// Bind the terminal keymap (global): Cmd+` on macOS, Ctrl+` elsewhere.
-pub fn init(cx: &mut App) {
-    let toggle = if cfg!(target_os = "macos") {
-        "cmd-`"
-    } else {
-        "ctrl-`"
-    };
-    cx.bind_keys([KeyBinding::new(toggle, ToggleTerminal, None)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -152,17 +143,14 @@ pub fn shell_title(shell: &str) -> String {
 }
 
 fn decode_base64(data: &str) -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data))
-        .unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "terminal: dropping undecodable data frame");
-            Vec::new()
-        })
+    crate::simd_base64::decode(data.as_bytes()).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "terminal: dropping undecodable data frame");
+        Vec::new()
+    })
 }
 
 fn encode_base64(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    crate::simd_base64::encode(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +909,12 @@ impl TerminalPanel {
 
     // ---- tab management ----
 
+    fn open_selected_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(chat) = self.selected_chat(cx) {
+            self.open_tab(chat, cx);
+        }
+    }
+
     fn select_tab(&mut self, chat: &str, ix: usize, cx: &mut Context<Self>) {
         if let Some(tabs) = self.chats.get_mut(chat)
             && ix < tabs.tabs.len()
@@ -938,6 +932,21 @@ impl TerminalPanel {
         let now_empty = tabs.tabs.is_empty();
         self.drag = None;
         Some((tab.terminal_id, now_empty))
+    }
+
+    fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.selected_chat(cx) else {
+            return;
+        };
+        let Some(key) = self
+            .chats
+            .get(&chat)
+            .and_then(|tabs| tabs.tabs.get(tabs.active))
+            .map(|tab| tab.key)
+        else {
+            return;
+        };
+        self.close_tab(&chat, key, window, cx);
     }
 
     fn close_tab(&mut self, chat: &str, key: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -1202,11 +1211,7 @@ impl TerminalPanel {
                         crate::theme::ink(0.05),
                     ))
                     .on_hover(motion::hover_listener("term-new-tab"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(chat) = this.selected_chat(cx) {
-                            this.open_tab(chat, cx);
-                        }
-                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_selected_tab(cx)))
                     .child(
                         crate::icons::icon(crate::icons::PLUS)
                             .size(px(16.0))
@@ -1282,6 +1287,12 @@ impl Render for TerminalPanel {
                     .min_h_0()
                     .key_context("Terminal")
                     .track_focus(&self.focus_handle)
+                    .on_action(cx.listener(|this, _: &NewTerminalTab, _, cx| {
+                        this.open_selected_tab(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &CloseTerminalTab, window, cx| {
+                        this.close_active_tab(window, cx);
+                    }))
                     .on_key_down(cx.listener(Self::on_key_down))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1291,7 +1302,7 @@ impl Render for TerminalPanel {
                         let lines = match event.delta {
                             ScrollDelta::Lines(delta) => delta.y,
                             ScrollDelta::Pixels(delta) => {
-                                f32::from(delta.y) / super::view::TERM_LINE_HEIGHT
+                                f32::from(delta.y) / Theme::of(cx).font_sizes.terminal_line_height()
                             }
                         };
                         this.scroll_active(lines, cx);

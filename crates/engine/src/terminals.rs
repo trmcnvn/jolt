@@ -14,8 +14,6 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 
@@ -296,8 +294,7 @@ impl Terminals {
     /// Write input bytes; `data` is base64 (matching `Data` events), with a plain
     /// UTF-8 fallback for lenient callers.
     pub fn write(&self, terminal_id: &str, data: &str) -> Result<(), EngineError> {
-        let bytes = BASE64
-            .decode(data)
+        let bytes = crate::simd_base64::decode(data.as_bytes())
             .unwrap_or_else(|_| data.as_bytes().to_vec());
         if bytes.len() > MAX_INPUT_BYTES {
             return Err(EngineError::Other("Terminal input is too large".into()));
@@ -396,7 +393,7 @@ async fn pump_output(
         let seq = session.next_seq();
         session.emit(TerminalEvent::Data {
             seq,
-            data: BASE64.encode(&buffer),
+            data: crate::simd_base64::encode(&buffer),
         });
         true
     };

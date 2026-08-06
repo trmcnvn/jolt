@@ -77,6 +77,8 @@ A non-empty composer during a live steerable run sends a durable `steer` command
 
 The harness-native session ID is updated after successful runs. Resume is scoped to the working directory where the CLI conversation was created.
 
+When compaction finishes, Jolt arms a hidden continuation. Any subsequent user or agent message cancels it; if the harness instead settles without resuming, Jolt sends the continuation into the same live session. This guard uses the normalized compaction lifecycle and therefore applies equally to Claude Code, Codex, and Pi.
+
 ## Harness secrets
 
 Use **Settings → Secrets** to define an environment variable for one or more harnesses.

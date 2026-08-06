@@ -14,6 +14,7 @@ import SwiftUI
 /// expanded because the pickers need the full row.
 struct ComposerShell<Chips: View>: View {
     @Binding var draft: String
+    @Binding var selection: TextSelection?
     var placeholder = "Message"
     var sendEnabled: Bool
     var showStop: Bool
@@ -93,7 +94,7 @@ struct ComposerShell<Chips: View>: View {
     }
 
     private var input: some View {
-        TextField(placeholder, text: $draft, axis: .vertical)
+        TextField(placeholder, text: $draft, selection: $selection, axis: .vertical)
             .font(Theme.sans(16))
             .foregroundStyle(Theme.text)
             .tint(Theme.text)
@@ -170,34 +171,51 @@ struct ComposerView: View {
     let runLive: Bool
 
     @State private var text = ""
+    @State private var selection: TextSelection?
+    @State private var mentions = FileMentionDraft()
     @State private var attachments: [StagedAttachment] = []
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPicker = false
     @State private var uploading = false
-    @State private var uploadError: String?
+    @State private var commandBusy = false
+    @State private var composerError: String?
+    @State private var extractedAnswers: ExtractedAnswerFlow?
 
     var body: some View {
         VStack(spacing: 6) {
-            if let uploadError {
-                Text(uploadError)
+            if let composerError {
+                Text(composerError)
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.danger)
                     .lineLimit(2)
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            ComposerShell(
-                draft: $text,
-                sendEnabled: true,
-                showStop: runLive,
-                busy: uploading,
-                onSend: send,
-                onStop: { store.sendInterrupt() },
-                attachments: attachments,
-                onAttach: { showPicker = true },
-                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
-            ) {
-                EmptyView()
+            if let flow = extractedAnswers {
+                ExtractedAnswerPanel(
+                    flow: flow,
+                    answer: extractedAnswerBinding,
+                    onBack: extractedBack,
+                    onAdvance: extractedAdvance,
+                    onCancel: { extractedAnswers = nil }
+                )
+            } else {
+                commandSuggestions
+                FileMentionMenu(draft: mentions, select: acceptMention)
+                ComposerShell(
+                    draft: $text,
+                    selection: $selection,
+                    sendEnabled: true,
+                    showStop: runLive,
+                    busy: uploading || commandBusy,
+                    onSend: send,
+                    onStop: { store.sendInterrupt() },
+                    attachments: attachments,
+                    onAttach: { showPicker = true },
+                    onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
+                ) {
+                    EmptyView()
+                }
             }
         }
         .photosPicker(isPresented: $showPicker, selection: $pickerItems,
@@ -206,6 +224,8 @@ struct ComposerView: View {
             guard !items.isEmpty else { return }
             stage(items)
         }
+        .onChange(of: text) { refreshMentions() }
+        .onChange(of: selection) { refreshMentions() }
     }
 
     /// Load picked photos into staged attachments (HEIC transcodes to JPEG;
@@ -223,22 +243,56 @@ struct ComposerView: View {
             }
             pickerItems = []
             if failed > 0 {
-                uploadError = failed == 1
+                composerError = failed == 1
                     ? "One image couldn't be attached (unsupported or over 24 MB)."
                     : "\(failed) images couldn't be attached (unsupported or over 24 MB)."
             } else {
-                uploadError = nil
+                composerError = nil
             }
         }
     }
 
     private func send() {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let encodedPrompt = mentions.encodedPrompt(text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let staged = attachments
         guard !prompt.isEmpty || !staged.isEmpty else { return }
 
+        if !runLive, prompt == "/answer" {
+            beginAnswerQuestions()
+            return
+        }
+        if !runLive, prompt == "/bro" {
+            guard staged.isEmpty else {
+                composerError = "Remove attachments before using /bro."
+                return
+            }
+            store.sendHiddenPrompt(prompt: broPrompt, chat: chat)
+            composerError = nil
+            clearDraft()
+            return
+        }
+        if hasShellPrefix(prompt) {
+            guard staged.isEmpty else {
+                composerError = "Remove attachments before running a shell command."
+                return
+            }
+            guard let shell = parseShellCommand(prompt) else {
+                composerError = "Enter a Bash command after ! or !!."
+                return
+            }
+            store.sendBash(command: shell.command,
+                           excludeFromContext: shell.excludeFromContext,
+                           chat: chat)
+            composerError = nil
+            clearDraft()
+            return
+        }
+
         if staged.isEmpty {
-            deliver(content: prompt, paths: [])
+            deliver(content: encodedPrompt, paths: [])
+            composerError = nil
             clearDraft()
             return
         }
@@ -246,7 +300,7 @@ struct ComposerView: View {
         // paths, and the doc entry must never point at files that don't
         // exist. The shell shows the spinner (`busy`) while chunks stream.
         uploading = true
-        uploadError = nil
+        composerError = nil
         Task { @MainActor in
             defer { uploading = false }
             do {
@@ -259,13 +313,130 @@ struct ComposerView: View {
                                                      name: att.name, data: att.data)
                     paths.append(path)
                 }
-                deliver(content: withAttachments(text: prompt, paths: paths), paths: paths)
+                deliver(content: withAttachments(text: encodedPrompt, paths: paths), paths: paths)
                 attachments = []
                 clearDraft()
             } catch {
-                uploadError = "Attachment upload failed — \(error.localizedDescription)"
+                composerError = "Attachment upload failed — \(error.localizedDescription)"
             }
         }
+    }
+
+    @ViewBuilder
+    private var commandSuggestions: some View {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        if !runLive, trimmed.hasPrefix("/"), !trimmed.contains(where: { $0.isWhitespace }) {
+            let query = String(trimmed.dropFirst()).lowercased()
+            let commands = [
+                HarnessInfo(id: "answer", label: "Answer questions from the latest response"),
+                HarnessInfo(id: "bro", label: "Restate the latest response plainly"),
+            ].filter { query.isEmpty || $0.id.hasPrefix(query) }
+            if !commands.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(commands) { command in
+                        Button {
+                            text = "/\(command.id)"
+                        } label: {
+                            HStack(spacing: 10) {
+                                Text("/\(command.id)")
+                                    .font(Theme.mono(12))
+                                    .foregroundStyle(Theme.text)
+                                Text(command.label)
+                                    .font(Theme.sans(12))
+                                    .foregroundStyle(Theme.textMuted)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 14)
+                            .frame(height: 38)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .background(Theme.surfaceRaised.opacity(0.96), in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(whiteAlpha(0.06)))
+                .padding(.horizontal, 16)
+            }
+        }
+    }
+
+    private func beginAnswerQuestions() {
+        guard attachments.isEmpty else {
+            composerError = "Remove attachments before using /answer."
+            return
+        }
+        guard let source = latestCompletedAssistantMessage() else {
+            composerError = "There is no completed assistant response to inspect."
+            return
+        }
+        commandBusy = true
+        composerError = nil
+        clearDraft()
+        Task { @MainActor in
+            defer { commandBusy = false }
+            do {
+                let result = try await store.extractQuestions(sourceMessageId: source)
+                guard result.sourceMessageId == source else {
+                    composerError = "Question extraction became stale."
+                    return
+                }
+                guard !result.questions.isEmpty else {
+                    composerError = "No questions requiring an answer were found."
+                    return
+                }
+                extractedAnswers = ExtractedAnswerFlow(questions: result.questions)
+            } catch {
+                composerError = "Question extraction failed — \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func latestCompletedAssistantMessage() -> String? {
+        store.entries.reversed().first { entry in
+            entry.role == .assistant && entry.status == .complete && entry.parts.contains {
+                if case .text(_, let text) = $0 { return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                return false
+            }
+        }?.id
+    }
+
+    private var extractedAnswerBinding: Binding<String> {
+        Binding(
+            get: { extractedAnswers?.currentAnswer ?? "" },
+            set: { answer in
+                guard var flow = extractedAnswers else { return }
+                flow.setCurrentAnswer(answer)
+                extractedAnswers = flow
+            }
+        )
+    }
+
+    private func extractedBack() {
+        guard var flow = extractedAnswers else { return }
+        flow.back()
+        extractedAnswers = flow
+    }
+
+    private func extractedAdvance() {
+        guard var flow = extractedAnswers else { return }
+        if flow.advance() {
+            extractedAnswers = nil
+            store.sendRun(prompt: flow.compiledMessage(), chat: chat)
+        } else {
+            extractedAnswers = flow
+        }
+    }
+
+    private func refreshMentions() {
+        mentions.update(text: text, selection: selection, contextKey: chat.id) { query in
+            try await store.searchFiles(query: query)
+        }
+    }
+
+    private func acceptMention(_ match: FileSearchMatch) {
+        guard let insertion = mentions.accept(match, in: text) else { return }
+        text = insertion.text
+        selection = insertion.selection
     }
 
     private func deliver(content: String, paths: [String]) {
@@ -277,7 +448,9 @@ struct ComposerView: View {
     }
 
     private func clearDraft() {
+        mentions.reset()
         text = ""
+        selection = nil
         // The clear above is unconditional, so a prompt left sitting in the
         // composer after a successful send is not this path failing to run —
         // it is the text view writing the pre-send string back. A focused
@@ -289,7 +462,113 @@ struct ComposerView: View {
     }
 }
 
-// MARK: - Question panel (composer.rs Wizard)
+// MARK: - Extracted `/answer` questions
+
+struct ExtractedAnswerFlow {
+    var questions: [ExtractedQuestion]
+    var answers: [String]
+    var page = 0
+
+    init(questions: [ExtractedQuestion]) {
+        self.questions = questions
+        self.answers = Array(repeating: "", count: questions.count)
+    }
+
+    var current: ExtractedQuestion { questions[page] }
+    var currentAnswer: String { answers[page] }
+
+    mutating func setCurrentAnswer(_ answer: String) {
+        answers[page] = answer
+    }
+
+    mutating func back() {
+        page = max(0, page - 1)
+    }
+
+    /// Returns true when the final page was submitted.
+    mutating func advance() -> Bool {
+        guard page + 1 < questions.count else { return true }
+        page += 1
+        return false
+    }
+
+    func compiledMessage() -> String {
+        var lines = ["I answered your questions in the following way:"]
+        for (question, answer) in zip(questions, answers) {
+            lines.append("")
+            lines.append("Q: \(question.question)")
+            if let context = question.context { lines.append("> \(context)") }
+            let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+            lines.append("A: \(trimmed.isEmpty ? "(no answer)" : trimmed)")
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+struct ExtractedAnswerPanel: View {
+    let flow: ExtractedAnswerFlow
+    @Binding var answer: String
+    let onBack: () -> Void
+    let onAdvance: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("ANSWER QUESTIONS")
+                    .font(Theme.sans(10.5, weight: .medium))
+                    .kerning(1)
+                    .foregroundStyle(Theme.textMuted.opacity(0.6))
+                Spacer()
+                Text("\(flow.page + 1)/\(flow.questions.count)")
+                    .font(Theme.sans(10))
+                    .foregroundStyle(Theme.textMuted)
+                Button(action: onCancel) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Theme.textMuted)
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Cancel answering questions")
+            }
+            Text(flow.current.question)
+                .font(Theme.sans(15, weight: .medium))
+                .foregroundStyle(Theme.text)
+            if let context = flow.current.context {
+                Text(context)
+                    .font(Theme.sans(12.5))
+                    .foregroundStyle(Theme.textMuted)
+            }
+            TextField("Type your answer", text: $answer, axis: .vertical)
+                .font(Theme.sans(14))
+                .foregroundStyle(Theme.text)
+                .lineLimit(1...5)
+                .padding(12)
+                .background(whiteAlpha(0.04), in: RoundedRectangle(cornerRadius: 12))
+            HStack {
+                if flow.page > 0 {
+                    Button("Back", action: onBack)
+                        .font(Theme.sans(13, weight: .medium))
+                        .foregroundStyle(Theme.textMuted)
+                }
+                Spacer()
+                Button(flow.page + 1 < flow.questions.count ? "Next" : "Submit", action: onAdvance)
+                    .font(Theme.sans(13, weight: .medium))
+                    .foregroundStyle(Theme.bg)
+                    .padding(.horizontal, 16)
+                    .frame(height: 34)
+                    .background(Theme.text, in: Capsule())
+            }
+        }
+        .padding(16)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26))
+        .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(whiteAlpha(0.05)))
+        .padding(.horizontal, 12)
+    }
+}
+
+// MARK: - Agent question panel
 
 struct QuestionPanel: View {
     let requestId: String

@@ -37,7 +37,7 @@ use crate::attachments::{self, StagedAttachment};
 use crate::loaders;
 use crate::motion;
 use crate::pickers::Pickers;
-use crate::state::{AppState, Indicator};
+use crate::state::{AppState, Indicator, PENDING_SEND_TTL_MS};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -1454,6 +1454,9 @@ pub struct ComposerInput {
     /// Key context for the binding map ("Composer", or "PaletteSearch" for
     /// palette filters whose navigation keys must bubble).
     key_context: &'static str,
+    /// Use the independently configured prompt scale. Generic text fields keep
+    /// the fixed UI-input metrics.
+    prompt_typography: bool,
     focus_handle: FocusHandle,
     content: String,
     placeholder: SharedString,
@@ -1534,6 +1537,7 @@ impl ComposerInput {
     ) -> Self {
         Self {
             key_context,
+            prompt_typography: false,
             focus_handle: cx.focus_handle(),
             content: String::new(),
             placeholder: placeholder.into(),
@@ -1621,6 +1625,10 @@ impl ComposerInput {
         self.mention_open = open;
         self.mention_has_selection = has_selection;
         cx.notify();
+    }
+
+    fn enable_prompt_typography(&mut self) {
+        self.prompt_typography = true;
     }
 
     fn enable_mentions(&mut self) {
@@ -2695,7 +2703,12 @@ impl ComposerInput {
             (SharedString::from(self.projection.display.clone()), false)
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
-        self.line_height = px(INPUT_LINE_HEIGHT);
+        let line_height = if self.prompt_typography {
+            Theme::of(cx).font_sizes.prompt_line_height()
+        } else {
+            INPUT_LINE_HEIGHT
+        };
+        self.line_height = px(line_height);
 
         // Chips read as inline code: the markdown renderer's recipe (mono font
         // + `code_text` violet) over the rounded `code_wash` painted beneath.
@@ -2781,7 +2794,7 @@ impl ComposerInput {
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
-        self.content_height = content_height.max(INPUT_LINE_HEIGHT);
+        self.content_height = content_height.max(line_height);
         self.max_line_width = if is_placeholder { 0.0 } else { max_line_width };
         self.last_width = f32::from(width);
         self.layout_epoch += 1;
@@ -3277,6 +3290,15 @@ impl gpui::Element for ComposerTextElement {
 impl Render for ComposerInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
+        let (text_size, line_height, font_family) = if self.prompt_typography {
+            (
+                f32::from(theme.font_sizes.prompt),
+                theme.font_sizes.prompt_line_height(),
+                theme.font_prompt.clone(),
+            )
+        } else {
+            (INPUT_TEXT_SIZE, INPUT_LINE_HEIGHT, theme.font_sans.clone())
+        };
         let text_color = if self.content.is_empty() {
             theme.text_faint
         } else {
@@ -3328,10 +3350,10 @@ impl Render for ComposerInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
-            .text_size(px(INPUT_TEXT_SIZE))
-            .line_height(px(INPUT_LINE_HEIGHT))
+            .text_size(px(text_size))
+            .line_height(px(line_height))
             .text_color(text_color)
-            .font_family(theme.font_sans.clone())
+            .font_family(font_family)
             .child(ComposerTextElement {
                 input: cx.entity(),
                 // Internal scrolling once content exceeds the 260px textarea
@@ -3526,7 +3548,7 @@ fn is_bro_command(text: &str) -> bool {
 pub enum MessageHistoryDirection {
     /// Move toward the start of the transcript.
     Older,
-    /// Move toward the empty prompt after the newest user message.
+    /// Move toward the draft after the newest user message.
     Newer,
 }
 
@@ -3577,6 +3599,13 @@ fn user_message_history(
         .collect()
 }
 
+fn message_history_text(history: &[String], position: Option<usize>, draft: &str) -> String {
+    position
+        .and_then(|position| history.iter().rev().nth(position))
+        .cloned()
+        .unwrap_or_else(|| draft.to_string())
+}
+
 #[derive(Debug, Clone)]
 struct BroRun {
     source_message_id: String,
@@ -3625,12 +3654,14 @@ pub struct Composer {
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
-    /// Offset from the newest sent user message; `None` is the empty prompt
-    /// below the newest message.
+    /// Offset from the newest sent user message; `None` is the draft below
+    /// the newest message.
     message_history_position: Option<usize>,
     /// Text expected while a recalled message is untouched. Any edit leaves
     /// history navigation and turns the recalled prompt into a fresh draft.
     message_history_text: Option<String>,
+    /// Unsent text captured before entering history, restored at the bottom.
+    message_history_draft: Option<String>,
     /// Staged-but-unsent attachments per chat key. Navigating away and back
     /// restores them; they remain memory-only.
     attachments: HashMap<String, Vec<StagedAttachment>>,
@@ -3703,6 +3734,7 @@ impl Composer {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             let mut input = ComposerInput::new(DEFAULT_PLACEHOLDER, cx);
+            input.enable_prompt_typography();
             input.enable_mentions();
             input.enable_message_history();
             input
@@ -3744,6 +3776,7 @@ impl Composer {
             drafts: HashMap::new(),
             message_history_position: None,
             message_history_text: None,
+            message_history_draft: None,
             attachments: HashMap::new(),
             preview: None,
             picker_task: None,
@@ -4277,6 +4310,7 @@ impl Composer {
         if self.input.read(cx).text() != expected {
             self.message_history_position = None;
             self.message_history_text = None;
+            self.message_history_draft = None;
         }
     }
 
@@ -4304,10 +4338,14 @@ impl Composer {
         if next == self.message_history_position {
             return;
         }
-        let text = next
-            .and_then(|position| history.get(history.len() - 1 - position))
-            .cloned()
-            .unwrap_or_default();
+        if self.message_history_position.is_none() && next.is_some() {
+            self.message_history_draft = Some(self.input.read(cx).text().to_string());
+        }
+        let draft = self.message_history_draft.as_deref().unwrap_or_default();
+        let text = message_history_text(&history, next, draft);
+        if next.is_none() {
+            self.message_history_draft = None;
+        }
         self.message_history_position = next;
         self.message_history_text = next.map(|_| text.clone());
         self.input.update(cx, |input, cx| input.set_text(text, cx));
@@ -5060,7 +5098,10 @@ impl Composer {
                 }
                 self.input.update(cx, |input, cx| input.set_text("", cx));
             }
-            let old_text = self.input.read(cx).text().to_string();
+            let old_text = self
+                .message_history_draft
+                .take()
+                .unwrap_or_else(|| self.input.read(cx).text().to_string());
             if old_text.is_empty() {
                 self.drafts.remove(&self.current_key);
             } else {
@@ -5070,6 +5111,7 @@ impl Composer {
             self.current_key = key;
             self.message_history_position = None;
             self.message_history_text = None;
+            self.message_history_draft = None;
             self.failure = None;
             self.extraction_notice = None;
             self.wizard = None;
@@ -5359,7 +5401,8 @@ impl Composer {
             self.preview = None;
         }
         let message_id = uuid::Uuid::new_v4().to_string();
-        let created_at = chrono::Utc::now().timestamp_millis();
+        let sent_at = chrono::Utc::now();
+        let created_at = sent_at.timestamp_millis();
 
         // Image-only sends echo the same body `with_attachments` will use, so
         // the bubble never renders empty (refs are upserted in post-upload).
@@ -5403,8 +5446,24 @@ impl Composer {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
             s.push_echo(&chat_id, echo);
+            s.begin_pending_send(&chat_id, &message_id, sent_at);
             cx.notify();
         });
+        let expiry_chat_id = chat_id.clone();
+        let expiry_message_id = message_id.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(PENDING_SEND_TTL_MS as u64))
+                .await;
+            this.update(cx, |composer, cx| {
+                composer.state.update(cx, |state, cx| {
+                    state.end_pending_send(&expiry_chat_id, &expiry_message_id);
+                    cx.notify();
+                });
+            })
+            .ok();
+        })
+        .detach();
 
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
@@ -5526,6 +5585,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
+                            &chat_id,
                             att,
                         )
                         .await
@@ -5624,6 +5684,7 @@ impl Composer {
                     composer.failure = Some(message.into());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
+                        s.end_pending_send(&err_chat_id, &err_message_id);
                         cx.notify();
                     });
                     composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
@@ -6626,10 +6687,11 @@ impl Render for Composer {
         let staged_count = self.staged().len();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
+        let compact_total_height = theme.font_sizes.prompt_line_height() + 26.0;
         let base_height = if expanded {
             composer_total_height(content_height)
         } else {
-            COMPACT_TOTAL_HEIGHT
+            compact_total_height
         };
         let target_height = base_height + strip_h;
         let (pill_height, morph_t, morphing) = match self.flip_morph {
@@ -6770,7 +6832,7 @@ impl Render for Composer {
                 .children(strip)
                 .child(
                     div()
-                        .h(px(COMPACT_TOTAL_HEIGHT - PILL_BORDER_V))
+                        .h(px(compact_total_height - PILL_BORDER_V))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -6865,7 +6927,7 @@ mod tests {
     }
 
     #[test]
-    fn message_history_walks_to_an_empty_new_prompt() {
+    fn message_history_walks_to_the_bottom_draft_slot() {
         let mut position = None;
         position = message_history_position(position, 3, MessageHistoryDirection::Older);
         assert_eq!(position, Some(0));
@@ -6883,7 +6945,7 @@ mod tests {
         position = message_history_position(position, 3, MessageHistoryDirection::Newer);
         assert_eq!(position, Some(0));
         position = message_history_position(position, 3, MessageHistoryDirection::Newer);
-        assert_eq!(position, None, "the bottom slot is a fresh empty prompt");
+        assert_eq!(position, None, "the bottom slot is the current draft");
         assert_eq!(
             message_history_position(None, 3, MessageHistoryDirection::Newer),
             None
@@ -6896,6 +6958,19 @@ mod tests {
             message_history_position(Some(9), 3, MessageHistoryDirection::Newer),
             Some(1),
             "a transcript shrink clamps a stale position"
+        );
+    }
+
+    #[test]
+    fn message_history_restores_unsent_draft_at_the_bottom() {
+        let history = vec!["first prompt".to_string(), "latest prompt".to_string()];
+        assert_eq!(
+            message_history_text(&history, Some(0), "unsent draft"),
+            "latest prompt"
+        );
+        assert_eq!(
+            message_history_text(&history, None, "unsent draft"),
+            "unsent draft"
         );
     }
 

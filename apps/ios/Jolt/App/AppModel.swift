@@ -238,11 +238,18 @@ final class AppModel {
         return spaces.first { $0.id == spaceId }
     }
 
-    func indicator(for chat: Chat) -> ChatIndicator {
+    func sessionStatus(for chat: Chat) -> SessionStatus? {
         if let demo {
-            return chatIndicator(chat: chat, live: effectiveStatus(demo.sessions[chat.id], now: nowMs()))
+            return effectiveStatus(demo.sessions[chat.id], now: nowMs())
         }
-        return workspace?.indicator(for: chat) ?? .idle
+        if sessionStores[chat.id]?.sendPending() == true {
+            return .working
+        }
+        return effectiveStatus(workspace?.sessions[chat.id], now: nowMs())
+    }
+
+    func indicator(for chat: Chat) -> ChatIndicator {
+        chatIndicator(chat: chat, live: sessionStatus(for: chat))
     }
 
     func spaceIndicator(_ spaceId: String) -> ChatIndicator? {
@@ -261,9 +268,15 @@ final class AppModel {
         return workspace?.deviceOnline(deviceId) ?? false
     }
 
+    func listHarnesses(space: Space) async -> [HarnessInfo] {
+        if demo != nil { return HarnessCatalog.harnesses }
+        return await workspace?.listHarnesses(deviceId: space.deviceId) ?? HarnessCatalog.harnesses
+    }
+
     /// Live model catalog from the space's owning device (the desktop's
     /// "catalog source = the device that runs the session" rule); static
-    /// fallback when the device is unreachable.
+    /// fallback when the device is unreachable. Pi has no meaningful static
+    /// catalog because its providers are configured on the host.
     func listModels(space: Space, harness: String) async -> [ModelInfo] {
         if demo != nil {
             try? await Task.sleep(nanoseconds: 100_000_000)
@@ -276,7 +289,7 @@ final class AppModel {
         return HarnessCatalog.models(for: harness)
     }
 
-    /// Refs of the space's repo (git spaces only).
+    /// Refs/revisions from the host's active VCS backend.
     func listRefs(space: Space) async -> [RepoRef]? {
         if let demo {
             try? await Task.sleep(nanoseconds: 120_000_000)
@@ -285,22 +298,38 @@ final class AppModel {
         return await workspace?.listRefs(deviceId: space.deviceId, repoPath: space.path)
     }
 
-    /// Draft-mode checkout switch: `git checkout` in the SPACE's folder.
+    func searchFiles(space: Space, path: String?, query: String) async throws -> [FileSearchMatch] {
+        if demo != nil {
+            let files = [
+                FileSearchMatch(path: "README.md", isDir: false),
+                FileSearchMatch(path: "apps/ios/Jolt", isDir: true),
+                FileSearchMatch(path: "apps/ios/Jolt/Composer/ComposerView.swift", isDir: false),
+                FileSearchMatch(path: "crates/ui/src/composer.rs", isDir: false),
+            ]
+            let needle = query.lowercased()
+            return files.filter { needle.isEmpty || $0.path.lowercased().contains(needle) }
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.searchFiles(deviceId: space.deviceId, spaceId: space.id,
+                                               path: path, query: query)
+    }
+
+    /// Switch the space checkout through its host's active VCS backend.
     /// Returns an error message, or nil on success.
-    func switchSpaceRef(space: Space, refName: String) async -> String? {
+    func switchSpaceRef(space: Space, ref: RepoRef) async -> String? {
         if let demo {
             try? await Task.sleep(nanoseconds: 200_000_000)
-            demo.switchRef(path: space.path, refName: refName)
+            demo.switchRef(path: space.path, refName: ref.name)
             return nil
         }
         guard let workspace else { return "Not connected" }
         return await workspace.switchRef(deviceId: space.deviceId,
-                                         repoPath: space.path, refName: refName)
+                                         repoPath: space.path,
+                                         refName: ref.revision ?? ref.name)
     }
 
-    /// Mid-session ref switch (desktop switch_session_ref): retarget onto the
-    /// ref's existing worktree (row writes, no git), else checkout in the
-    /// session's own cwd on the host. Returns an error message or nil.
+    /// Mid-session ref switch: retarget onto an existing isolated checkout,
+    /// or switch the session's cwd through the host VCS. Returns an error or nil.
     func switchSessionRef(chat: Chat, ref: RepoRef) async -> String? {
         guard let cwd = chat.cwd else { return "Session has no working folder" }
         if let worktree = ref.worktreePath {
@@ -325,23 +354,43 @@ final class AppModel {
         }
         guard let workspace else { return "Not connected" }
         let error = await workspace.switchRef(deviceId: chat.deviceId,
-                                              repoPath: cwd, refName: ref.name)
+                                              repoPath: cwd,
+                                              refName: ref.revision ?? ref.name)
         if error == nil {
-            // The host's HEAD watcher reconciles chat.branch eventually;
+            // The host's checkout watcher reconciles chat.branch eventually;
             // stamp it optimistically so the UI answers immediately.
             workspace.setChatCheckout(chatId: chat.id, cwd: cwd, branch: ref.name)
         }
         return error
     }
 
-    /// CreateWorktree off the base ref; returns the new worktree's path.
-    func createWorktree(space: Space, base: String) async -> String? {
+    /// Create an isolated checkout from the backend revision.
+    func createWorktree(space: Space, base: RepoRef) async -> Worktree? {
         if let demo {
             try? await Task.sleep(nanoseconds: 250_000_000)
-            return demo.createWorktree(spacePath: space.path, base: base)
+            let path = demo.createWorktree(spacePath: space.path, base: base.name)
+            return Worktree(repoPath: space.path, path: path, branch: base.name,
+                            name: nil, checkoutId: nil)
         }
         return await workspace?.createWorktree(deviceId: space.deviceId,
-                                               repoPath: space.path, branch: base)
+                                               repoPath: space.path,
+                                               revision: base.revision ?? base.name)
+    }
+
+    func uploadAttachment(deviceId: String, chatId: String,
+                          name: String, data: Data) async throws -> String {
+        if demo != nil { return "/tmp/jolt-demo-uploads/\(name)" }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.uploadAttachment(deviceId: deviceId, chatId: chatId,
+                                                    name: name, data: data)
+    }
+
+    func deleteChat(_ chatId: String) {
+        if let demo {
+            demo.chats.removeAll { $0.id == chatId }
+        } else {
+            workspace?.deleteChat(chatId: chatId)
+        }
     }
 
     @discardableResult

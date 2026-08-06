@@ -6,7 +6,7 @@
 //! 1. skip when the chat already has a title (or has no workspace row);
 //! 2. pick the run harness's cheapest model (small-tier name heuristic, else the
 //!    last listed model);
-//! 3. run a one-shot, non-streaming-collected titling prompt through the
+//! 3. run an ephemeral, non-streaming-collected titling prompt through the
 //!    [`Harness`] trait (read-only sandbox, minimal reasoning, auto-approve),
 //!    retrying with a short backoff ladder; fall back to the prompt's first
 //!    words when every attempt produces nothing;
@@ -220,6 +220,7 @@ pub(crate) async fn collect_text(
 ) -> Result<String, EngineError> {
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
     let controls = RunControls {
+        persist_session: false,
         request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());

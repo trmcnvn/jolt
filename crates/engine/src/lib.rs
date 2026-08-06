@@ -5,7 +5,7 @@
 //! See docs/architecture.md for process and data ownership.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use async_trait::async_trait;
 use jolt_rpc::{RpcError, RpcReply, RpcService};
@@ -25,8 +25,10 @@ pub mod registry;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
+pub mod scopes;
 pub mod secrets;
 pub mod sessions;
+mod simd_base64;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;
@@ -44,6 +46,7 @@ pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
+pub use scopes::{AccountScope, ScopeKind, ScopeLayout, ScopeStatus};
 pub use secrets::{HarnessSecrets, SecretsError};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
@@ -81,13 +84,18 @@ pub(crate) fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Data directory (default `~/.jolt`, dev `~/.jolt-dev`).
     pub data_dir: PathBuf,
     /// Edge base URL.
     pub edge_url: String,
-    /// Bearer for edge room joins; `None` runs fully offline (sync disabled).
+    /// Bearer for development edge room joins. `None` disables authenticated
+    /// sync in Local, but the public release endpoint remains available.
     pub edge_token: Option<String>,
     /// Localhost IPC port for the UI.
     pub ipc_port: u16,
@@ -98,6 +106,22 @@ pub struct EngineConfig {
     pub org_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
     pub workos_client_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct DeviceServices {
+    secrets: HarnessSecrets,
+    agent_accounts: AgentAccounts,
+}
+
+impl DeviceServices {
+    fn open(data_dir: &Path) -> Result<Self, EngineError> {
+        Ok(Self {
+            secrets: HarnessSecrets::open(data_dir)
+                .map_err(|error| EngineError::Other(format!("secrets: {error}")))?,
+            agent_accounts: AgentAccounts::new(AgentAccountsConfig::detect(data_dir)),
+        })
+    }
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -150,25 +174,78 @@ impl EngineCore {
         org_id: &str,
         user_id: &str,
     ) -> Result<Self, EngineError> {
-        std::fs::create_dir_all(data_dir)?;
-        // Single-instance guard: two engines on one data dir would race the
-        // SQLite snapshots + journals. Taken before any store opens or the IPC
-        // port binds; held (and kernel-released on crash) for the engine's life.
-        let lock = InstanceLock::acquire(data_dir)?;
-        let secrets = HarnessSecrets::open(data_dir)
-            .map_err(|error| EngineError::Other(format!("secrets: {error}")))?;
-        registry.set_environment_provider(Arc::new(secrets.clone()));
-        let device_id = load_or_create_device_id(data_dir)?;
-        // Identity-scoped storage: snapshots, the command ledger, and run
-        // journals live under `orgs/{orgId}/{userId}/` so switching accounts or
-        // orgs on one machine never reuses another identity's cached docs.
-        let org_dir = data_dir
+        let identity_dir = data_dir
             .join("orgs")
             .join(sanitize_path_id(org_id))
             .join(sanitize_path_id(user_id));
-        let store = Arc::new(DocsStore::open(&org_dir)?);
-        let journal = Arc::new(RunJournal::open(org_dir.join("journals"))?);
-        let usage = UsageStore::open(&org_dir.join("usage.sqlite"), device_id.clone())
+        Self::assemble_in_scope(
+            data_dir,
+            &identity_dir,
+            data_dir,
+            data_dir,
+            registry,
+            default_harness,
+            edge,
+            org_id,
+            user_id,
+            None,
+        )
+    }
+
+    /// Assemble one Local or Account runtime. Device-wide configuration stays
+    /// under `data_dir`; documents, usage, journals, uploads, and the logical
+    /// device id are isolated under `scope_dir`.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_scoped(
+        data_dir: &Path,
+        scope_dir: &Path,
+        lock_dir: &Path,
+        registry: Arc<HarnessRegistry>,
+        default_harness: HarnessId,
+        edge: Option<EdgeConfig>,
+        org_id: &str,
+        user_id: &str,
+        services: Option<DeviceServices>,
+    ) -> Result<Self, EngineError> {
+        Self::assemble_in_scope(
+            data_dir,
+            scope_dir,
+            scope_dir,
+            lock_dir,
+            registry,
+            default_harness,
+            edge,
+            org_id,
+            user_id,
+            services,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_in_scope(
+        data_dir: &Path,
+        identity_dir: &Path,
+        device_dir: &Path,
+        lock_dir: &Path,
+        registry: Arc<HarnessRegistry>,
+        default_harness: HarnessId,
+        edge: Option<EdgeConfig>,
+        org_id: &str,
+        user_id: &str,
+        services: Option<DeviceServices>,
+    ) -> Result<Self, EngineError> {
+        std::fs::create_dir_all(data_dir)?;
+        std::fs::create_dir_all(identity_dir)?;
+        std::fs::create_dir_all(device_dir)?;
+        std::fs::create_dir_all(lock_dir)?;
+        let lock = InstanceLock::acquire(lock_dir)?;
+        let services = services.map_or_else(|| DeviceServices::open(data_dir), Ok)?;
+        let secrets = services.secrets;
+        registry.set_environment_provider(Arc::new(secrets.clone()));
+        let device_id = load_or_create_device_id(device_dir)?;
+        let store = Arc::new(DocsStore::open(identity_dir)?);
+        let journal = Arc::new(RunJournal::open(identity_dir.join("journals"))?);
+        let usage = UsageStore::open(&identity_dir.join("usage.sqlite"), device_id.clone())
             .map_err(|error| EngineError::Other(format!("usage store: {error}")))?;
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone(), usage);
         let doc_host = DocHost::new(
@@ -200,8 +277,8 @@ impl EngineCore {
         }
         let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
-        let uploads = Uploads::new(data_dir, edge.clone());
-        let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
+        let uploads = Uploads::new(identity_dir, edge.clone());
+        let agent_accounts = services.agent_accounts;
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -355,9 +432,6 @@ impl EngineCore {
     /// snapshot.
     pub async fn shutdown(&self) {
         self.sessions.shutdown().await;
-        if let Some(updater) = self.updater() {
-            updater.shutdown();
-        }
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
         self.doc_host.flush_all();
@@ -375,6 +449,7 @@ pub struct Engine {
 pub struct EngineRuntime {
     core: EngineCore,
     _host_relay: Option<jolt_rpc::HostRelay>,
+    owns_updater: bool,
 }
 
 #[derive(Clone)]
@@ -384,83 +459,440 @@ enum SupervisedEngineState {
     Failed(String),
 }
 
-/// Process-level RPC owner that keeps authentication available while the sole
-/// identity-scoped runtime waits for sign-in and automatic organization setup.
+/// Owns the always-on Local runtime and, while authenticated, one Account
+/// runtime. Switching changes only the viewport's routed service; both runtimes
+/// continue executing independently.
 pub struct EngineSupervisor {
     config: EngineConfig,
     auth: Auth,
     auth_rpc: rpc::AuthRpc,
+    updater: jolt_update::Updater,
     state_tx: tokio::sync::watch::Sender<SupervisedEngineState>,
-    runtime: tokio::sync::Mutex<Option<EngineRuntime>>,
+    scope_tx: tokio::sync::watch::Sender<ScopeStatus>,
+    local: std::sync::Mutex<Option<EngineRuntime>>,
+    account: std::sync::Mutex<Option<EngineRuntime>>,
+    device_services: std::sync::Mutex<Option<DeviceServices>>,
     assembly_gate: tokio::sync::Mutex<()>,
 }
 
 impl EngineSupervisor {
     pub fn new(config: EngineConfig, auth: Auth) -> Arc<Self> {
         let (state_tx, _) = tokio::sync::watch::channel(SupervisedEngineState::Waiting);
-        Arc::new(Self {
-            config,
-            auth: auth.clone(),
-            auth_rpc: rpc::AuthRpc::new(auth),
-            state_tx,
-            runtime: tokio::sync::Mutex::new(None),
-            assembly_gate: tokio::sync::Mutex::new(()),
+        let (scope_tx, _) = tokio::sync::watch::channel(ScopeStatus::local());
+        Arc::new_cyclic(|weak: &Weak<Self>| {
+            let weak = weak.clone();
+            let quiescent: jolt_update::QuiescentCheck = Arc::new(move || {
+                weak.upgrade().is_none_or(|supervisor| {
+                    let quiet = |slot: &Mutex<Option<EngineRuntime>>| {
+                        lock(slot).as_ref().is_none_or(|runtime| {
+                            !runtime.core().sessions.any_active()
+                                && !runtime.core().terminals.any_open()
+                        })
+                    };
+                    quiet(&supervisor.local) && quiet(&supervisor.account)
+                })
+            });
+            let updater = jolt_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+            Self {
+                config,
+                auth: auth.clone(),
+                auth_rpc: rpc::AuthRpc::new(auth),
+                updater,
+                state_tx,
+                scope_tx,
+                local: std::sync::Mutex::new(None),
+                account: std::sync::Mutex::new(None),
+                device_services: std::sync::Mutex::new(None),
+                assembly_gate: tokio::sync::Mutex::new(()),
+            }
         })
     }
 
-    /// Wait for the automatically-provisioned org-scoped session and assemble
-    /// the runtime. Auth RPCs remain usable while this task waits.
+    /// Resolve the preferred scope behind the splash, then continue watching
+    /// authentication so a completed browser sign-in can assemble Account.
     pub fn spawn_when_ready(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let supervisor = self.clone();
         tokio::spawn(async move {
-            let mut auth_state = supervisor.auth.watch_state();
-            while !auth_state.borrow().is_signed_in() {
-                if auth_state.changed().await.is_err() {
-                    supervisor
-                        .state_tx
-                        .send_replace(SupervisedEngineState::Failed(
-                            "authentication state closed before sign-in".into(),
-                        ));
-                    return;
-                }
-            }
-            if let Err(err) = supervisor.assemble_current().await {
+            if let Err(err) = supervisor.start().await {
                 tracing::error!(error = %err, "engine assembly failed");
                 supervisor
                     .state_tx
                     .send_replace(SupervisedEngineState::Failed(format!("{err:#}")));
+                return;
+            }
+            let mut states = supervisor.auth.watch_state();
+            loop {
+                if states.changed().await.is_err() {
+                    return;
+                }
+                let state = states.borrow().clone();
+                if let Err(err) = supervisor.auth_changed(state).await {
+                    tracing::warn!(error = %err, "account runtime transition failed");
+                }
             }
         })
     }
 
-    /// Assemble immediately for callers that already completed authentication
-    /// and automatic organization provisioning.
-    pub async fn assemble_current(&self) -> anyhow::Result<()> {
-        let _gate = self.assembly_gate.lock().await;
-        if self.runtime.lock().await.is_some() {
+    async fn start(&self) -> anyhow::Result<()> {
+        self.ensure_local_runtime()?;
+        if !self.auth.workos_enabled() && self.config.edge_token.is_none() {
+            self.activate(ScopeKind::Local)?;
             return Ok(());
         }
-        let runtime = Engine::assemble_runtime(&self.config, self.auth.clone()).await?;
-        let service = runtime.core().rpc_service();
-        *self.runtime.lock().await = Some(runtime);
+        match self.auth.state() {
+            AuthState::SignedIn { .. } => {
+                if let Err(error) = self.prepare_signed_in(true).await {
+                    tracing::warn!(error = %error, "account unavailable at startup; using Local");
+                    self.activate(ScopeKind::Local)?;
+                }
+            }
+            AuthState::NeedsOrganization { .. } => {
+                if self.auth.ensure_personal_org().await.is_ok() {
+                    self.prepare_signed_in(true).await?;
+                } else {
+                    self.activate(ScopeKind::Local)?;
+                }
+            }
+            AuthState::SignedOut => self.activate(ScopeKind::Local)?,
+        }
+        Ok(())
+    }
+
+    async fn auth_changed(&self, state: AuthState) -> anyhow::Result<()> {
+        match state {
+            AuthState::SignedIn { .. } => self.prepare_signed_in(false).await,
+            AuthState::NeedsOrganization { .. } => {
+                self.auth.ensure_personal_org().await?;
+                Ok(())
+            }
+            AuthState::SignedOut => {
+                self.activate(ScopeKind::Local)?;
+                let runtime = { lock(&self.account).take() };
+                if let Some(runtime) = runtime {
+                    runtime.shutdown().await;
+                }
+                self.publish_scope(ScopeKind::Local, false);
+                Ok(())
+            }
+        }
+    }
+
+    async fn prepare_signed_in(&self, startup: bool) -> anyhow::Result<()> {
+        let _gate = self.assembly_gate.lock().await;
+        if lock(&self.account).is_some() {
+            let active = if startup {
+                ScopeKind::Account
+            } else {
+                self.scope_tx.borrow().active
+            };
+            self.publish_scope(active, false);
+            if startup {
+                self.activate(ScopeKind::Account)?;
+            }
+            return Ok(());
+        }
+        let local_has_data = self.local_has_data();
+        if local_has_data {
+            self.scope_tx.send_modify(|status| {
+                status.account_available = false;
+                status.account_email = self.auth.state().user().map(|user| user.email.clone());
+                status.local_has_data = true;
+                status.merge_pending = true;
+            });
+            self.activate(ScopeKind::Local)?;
+            return Ok(());
+        }
+        self.ensure_account_runtime()?;
+        self.activate(ScopeKind::Account)?;
+        self.publish_scope(ScopeKind::Account, false);
+        Ok(())
+    }
+
+    fn device_services(&self) -> Result<DeviceServices, EngineError> {
+        let mut services = lock(&self.device_services);
+        if services.is_none() {
+            *services = Some(DeviceServices::open(&self.config.data_dir)?);
+        }
+        Ok(services
+            .as_ref()
+            .expect("device services initialized")
+            .clone())
+    }
+
+    fn ensure_local_runtime(&self) -> anyhow::Result<()> {
+        if lock(&self.local).is_some() {
+            return Ok(());
+        }
+        let layout = ScopeLayout::new(&self.config.data_dir);
+        let scope_dir = layout.ensure_local()?;
+        let scope_id = layout.local_scope_id()?;
+        let core = EngineCore::assemble_scoped(
+            &self.config.data_dir,
+            &scope_dir,
+            &self.config.data_dir,
+            Arc::new(default_registry()),
+            self.config.default_harness,
+            None,
+            "local",
+            &scope_id,
+            Some(self.device_services()?),
+        )?;
+        core.set_auth(self.auth.clone());
+        core.set_updater(self.updater.clone());
+        *lock(&self.local) = Some(EngineRuntime {
+            core,
+            _host_relay: None,
+            owns_updater: false,
+        });
+        Ok(())
+    }
+
+    fn ensure_account_runtime(&self) -> anyhow::Result<()> {
+        if lock(&self.account).is_some() {
+            return Ok(());
+        }
+        let (org_id, user_id) = self.account_identity()?;
+        let scope = ScopeLayout::new(&self.config.data_dir).migrate_account(&org_id, &user_id)?;
+        let device_id = load_or_create_device_id(&scope.dir)?;
+        let edge = Some(
+            EdgeConfig::new(self.config.edge_url.clone(), Arc::new(self.auth.clone()))
+                .with_device(device_id),
+        );
+        let core = EngineCore::assemble_scoped(
+            &self.config.data_dir,
+            &scope.dir,
+            &scope.dir,
+            Arc::new(default_registry()),
+            self.config.default_harness,
+            edge.clone(),
+            &org_id,
+            &user_id,
+            Some(self.device_services()?),
+        )?;
+        core.set_auth(self.auth.clone());
+        core.set_updater(self.updater.clone());
+        let host_relay = edge
+            .as_ref()
+            .map(|edge| configure_online_core(&core, edge, &self.auth));
+        *lock(&self.account) = Some(EngineRuntime {
+            core,
+            _host_relay: host_relay,
+            owns_updater: false,
+        });
+        Ok(())
+    }
+
+    fn account_identity(&self) -> anyhow::Result<(String, String)> {
+        let dev_org = self
+            .config
+            .edge_token
+            .as_deref()
+            .and_then(|token| token.split_once('@'))
+            .map(|(_, org)| org.to_string());
+        let org_id = self
+            .auth
+            .state()
+            .org_id()
+            .map(str::to_string)
+            .or(dev_org)
+            .or_else(|| self.config.org_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("account has no organization"))?;
+        let user_id = self
+            .auth
+            .user_id()
+            .ok_or_else(|| anyhow::anyhow!("account has no user"))?;
+        Ok((org_id, user_id))
+    }
+
+    fn local_has_data(&self) -> bool {
+        lock(&self.local).as_ref().is_some_and(|runtime| {
+            runtime
+                .core()
+                .workspace
+                .read_chats()
+                .is_ok_and(|chats| !chats.is_empty())
+                || runtime
+                    .core()
+                    .workspace
+                    .read_spaces()
+                    .is_ok_and(|spaces| !spaces.is_empty())
+        })
+    }
+
+    fn activate(&self, scope: ScopeKind) -> anyhow::Result<()> {
+        let service = match scope {
+            ScopeKind::Local => lock(&self.local)
+                .as_ref()
+                .map(|runtime| runtime.core().rpc_service()),
+            ScopeKind::Account => lock(&self.account)
+                .as_ref()
+                .map(|runtime| runtime.core().rpc_service()),
+        }
+        .ok_or_else(|| anyhow::anyhow!("{scope:?} runtime unavailable"))?;
         self.state_tx
             .send_replace(SupervisedEngineState::Ready(service));
+        let merge_pending = self.scope_tx.borrow().merge_pending;
+        self.publish_scope(scope, merge_pending);
         Ok(())
+    }
+
+    fn publish_scope(&self, active: ScopeKind, merge_pending: bool) {
+        let account_available = lock(&self.account).is_some();
+        self.scope_tx.send_replace(ScopeStatus {
+            active,
+            account_available,
+            account_email: self.auth.state().user().map(|user| user.email.clone()),
+            local_has_data: self.local_has_data(),
+            merge_pending,
+        });
+    }
+
+    async fn resolve_account_link(&self, merge: bool) -> anyhow::Result<()> {
+        let _gate = self.assembly_gate.lock().await;
+        let (org_id, user_id) = self.account_identity()?;
+        if merge {
+            let layout = ScopeLayout::new(&self.config.data_dir);
+            let account_existed = layout.has_account_data(&org_id, &user_id);
+            if account_existed {
+                self.ensure_account_runtime()?;
+            }
+            {
+                let local = lock(&self.local);
+                let runtime = local
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Local runtime unavailable"))?;
+                if runtime.core().sessions.any_active() || runtime.core().terminals.any_open() {
+                    anyhow::bail!(
+                        "finish or stop active Local runs and terminals before syncing Local"
+                    );
+                }
+                let chat_ids: Vec<String> = runtime
+                    .core()
+                    .workspace
+                    .read_chats()?
+                    .into_iter()
+                    .map(|chat| chat.id)
+                    .collect();
+                runtime.core().doc_host.rewrite_text_prefix(
+                    &chat_ids,
+                    &layout.local_dir().join("uploads").to_string_lossy(),
+                    &layout
+                        .account_dir(&org_id, &user_id)
+                        .join("uploads")
+                        .to_string_lossy(),
+                )?;
+            }
+            // Stop routing new work into either store before merging files.
+            self.state_tx.send_replace(SupervisedEngineState::Waiting);
+            let local = { lock(&self.local).take() };
+            if let Some(local) = local {
+                local.shutdown().await;
+            }
+            let account = { lock(&self.account).take() };
+            if let Some(account) = account {
+                account.shutdown().await;
+            }
+            tokio::task::yield_now().await;
+            let result = if account_existed {
+                layout.merge_local_into_account(&org_id, &user_id)
+            } else {
+                layout.promote_local(&org_id, &user_id)
+            };
+            if let Err(error) = result {
+                self.ensure_local_runtime()?;
+                let _ = self.ensure_account_runtime();
+                self.activate(ScopeKind::Local)?;
+                return Err(error.into());
+            }
+            self.ensure_local_runtime()?;
+        }
+        if let Err(error) = self.ensure_account_runtime() {
+            self.activate(ScopeKind::Local)?;
+            return Err(error);
+        }
+        if merge && let Some(account) = lock(&self.account).as_ref() {
+            for chat in account.core().workspace.read_chats()? {
+                account.core().doc_host.open(&chat.id)?;
+            }
+        }
+        self.activate(ScopeKind::Account)?;
+        self.publish_scope(ScopeKind::Account, false);
+        Ok(())
+    }
+
+    pub async fn assemble_current(&self) -> anyhow::Result<()> {
+        self.start().await
+    }
+
+    /// Wait for splash-time Local/Account resolution without exposing the
+    /// intermediate Local runtime to the headed viewport.
+    pub async fn wait_ready(&self) -> anyhow::Result<()> {
+        let mut state = self.state_tx.subscribe();
+        loop {
+            let current = state.borrow().clone();
+            match current {
+                SupervisedEngineState::Waiting => {}
+                SupervisedEngineState::Ready(_) => return Ok(()),
+                SupervisedEngineState::Failed(message) => anyhow::bail!(message),
+            }
+            state.changed().await?;
+        }
     }
 
     pub async fn shutdown(&self) {
         self.state_tx.send_replace(SupervisedEngineState::Waiting);
-        if let Some(runtime) = self.runtime.lock().await.take() {
-            runtime.shutdown().await;
+        let account = { lock(&self.account).take() };
+        if let Some(account) = account {
+            account.shutdown().await;
         }
+        let local = { lock(&self.local).take() };
+        if let Some(local) = local {
+            local.shutdown().await;
+        }
+        self.updater.shutdown();
     }
 }
 
 #[async_trait]
 impl RpcService for EngineSupervisor {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
-        if rpc::AuthRpc::handles(method) {
-            return self.auth_rpc.handle(method, params).await;
+        match method {
+            jolt_rpc::methods::SCOPE_STATUS => {
+                return Ok(RpcReply::Stream(rpc::watch_stream(
+                    self.scope_tx.subscribe(),
+                )));
+            }
+            jolt_rpc::methods::SWITCH_SCOPE => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    scope: ScopeKind,
+                }
+                let params: Params = jolt_rpc::parse_params(params)?;
+                self.activate(params.scope)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                return RpcReply::value(&self.scope_tx.borrow().clone());
+            }
+            jolt_rpc::methods::RESOLVE_ACCOUNT_LINK => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    merge: bool,
+                }
+                let params: Params = jolt_rpc::parse_params(params)?;
+                self.resolve_account_link(params.merge)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                return RpcReply::value(&self.scope_tx.borrow().clone());
+            }
+            jolt_rpc::methods::SIGN_OUT => {
+                self.activate(ScopeKind::Local)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                self.auth.sign_out();
+                return RpcReply::value(&serde_json::json!({ "ok": true }));
+            }
+            _ if rpc::AuthRpc::handles(method) => {
+                return self.auth_rpc.handle(method, params).await;
+            }
+            _ => {}
         }
 
         let mut state = self.state_tx.subscribe();
@@ -487,7 +919,26 @@ impl EngineRuntime {
 
     pub async fn shutdown(&self) {
         self.core.shutdown().await;
+        if self.owns_updater
+            && let Some(updater) = self.core.updater()
+        {
+            updater.shutdown();
+        }
     }
+}
+
+fn configure_online_core(core: &EngineCore, edge: &EdgeConfig, auth: &Auth) -> jolt_rpc::HostRelay {
+    let links = jolt_rpc::LinkCache::new(jolt_rpc::LinkCacheConfig::new(
+        edge.url.clone(),
+        Arc::new(auth.clone()),
+    ));
+    let links_for_presence = links.clone();
+    core.workspace
+        .set_peer_alive_hook(Arc::new(move |device_id: &str| {
+            links_for_presence.reset_cooldown(device_id);
+        }));
+    core.set_links(links);
+    core.start_host_relay(&edge.url)
 }
 
 impl Engine {
@@ -518,26 +969,18 @@ impl Engine {
         Auth::detect(auth_config).await
     }
 
-    /// Open the identity-scoped stores and online transports for an auth session
-    /// that is already ready. The headed UI waits behind its sign-in gate before
-    /// calling this; headless mode waits on the terminal flow.
+    /// Assemble the account-only runtime used by headless mode. Authentication
+    /// is mandatory there; the headed app uses [`EngineSupervisor`] instead.
     pub async fn assemble_runtime(
         config: &EngineConfig,
         auth: Auth,
     ) -> anyhow::Result<EngineRuntime> {
-        let online = (auth.workos_enabled() || config.edge_token.is_some())
-            && auth.access_token().await.is_some();
-        let device_id = load_or_create_device_id(&config.data_dir)?;
-        let edge = online.then(|| {
-            EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
-        });
-
         let dev_token_org = config
             .edge_token
             .as_deref()
-            .and_then(|t| t.split_once('@'))
+            .and_then(|token| token.split_once('@'))
             .map(|(_, org)| org.to_string())
-            .filter(|s| !s.is_empty());
+            .filter(|org| !org.is_empty());
         let org_id = auth
             .state()
             .org_id()
@@ -547,19 +990,23 @@ impl Engine {
             .unwrap_or_else(|| env_or("JOLT_ORG_ID", DEFAULT_ORG_ID));
         let user_id = auth
             .user_id()
-            .unwrap_or_else(|| env_or("JOLT_USER_ID", DEFAULT_USER_ID));
-        let core = EngineCore::assemble_with_identity(
+            .ok_or_else(|| anyhow::anyhow!("headless mode requires an account"))?;
+        let scope = ScopeLayout::new(&config.data_dir).migrate_account(&org_id, &user_id)?;
+        let device_id = load_or_create_device_id(&scope.dir)?;
+        let edge =
+            EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id);
+        let core = EngineCore::assemble_scoped(
+            &config.data_dir,
+            &scope.dir,
             &config.data_dir,
             Arc::new(default_registry()),
             config.default_harness,
-            edge.clone(),
+            Some(edge.clone()),
             &org_id,
             &user_id,
+            None,
         )?;
         core.set_auth(auth.clone());
-        // Release checker: polls {edge}/releases on a 6h cadence; headless
-        // installs with JOLT_AUTO_UPDATE=1 apply + restart themselves — gated
-        // on quiescence so a restart never lands under a live run or open PTY.
         let quiescent: jolt_update::QuiescentCheck = {
             let sessions = core.sessions.clone();
             let terminals = core.terminals.clone();
@@ -569,25 +1016,13 @@ impl Engine {
             config.edge_url.clone(),
             Some(quiescent),
         ));
-        tracing::info!(device_id = %core.device_id, "engine core assembled");
-
-        let host_relay = edge.as_ref().map(|edge| {
-            let links = jolt_rpc::LinkCache::new(jolt_rpc::LinkCacheConfig::new(
-                edge.url.clone(),
-                Arc::new(auth.clone()),
-            ));
-            let links_for_presence = links.clone();
-            core.workspace
-                .set_peer_alive_hook(Arc::new(move |device_id: &str| {
-                    links_for_presence.reset_cooldown(device_id);
-                }));
-            core.set_links(links);
-            core.start_host_relay(&edge.url)
-        });
+        tracing::info!(device_id = %core.device_id, "account engine core assembled");
+        let host_relay = Some(configure_online_core(&core, &edge, &auth));
 
         Ok(EngineRuntime {
             core,
             _host_relay: host_relay,
+            owns_updater: true,
         })
     }
 
@@ -609,18 +1044,18 @@ impl Engine {
             terminal_sign_in(&auth).await?;
         }
 
-        let supervisor = EngineSupervisor::new(config.clone(), auth);
-        supervisor.assemble_current().await?;
+        let runtime = Self::assemble_runtime(&config, auth).await?;
+        let service = runtime.core().rpc_service();
 
         // A daemon exists to serve this port, so a bind failure is fatal here —
         // unlike the headed app, which can still work over its in-process
         // transport (see `serve_ipc`).
-        let server = serve_ipc(config.ipc_port, supervisor.clone()).await?;
+        let server = serve_ipc(config.ipc_port, service).await?;
 
         shutdown_signal().await?;
         tracing::info!("shutting down");
         server.abort();
-        supervisor.shutdown().await;
+        runtime.shutdown().await;
         Ok(())
     }
 }
@@ -780,5 +1215,126 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
             std::fs::write(&path, &id)?;
             Ok(id)
         }
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn existing_account_is_moved_and_coexists_with_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = EngineCore::assemble_with_identity(
+            dir.path(),
+            Arc::new(default_registry()),
+            HarnessId::Mock,
+            None,
+            "org-1",
+            "user-1",
+        )
+        .unwrap();
+        let account_device = legacy.device_id.clone();
+        legacy.shutdown().await;
+        drop(legacy);
+        std::fs::write(
+            dir.path().join("session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "refreshToken": "offline-refresh",
+                "user": { "id": "user-1", "email": "user@example.com" },
+                "orgId": "org-1"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut auth_config = AuthConfig::new("http://127.0.0.1:1", dir.path());
+        auth_config.workos_client_id = Some("client_test".into());
+        let auth = Auth::new(auth_config);
+        let supervisor = EngineSupervisor::new(
+            EngineConfig {
+                data_dir: dir.path().to_path_buf(),
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                ipc_port: 0,
+                default_harness: HarnessId::Mock,
+                org_id: None,
+                workos_client_id: Some("client_test".into()),
+            },
+            auth,
+        );
+        let task = supervisor.spawn_when_ready();
+        let client = jolt_rpc::memory_client(supervisor.clone());
+        let account_local_device = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.call(jolt_rpc::methods::LOCAL_DEVICE, serde_json::json!({})),
+        )
+        .await
+        .expect("Account runtime booted")
+        .unwrap();
+        assert_eq!(account_local_device["deviceId"], account_device);
+        assert!(!dir.path().join("orgs/org-1/user-1").exists());
+        assert!(
+            dir.path()
+                .join("scopes/accounts/org-1/user-1/docs.sqlite3")
+                .exists()
+        );
+
+        client
+            .call(
+                jolt_rpc::methods::SWITCH_SCOPE,
+                serde_json::json!({ "scope": "local" }),
+            )
+            .await
+            .unwrap();
+        let local_device = client
+            .call(jolt_rpc::methods::LOCAL_DEVICE, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_ne!(local_device["deviceId"], account_device);
+        assert!(lock(&supervisor.account).is_some(), "Account keeps running");
+
+        task.abort();
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn signed_out_supervisor_serves_local_and_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut auth_config = AuthConfig::new("http://127.0.0.1:1", dir.path());
+        auth_config.workos_client_id = Some("client_test".into());
+        let auth = Auth::new(auth_config);
+        let supervisor = EngineSupervisor::new(
+            EngineConfig {
+                data_dir: dir.path().to_path_buf(),
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                ipc_port: 0,
+                default_harness: HarnessId::Mock,
+                org_id: None,
+                workos_client_id: Some("client_test".into()),
+            },
+            auth,
+        );
+        let task = supervisor.spawn_when_ready();
+        let client = jolt_rpc::memory_client(supervisor.clone());
+        let harnesses = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.call(jolt_rpc::methods::LIST_HARNESSES, serde_json::json!({})),
+        )
+        .await
+        .expect("Local runtime booted")
+        .expect("harness list");
+        assert!(harnesses.as_array().is_some_and(|rows| !rows.is_empty()));
+        let mut updates = client
+            .subscribe(jolt_rpc::methods::UPDATE_STATUS, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(
+            updates.recv().await.is_some(),
+            "Local receives update status"
+        );
+        task.abort();
+        supervisor.shutdown().await;
     }
 }

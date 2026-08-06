@@ -31,7 +31,7 @@ jolt daemon status
 
 ### Desktop from source
 
-Build the desktop app from the Rust workspace with stable Rust and Zig 0.15.2:
+Build the desktop app from the Rust workspace with stable Rust and Zig 0.16.0:
 
 ```bash
 cargo build -p jolt
@@ -54,9 +54,11 @@ Jolt discovers models from the installed CLI, and each engine uses the credentia
 
 See [Agent harnesses](harnesses.md) for details.
 
-## 3. Sign in to Jolt
+## 3. Choose Local or sign in
 
-For a headless device:
+The desktop opens without an account in a Local scope stored only on that device. Sign in from the user menu to add synchronized spaces, remote device control, and iOS access. If Local already contains sessions, Jolt asks before moving them into the account and explains which data remains device-local.
+
+For a headless device, an account is required:
 
 ```bash
 jolt login
@@ -64,7 +66,7 @@ jolt login
 
 Open the printed URL, then paste the browser code into the terminal. The session is saved under Jolt's data directory and reused by the daemon.
 
-The desktop app presents the same sign-in flow in its gate. Organization setup is automatic: Jolt adopts the sole existing membership or creates a private organization named `Personal`.
+Organization setup is automatic: Jolt adopts the sole existing membership or creates a private organization named `Personal`. **Switch to Local** keeps the account runtime running in the background; **Sign out** disconnects it and returns to Local.
 
 ## 4. Add a space
 

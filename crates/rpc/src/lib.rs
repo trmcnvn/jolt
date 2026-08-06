@@ -74,6 +74,10 @@ pub mod methods {
     pub const LIST_ORGS: &str = "ListOrgs";
     /// Provision or select the signed-in user's sole hidden organization.
     pub const ENSURE_PERSONAL_ORG: &str = "EnsurePersonalOrg";
+    // Device-local Local/Account scope lifecycle (IPC-only).
+    pub const SCOPE_STATUS: &str = "ScopeStatus";
+    pub const SWITCH_SCOPE: &str = "SwitchScope";
+    pub const RESOLVE_ACCOUNT_LINK: &str = "ResolveAccountLink";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";

@@ -4,7 +4,7 @@ Jolt coordinates powerful local coding agents. Its security boundary is the sign
 
 ## Authentication and tenancy
 
-Production Jolt uses WorkOS AuthKit. The engine is a public client: it builds the authorize URL, while the edge Worker holds the WorkOS API key and performs code exchange and refresh.
+Desktop Jolt runs locally without an account. Production Account scopes use WorkOS AuthKit: the engine is a public client that builds the authorize URL, while the edge Worker holds the WorkOS API key and performs code exchange and refresh. Local scopes never receive an edge token or join registry, session, or device rooms; the public release endpoint remains available for update checks.
 
 Each signed-in user has one hidden Jolt organization:
 
@@ -37,7 +37,7 @@ Use operating-system isolation, containers, or a dedicated user account when a r
 
 The saved Jolt refresh session lives at `{data_dir}/session.json` with owner-only permissions. Refresh tokens rotate, so the engine owns session refresh while running. Standalone `login` and `logout` refuse to mutate the same data directory concurrently.
 
-Identity-scoped stores live under `orgs/<org>/<user>/`, preventing a later login from silently reading another account's cached docs and usage through normal engine assembly.
+Local and Account stores live under separate `scopes/` directories. Switching to Local does not sign out, but the relay remains hardwired to Account and cannot route into Local. Signing out returns the viewport to Local and preserves the account cache for the same identity's next sign-in.
 
 ## Agent accounts
 
@@ -77,11 +77,12 @@ Composer images are uploaded in chunks to the host engine. The prompt stores hos
 
 The edge attachment store is:
 
-- content-addressed by SHA-256;
-- scoped under the authenticated user;
+- content-addressed by SHA-256 within each chat;
+- scoped under the authenticated user and chat;
 - hash-verified on upload;
 - limited to 32 MiB per object;
-- served only after authentication.
+- served only after authentication;
+- deleted with the chat through the registry’s durable artifact-purge queue.
 
 Jolt also caches encoded/decoded images locally for transcript rendering. Signing out on iOS clears identity-scoped document caches; desktop data remains until removed from its data directory.
 

@@ -88,7 +88,7 @@ Server to client:
 - A full resync also reseeds local-only rows.
 - Registry snapshots are stored under the identity-scoped `docs.sqlite3`, so offline restarts keep rows and pending writes.
 
-RegistryRoom writes nightly table backups to R2 and exposes authenticated stats/rows/reset routes for operations. A reset is self-healing because clients reseed automatically.
+RegistryRoom writes table backups to R2 and exposes authenticated stats/rows/reset routes for operations. Destructive batches trigger an immediate backup. When a chat row becomes tombstoned, the room durably queues retirement of its SessionRoom plus deletion of its chat-scoped R2 attachments; failed cleanup retries by alarm. A reset is self-healing because clients reseed automatically.
 
 ## Session documents
 
@@ -111,7 +111,7 @@ The per-chat Durable Object keeps:
 
 Dirty update rows flush on a short cadence. Logical updates larger than Durable Object SQLite's row limit are split across continuation rows and reassembled before replay. When the update log reaches the configured threshold, the room folds it losslessly into the snapshot. Daily checkpoint-based trimming discards history beyond the three-day retention frontier while preserving current state. A joining client behind a shallow snapshot's retained frontier receives the full snapshot instead of an unusable partial diff.
 
-The host engine keeps local snapshots and an LRU of open documents. A viewport watch receives a full reset frame first, then entry upserts/text appends rather than a full transcript on each stream commit.
+The host engine keeps local snapshots and an LRU of open documents. A viewport watch receives a full reset frame first, then entry upserts/text appends rather than a full transcript on each stream commit. Retiring a deleted chat closes its room, prevents stale clients from recreating backups, and removes `backup/<chatId>/latest.loro`.
 
 ### Writer discipline
 

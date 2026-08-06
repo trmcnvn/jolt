@@ -39,7 +39,7 @@ use crate::theme::Theme;
 
 pub const FILE_HEADER_HEIGHT: f32 = 36.0;
 pub const HUNK_HEADER_HEIGHT: f32 = 28.0;
-pub const DIFF_LINE_HEIGHT: f32 = 21.0;
+pub const DIFF_LINE_HEIGHT: f32 = 22.0;
 pub const NOTICE_HEIGHT: f32 = 24.0;
 pub const BODY_BOTTOM_PAD: f32 = 8.0;
 /// Gutter width per line-number column.
@@ -48,7 +48,6 @@ pub const GUTTER_WIDTH: f32 = 36.0;
 pub const MARKER_WIDTH: f32 = 28.0;
 /// Width of the coloured accent bar on the left edge of +/− rows.
 pub const ACCENT_BAR_WIDTH: f32 = 3.0;
-const DIFF_TEXT_SIZE: f32 = 12.0;
 
 // ---------------------------------------------------------------------------
 // Patch model + parser (pure)
@@ -317,10 +316,14 @@ pub fn file_notices(file: &FileDiff) -> Vec<String> {
 /// Analytic expanded-body height — drives the 180 ms fold tween without
 /// measurement.
 pub fn body_height(file: &FileDiff) -> f32 {
+    body_height_with_line_height(file, DIFF_LINE_HEIGHT)
+}
+
+fn body_height_with_line_height(file: &FileDiff, line_height: f32) -> f32 {
     let notices = file_notices(file).len() as f32 * NOTICE_HEIGHT;
     let hunks = file.hunks.len() as f32 * HUNK_HEADER_HEIGHT;
     let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
-    notices + hunks + lines as f32 * DIFF_LINE_HEIGHT + BODY_BOTTOM_PAD
+    notices + hunks + lines as f32 * line_height + BODY_BOTTOM_PAD
 }
 
 // ---------------------------------------------------------------------------
@@ -813,7 +816,8 @@ impl Changes {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
-        let expanded_height = body_height(file);
+        let expanded_height =
+            body_height_with_line_height(file, theme.font_sizes.diff_line_height());
         let fold = self.folds.get(&file.path).copied().unwrap_or_default();
         let highlight = self.request_highlight(file, &parsed_key, cx);
         let path = file.path.clone();
@@ -1098,7 +1102,7 @@ fn render_file_body(
             if line.kind == LineKind::Meta {
                 children.push(
                     div()
-                        .h(px(DIFF_LINE_HEIGHT))
+                        .h(px(theme.font_sizes.diff_line_height()))
                         .flex_none()
                         .flex()
                         .items_center()
@@ -1161,7 +1165,7 @@ fn render_file_body(
             );
             children.push(
                 div()
-                    .h(px(DIFF_LINE_HEIGHT))
+                    .h(px(theme.font_sizes.diff_line_height()))
                     .flex_none()
                     .flex()
                     .flex_row()
@@ -1198,7 +1202,7 @@ fn render_file_body(
                             .flex_none()
                             .flex()
                             .justify_center()
-                            .text_size(px(DIFF_TEXT_SIZE))
+                            .text_size(px(f32::from(theme.font_sizes.code)))
                             .text_color(marker_color)
                             .font_family(theme.font_mono.clone())
                             .child(SharedString::from(marker)),
@@ -1210,7 +1214,7 @@ fn render_file_body(
                             .overflow_hidden()
                             .pl(px(12.0))
                             .font_family(theme.font_mono.clone())
-                            .text_size(px(DIFF_TEXT_SIZE))
+                            .text_size(px(f32::from(theme.font_sizes.code)))
                             .whitespace_nowrap()
                             .child(gpui::StyledText::new(line.text.clone()).with_runs(runs)),
                     )

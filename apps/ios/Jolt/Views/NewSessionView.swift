@@ -4,43 +4,61 @@
 // carries the agent/model chip, and sending mints the chat, queues the first
 // run, and swaps straight into the live session.
 
+import PhotosUI
 import SwiftUI
 
 struct NewSessionView: View {
     @Environment(AppModel.self) private var model
     let spaceId: String
     @Binding var path: [Route]
+    @State private var selectedSpaceId: String
+
+    init(spaceId: String, path: Binding<[Route]>) {
+        self.spaceId = spaceId
+        _path = path
+        _selectedSpaceId = State(initialValue: spaceId)
+    }
 
     // Sticky run configuration.
     @AppStorage("newSessionHarness") private var harness = "claude-code"
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
+    @AppStorage("lastNewSessionSpaceId") private var lastNewSessionSpaceId = ""
 
     @State private var draft = ""
+    @State private var selection: TextSelection?
+    @State private var mentions = FileMentionDraft()
     @State private var showPicker = false
+    @State private var showSpacePicker = false
     @State private var showRefPicker = false
     @State private var showCheckoutPicker = false
     /// Live per-harness catalogs from the space's device (static fallback).
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var harnesses = HarnessCatalog.harnesses
     @State private var refs: [RepoRef] = []
     @State private var selectedRef: String?
     @State private var checkoutKind: CheckoutKind = .local
     @State private var busy = false
+    @State private var attachments: [StagedAttachment] = []
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var showPhotoPicker = false
+    @State private var sendError: String?
     @FocusState private var focused: Bool
 
     private var space: Space? {
-        model.spaces.first { $0.id == spaceId }
+        model.spaces.first { $0.id == selectedSpaceId }
     }
 
     private var models: [ModelInfo] {
         catalogs[harness] ?? HarnessCatalog.models(for: harness)
     }
 
-    private var selectedModel: ModelInfo {
-        models.first { $0.id == storedModel } ?? models[0]
+    private var selectedModel: ModelInfo? {
+        models.first { $0.id == storedModel } ?? models.first
     }
 
     private var reasoning: String? {
+        guard let selectedModel else { return nil }
         if selectedModel.reasoningLevels.isEmpty { return nil }
         if selectedModel.reasoningLevels.contains(storedReasoning) { return storedReasoning }
         return HarnessCatalog.defaultReasoning(for: selectedModel)
@@ -66,6 +84,15 @@ struct NewSessionView: View {
             if let space, !model.deviceOnline(space.deviceId), model.demo == nil {
                 offlineNotice(space: space)
             }
+            if let sendError {
+                Text(sendError)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.danger)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 6)
+            }
 
             composer
                 .padding(.bottom, 8)
@@ -88,6 +115,17 @@ struct NewSessionView: View {
                 }
             }
         }
+        .sheet(isPresented: $showSpacePicker) {
+            SpaceFilterSheet(
+                selected: selectedSpaceId,
+                includeAll: false,
+                title: "Session space"
+            ) { selected in
+                if let selected {
+                    selectedSpaceId = selected
+                }
+            }
+        }
         .sheet(isPresented: $showRefPicker) {
             RefPickerSheet(refs: refs, selected: selectedRef) { ref in
                 await pickRef(ref)
@@ -95,35 +133,73 @@ struct NewSessionView: View {
         }
         .sheet(isPresented: $showCheckoutPicker) {
             CheckoutPickerSheet(kind: checkoutKind,
-                                selectedRefHasWorktree: selectedRefRow?.worktreePath != nil) { kind in
+                                selectedRefHasWorktree: selectedRefRow?.worktreePath != nil,
+                                isJujutsu: isJujutsu) { kind in
                 pickCheckout(kind)
             }
         }
-        .task(id: spaceId) {
-            // Load refs for the branch chip (git spaces only).
-            guard let space, space.gitDetected else { return }
+        .task(id: selectedSpaceId) {
+            guard let space else { return }
+            let requestedSpace = space.id
+            let loadedHarnesses = await model.listHarnesses(space: space)
+            guard selectedSpaceId == requestedSpace else { return }
+            harnesses = loadedHarnesses
+            if !harnesses.contains(where: { $0.id == harness }) {
+                harness = harnesses.first?.id ?? "claude-code"
+                storedModel = ""
+                storedReasoning = ""
+            }
+            // Load refs for any VCS recognized by the host's active backend.
+            guard space.gitDetected else { return }
             if let loaded = await model.listRefs(space: space) {
+                guard selectedSpaceId == requestedSpace else { return }
                 refs = loaded
                 if selectedRef == nil {
-                    selectedRef = loaded.first(where: \.current)?.name ?? loaded.first?.name
+                    selectedRef = loaded.first(where: \.current)?.id ?? loaded.first?.id
                 }
             }
         }
-        .task(id: "\(spaceId)/\(harness)") {
+        .task(id: "\(selectedSpaceId)/\(harness)") {
             // Live model catalog from the device that will run the session.
             guard let space else { return }
-            catalogs[harness] = await model.listModels(space: space, harness: harness)
+            let requestedSpace = space.id
+            let requestedHarness = harness
+            let loaded = await model.listModels(space: space, harness: requestedHarness)
+            guard selectedSpaceId == requestedSpace, harness == requestedHarness else { return }
+            catalogs[requestedHarness] = loaded
+            if !loaded.contains(where: { $0.id == storedModel }) {
+                storedModel = loaded.first?.id ?? ""
+                storedReasoning = loaded.first.flatMap(HarnessCatalog.defaultReasoning) ?? ""
+            }
         }
         .sheet(isPresented: $showPicker) {
             ModelPickerSheet(harness: $harness, modelId: Binding(
-                get: { selectedModel.id },
+                get: { selectedModel?.id ?? "" },
                 set: { storedModel = $0 }
             ), reasoning: Binding(
                 get: { reasoning },
                 set: { storedReasoning = $0 ?? "" }
-            ), catalogs: catalogs)
+            ), catalogs: catalogs, harnesses: harnesses)
+        }
+        .photosPicker(isPresented: $showPhotoPicker, selection: $pickerItems,
+                      maxSelectionCount: 8, matching: .images)
+        .onChange(of: pickerItems) { _, items in
+            guard !items.isEmpty else { return }
+            stage(items)
+        }
+        .onChange(of: draft) { refreshMentions() }
+        .onChange(of: selection) { refreshMentions() }
+        .onChange(of: mentionContextKey) { refreshMentions() }
+        .onChange(of: selectedSpaceId) { _, selected in
+            lastNewSessionSpaceId = selected
+            refs = []
+            selectedRef = nil
+            checkoutKind = .local
+            catalogs.removeAll()
+            sendError = nil
         }
         .onAppear {
+            lastNewSessionSpaceId = selectedSpaceId
             focused = true
             if model.launchAutosend {
                 model.launchAutosend = false
@@ -139,14 +215,31 @@ struct NewSessionView: View {
     // MARK: Composer
 
     private var composer: some View {
-        ComposerShell(
-            draft: $draft,
-            placeholder: "Do anything…",
-            sendEnabled: space != nil,
-            showStop: false,
-            busy: busy,
-            onSend: send
-        ) {
+        VStack(spacing: 6) {
+            FileMentionMenu(draft: mentions, select: acceptMention)
+            ComposerShell(
+                draft: $draft,
+                selection: $selection,
+                placeholder: "Do anything…",
+                sendEnabled: canSend,
+                showStop: false,
+                busy: busy,
+                onSend: send,
+                attachments: attachments,
+                onAttach: { showPhotoPicker = true },
+                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
+            ) {
+            if let space {
+                chip(
+                    icon: .folder,
+                    label: "\(space.displayName) @ \(model.deviceName(space.deviceId))"
+                ) {
+                    focused = false
+                    showSpacePicker = true
+                }
+                .layoutPriority(1)
+            }
+
             // Agent chip — brand mark + model, opens the picker sheet
             // (desktop's in-pill HarnessModel trigger chip).
             Button {
@@ -155,7 +248,7 @@ struct NewSessionView: View {
             } label: {
                 HStack(spacing: 6) {
                     HarnessBadge(harness: harness, size: 15)
-                    Text(selectedModel.label)
+                    Text(selectedModel?.label ?? (harness == "pi" ? "Pi unavailable" : "Select model"))
                         .font(Theme.sans(13, weight: .medium))
                         .foregroundStyle(Theme.text.opacity(0.9))
                         .lineLimit(1)
@@ -174,7 +267,7 @@ struct NewSessionView: View {
             }
             .buttonStyle(ChipPressButtonStyle())
 
-            // Checkout + ref chips — the desktop footer (git spaces only).
+            // Checkout + ref chips from the host's active VCS backend.
             if space?.gitDetected == true {
                 chip(icon: checkoutIcon, label: checkoutLabel) {
                     focused = false
@@ -186,6 +279,7 @@ struct NewSessionView: View {
                     showRefPicker = true
                 }
                 .layoutPriority(-1)
+            }
             }
         }
     }
@@ -209,14 +303,22 @@ struct NewSessionView: View {
     // MARK: Checkout model (pickers.rs port)
 
     private var selectedRefRow: RepoRef? {
-        refs.first { $0.name == selectedRef }
+        refs.first { $0.id == selectedRef }
     }
 
-    /// checkout_label: New worktree / Current worktree / Current checkout.
+    private var isJujutsu: Bool {
+        refs.contains(where: \.isJujutsu)
+    }
+
+    /// Backend-aware isolated-checkout label.
     private var checkoutLabel: String {
         switch checkoutKind {
-        case .newWorktree: return "New worktree"
-        case .local: return selectedRefRow?.worktreePath != nil ? "Current worktree" : "Current checkout"
+        case .newWorktree: return isJujutsu ? "New workspace" : "New worktree"
+        case .local:
+            if selectedRefRow?.worktreePath != nil {
+                return isJujutsu ? "Current workspace" : "Current worktree"
+            }
+            return "Current checkout"
         }
     }
 
@@ -224,30 +326,32 @@ struct NewSessionView: View {
         checkoutKind == .local && selectedRefRow?.worktreePath == nil ? .folder : .folderWithFiles
     }
 
-    /// ref_label: "From <ref>" only when a NEW worktree will be created off it.
+    /// "From <ref>" only when a new isolated checkout will be created.
     private var refLabel: String {
-        guard let name = selectedRef else { return "Select ref" }
-        return checkoutKind == .newWorktree ? "From \(name)" : name
+        guard let row = selectedRefRow else { return "Select ref" }
+        return checkoutKind == .newWorktree ? "From \(row.name)" : row.name
     }
 
-    /// pick_ref (draft mode): a worktree'd ref flips to "Current worktree";
-    /// base picks just record; a plain non-current ref in Local mode CHECKS
-    /// OUT the space folder (it must never silently flip the mode).
+    /// An already materialized ref reuses its checkout; otherwise local mode
+    /// switches the space checkout through the host's active backend.
     private func pickRef(_ row: RepoRef) async -> String? {
         if row.worktreePath != nil {
-            selectedRef = row.name
+            selectedRef = row.id
             checkoutKind = .local
             return nil
         }
         if checkoutKind == .newWorktree || row.current {
-            selectedRef = row.name
+            selectedRef = row.id
             return nil
         }
         guard let space else { return nil }
-        let error = await model.switchSpaceRef(space: space, refName: row.name)
+        let requestedSpace = space.id
+        let error = await model.switchSpaceRef(space: space, ref: row)
+        guard selectedSpaceId == requestedSpace else { return nil }
         if error == nil {
-            selectedRef = row.name
-            if let reloaded = await model.listRefs(space: space) {
+            selectedRef = row.id
+            if let reloaded = await model.listRefs(space: space),
+               selectedSpaceId == requestedSpace {
                 refs = reloaded
             }
         }
@@ -259,14 +363,38 @@ struct NewSessionView: View {
     private func pickCheckout(_ kind: CheckoutKind) {
         if kind == .local, checkoutKind == .newWorktree,
            let row = selectedRefRow, row.worktreePath == nil, !row.current {
-            selectedRef = refs.first(where: \.current)?.name
+            selectedRef = refs.first(where: \.current)?.id
         }
         checkoutKind = kind
     }
 
+    private var mentionSearchPath: String? {
+        checkoutKind == .local ? selectedRefRow?.worktreePath : nil
+    }
+
+    private var mentionContextKey: String {
+        "\(selectedSpaceId)|\(mentionSearchPath ?? "")"
+    }
+
+    private func refreshMentions() {
+        guard let space else {
+            mentions.dismiss()
+            return
+        }
+        mentions.update(text: draft, selection: selection, contextKey: mentionContextKey) { query in
+            try await model.searchFiles(space: space, path: mentionSearchPath, query: query)
+        }
+    }
+
+    private func acceptMention(_ match: FileSearchMatch) {
+        guard let insertion = mentions.accept(match, in: draft) else { return }
+        draft = insertion.text
+        selection = insertion.selection
+    }
+
     private var canSend: Bool {
-        guard !busy, space != nil else { return false }
-        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !busy, space != nil, selectedModel != nil else { return false }
+        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
     }
 
     private func offlineNotice(space: Space) -> some View {
@@ -281,50 +409,119 @@ struct NewSessionView: View {
             .padding(.bottom, 8)
     }
 
-    /// Mint the chat per the checkout plan, queue the first run, swap to the
-    /// live session (composer.rs on-send: current checkout as-is, reuse the
-    /// picked ref's worktree, or CreateWorktree off the base first).
+    /// Mint the chat per the checkout plan, queue the first command, and swap
+    /// to the live session.
     private func send() {
-        guard let space, canSend else { return }
+        guard let space, let selectedModel, canSend else { return }
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let encodedPrompt = mentions.encodedPrompt(draft)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let staged = attachments
+        let shell = parseShellCommand(prompt)
+        if hasShellPrefix(prompt), shell == nil {
+            sendError = "Enter a Bash command after ! or !!."
+            return
+        }
+        if shell != nil, !staged.isEmpty {
+            sendError = "Remove attachments before running a shell command."
+            return
+        }
+        if prompt == "/answer" || prompt == "/bro" {
+            sendError = "Start the session before using this command."
+            return
+        }
+
         busy = true
+        sendError = nil
         let config = ChatConfig(harness: harness, model: selectedModel.id,
-                                reasoning: reasoning, sandbox: "workspace-write")
+                                reasoning: reasoning, modelOptions: [:],
+                                sandbox: "workspace-write")
         Task { @MainActor in
-            var cwd: String?
-            var branch = selectedRef
-            switch checkoutKind {
-            case .newWorktree:
-                if let base = selectedRef {
-                    guard let worktreePath = await model.createWorktree(space: space, base: base) else {
-                        busy = false
-                        return
+            defer { busy = false }
+            var createdChatId: String?
+            do {
+                var cwd: String?
+                var branch = selectedRefRow?.name
+                switch checkoutKind {
+                case .newWorktree:
+                    if let base = selectedRefRow {
+                        guard let worktree = await model.createWorktree(space: space, base: base) else {
+                            sendError = isJujutsu
+                                ? "Couldn't create the Jujutsu workspace."
+                                : "Couldn't create the Git worktree."
+                            return
+                        }
+                        cwd = worktree.path
+                        branch = worktree.branch
                     }
-                    cwd = worktreePath
-                    branch = base
+                case .local:
+                    cwd = selectedRefRow?.worktreePath
                 }
-            case .local:
-                if let worktree = selectedRefRow?.worktreePath {
-                    cwd = worktree  // reuse the ref's existing checkout
+                guard let chatId = model.createChat(space: space, config: config,
+                                                    branch: branch, cwd: cwd),
+                      let chat = model.chat(id: chatId),
+                      let store = model.sessionStore(for: chat) else {
+                    sendError = "Couldn't create the session."
+                    return
                 }
+                createdChatId = chatId
+                var attachmentPaths: [String] = []
+                for attachment in staged {
+                    let uploaded = try await model.uploadAttachment(deviceId: space.deviceId,
+                                                                    chatId: chatId,
+                                                                    name: attachment.name,
+                                                                    data: attachment.data)
+                    AttachmentImageCache.shared.seed(deviceId: space.deviceId, path: uploaded,
+                                                     name: attachment.name, data: attachment.data)
+                    attachmentPaths.append(uploaded)
+                }
+                if let shell {
+                    store.sendBash(command: shell.command,
+                                   excludeFromContext: shell.excludeFromContext,
+                                   chat: chat)
+                } else {
+                    let content = withAttachments(text: encodedPrompt, paths: attachmentPaths)
+                    store.sendRun(prompt: content, chat: chat, attachments: attachmentPaths)
+                }
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                mentions.reset()
+                draft = ""
+                selection = nil
+                attachments = []
+                // Replace the canvas with the live session (in-place swap, no
+                // back-through-canvas).
+                if path.last == .newSession(spaceId: spaceId) {
+                    path.removeLast()
+                }
+                path.append(.chat(chatId))
+            } catch {
+                if let createdChatId {
+                    model.deleteChat(createdChatId)
+                }
+                sendError = "Attachment upload failed — \(error.localizedDescription)"
             }
-            guard let chatId = model.createChat(space: space, config: config,
-                                                branch: branch, cwd: cwd),
-                  let chat = model.chat(id: chatId),
-                  let store = model.sessionStore(for: chat) else {
-                busy = false
-                return
+        }
+    }
+
+    private func stage(_ items: [PhotosPickerItem]) {
+        Task { @MainActor in
+            var failed = 0
+            for item in items {
+                guard let data = try? await item.loadTransferable(type: Data.self),
+                      let staged = StagedAttachment.stage(data: data) else {
+                    failed += 1
+                    continue
+                }
+                attachments.append(staged)
             }
-            store.sendRun(prompt: prompt, chat: chat)
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            draft = ""
-            busy = false
-            // Replace the canvas with the live session (in-place swap, no
-            // back-through-canvas).
-            if path.last == .newSession(spaceId: spaceId) {
-                path.removeLast()
+            pickerItems = []
+            if failed > 0 {
+                sendError = failed == 1
+                    ? "One image couldn't be attached (unsupported or over 24 MB)."
+                    : "\(failed) images couldn't be attached (unsupported or over 24 MB)."
+            } else {
+                sendError = nil
             }
-            path.append(.chat(chatId))
         }
     }
 }
@@ -337,10 +534,11 @@ struct NewSessionView: View {
 /// list (the desktop keeps its branch selector interactive mid-session).
 struct SessionCheckoutContext {
     var isWorktree: Bool
+    var isJujutsu: Bool
     var cwd: String
     var refs: [RepoRef]
     var currentBranch: String?
-    /// Returns git's error to surface inline, or nil on success.
+    /// Returns the host VCS error to surface inline, or nil on success.
     var onPick: (RepoRef) async -> String?
 }
 
@@ -353,7 +551,8 @@ struct ModelPickerSheet: View {
     var lockedHarness = false
     /// Live per-harness catalogs from the device (static fallback when absent).
     var catalogs: [String: [ModelInfo]] = [:]
-    /// Present on live git chats: checkout label + switchable refs.
+    var harnesses = HarnessCatalog.harnesses
+    /// Present on live VCS chats: checkout label + switchable refs.
     var checkout: SessionCheckoutContext?
 
     private func models(for harness: String) -> [ModelInfo] {
@@ -369,7 +568,7 @@ struct ModelPickerSheet: View {
                 VStack(alignment: .leading, spacing: 22) {
                     if !lockedHarness {
                         HStack(spacing: 8) {
-                            ForEach(HarnessCatalog.harnesses) { h in
+                            ForEach(harnesses) { h in
                                 harnessTab(h)
                             }
                             Spacer(minLength: 0)
@@ -380,15 +579,24 @@ struct ModelPickerSheet: View {
                         SheetLabel("Model")
                         SheetCard {
                             let models = models(for: harness)
-                            ForEach(Array(models.enumerated()), id: \.element.id) { ix, m in
-                                SheetSelectRow(title: m.label,
-                                               subtitle: m.description,
-                                               selected: m.id == modelId,
-                                               leading: nil) {
-                                    select(model: m)
-                                }
-                                if ix < models.count - 1 {
-                                    SheetSeparator()
+                            if models.isEmpty {
+                                Text(harness == "pi"
+                                     ? "Pi is unavailable or has no authenticated models on this device."
+                                     : "No models are available on this device.")
+                                    .font(Theme.sans(13))
+                                    .foregroundStyle(Theme.textMuted)
+                                    .padding(16)
+                            } else {
+                                ForEach(Array(models.enumerated()), id: \.element.id) { ix, m in
+                                    SheetSelectRow(title: m.label,
+                                                   subtitle: m.description,
+                                                   selected: m.id == modelId,
+                                                   leading: nil) {
+                                        select(model: m)
+                                    }
+                                    if ix < models.count - 1 {
+                                        SheetSeparator()
+                                    }
                                 }
                             }
                         }
@@ -451,9 +659,9 @@ struct ModelPickerSheet: View {
             guard harness != h.id else { return }
             UISelectionFeedbackGenerator().selectionChanged()
             harness = h.id
-            let fallback = HarnessCatalog.defaultModel(for: h.id)
-            modelId = fallback.id
-            reasoning = HarnessCatalog.defaultReasoning(for: fallback)
+            let fallback = models(for: h.id).first
+            modelId = fallback?.id ?? ""
+            reasoning = fallback.flatMap(HarnessCatalog.defaultReasoning)
         } label: {
             HStack(spacing: 7) {
                 HarnessBadge(harness: h.id, size: 15, dimmed: !selected)
@@ -476,9 +684,7 @@ struct ModelPickerSheet: View {
         reasoning = HarnessCatalog.defaultReasoning(for: m)
     }
 
-    /// Checkout: read-only kind (fixed at creation — resume is cwd-scoped)
-    /// plus the LIVE ref list: retarget onto a ref's worktree, or git-checkout
-    /// in the session's own folder.
+    /// Checkout kind plus the live host-VCS ref/revision list.
     @ViewBuilder
     private func checkoutSection(_ checkout: SessionCheckoutContext) -> some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -489,7 +695,9 @@ struct ModelPickerSheet: View {
                                  size: 16, color: Theme.textMuted)
                         .frame(width: 22)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(checkout.isWorktree ? "Worktree" : "Local checkout")
+                        Text(checkout.isWorktree
+                             ? (checkout.isJujutsu ? "Workspace" : "Worktree")
+                             : "Local checkout")
                             .font(Theme.sans(15))
                             .foregroundStyle(Theme.text)
                         Text(checkout.cwd)
@@ -515,7 +723,7 @@ struct ModelPickerSheet: View {
                     .padding(.vertical, 20)
             } else {
                 SheetCard {
-                    ForEach(Array(checkout.refs.enumerated()), id: \.element.name) { ix, ref in
+                    ForEach(Array(checkout.refs.enumerated()), id: \.element.id) { ix, ref in
                         refRow(ref, checkout: checkout)
                         if ix < checkout.refs.count - 1 {
                             SheetSeparator()
@@ -538,7 +746,7 @@ struct ModelPickerSheet: View {
             guard switching == nil, !selected else { return }
             UISelectionFeedbackGenerator().selectionChanged()
             switchError = nil
-            switching = ref.name
+            switching = ref.id
             Task { @MainActor in
                 let result = await checkout.onPick(ref)
                 switching = nil
@@ -559,7 +767,7 @@ struct ModelPickerSheet: View {
                     }
                 }
                 Spacer(minLength: 8)
-                if switching == ref.name {
+                if switching == ref.id {
                     ProgressView()
                         .controlSize(.small)
                         .tint(Theme.textMuted)
@@ -578,10 +786,14 @@ struct ModelPickerSheet: View {
     }
 
     private func refSubtitle(_ ref: RepoRef, checkout: SessionCheckoutContext) -> String? {
-        if ref.worktreePath == checkout.cwd { return "This session's worktree" }
-        if let worktree = ref.worktreePath, worktree != checkout.cwd { return "Switches to its worktree" }
-        if ref.current { return "Main checkout" }
-        return nil
+        if ref.worktreePath == checkout.cwd {
+            return checkout.isJujutsu ? "This session's workspace" : "This session's worktree"
+        }
+        if let worktree = ref.worktreePath, worktree != checkout.cwd {
+            return checkout.isJujutsu ? "Switches to its workspace" : "Switches to its worktree"
+        }
+        if ref.current { return "Current checkout" }
+        return ref.kind == .bookmark ? "Bookmark" : nil
     }
 
     /// One-line hints for the ladder (the special modes deserve explanation).
@@ -602,10 +814,8 @@ struct ModelPickerSheet: View {
 
 // MARK: - Ref picker sheet
 
-/// Base-ref selector (the desktop footer's branch popover): branch rows with
-/// current-checkout / worktree markers. Picks that require a git checkout run
-/// inline — a spinner on the row, git's error surfaced in place on failure
-/// (dirty tree, held ref), success dismisses.
+/// Host-VCS ref selector: Git branches or Jujutsu working copies/bookmarks,
+/// with existing isolated checkouts identified inline.
 struct RefPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     let refs: [RepoRef]
@@ -620,7 +830,7 @@ struct RefPickerSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
-                    SheetLabel("Ref")
+                    SheetLabel(isJujutsu ? "Revision" : "Ref")
                     if refs.isEmpty {
                         Text("Loading refs from the device…")
                             .font(Theme.sans(13))
@@ -629,7 +839,7 @@ struct RefPickerSheet: View {
                             .padding(.vertical, 28)
                     } else {
                         SheetCard {
-                            ForEach(Array(refs.enumerated()), id: \.element.name) { ix, ref in
+                            ForEach(Array(refs.enumerated()), id: \.element.id) { ix, ref in
                                 row(ref)
                                 if ix < refs.count - 1 {
                                     SheetSeparator()
@@ -647,7 +857,7 @@ struct RefPickerSheet: View {
                 .padding(20)
             }
             .background(SheetStyle.panel)
-            .navigationTitle("Select ref")
+            .navigationTitle(isJujutsu ? "Select revision" : "Select ref")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -667,12 +877,14 @@ struct RefPickerSheet: View {
         .preferredColorScheme(.dark)
     }
 
+    private var isJujutsu: Bool { refs.contains(where: \.isJujutsu) }
+
     private func row(_ ref: RepoRef) -> some View {
         Button {
             guard switching == nil else { return }
             UISelectionFeedbackGenerator().selectionChanged()
             error = nil
-            switching = ref.name
+            switching = ref.id
             Task { @MainActor in
                 let result = await onPick(ref)
                 switching = nil
@@ -697,7 +909,7 @@ struct RefPickerSheet: View {
                     }
                 }
                 Spacer(minLength: 8)
-                if switching == ref.name {
+                if switching == ref.id {
                     ProgressView()
                         .controlSize(.small)
                         .tint(Theme.textMuted)
@@ -705,7 +917,7 @@ struct RefPickerSheet: View {
                     Image(systemName: "checkmark")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(Theme.text)
-                        .opacity(ref.name == selected ? 1 : 0)
+                        .opacity(ref.id == selected ? 1 : 0)
                 }
             }
             .padding(.horizontal, 16)
@@ -717,20 +929,23 @@ struct RefPickerSheet: View {
 
     private func subtitle(for ref: RepoRef) -> String? {
         if ref.current { return "Current checkout" }
-        if ref.worktreePath != nil { return "Checked out in a worktree" }
+        if ref.worktreePath != nil {
+            return ref.isJujutsu ? "Checked out in a workspace" : "Checked out in a worktree"
+        }
+        if ref.kind == .bookmark { return "Bookmark" }
         return nil
     }
 }
 
 // MARK: - Checkout picker sheet
 
-/// Where the session runs (the desktop's checkout popover): the space's
-/// folder as-is (or the picked ref's existing worktree), or a fresh isolated
-/// worktree created off the base ref on send.
+/// Where the session runs: the space folder, an existing isolated checkout,
+/// or a fresh Git worktree/Jujutsu workspace created on send.
 struct CheckoutPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     let kind: CheckoutKind
     let selectedRefHasWorktree: Bool
+    let isJujutsu: Bool
     let onPick: (CheckoutKind) -> Void
 
     var body: some View {
@@ -741,13 +956,20 @@ struct CheckoutPickerSheet: View {
                     SheetCard {
                         row(.local,
                             icon: selectedRefHasWorktree ? .folderWithFiles : .folder,
-                            title: selectedRefHasWorktree ? "Current worktree" : "Current checkout",
+                            title: selectedRefHasWorktree
+                                ? (isJujutsu ? "Current workspace" : "Current worktree")
+                                : "Current checkout",
                             subtitle: selectedRefHasWorktree
-                                ? "Reuse the picked ref's existing worktree"
+                                ? (isJujutsu
+                                   ? "Reuse the picked revision's existing workspace"
+                                   : "Reuse the picked ref's existing worktree")
                                 : "Run in the space's folder as-is")
                         SheetSeparator()
-                        row(.newWorktree, icon: .folderWithFiles, title: "New worktree",
-                            subtitle: "A fresh isolated worktree created off the picked base ref")
+                        row(.newWorktree, icon: .folderWithFiles,
+                            title: isJujutsu ? "New workspace" : "New worktree",
+                            subtitle: isJujutsu
+                                ? "A fresh isolated workspace created from the picked revision"
+                                : "A fresh isolated worktree created off the picked base ref")
                     }
                 }
                 .padding(20)

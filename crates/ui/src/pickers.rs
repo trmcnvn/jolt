@@ -22,7 +22,7 @@ use gpui::{
 
 use jolt_engine::registry::HarnessDescriptor;
 use jolt_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
     UsageSummary,
 };
 use jolt_rpc::methods;
@@ -258,6 +258,8 @@ pub enum PickerKind {
     Checkout,
     HarnessModel,
     Traits,
+    /// New-session target space. Existing sessions remain pinned to theirs.
+    Space,
     Usage,
 }
 
@@ -375,6 +377,8 @@ pub struct Pickers {
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
+    /// Invalidates every space/device-derived async response.
+    catalog_generation: u64,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
     /// Models-list scroll — keyboard nav keeps the highlighted row in view
@@ -446,6 +450,9 @@ impl Pickers {
                 this.config.checkout = CheckoutKind::default();
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
+                this.refs_task = None;
+                this.load_task = None;
+                this.catalog_generation = this.catalog_generation.wrapping_add(1);
                 // Catalogs are per-DEVICE (fetched from the space's host):
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
@@ -484,6 +491,7 @@ impl Pickers {
             models: HashMap::new(),
             refs: Loadable::Idle,
             refs_space: None,
+            catalog_generation: 0,
             active: 0,
             model_scroll: gpui::ScrollHandle::new(),
             search,
@@ -695,6 +703,7 @@ impl Pickers {
                 CheckoutKind::NewWorktree => 1,
             },
             PickerKind::Branch => self.selected_ref_index(cx),
+            PickerKind::Space => self.selected_space_index(cx),
             _ => 0,
         };
         if kind == PickerKind::HarnessModel {
@@ -712,6 +721,13 @@ impl Pickers {
                 });
                 window.focus(&handle, cx);
             }
+            PickerKind::Space => {
+                let handle = self.search.read(cx).focus_handle(cx);
+                self.search.update(cx, |input, cx| {
+                    input.set_placeholder("Search spaces…", cx);
+                });
+                window.focus(&handle, cx);
+            }
             PickerKind::Usage => {}
             _ => window.focus(&self.focus, cx),
         }
@@ -726,7 +742,7 @@ impl Pickers {
                     self.ensure_models(harness, cx);
                 }
             }
-            PickerKind::Usage => {}
+            PickerKind::Space | PickerKind::Usage => {}
         }
         cx.notify();
     }
@@ -744,6 +760,7 @@ impl Pickers {
             return;
         };
         let target = self.space_target(cx);
+        let generation = self.catalog_generation;
         self.harnesses = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
@@ -758,6 +775,9 @@ impl Pickers {
                 .call(methods::LIST_HARNESSES, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |pickers, cx| {
+                if pickers.catalog_generation != generation {
+                    return;
+                }
                 pickers.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(list) => Loadable::Ready(list),
@@ -788,6 +808,7 @@ impl Pickers {
             return;
         };
         let target = self.space_target(cx);
+        let generation = self.catalog_generation;
         self.models.insert(harness, Loadable::Loading);
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
@@ -799,6 +820,9 @@ impl Pickers {
             }
             let result = engine.client().call(methods::LIST_MODELS, params).await;
             this.update(cx, |pickers, cx| {
+                if pickers.catalog_generation != generation {
+                    return;
+                }
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
                         Ok(models) => Loadable::Ready(models),
@@ -857,6 +881,7 @@ impl Pickers {
             self.refs = Loadable::Loading;
         }
         self.refs_space = Some(space.id.clone());
+        let generation = self.catalog_generation;
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert(
@@ -874,6 +899,9 @@ impl Pickers {
                 .call(methods::LIST_REFS, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |pickers, cx| {
+                if pickers.catalog_generation != generation {
+                    return;
+                }
                 pickers.refs = match result {
                     Ok(value) => match serde_json::from_value::<Vec<RepoRef>>(value) {
                         Ok(refs) => Loadable::Ready(refs),
@@ -1424,11 +1452,121 @@ impl Pickers {
         }
     }
 
+    fn filtered_space_rows(&self, cx: &App) -> Vec<Space> {
+        let query = self.search.read(cx).text().to_string();
+        let state = self.state.read(cx);
+        let spaces = state.spaces_sorted();
+        let names: Vec<String> = spaces
+            .iter()
+            .map(|space| space.display_name().to_string())
+            .collect();
+        popover::filter_indices(&query, &names)
+            .into_iter()
+            .map(|index| spaces[index].clone())
+            .collect()
+    }
+
+    fn selected_space_index(&self, cx: &App) -> usize {
+        let state = self.state.read(cx);
+        state
+            .selected_space
+            .as_deref()
+            .and_then(|id| {
+                state
+                    .spaces_sorted()
+                    .iter()
+                    .position(|space| space.id == id)
+            })
+            .unwrap_or(0)
+    }
+
+    fn pick_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |state, cx| state.select_space(Some(space_id), cx));
+        self.close(cx);
+    }
+
+    fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let rows = self.filtered_space_rows(cx);
+        let (selected, details): (Option<String>, Vec<(String, bool)>) = {
+            let state = self.state.read(cx);
+            (
+                state.selected_space.clone(),
+                rows.iter()
+                    .map(|space| state.space_device_tag(space, chrono::Utc::now()))
+                    .collect(),
+            )
+        };
+        let active = self.active;
+        let body: AnyElement = if rows.is_empty() {
+            div()
+                .p(px(Theme::SPACE_SM))
+                .text_size(px(12.0))
+                .text_color(theme.text_faint)
+                .child("No spaces match.")
+                .into_any_element()
+        } else {
+            div()
+                .id("space-picker-list")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(224.0))
+                .overflow_y_scroll()
+                .children(rows.into_iter().zip(details).enumerate().map(
+                    |(index, (space, (device, offline)))| {
+                        let pick_id = space.id.clone();
+                        let is_selected = selected.as_deref() == Some(space.id.as_str());
+                        popover::menu_row_nav(
+                            &theme,
+                            is_selected,
+                            index == active,
+                            format!("space-picker-row-{index}"),
+                        )
+                        .id(("space-picker-row", index))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_space(pick_id.clone(), cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(space.display_name().to_string())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .text_color(if offline {
+                                    theme.warning.opacity(0.8)
+                                } else {
+                                    theme.text_muted.opacity(0.45)
+                                })
+                                .child(SharedString::from(device)),
+                        )
+                    },
+                ))
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(self.search_box(&theme))
+            .child(body)
+            .into_any_element()
+    }
+
     fn on_search_submit(&mut self, cx: &mut Context<Self>) {
         if self.open == Some(PickerKind::Branch)
             && let Some(row) = self.filtered_ref_rows(cx).into_iter().nth(self.active)
         {
             self.pick_ref(row, cx);
+        } else if self.open == Some(PickerKind::Space)
+            && let Some(space) = self.filtered_space_rows(cx).into_iter().nth(self.active)
+        {
+            self.pick_space(space.id, cx);
         }
     }
 
@@ -1453,6 +1591,7 @@ impl Pickers {
                     // chips below (reasoning ladder, model options) are
                     // mouse-only.
                     Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
+                    Some(PickerKind::Space) => self.filtered_space_rows(cx).len(),
                     Some(PickerKind::Traits | PickerKind::Usage) => 0,
                     None => 0,
                 };
@@ -1503,6 +1642,7 @@ impl Pickers {
             PickerKind::Checkout => "picker-checkout",
             PickerKind::HarnessModel => "picker-model",
             PickerKind::Traits => "picker-traits",
+            PickerKind::Space => "picker-space",
             PickerKind::Usage => "composer-usage",
         };
         let open = self.open == Some(kind)
@@ -1888,7 +2028,7 @@ impl Pickers {
                             this.models.clear();
                             this.ensure_harnesses(cx);
                         }
-                        PickerKind::Usage => {}
+                        PickerKind::Space | PickerKind::Usage => {}
                     }))
                     .child(SharedString::from("Retry")),
             )
@@ -1993,7 +2133,6 @@ impl Pickers {
                                             .child(SharedString::from(tag)),
                                     )
                                 })
-                                .when(is_selected, |el| el.child(popover::menu_check(&theme)))
                             },
                         ))
                         .into_any_element()
@@ -2102,7 +2241,6 @@ impl Pickers {
                                 .truncate()
                                 .child(SharedString::from(label)),
                         )
-                        .when(is_selected, |el| el.child(popover::menu_check(&theme)))
                     }),
             )
             .into_any_element()
@@ -2265,7 +2403,6 @@ impl Pickers {
                                     )
                                 }),
                         )
-                        .when(is_selected, |el| el.child(popover::menu_check(&theme)))
                         .into_any_element()
                     })
                     .collect()
@@ -2748,20 +2885,49 @@ impl Render for Pickers {
                     self.popover_frame_flush(460.0, content, cx),
                 ))
             }
+            Some(PickerKind::Space) => {
+                let content = self.render_space_popover(cx);
+                Some((PickerKind::Space, self.popover_frame(300.0, content, cx)))
+            }
             // Traits merged into the HarnessModel popover; usage renders in
             // the composer footer beside its trigger.
             Some(PickerKind::Traits | PickerKind::Usage) | None => None,
         };
 
-        // Left cluster (the branch chip moved to the composer FOOTER row).
-        // Right cluster: agent/model and traits. The composer appends attach
-        // and send after this element.
-        let left = div()
+        // The target-space chip exists only on the new-session canvas.
+        let new_chat = self.state.read(cx).selected_chat.is_none();
+        let space_label = new_chat
+            .then(|| {
+                let state = self.state.read(cx);
+                state.selected_space_row().map(|space| {
+                    let (device, _) = state.space_device_tag(space, chrono::Utc::now());
+                    SharedString::from(format!("{} {device}", space.display_name()))
+                })
+            })
+            .flatten();
+        let mut left = div()
             .flex()
             .flex_row()
             .items_center()
             .min_w_0()
             .gap(px(4.0));
+        if let Some(label) = space_label {
+            let chip = self.trigger_chip(
+                PickerKind::Space,
+                label,
+                true,
+                Some((crate::icons::FOLDER, None)),
+                None,
+                &theme,
+                cx,
+            );
+            left = left.child(attach_overlay(
+                chip,
+                &mut overlay,
+                PickerKind::Space,
+                "space-popover",
+            ));
+        }
         // ONE combined model+effort chip (user request): brand icon + model
         // name, then the effort level muted with no icon — a single button
         // opening the single merged menu.

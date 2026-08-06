@@ -134,9 +134,10 @@ struct StagedAttachment: Identifiable, Hashable {
 
 /// Chunked upload straight to the host device's relay room: base64 the bytes,
 /// `UploadChunk {uploadId, seq, data}` per 60k-char slice (positional `seq`
-/// makes retries idempotent), then `UploadCommit {uploadId, fileName}` → the
-/// durable absolute path on the host.
-func uploadAttachmentChunked(relay: DeviceRelayClient, name: String, data: Data) async throws -> String {
+/// makes retries idempotent), then `UploadCommit {uploadId, fileName, chatId}`
+/// → the durable absolute path on the host.
+func uploadAttachmentChunked(relay: DeviceRelayClient, chatId: String,
+                             name: String, data: Data) async throws -> String {
     struct OkReply: Decodable { var ok: Bool? }
     struct CommitReply: Decodable { var path: String }
 
@@ -166,7 +167,7 @@ func uploadAttachmentChunked(relay: DeviceRelayClient, name: String, data: Data)
     // Commit outlasts the engine's assemble + best-effort edge mirror.
     let reply: CommitReply = try await relay.call(
         method: "UploadCommit",
-        params: ["uploadId": uploadId, "fileName": name],
+        params: ["uploadId": uploadId, "fileName": name, "chatId": chatId],
         timeoutSeconds: 150)
     return reply.path
 }

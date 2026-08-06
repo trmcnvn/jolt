@@ -1,6 +1,5 @@
-// Space detail — the phone's answer to the desktop's horizontal session tabs:
-// the space's sessions as a vertical list (creation order, like tab order),
-// swipe-to-archive (= tab close), and "+" to start a session in this space.
+// Space detail remains a filtered mobile deep link. Sessions use native
+// navigation, swipe-to-archive stays explicit, and "+" starts in this space.
 
 import SwiftUI
 
@@ -313,7 +312,7 @@ struct NewSpaceSheet: View {
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 if entry.isRepo {
-                    Text("git")
+                    Text("repo")
                         .font(Theme.mono(10))
                         .foregroundStyle(Theme.accent.opacity(0.85))
                         .padding(.horizontal, 7)

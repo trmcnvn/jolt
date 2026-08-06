@@ -28,7 +28,7 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use jolt_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
-use jolt_engine::{Engine, EngineConfig, EngineSupervisor};
+use jolt_engine::{Engine, EngineConfig, EngineSupervisor, ScopeKind, ScopeStatus};
 use jolt_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space, UsageSummary};
 use jolt_rpc::{RpcClient, connect_ws, memory_client, methods};
 
@@ -45,7 +45,8 @@ pub struct EngineBootConfig {
     pub ipc_port: u16,
     /// Edge base URL for the embedded engine.
     pub edge_url: String,
-    /// Bearer for edge room joins; `None` runs offline.
+    /// Development bearer for authenticated edge room joins. Update checks use
+    /// the public edge release endpoint even when this is `None`.
     pub edge_token: Option<String>,
     /// Workspace org override for explicit dev-mode runs.
     pub org_id: Option<String>,
@@ -195,6 +196,14 @@ impl EngineHandle {
                 }
             };
         let boot_task = supervisor.spawn_when_ready();
+        if let Err(error) = supervisor.wait_ready().await {
+            boot_task.abort();
+            if let Some(ipc_task) = &ipc_task {
+                ipc_task.abort();
+            }
+            refresh_task.abort();
+            return Err(error);
+        }
         Ok(EngineHandle {
             inner: Arc::new(InProcessEngine {
                 supervisor,
@@ -237,6 +246,16 @@ pub use jolt_proto::view::{
 // AppState entity
 // ---------------------------------------------------------------------------
 
+/// How long a queued send may override the synced session status. An offline
+/// host must not leave the chat looking permanently active.
+pub const PENDING_SEND_TTL_MS: i64 = 30_000;
+
+#[derive(Debug, Clone)]
+struct PendingSend {
+    message_id: String,
+    started_at: DateTime<Utc>,
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -244,6 +263,8 @@ pub struct AppState {
     pub connection: ConnectionStatus,
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
+    /// Active Local/Account data scope. Older/headless engines may not expose it.
+    pub scope: Option<ScopeStatus>,
     pub devices: Vec<Device>,
     /// Sorted (see [`sort_spaces`]).
     pub spaces: Vec<Space>,
@@ -258,11 +279,18 @@ pub struct AppState {
     pub selected_chat: Option<String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
+    /// Initial registry frames have landed. Device-local tab/filter state must
+    /// not reconcile against the empty pre-sync collections.
+    pub chats_synced: bool,
+    pub spaces_synced: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
+    /// Latest queued send per chat, overlaid as Working until the host writes
+    /// the matching message into the transcript.
+    pending_sends: HashMap<String, PendingSend>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -272,7 +300,10 @@ pub struct AppState {
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
     engine: Option<EngineHandle>,
+    /// Watches bound to the currently selected Local/Account runtime.
     watch_tasks: Vec<Task<()>>,
+    /// Auth, update, and scope watches survive runtime switches.
+    global_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
     usage_task: Option<Task<()>>,
 }
@@ -288,6 +319,7 @@ impl AppState {
         Self {
             connection: ConnectionStatus::Connecting,
             auth: None,
+            scope: None,
             devices: Vec::new(),
             spaces: Vec::new(),
             chats: Vec::new(),
@@ -297,14 +329,18 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             echoes: HashMap::new(),
+            pending_sends: HashMap::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
+            global_tasks: Vec::new(),
             transcript_task: None,
             usage_task: None,
             auto_selected: false,
+            chats_synced: false,
+            spaces_synced: false,
         }
     }
 
@@ -313,6 +349,7 @@ impl AppState {
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
+        self.chats_synced = true;
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
         {
@@ -332,6 +369,7 @@ impl AppState {
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
         sort_spaces(&mut spaces);
         self.spaces = spaces;
+        self.spaces_synced = true;
         // Heal a vanished selection (space deleted elsewhere): fall back to the
         // first space; its chats died with it, so a matching chat selection is
         // healed by the accompanying chats frame (`apply_chats`).
@@ -368,6 +406,18 @@ impl AppState {
         self.auth = Some(auth);
     }
 
+    pub fn active_scope(&self) -> ScopeKind {
+        self.scope
+            .as_ref()
+            .map_or(ScopeKind::Account, |status| status.active)
+    }
+
+    pub fn account_available(&self) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|status| status.account_available)
+    }
+
     /// Tolerant AuthStatus frame reducer (see [`parse_auth_state`]).
     pub fn apply_auth_value(&mut self, value: serde_json::Value) {
         match parse_auth_state(&value) {
@@ -392,6 +442,7 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+        self.ack_pending_send_from_transcript();
     }
 
     /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
@@ -407,6 +458,7 @@ impl AppState {
             let transcript = &self.transcript;
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
         }
+        self.ack_pending_send_from_transcript();
         Ok(())
     }
 
@@ -422,6 +474,55 @@ impl AppState {
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
         if let Some(echoes) = self.echoes.get_mut(chat_id) {
             echoes.retain(|e| e.id != message_id);
+        }
+    }
+
+    /// Overlay a queued send as Working until its host acknowledges the
+    /// client-minted message id, the send fails, or the TTL expires.
+    pub fn begin_pending_send(
+        &mut self,
+        chat_id: &str,
+        message_id: &str,
+        started_at: DateTime<Utc>,
+    ) {
+        self.pending_sends.insert(
+            chat_id.to_string(),
+            PendingSend {
+                message_id: message_id.to_string(),
+                started_at,
+            },
+        );
+    }
+
+    /// Clear only the overlay started by this message. A stale failure or TTL
+    /// task must not clear a newer send for the same chat.
+    pub fn end_pending_send(&mut self, chat_id: &str, message_id: &str) {
+        if self
+            .pending_sends
+            .get(chat_id)
+            .is_some_and(|pending| pending.message_id == message_id)
+        {
+            self.pending_sends.remove(chat_id);
+        }
+    }
+
+    pub fn send_pending(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|pending| {
+            now.signed_duration_since(pending.started_at)
+                .num_milliseconds()
+                <= PENDING_SEND_TTL_MS
+        })
+    }
+
+    fn ack_pending_send_from_transcript(&mut self) {
+        if let Some(chat_id) = self.selected_chat.as_deref()
+            && let Some(pending) = self.pending_sends.get(chat_id)
+            && self
+                .transcript
+                .iter()
+                .any(|entry| entry.id == pending.message_id)
+        {
+            self.pending_sends.remove(chat_id);
         }
     }
 
@@ -448,6 +549,13 @@ impl AppState {
 
     pub fn space_row(&self, space_id: &str) -> Option<&Space> {
         self.spaces.iter().find(|s| s.id == space_id)
+    }
+
+    /// Spaces in the stable alphabetical order used by both space pickers.
+    pub fn spaces_sorted(&self) -> Vec<&Space> {
+        let mut spaces: Vec<&Space> = self.spaces.iter().collect();
+        spaces.sort_by_key(|space| (space.display_name().to_lowercase(), space.id.clone()));
+        spaces
     }
 
     pub fn space_for_chat(&self, chat: &Chat) -> Option<&Space> {
@@ -486,14 +594,33 @@ impl AppState {
         }
     }
 
+    /// Space provenance shared by filter rows, new-session chips, and tab
+    /// tooltips. Returns the rendered tag and whether the host is offline.
+    pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
+        let offline = !self.device_online(&space.device_id, now);
+        let device = self
+            .device_name(&space.device_id)
+            .unwrap_or("Unknown device");
+        let tag = if offline {
+            format!("@ {device} · offline")
+        } else {
+            format!("@ {device}")
+        };
+        (tag, offline)
+    }
+
     /// Does the selected space's folder have git? Drives the branch picker and
     /// the diff sidebar (owner-stamped, synced — no RPC).
     pub fn selected_space_git(&self) -> bool {
         self.selected_space_row().is_some_and(|s| s.git_detected)
     }
 
-    /// Full display status for a chat (tab dots, Active list).
+    /// Full display status for a chat (tab dots, Active list). A queued send
+    /// reads as Working until its host acknowledges it.
     pub fn display_status_for(&self, chat: &Chat, now: DateTime<Utc>) -> ChatIndicator {
+        if self.send_pending(&chat.id, now) {
+            return ChatIndicator::Working;
+        }
         display_status(chat, self.session_for(&chat.id), now)
     }
 
@@ -508,7 +635,7 @@ impl AppState {
                     .as_deref()
                     .is_some_and(|id| self.space_row(id).is_some())
             })
-            .map(|c| (display_status(c, self.session_for(&c.id), now), c))
+            .map(|c| (self.display_status_for(c, now), c))
             .collect();
         sort_active(&mut rows);
         rows
@@ -520,6 +647,9 @@ impl AppState {
 
     /// Staleness-checked status dot for a chat row.
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
+        if self.send_pending(chat_id, now) {
+            return Indicator::Working;
+        }
         effective_indicator(self.session_for(chat_id), now)
     }
 
@@ -529,7 +659,16 @@ impl AppState {
     }
 
     pub fn gate(&self) -> GatePhase {
-        gate_phase(&self.connection, self.auth.as_ref())
+        if self.connection == ConnectionStatus::Ready
+            && self
+                .scope
+                .as_ref()
+                .is_some_and(|status| status.active == ScopeKind::Local)
+        {
+            GatePhase::Ready
+        } else {
+            gate_phase(&self.connection, self.auth.as_ref())
+        }
     }
 
     pub fn engine(&self) -> Option<&EngineHandle> {
@@ -569,12 +708,51 @@ impl AppState {
         .detach();
     }
 
-    /// Wire the connected engine: mark Ready and start the standing watches.
-    /// Methods the engine doesn't serve yet (chats/devices/auth land with the
-    /// workspace doc in M4) fail their subscribe and are skipped gracefully.
+    /// Wire the connected engine and start standing watches. The splash stays
+    /// up until `ScopeStatus` chooses Local or Account; engines without scope
+    /// support mark Ready when that subscription is rejected.
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
-        self.connection = ConnectionStatus::Ready;
         self.engine = Some(handle.clone());
+        self.restart_scope_watches(handle.clone(), cx);
+        self.global_tasks = vec![
+            spawn_auth_watch(cx, handle.clone()),
+            spawn_scope_watch(cx, handle.clone()),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::UPDATE_STATUS,
+                AppState::apply_update,
+            ),
+        ];
+        // Re-subscribe the transcript if a chat was already selected (reconnect path).
+        if let Some(chat_id) = self.selected_chat.clone() {
+            let target_device_id = self
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .map(|chat| chat.device_id.clone());
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.usage_task = Some(spawn_usage_watch(cx, handle, chat_id, target_device_id));
+        }
+        cx.notify();
+    }
+
+    fn restart_scope_watches(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        self.devices.clear();
+        self.spaces.clear();
+        self.chats.clear();
+        self.sessions.clear();
+        self.selected_space = None;
+        self.selected_chat = None;
+        self.selected_usage = None;
+        self.transcript.clear();
+        self.transcript_task = None;
+        self.usage_task = None;
+        self.local_device_id = None;
+        self.chats_synced = false;
+        self.spaces_synced = false;
+        self.auto_selected = false;
         self.watch_tasks = vec![
             spawn_watch(
                 cx,
@@ -595,27 +773,8 @@ impl AppState {
                 methods::WATCH_SPACES,
                 AppState::apply_spaces,
             ),
-            spawn_auth_watch(cx, handle.clone()),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::UPDATE_STATUS,
-                AppState::apply_update,
-            ),
-            spawn_local_device_probe(cx, handle.clone()),
+            spawn_local_device_probe(cx, handle),
         ];
-        // Re-subscribe the transcript if a chat was already selected (reconnect path).
-        if let Some(chat_id) = self.selected_chat.clone() {
-            let target_device_id = self
-                .chats
-                .iter()
-                .find(|chat| chat.id == chat_id)
-                .map(|chat| chat.device_id.clone());
-            self.transcript_task =
-                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
-            self.usage_task = Some(spawn_usage_watch(cx, handle, chat_id, target_device_id));
-        }
-        cx.notify();
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -713,11 +872,8 @@ impl AppState {
     }
 }
 
-/// Subscribe to a watch method and pump each frame through `apply`. Runs on the
-/// gpui executor; ends when the stream closes or the entity is released.
-/// Chats watch with boot auto-select: the initial route redirects to the
-/// last-used chat; we approximate by selecting the most recent unarchived chat
-/// on the first frame when nothing is selected yet (manual selection wins).
+/// Chats watch. Boot selection belongs to the shell because restored tabs are
+/// device-local state unavailable to AppState.
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
         let mut rx = match handle
@@ -741,17 +897,6 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
             };
             let alive = this.update(cx, |state, cx| {
                 state.apply_chats(parsed);
-                if state.selected_chat.is_none() && !state.auto_selected {
-                    let most_recent = state
-                        .chats
-                        .iter()
-                        .find(|c| !c.archived)
-                        .map(|c| c.id.clone());
-                    if let Some(chat_id) = most_recent {
-                        state.auto_selected = true;
-                        state.select_chat(Some(chat_id), cx);
-                    }
-                }
                 cx.notify();
             });
             if alive.is_err() {
@@ -783,6 +928,50 @@ fn spawn_auth_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()
             if this
                 .update(cx, |state, cx| {
                     state.apply_auth(auth);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_scope_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        let mut rx = match handle
+            .client()
+            .subscribe(methods::SCOPE_STATUS, serde_json::json!({}))
+            .await
+        {
+            Ok(rx) => rx,
+            Err(err) => {
+                tracing::debug!(error = %err, "scope watch unavailable");
+                this.update(cx, |state, cx| {
+                    state.connection = ConnectionStatus::Ready;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+        };
+        while let Some(value) = rx.recv().await {
+            let status: ScopeStatus = match serde_json::from_value(value) {
+                Ok(status) => status,
+                Err(err) => {
+                    tracing::warn!(error = %err, "dropping malformed scope frame");
+                    continue;
+                }
+            };
+            if this
+                .update(cx, |state, cx| {
+                    let changed = state.scope.as_ref().map(|old| old.active) != Some(status.active);
+                    state.scope = Some(status);
+                    state.connection = ConnectionStatus::Ready;
+                    if changed {
+                        state.restart_scope_watches(handle.clone(), cx);
+                    }
                     cx.notify();
                 })
                 .is_err()
@@ -1104,7 +1293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_bootstrap_requires_sign_in_before_opening_engine_data() {
+    async fn production_bootstrap_opens_local_without_sign_in() {
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
@@ -1127,20 +1316,32 @@ mod tests {
             parse_auth_state(&auth.recv().await.unwrap()),
             Some(AuthState::SignedOut)
         );
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                handle
-                    .client()
-                    .call(methods::LIST_HARNESSES, serde_json::json!({})),
-            )
-            .await
-            .is_err(),
-            "data RPC must wait behind the production sign-in gate"
-        );
+        let harnesses = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle
+                .client()
+                .call(methods::LIST_HARNESSES, serde_json::json!({})),
+        )
+        .await
+        .expect("Local runtime assembled")
+        .expect("Local runtime is available while signed out");
+        assert!(harnesses.as_array().is_some_and(|rows| !rows.is_empty()));
+        let scope: jolt_engine::ScopeStatus = serde_json::from_value(
+            handle
+                .client()
+                .call(
+                    methods::SWITCH_SCOPE,
+                    serde_json::json!({ "scope": "local" }),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(scope.active, ScopeKind::Local);
+        assert!(dir.path().join("scopes/local/current").exists());
         assert!(
             !dir.path().join("orgs/dev-org/dev-user").exists(),
-            "production boot must not create dev-user data"
+            "production Local boot must not create dev-user data"
         );
         handle.shutdown().await;
     }
@@ -1206,6 +1407,18 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+        }
+    }
+
+    fn user_entry(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: jolt_doc::MessageRole::User,
+            parts: Vec::new(),
+            created_at: 0,
+            device_id: "dev".into(),
+            status: None,
+            continuation_of: None,
         }
     }
 
@@ -1498,6 +1711,51 @@ mod tests {
     }
 
     #[test]
+    fn pending_send_overlays_working_until_ttl() {
+        let now = Utc::now();
+        let unseen = chat("c", 0, Some(10));
+        let mut state = AppState::new();
+
+        assert_eq!(
+            state.display_status_for(&unseen, now),
+            ChatIndicator::Completed
+        );
+        state.begin_pending_send("c", "m1", now);
+        assert_eq!(
+            state.display_status_for(&unseen, now),
+            ChatIndicator::Working
+        );
+        assert_eq!(state.indicator_for("c", now), Indicator::Working);
+
+        let expired = now + TimeDelta::milliseconds(PENDING_SEND_TTL_MS + 1);
+        assert_eq!(
+            state.display_status_for(&unseen, expired),
+            ChatIndicator::Completed
+        );
+        assert_eq!(state.indicator_for("c", expired), Indicator::None);
+    }
+
+    #[test]
+    fn pending_send_clears_on_matching_ack_or_cleanup() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        state.begin_pending_send("c", "m1", now);
+        state.apply_transcript(vec![user_entry("other")]);
+        assert!(state.send_pending("c", now));
+
+        state.apply_transcript(vec![user_entry("other"), user_entry("m1")]);
+        assert!(!state.send_pending("c", now));
+
+        state.begin_pending_send("c", "m2", now);
+        state.begin_pending_send("c", "m3", now);
+        state.end_pending_send("c", "m2");
+        assert!(state.send_pending("c", now));
+        state.end_pending_send("c", "m3");
+        assert!(!state.send_pending("c", now));
+    }
+
+    #[test]
     fn echoes_show_until_doc_frame_confirms() {
         let mut state = AppState::new();
         state.selected_chat = Some("c1".into());
@@ -1563,7 +1821,7 @@ mod tests {
         assert_eq!(gate_phase(&ConnectionStatus::Ready, None), GatePhase::Ready);
         assert_eq!(
             gate_phase(&ConnectionStatus::Ready, Some(&AuthState::SignedOut)),
-            GatePhase::SignIn
+            GatePhase::Ready
         );
         assert_eq!(
             gate_phase(

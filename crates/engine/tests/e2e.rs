@@ -13,7 +13,7 @@ use jolt_doc::{
     MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
 };
-use jolt_engine::{EngineCore, HarnessRegistry, RunJournal};
+use jolt_engine::{EngineCore, HarnessRegistry, RunJournal, SteerOutcome};
 use jolt_harness::mock::MockHarness;
 use jolt_harness::{BashRequest, BashResult, Harness, HarnessError, RunControls};
 use jolt_proto::{
@@ -124,6 +124,190 @@ impl Harness for ScriptedHarness {
                 token.cancelled().await;
                 let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
             }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+struct CompactionContinuationHarness {
+    continuation: Arc<Mutex<Option<String>>>,
+    resumes_without_prompt: bool,
+}
+
+#[async_trait]
+impl Harness for CompactionContinuationHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Compaction continuation"
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let continuation = self.continuation.clone();
+        let resumes_without_prompt = self.resumes_without_prompt;
+        let mut steering = controls.steering;
+        let interrupt = controls.interrupt;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            for event in [
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: Vec::new(),
+                    cwd: "/tmp".into(),
+                    session_id: "hs-compaction".into(),
+                    assistant_message_id: "a-before-compaction".into(),
+                },
+                AgentEvent::CompactionStarted,
+                AgentEvent::CompactionFinished,
+            ] {
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+            if resumes_without_prompt
+                && tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "Resumed naturally".into(),
+                    }))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            if tx.send(Ok(done(DoneStatus::Completed))).await.is_err() {
+                return;
+            }
+
+            tokio::select! {
+                message = steering.recv() => {
+                    let Some(message) = message else { return };
+                    *continuation.lock().unwrap() = Some(message.prompt);
+                    for event in [
+                        AgentEvent::Steered {
+                            assistant_message_id: Some("a-before-compaction".into()),
+                            next_assistant_message_id: Some("a-after-compaction".into()),
+                        },
+                        AgentEvent::TextDelta { text: "Resumed after compaction".into() },
+                        done(DoneStatus::Completed),
+                    ] {
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    interrupt.cancelled().await;
+                }
+                _ = interrupt.cancelled() => {}
+            }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+struct CompactionUserCancellationHarness {
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Harness for CompactionUserCancellationHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Compaction user cancellation"
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let messages = self.messages.clone();
+        let mut steering = controls.steering;
+        let interrupt = controls.interrupt;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            for event in [
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: Vec::new(),
+                    cwd: "/tmp".into(),
+                    session_id: "hs-user-cancel".into(),
+                    assistant_message_id: "a-user-cancel".into(),
+                },
+                AgentEvent::CompactionStarted,
+                AgentEvent::CompactionFinished,
+            ] {
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+
+            let first = tokio::select! {
+                message = steering.recv() => message,
+                _ = interrupt.cancelled() => return,
+            };
+            let Some(first) = first else { return };
+            messages.lock().unwrap().push(first.prompt);
+            if tx.send(Ok(done(DoneStatus::Completed))).await.is_err() {
+                return;
+            }
+
+            tokio::select! {
+                message = steering.recv() => {
+                    if let Some(message) = message {
+                        messages.lock().unwrap().push(message.prompt);
+                    }
+                }
+                _ = interrupt.cancelled() => return,
+            }
+            interrupt.cancelled().await;
         });
         Ok(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|event| (event, rx))
@@ -786,6 +970,139 @@ async fn compaction_events_toggle_live_session_feedback() {
             (SessionStatus::Idle, false),
         ]
     );
+}
+
+#[tokio::test]
+async fn compaction_shutdown_queues_a_hidden_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    let continuation = Arc::new(Mutex::new(None));
+    let core = assemble(
+        dir.path(),
+        Arc::new(CompactionContinuationHarness {
+            continuation: continuation.clone(),
+            resumes_without_prompt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-compaction-continuation",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+
+    wait_for(
+        || continuation.lock().unwrap().is_some(),
+        "compaction continuation",
+    )
+    .await;
+    let prompt = continuation.lock().unwrap().clone().unwrap();
+    assert!(prompt.contains("Resume the existing task"));
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.parts.iter().any(|part| {
+                        matches!(part, MessagePart::Text { text, .. } if text == "Resumed after compaction")
+                    })
+            })
+        },
+        "resumed assistant turn",
+    )
+    .await;
+    assert_eq!(
+        entries(&core)
+            .iter()
+            .filter(|entry| entry.role == MessageRole::User)
+            .count(),
+        1,
+        "the continuation prompt must stay hidden"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_message_after_compaction_cancels_the_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    let continuation = Arc::new(Mutex::new(None));
+    let core = assemble(
+        dir.path(),
+        Arc::new(CompactionContinuationHarness {
+            continuation: continuation.clone(),
+            resumes_without_prompt: true,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-compaction-natural-resume",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.parts.iter().any(|part| {
+                        matches!(part, MessagePart::Text { text, .. } if text == "Resumed naturally")
+                    })
+            })
+        },
+        "natural post-compaction output",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(continuation.lock().unwrap().is_none());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn user_message_after_compaction_cancels_the_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        dir.path(),
+        Arc::new(CompactionUserCancellationHarness {
+            messages: messages.clone(),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-compaction-user-cancel",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            core.sessions.subscribe(CHAT, 0).is_ok_and(|(replay, _)| {
+                replay
+                    .iter()
+                    .any(|entry| entry.event == AgentEvent::CompactionFinished)
+            })
+        },
+        "compaction finish",
+    )
+    .await;
+
+    assert_eq!(
+        core.sessions
+            .steer(CHAT, "Keep going", Some("m-2".into()))
+            .await
+            .unwrap(),
+        SteerOutcome::Accepted
+    );
+    wait_for(|| messages.lock().unwrap().len() == 1, "user steer").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(messages.lock().unwrap().as_slice(), ["Keep going"]);
+    core.shutdown().await;
 }
 
 #[tokio::test]
@@ -1953,7 +2270,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     let committed = client
         .call(
             jolt_rpc::methods::UPLOAD_COMMIT,
-            serde_json::json!({ "uploadId": "e2e-att", "fileName": "red.png" }),
+            serde_json::json!({ "uploadId": "e2e-att", "fileName": "red.png", "chatId": CHAT }),
         )
         .await
         .expect("UploadCommit");
@@ -2071,7 +2388,7 @@ async fn real_claude_sees_uploaded_image_inline() {
     let committed = client
         .call(
             jolt_rpc::methods::UPLOAD_COMMIT,
-            serde_json::json!({ "uploadId": "real-img", "fileName": "swatch.png" }),
+            serde_json::json!({ "uploadId": "real-img", "fileName": "swatch.png", "chatId": CHAT }),
         )
         .await
         .expect("UploadCommit");

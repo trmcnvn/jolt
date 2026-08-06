@@ -1,7 +1,5 @@
-// Home — the mobile shell. The desktop sidebar's two sections become the
-// phone's home screen: Spaces (grouped work) and Sessions (the global
-// attention-sorted list). Tabs-as-sessions don't fit a phone; a space opens
-// into its own session list instead, and close=archive becomes swipe-to-archive.
+// Home — Sessions are the durable corpus. Spaces are a searchable local
+// filter and new-session target rather than the mobile navigation spine.
 
 import SwiftUI
 
@@ -13,13 +11,31 @@ enum Route: Hashable {
 
 struct HomeView: View {
     @Environment(AppModel.self) private var model
+    @AppStorage("homeSpaceFilter") private var storedSpaceFilter = ""
+    @AppStorage("lastNewSessionSpaceId") private var lastNewSessionSpaceId = ""
     @State private var path: [Route] = []
     @State private var showNewSpace = false
+    @State private var showSpaceFilter = false
+
+    private var spaceFilter: String? {
+        storedSpaceFilter.isEmpty ? nil : storedSpaceFilter
+    }
+
+    private var filteredChats: [Chat] {
+        guard let spaceFilter else { return model.overviewChats }
+        return model.overviewChats.filter { $0.spaceId == spaceFilter }
+    }
+
+    private var filterLabel: String {
+        guard let id = spaceFilter,
+              let space = model.spaces.first(where: { $0.id == id }) else { return "All spaces" }
+        return space.displayName
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
             List {
-                spacesSection
+                filterRow
                 sessionsSection
             }
             .listStyle(.plain)
@@ -28,7 +44,7 @@ struct HomeView: View {
             .scrollContentBackground(.hidden)
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(Theme.surface.ignoresSafeArea())
-            .navigationTitle("Jolt")  // feeds the back menu; not displayed
+            .navigationTitle("Jolt")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(removing: .title)
             .navigationDestination(for: Route.self) { route in
@@ -40,8 +56,6 @@ struct HomeView: View {
             }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    // In the bar, not the list: as a list row it appeared and
-                    // vanished with the connection and shoved the content down.
                     if !model.connected {
                         ProgressView()
                             .controlSize(.mini)
@@ -49,18 +63,18 @@ struct HomeView: View {
                             .accessibilityLabel("Connecting")
                     }
                 }
-                // Bare spinner — no glass capsule behind it.
                 .sharedBackgroundVisibility(.hidden)
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showNewSpace = true
-                    } label: {
+                    Button(action: openNewSession) {
                         Image(systemName: "plus")
                     }
-                    .accessibilityLabel("New space")
+                    .accessibilityLabel("New session")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
+                        Button("New space", systemImage: "folder.badge.plus") {
+                            showNewSpace = true
+                        }
                         if model.demo != nil {
                             Text("Demo mode")
                         }
@@ -70,19 +84,29 @@ struct HomeView: View {
                     }
                 }
             }
+            .sheet(isPresented: $showSpaceFilter) {
+                SpaceFilterSheet(selected: spaceFilter) { selected in
+                    storedSpaceFilter = selected ?? ""
+                }
+            }
             .sheet(isPresented: $showNewSpace) {
                 NewSpaceSheet { spaceId in
+                    storedSpaceFilter = spaceId
+                    lastNewSessionSpaceId = spaceId
                     path.append(.space(spaceId))
                 }
             }
             .task(id: model.overviewChats.map(\.id).joined()) {
                 model.preloadSessions()
             }
+            .onChange(of: model.spaces.map(\.id)) { _, ids in
+                if let filter = spaceFilter, !ids.contains(filter) {
+                    storedSpaceFilter = ""
+                }
+            }
             .onAppear {
                 if let route = model.launchRoute {
                     model.launchRoute = nil
-                    // Push the whole stack atomically — appending from a child's
-                    // onAppear mid-transition gets dropped by NavigationStack.
                     if case .space(let id) = route, model.launchSheet == "newsession" {
                         model.launchSheet = nil
                         path = [route, .newSession(spaceId: id)]
@@ -98,40 +122,38 @@ struct HomeView: View {
         }
     }
 
-    // MARK: Spaces
-
-    private var spacesSection: some View {
-        Section {
-            if model.spaces.isEmpty {
-                Text("No spaces yet — add one from a desktop device")
-                    .font(Theme.sans(12))
+    private var filterRow: some View {
+        Button {
+            showSpaceFilter = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "folder")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Theme.textMuted)
+                Text(filterLabel)
+                    .font(Theme.sans(13, weight: .medium))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(Theme.textFaint)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
             }
-            ForEach(model.spaces) { space in
-                Button {
-                    path.append(.space(space.id))
-                } label: {
-                    SpaceRow(space: space)
-                }
-                .buttonStyle(PressWashButtonStyle())
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
-            }
-        } header: {
-            sectionHeader("Spaces")
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+            .contentShape(RoundedRectangle(cornerRadius: 8))
         }
+        .buttonStyle(PressWashButtonStyle())
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
     }
-
-    // MARK: Sessions
 
     private var sessionsSection: some View {
         Section {
-            let chats = model.overviewChats
+            let chats = filteredChats
             if chats.isEmpty {
-                Text("No sessions yet")
+                Text(spaceFilter == nil ? "No sessions yet" : "No sessions in this space")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
@@ -158,16 +180,108 @@ struct HomeView: View {
             }
             .motionAnimation(Motion.resort, value: chats.map(\.id))
         } header: {
-            sectionHeader("Sessions")
+            Text("Sessions")
+                .font(Theme.sans(11, weight: .medium))
+                .foregroundStyle(Theme.textMuted.opacity(0.6))
+                .textCase(nil)
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
         }
     }
 
-    private func sectionHeader(_ title: String) -> some View {
-        Text(title)
-            .font(Theme.sans(11, weight: .medium))
-            .foregroundStyle(Theme.textMuted.opacity(0.6))
-            .textCase(nil)
-            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
+    private func openNewSession() {
+        guard let target = resolvedNewSessionSpace() else {
+            showNewSpace = true
+            return
+        }
+        lastNewSessionSpaceId = target
+        path.append(.newSession(spaceId: target))
+    }
+
+    private func resolvedNewSessionSpace() -> String? {
+        let ids = Set(model.spaces.map(\.id))
+        if let filter = spaceFilter, ids.contains(filter) { return filter }
+        if ids.contains(lastNewSessionSpaceId) { return lastNewSessionSpaceId }
+        return model.spaces.first?.id
+    }
+}
+
+struct SpaceFilterSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let selected: String?
+    var includeAll = true
+    var title = "Filter sessions"
+    let onSelect: (String?) -> Void
+    @State private var query = ""
+
+    private var spaces: [Space] {
+        let sorted = model.spaces.sorted {
+            let order = $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+            return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
+        }
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return sorted }
+        return sorted.filter { $0.displayName.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if includeAll, query.isEmpty {
+                    row(label: "All spaces", detail: nil, id: nil)
+                }
+                ForEach(spaces) { space in
+                    let online = model.deviceOnline(space.deviceId)
+                    row(label: space.displayName,
+                        detail: online
+                            ? "@ \(model.deviceName(space.deviceId))"
+                            : "@ \(model.deviceName(space.deviceId)) · offline",
+                        id: space.id)
+                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(Theme.surface.ignoresSafeArea())
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $query, prompt: "Search spaces")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .preferredColorScheme(.dark)
+    }
+
+    private func row(label: String, detail: String?, id: String?) -> some View {
+        Button {
+            onSelect(id)
+            dismiss()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "folder")
+                    .foregroundStyle(Theme.textMuted)
+                Text(label)
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if let detail {
+                    Text(detail)
+                        .font(Theme.sans(11))
+                        .foregroundStyle(Theme.textMuted.opacity(0.6))
+                        .lineLimit(1)
+                }
+                if selected == id {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.textMuted)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(Color.clear)
     }
 }
 

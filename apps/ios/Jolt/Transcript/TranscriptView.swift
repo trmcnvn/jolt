@@ -199,8 +199,8 @@ struct TranscriptView: View {
     private func rowView(_ row: TranscriptRow) -> some View {
         Group {
             switch row.kind {
-            case .user(let text):
-                UserBubble(text: text, pending: row.timestamp == nil,
+            case .user(let text, let blocks):
+                UserBubble(text: text, blocks: blocks, pending: row.timestamp == nil,
                            deviceId: store.hostDeviceId ?? "")
 
             case .markdown(let block, let streaming):
@@ -340,6 +340,7 @@ final class VeilStore {
 
 struct UserBubble: View {
     let text: String
+    let blocks: [TopBlock]
     var pending = false
     /// The chat's host device — where attachment files live (read-back key).
     var deviceId = ""
@@ -349,26 +350,28 @@ struct UserBubble: View {
         // thumbnails above the bubble,
         // exactly like the desktop's user rows.
         let parsed = parseUserMessageImages(text)
+        let mentions = projectFileMentions(parsed.text)
         VStack(alignment: .trailing, spacing: 8) {
             if !parsed.attachments.isEmpty, !deviceId.isEmpty {
                 UserAttachmentsStrip(deviceId: deviceId, attachments: parsed.attachments)
             }
-            if !parsed.text.isEmpty {
-                Text(parsed.text)
-                    .font(Theme.sans(MD.textSize))
-                    .lineSpacing(MD.lineHeight - MD.textSize - 4)
-                    .foregroundStyle(Theme.text)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
-                    .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
-                    .contextMenu {
-                        Button {
-                            UIPasteboard.general.string = parsed.text
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                        }
+            if !blocks.isEmpty {
+                VStack(alignment: .leading, spacing: MD.blockGap) {
+                    ForEach(Array(blocks.enumerated()), id: \.offset) { ix, top in
+                        MarkdownBlockView(block: top.block, cacheKey: "user/\(ix)", fillsWidth: false)
                     }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
+                .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = mentions.plainText
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                }
             }
         }
         .opacity(pending ? 0.65 : 1)

@@ -1146,6 +1146,43 @@ impl DocHost {
         }
     }
 
+    /// Rewrite an absolute path prefix in every text part before a scope
+    /// directory move. Documents are opened from their persisted snapshots and
+    /// flushed synchronously, so no attachment reference points at the retired
+    /// Local root after promotion.
+    pub fn rewrite_text_prefix(
+        &self,
+        chat_ids: &[String],
+        from: &str,
+        to: &str,
+    ) -> Result<(), EngineError> {
+        for chat_id in chat_ids {
+            let handle = self.open(chat_id)?;
+            let entries = handle.doc.read_entries()?;
+            let mut changed = false;
+            for entry in entries {
+                let message_id = entry.id;
+                for part in entry.parts {
+                    let MessagePart::Text { id, text } = part else {
+                        continue;
+                    };
+                    if text.contains(from) {
+                        changed |= handle.doc.replace_text_part(
+                            &message_id,
+                            &id,
+                            &text.replace(from, to),
+                        )?;
+                    }
+                }
+            }
+            if changed {
+                handle.publish_messages_if_watched();
+                self.save_snapshot(&handle);
+            }
+        }
+        Ok(())
+    }
+
     /// Persist every open doc now (shutdown path; bypasses the debounce).
     pub fn flush_all(&self) {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();

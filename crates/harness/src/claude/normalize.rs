@@ -67,6 +67,10 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+fn positive_u64_field(input: &Value, key: &str) -> Option<u64> {
+    input.get(key).and_then(Value::as_u64).filter(|n| *n > 0)
+}
+
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
 pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
@@ -75,6 +79,8 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
         },
         "Read" => ToolCall::ReadFile {
             path: str_field(input, "file_path"),
+            offset: positive_u64_field(input, "offset"),
+            limit: positive_u64_field(input, "limit"),
         },
         "Write" => ToolCall::WriteFile {
             path: str_field(input, "file_path"),
@@ -393,6 +399,17 @@ mod tests {
             decode_tool_use("Bash", &json!({"command": "ls -la"})),
             ToolCall::Exec {
                 command: "ls -la".into()
+            }
+        );
+        assert_eq!(
+            decode_tool_use(
+                "Read",
+                &json!({"file_path": "/a", "offset": 20, "limit": 10})
+            ),
+            ToolCall::ReadFile {
+                path: "/a".into(),
+                offset: Some(20),
+                limit: Some(10)
             }
         );
         assert_eq!(

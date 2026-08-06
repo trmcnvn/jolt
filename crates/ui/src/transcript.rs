@@ -30,9 +30,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent,
-    ListState, ObjectFit, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
-    Window, canvas, div, img, list, prelude::*, px, quad,
+    AnyElement, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent, ListState,
+    ObjectFit, SharedString, StyledImage as _, Subscription, Task, Window, div, img, list,
+    prelude::*, px,
 };
 
 use jolt_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
@@ -198,14 +198,10 @@ pub struct ToolItem {
 #[derive(Clone)]
 pub enum RowKind {
     User {
-        /// Visible prompt (attachment-ref trailer already stripped). When the
-        /// prompt carries file mentions this is the *projected* display text —
-        /// chip labels in place of the raw Markdown links.
-        text: SharedString,
-        /// File-mention chips over `text`, in display-byte terms. Computed
-        /// once per entry change in [`rows_for_entry`] (rows are cached by
-        /// fingerprint), never per frame. Empty for ordinary prompts.
-        mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+        /// Parsed prompt Markdown (attachment-ref trailer already stripped).
+        /// User messages stay one virtualized bubble row even when the tree
+        /// contains multiple blocks.
+        tree: Arc<BlockTree>,
         /// Image refs parsed out of the message text; thumbnails load from the
         /// owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
@@ -323,20 +319,20 @@ pub fn rows_for_entry(
         // Attachment refs ride the plain text; split them back out for the
         // thumbnail strip.
         let parsed = crate::attachments::parse_user_message_images(&raw);
-        // File mentions render as chips here too, not just in the composer.
-        // The projection is pure over the text, so the raw-length row version
-        // below stays a valid cache/diff key.
-        let (text, mentions) = match crate::composer::sent_mention_display(&parsed.text) {
-            Some((display, spans)) => (display, spans),
-            None => (parsed.text, Vec::new()),
+        // File mentions keep their compact inline-code treatment while the
+        // rest of the prompt is parsed as Markdown (including inline and
+        // fenced code). User entries are already row-cached, so a full parse
+        // happens only when the entry changes.
+        let markdown = match crate::composer::sent_mention_display(&parsed.text) {
+            Some((display, spans)) => user_markdown_source(&display, &spans),
+            None => parsed.text,
         };
         return vec![Row {
             id: entry.id.clone().into(),
             version: (raw.len() as u64) << 1 | pending as u64,
             turn_start: true,
             kind: RowKind::User {
-                text: text.into(),
-                mentions: Arc::new(mentions),
+                tree: Arc::new(parse_full(&markdown)),
                 attachments: Arc::new(parsed.attachments),
                 pending,
             },
@@ -1989,14 +1985,12 @@ impl Transcript {
 
         let inner: AnyElement = match &row.kind {
             RowKind::User {
-                text,
-                mentions,
+                tree,
                 attachments,
                 pending,
             } => {
                 let attachments = attachments.clone();
-                let text = text.clone();
-                let mentions = mentions.clone();
+                let tree = tree.clone();
                 let pending = *pending;
                 // Attachment thumbnails sit above the right-aligned bubble;
                 // image-only sends show no bubble at all.
@@ -2004,7 +1998,19 @@ impl Transcript {
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
                 }
-                if !text.is_empty() {
+                if !tree.is_empty() {
+                    let opts = RenderOptions {
+                        row_key: row.id.clone(),
+                        veil: None,
+                        cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+                        now: Instant::now(),
+                        copy: Some(self.copy_ui_for(&row.id, cx)),
+                        open_link: Some(self.open_link_for(cx)),
+                    };
+                    let highlights = self.code_highlight_for(&row.id, &tree, None, cx);
+                    let markdown = render::render_tree(&tree, &opts, &theme, window, &|ix| {
+                        highlights.get(&ix).cloned().flatten()
+                    });
                     // `min_w_0` is load-bearing: gpui text answers min/max-content
                     // probes with its UNWRAPPED width, so without it the bubble's
                     // automatic min-size is the full single-line width — the flex
@@ -2020,11 +2026,9 @@ impl Transcript {
                                 .rounded(px(Theme::BUBBLE_RADIUS))
                                 .px(px(16.0))
                                 .py(px(10.0))
-                                .text_size(px(14.0))
-                                .line_height(px(22.0))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
-                                .child(user_bubble_text(&row.id, text, mentions, &theme)),
+                                .child(markdown),
                         ),
                     );
                 }
@@ -2395,90 +2399,36 @@ impl Transcript {
     }
 }
 
-/// Selectable sent-message text with its file-mention chips. The same recipe
-/// as the markdown renderer's inline code (`flat_text_element`): chip ranges
-/// shape in the mono font at `code_text` violet, [`StyledText`] supplies wrapped
-/// glyph geometry through its layout handle, and a canvas paints the rounded
-/// `code_wash` and selection wash *beneath* the glyphs.
-///
-/// Per-frame cost while an assistant message streams below: shaping hits
-/// gpui's line-layout cache (identical text + runs ⇒ reuse) and the underlay
-/// repaints O(chips) quads — no layout work, no re-projection (spans were
-/// computed once in [`rows_for_entry`]).
-fn user_bubble_text(
-    row_id: &SharedString,
-    text: SharedString,
-    mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
-    theme: &Theme,
-) -> AnyElement {
-    // Split runs at chip boundaries (spans are in order): body text keeps the
-    // sans font, chips read as inline code. Size/line-height flow from the
-    // bubble's div like every text child.
-    let body_run = |len: usize| TextRun {
-        len,
-        font: gpui::font(theme.font_sans.clone()),
-        color: theme.text,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let chip_run = |len: usize| TextRun {
-        len,
-        font: gpui::font(theme.font_mono.clone()),
-        color: theme.code_text,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let mut runs = Vec::with_capacity(mentions.len() * 2 + 1);
+/// Convert projected file-mention ranges to Markdown code spans so they retain
+/// their compact chip treatment inside an otherwise normal Markdown prompt.
+fn user_markdown_source(text: &str, mentions: &[crate::composer::SentMentionSpan]) -> String {
+    if mentions.is_empty() {
+        return text.to_string();
+    }
+    let mut markdown = String::with_capacity(text.len() + mentions.len() * 2);
     let mut at = 0;
-    for span in mentions.iter() {
-        if at < span.range.start {
-            runs.push(body_run(span.range.start - at));
+    for mention in mentions {
+        markdown.push_str(&text[at..mention.range.start]);
+        markdown.push_str(&markdown_code_span(&text[mention.range.clone()]));
+        at = mention.range.end;
+    }
+    markdown.push_str(&text[at..]);
+    markdown
+}
+
+fn markdown_code_span(text: &str) -> String {
+    let mut longest = 0;
+    let mut current = 0;
+    for byte in text.bytes() {
+        if byte == b'`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
         }
-        runs.push(chip_run(span.range.len()));
-        at = span.range.end;
     }
-    if at < text.len() {
-        runs.push(body_run(text.len() - at));
-    }
-    let styled = StyledText::new(text.clone()).with_runs(runs);
-    let layout = styled.layout().clone();
-    let mention_wash = theme.code_wash;
-    let selection_wash = render::selection_wash(theme);
-    let selection_key: Arc<str> = format!("{row_id}:user").into();
-    let selection_text = text.clone();
-    let underlay = canvas(
-        |_, _, _| (),
-        move |_, _, window, _| {
-            for span in mentions.iter() {
-                for rect in render::range_rects(&layout, &selection_text, &span.range, 0.0, 2.0) {
-                    window.paint_quad(quad(
-                        rect,
-                        px(5.0),
-                        mention_wash,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        BorderStyle::default(),
-                    ));
-                }
-            }
-            render::paint_and_register_selection(
-                window,
-                &selection_key,
-                &selection_text,
-                &layout,
-                selection_wash,
-            );
-        },
-    )
-    .absolute()
-    .size_full();
-    div()
-        .relative()
-        .child(underlay)
-        .child(styled)
-        .into_any_element()
+    let delimiter = "`".repeat(longest + 1);
+    format!("{delimiter}{text}{delimiter}")
 }
 
 /// The transcript ErrorChip: a 34px row (`rounded-[10px] border
@@ -3182,12 +3132,20 @@ mod tests {
         let rows = rows_for_entry(&entry, false, &mut parse);
         assert_eq!(rows.len(), 1);
         let RowKind::User {
-            text, attachments, ..
+            tree, attachments, ..
         } = &rows[0].kind
         else {
             panic!("expected a user row");
         };
-        assert_eq!(text.as_ref(), "what color is this?");
+        assert_eq!(
+            tree.blocks[0].block,
+            Block::Paragraph {
+                runs: vec![crate::markdown::parser::InlineRun {
+                    text: "what color is this?".to_string(),
+                    style: Default::default(),
+                }]
+            }
+        );
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].path, "/data/uploads/ab12-red.png");
         assert_eq!(attachments[0].name, "ab12-red.png");
@@ -3197,51 +3155,65 @@ mod tests {
         entry.parts = vec![text_part("t0", &only)];
         let rows = rows_for_entry(&entry, false, &mut parse);
         let RowKind::User {
-            text, attachments, ..
+            tree, attachments, ..
         } = &rows[0].kind
         else {
             panic!("expected a user row");
         };
-        assert_eq!(text.as_ref(), "");
+        assert!(tree.is_empty());
         assert_eq!(attachments.len(), 1);
     }
 
-    /// A sent prompt's file mentions render as chips in the transcript: the
-    /// row carries the projected display text plus spans, while ordinary
-    /// prompts keep the empty-spans fast path. The row version derives from
-    /// the RAW text either way, so projection never perturbs the diff key.
+    /// Sent file mentions retain their chip treatment inside user Markdown.
     #[test]
-    fn user_rows_project_file_mentions_into_chips() {
+    fn user_rows_project_file_mentions_into_code_spans() {
         let raw = "look at [composer.rs](jolt-file:crates/ui/src/composer.rs) please";
         let mut entry = assistant("u3", MessageStatus::Complete, vec![]);
         entry.role = MessageRole::User;
         entry.status = None;
         entry.parts = vec![text_part("t0", raw)];
         let rows = rows_for_entry(&entry, false, &mut parse);
-        let RowKind::User { text, mentions, .. } = &rows[0].kind else {
+        let RowKind::User { tree, .. } = &rows[0].kind else {
             panic!("expected a user row");
+        };
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected a paragraph");
+        };
+        let mention = runs
+            .iter()
+            .find(|run| run.text.contains("composer.rs"))
+            .expect("projected mention run");
+        assert!(mention.style.code);
+        assert!(!mention.text.contains("jolt-file:"));
+        assert_eq!(rows[0].version, (raw.len() as u64) << 1);
+    }
+
+    #[test]
+    fn user_rows_parse_inline_and_fenced_code() {
+        let raw = "Run `cargo test`:\n\n```rust\nfn main() {}\n```";
+        let mut entry = assistant("u4", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        entry.parts = vec![text_part("t0", raw)];
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::User { tree, .. } = &rows[0].kind else {
+            panic!("expected a user row");
+        };
+        assert_eq!(tree.blocks.len(), 2);
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected a paragraph");
         };
         assert!(
-            !text.contains("jolt-file:"),
-            "raw link left visible: {text}"
+            runs.iter()
+                .any(|run| run.text == "cargo test" && run.style.code)
         );
-        assert!(text.contains("composer.rs"));
-        assert_eq!(mentions.len(), 1);
-        assert!(!mentions[0].is_dir);
-        assert_eq!(mentions[0].path.as_ref(), "crates/ui/src/composer.rs");
-        assert_eq!(&text[mentions[0].range.clone()], {
-            let projected: &str = "\u{00A0}@composer.rs\u{00A0}";
-            projected
-        });
-        assert_eq!(rows[0].version, (raw.len() as u64) << 1);
-
-        entry.parts = vec![text_part("t0", "no mentions here")];
-        let rows = rows_for_entry(&entry, false, &mut parse);
-        let RowKind::User { text, mentions, .. } = &rows[0].kind else {
-            panic!("expected a user row");
-        };
-        assert_eq!(text.as_ref(), "no mentions here");
-        assert!(mentions.is_empty());
+        assert_eq!(
+            tree.blocks[1].block,
+            Block::CodeBlock {
+                language: Some("rust".to_string()),
+                code: "fn main() {}".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -3321,7 +3293,11 @@ mod tests {
         // Reads / searches / misc.
         let tools = vec![
             ToolItem {
-                call: ToolCall::ReadFile { path: "x".into() },
+                call: ToolCall::ReadFile {
+                    path: "x".into(),
+                    offset: None,
+                    limit: None,
+                },
                 is_error: false,
                 resolved: true,
             },
@@ -3348,6 +3324,14 @@ mod tests {
                 command: "cargo test".into()
             }),
             ("Run", "cargo test".to_string())
+        );
+        assert_eq!(
+            tool_chip_content(&ToolCall::ReadFile {
+                path: "src/lib.rs".into(),
+                offset: Some(101),
+                limit: Some(50),
+            }),
+            ("Read", "src/lib.rs:101-150".to_string())
         );
         assert_eq!(
             tool_chip_content(&ToolCall::Search {

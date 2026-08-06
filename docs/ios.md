@@ -27,15 +27,17 @@ Development mode can connect to an edge running with `AUTH_MODE=dev`, where the 
 
 ## What the mobile viewport can do
 
-- View attention-sorted sessions across all devices.
-- Browse spaces and their sessions.
+- View attention-sorted sessions across all devices, filtered by a searchable space picker.
+- Open a space as a filtered deep link when navigating from external context.
 - Add a space by choosing a device and browsing that remote engine's folders.
-- Start Claude Code, Codex, or Pi sessions on a space's host device.
-- Discover models and reasoning levels from the target device.
-- Choose a ref, reuse a worktree, or create a new worktree for a session.
+- Ask a space's host device to start Claude Code, Codex, or Pi; no harness runs on the phone.
+- Discover harnesses, models, and reasoning levels from the target device.
+- Use the host's configured Git or Jujutsu backend to choose a ref/revision, reuse a worktree/workspace, or create an isolated one.
 - Stream transcripts with Markdown, code highlighting, grouped tools, errors, and input requests.
 - Send, steer, stop, and answer structured questions.
-- Attach images from Photos; uploads are chunked to the host device.
+- Attach images from Photos on the first or any later message; uploads are chunked to the host device.
+- Search the host checkout with `@` and send file/directory mentions as cross-platform `jolt-file:` links.
+- Use `/answer`, `/bro`, `!command`, and `!!command` from the composer.
 - Change model, reasoning, and ref for later turns.
 - Archive sessions with a swipe.
 - Use context menus to copy transcript text and code.
@@ -46,10 +48,11 @@ The app shows device online state and warns when a run is queued for an offline 
 
 | Desktop | iOS |
 | --- | --- |
-| Sidebar spaces and global session list | Home screen sections |
-| Horizontal session tabs | Space detail session list |
-| Close tab to archive | Swipe to archive |
+| Searchable sidebar space filter and session list | Sessions-first Home screen with a searchable space filter |
+| Device-local horizontal tabs | Native navigation stack; no mobile tab strip |
+| Explicit Archive action | Swipe to archive |
 | Harness/model popover | Model and effort sheets |
+| Global New Session canvas + space picker | Global New Session route + searchable space sheet |
 | Add-space palette | Device tabs and remote folder browser |
 | gpui virtual list | SwiftUI `LazyVStack` with stable row IDs |
 | Hover actions | Context menus |
@@ -62,7 +65,7 @@ The phone uses three paths:
 
 1. **Workspace registry:** JSON WebSocket protocol to the per-user `reg1` registry room for devices, spaces, chats, and session status.
 2. **Session documents:** Loro protocol 0.3 to each chat room for transcript projection and command appends.
-3. **Device relay:** binary device-room frames carrying RPC when folder browsing, model/ref discovery, worktree creation, or host file upload requires a live engine.
+3. **Device relay:** binary device-room frames carrying RPC when folder browsing, file-mention search, model/ref discovery, worktree creation, or host file upload requires a live engine.
 
 Run, steer, interrupt, and input-answer operations are appended to the session's durable command ledger. The phone then posts a device nudge so a cold host opens the document. If the host is offline, the command remains queued.
 

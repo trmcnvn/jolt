@@ -6,15 +6,17 @@ Open settings from the user menu or with `Cmd+,` on macOS / `Ctrl+,` elsewhere. 
 
 | Page | What it controls | Scope |
 | --- | --- | --- |
-| **Devices** | Registered devices, presence, version, rename, and copyable device ID | Device rows sync; UI state is local |
+| **Devices** | Registered devices, presence, version, rename/removal, and copyable device ID | Device rows sync; UI state is local |
 | **Accounts** | Claude Code and Codex login slots, activation, removal, and provider quota meters | Selected engine device |
 | **Secrets** | Write-only environment secrets scoped to Claude Code, Codex, and/or Pi | Local engine only |
 | **Version control** | Active Git or Jujutsu command-line backend and executable status | Selected engine device |
 | **Terminal** | Command used when a new terminal tab opens | Local viewport setting |
-| **Appearance** | System/light/dark mode and UI, code, and terminal fonts | Local viewport setting |
+| **Appearance** | System/light/dark mode plus typography families and sizes | Local viewport setting |
 | **Notifications** | In-app toasts versus operating-system notifications | Local viewport setting |
-| **Shortcuts** | Rebindable app actions with conflict detection and reset controls | Local viewport setting |
+| **Hotkeys** | Rebindable app commands with conflict detection and reset controls | Local viewport setting |
 | **Archived sessions** | Browse and restore archived chats | Synced chat rows |
+
+Removing a device tombstones its spaces and sessions. Synced R2 backups and attachments are purged asynchronously; folders and other local files on that machine are unaffected. If Jolt later starts there again, it registers as an empty device.
 
 ### Accounts
 
@@ -42,30 +44,45 @@ Leave **Launch command** blank to open the default interactive login shell. A cu
 - **Light:** always use Jolt's light palette.
 - **Dark:** always use Jolt's dark palette.
 
-Font pickers enumerate installed fonts. Code font applies to code blocks, diffs, and shortcut chips; terminal font applies to the PTY grid.
+Font pickers enumerate installed fonts. The prompt family applies only to the chat composer. Independent size selectors control interface/prose, the prompt box, code blocks/diffs, and the terminal grid. Code font applies to code blocks, diffs, and hotkey chips; terminal font applies to the PTY grid.
 
 ### Notifications
 
 Jolt defaults to in-app toasts. Enabling **System notifications** sends app-wide harness updates, Claude/Codex quota warnings, Jolt update notices, and app-wide errors through the OS instead.
 
-## Default shortcuts
+## Default hotkeys
 
-`Mod` means Command on macOS and Control elsewhere.
+`Mod` means Command on macOS and Control elsewhere. Every app command hotkey is listed on the Hotkeys page and can be rebound. Standard text editing and control navigation keys continue to follow platform conventions.
 
 | Action | Default |
 | --- | --- |
 | New session | `Mod+N` |
 | Clear input | `Mod+C` |
-| Archive current session | `Mod+W` |
+| Close current tab | `Mod+W` |
 | Open settings | `Mod+,` |
 | Add space | `Mod+K` |
+| Search sessions | `Mod+Shift+F` |
 | Toggle left sidebar | `Mod+E` |
 | Toggle Changes pane | `Mod+B` |
 | Toggle terminal | ``Mod+` `` |
+| New terminal tab (terminal focused) | `Mod+T` |
+| Close terminal tab (terminal focused) | `Mod+Shift+W` |
+| Select tabs 1–8 | `Mod+1` through `Mod+8` |
+| Select last tab | `Mod+9` |
 
-The shortcuts page records key combinations, detects duplicate assignments, resets one action, or restores defaults. Fixed native macOS menu shortcuts such as `Cmd+Q`, `Cmd+H`, and `Cmd+M` are not part of this customizable map.
+On macOS, the page also includes the native app and window hotkeys:
 
-Session tabs also support `Mod+1` through `Mod+9` for direct selection.
+| Action | Default |
+| --- | --- |
+| Quit Jolt | `Cmd+Q` |
+| Hide Jolt | `Cmd+H` |
+| Hide other applications | `Option+Cmd+H` |
+| Minimize window | `Cmd+M` |
+| Close window | `Cmd+W` |
+
+`Cmd+W` intentionally serves both Close current tab and Close window. In chat mode it closes only the device-local tab; on an empty new-session canvas it does nothing. In Settings it falls through to the native window action. Archive remains an explicit session context-menu action. Developer builds also expose the Performance HUD hotkey (`Mod+Shift+F12`).
+
+The Hotkeys page groups commands into collapsible Session actions, Tab switching, Navigation & layout, App & window, and Developer sections. Tab switching starts collapsed; the other available sections start expanded. The page records key combinations, detects duplicate assignments, resets one action, or restores defaults.
 
 ## User menu
 
@@ -80,7 +97,7 @@ Current-session context and token usage remains in the composer footer rather th
 
 ## Persistence
 
-Desktop viewport settings are stored in `{data_dir}/ui-settings.json`. They include pane sizes, sidebar state, selected space, local tab/space ordering, notification mode, keymap, appearance, fonts, and terminal command.
+Desktop viewport settings are stored in `{data_dir}/ui-settings.json`. They include pane sizes, sidebar state, the space filter, device-local open tab order and active tab, notification mode, keymap, appearance, font families and sizes, and terminal command.
 
 New-session composer defaults are stored separately in `{data_dir}/composer-defaults.json`. Corrupt or missing settings files fall back to defaults; numeric layout values are clamped on load.
 

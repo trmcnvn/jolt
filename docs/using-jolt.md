@@ -4,6 +4,12 @@ Jolt separates where work is displayed from where it runs. A desktop window or i
 
 ## Core concepts
 
+### Local and Account
+
+Desktop Jolt always has a Local scope that never synchronizes. Signing in adds an Account scope for cross-device synchronization, remote control, and iOS. **Switch to Local** changes only the desktop viewport, so Account sessions can keep running and syncing in the background. Local and Account have separate spaces, sessions, tabs, device identities, journals, usage, and uploads; harness credentials and Jolt secrets remain device-local.
+
+Moving non-empty Local data into an account requires explicit approval. After the move, Jolt creates a fresh blank Local scope. Keeping data Local means those sessions are unavailable remotely and on iOS.
+
 ### Devices
 
 A device is one Jolt engine installation with a stable local ID. Its engine owns:
@@ -13,24 +19,24 @@ A device is one Jolt engine installation with a stable local ID. Its engine owns
 - PTYs and working-tree diffs;
 - local transcript snapshots, run journals, and usage records.
 
-Presence indicates recent contact. Jolt also checks the device relay before remote calls, so a stale presence row does not make an offline engine look usable forever.
+Presence indicates recent contact. Jolt also checks the device relay before remote calls, so a stale presence row does not make an offline engine look usable forever. Removing a device cascades through its spaces and sessions without deleting folders or other local files.
 
 ### Spaces
 
-A space is a synced `(device, folder)` pair. Spaces are the top-level unit in the desktop sidebar. A space fixes the host device and base folder for sessions created inside it.
+A space is a synced `(device, folder)` pair. Spaces filter the desktop session list and provide the host device and base folder for new sessions; they are execution context rather than the navigation spine.
 
-The owning engine detects whether the folder is under the selected version-control backend and stamps checkout metadata into the workspace registry. Renaming a space changes only its display name. Deleting one tombstones the space and its chat/session index rows; transcript documents are separate.
+The owning engine detects whether the folder is under the selected version-control backend and stamps checkout metadata into the workspace registry. Renaming a space changes only its display name. Deleting one tombstones the space and its chat/session index rows. Any chat deletion also retires its edge transcript room and asynchronously purges its R2 backup and attachments.
 
 ### Sessions
 
 A session is one durable conversation attached to a space. Its row records the host device, folder, checkout, harness configuration, title, activity, and seen state. The transcript and command queue live in a separate Loro document. After the first completed exchange, an untitled session is named asynchronously with an economy-tier model; a user rename always wins, and Jolt-created worktree branches can be renamed with the generated title.
 
-The desktop shows a global, attention-sorted session list and horizontal tabs within the selected space. Closing a tab archives the session. Archived sessions can be restored from **Settings → Archived sessions**.
+The desktop shows an attention-sorted session list and device-local, cross-space tabs. Closing a tab only closes that local viewport; the synced session keeps running and remains in the sidebar. Archiving is an explicit session-row action, and archived sessions can be restored from **Settings → Archived sessions**.
 
 ## The desktop shell
 
-- **Left sidebar:** spaces, global sessions, add-space action, and user menu.
-- **Session tabs:** open sessions in the selected space; tabs can be reordered locally.
+- **Left sidebar:** searchable space filter, filtered sessions, title search (`Mod+Shift+F`), add-space action, and user menu.
+- **Session tabs:** device-local open sessions across spaces; tabs can be reordered or closed without changing session state.
 - **Conversation:** virtualized transcript with Markdown, code highlighting, grouped tools, input requests, errors, attachments, and a message rail on wide layouts.
 - **Composer:** prompt input, harness/model controls, checkout controls, attachments, context usage, and send/steer/stop state.
 - **Terminal panel:** session-scoped PTY tabs hosted on the session's device.
@@ -40,7 +46,7 @@ Sidebar, Changes, and terminal dimensions are resizable. Panel open state is per
 
 ## Creating a session
 
-The selected space supplies the target device and base folder. Before the first send, Jolt lets you choose:
+A new session defaults to the sidebar's filtered space, then the last active valid space. The canvas space picker can change the target device and base folder before sending. Jolt also lets you choose:
 
 - harness, model, reasoning level, and harness-specific model options;
 - the current checkout;

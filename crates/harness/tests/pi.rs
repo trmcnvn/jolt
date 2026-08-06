@@ -60,6 +60,7 @@ fn controls(answer: &'static str) -> (RunControls, mpsc::Sender<SteerMessage>, C
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        persist_session: true,
         request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
             let (tx, rx) = oneshot::channel();
             let answers = questions
@@ -96,6 +97,25 @@ async fn until_done(
     })
     .await
     .expect("Pi run settled")
+}
+
+#[tokio::test]
+async fn ephemeral_run_disables_session_persistence() {
+    let (mut controls, _steer, _interrupt) = controls("A");
+    controls.persist_session = false;
+    let mut stream = harness()
+        .run(request("scenario:ephemeral"), controls)
+        .await
+        .unwrap();
+    let events = until_done(&mut stream).await;
+
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]
@@ -146,6 +166,7 @@ async fn warm_pi_session_executes_bash_through_its_control_mailbox() {
     let (bash_tx, bash_rx) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        persist_session: true,
         request_input: Box::new(|_| oneshot::channel().1),
         steering: steer_rx,
         bash: bash_rx,

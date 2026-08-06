@@ -550,6 +550,38 @@ fn delete_space_cascades_and_converges() {
 }
 
 #[test]
+fn delete_device_cascades_through_spaces_and_chats() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.upsert_device(&device("dev-a", "laptop")).unwrap();
+    doc.upsert_device(&device("dev-b", "desktop")).unwrap();
+    doc.upsert_space(&space("sp-a", "dev-a", "/tmp/a")).unwrap();
+    doc.upsert_space(&space("sp-b", "dev-b", "/tmp/b")).unwrap();
+    let mut chat_a = chat("chat-a", "dev-a");
+    chat_a.space_id = Some("sp-a".into());
+    let mut chat_b = chat("chat-b", "dev-b");
+    chat_b.space_id = Some("sp-b".into());
+    doc.upsert_chat(&chat_a).unwrap();
+    doc.upsert_chat(&chat_b).unwrap();
+    doc.upsert_session(&session("chat-a", "dev-a", SessionStatus::Working))
+        .unwrap();
+
+    let deleted = doc.delete_device("dev-a").unwrap();
+    assert!(deleted.existed);
+    assert_eq!(deleted.space_ids, vec!["sp-a"]);
+    assert_eq!(deleted.chat_ids, vec!["chat-a"]);
+    assert_eq!(
+        doc.read_devices().unwrap(),
+        vec![device("dev-b", "desktop")]
+    );
+    assert_eq!(
+        doc.read_spaces().unwrap(),
+        vec![space("sp-b", "dev-b", "/tmp/b")]
+    );
+    assert_eq!(doc.read_chats().unwrap(), vec![chat_b]);
+    assert!(doc.read_sessions().unwrap().is_empty());
+}
+
+#[test]
 fn persistence_round_trips_rows_pending_and_cursor() {
     let mut doc = RegistryDoc::new("dev-a");
     doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();

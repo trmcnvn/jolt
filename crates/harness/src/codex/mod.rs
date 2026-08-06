@@ -537,6 +537,7 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
+        persist_session,
         request_input,
         mut steering,
         bash: _,
@@ -566,6 +567,9 @@ async fn run_session(session: Session) {
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
+        if !persist_session {
+            p.insert("ephemeral".into(), Value::Bool(true));
+        }
         if let Some(model) = &request.model {
             p.insert("model".into(), Value::String(model.clone()));
         }

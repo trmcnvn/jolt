@@ -8,7 +8,7 @@
 //! pinned rev (f14fea9bf3c9).
 //!
 //! Wiring: [`init`] registers the global action handlers (run once at boot),
-//! [`bind_keys`] installs the fixed macOS shortcuts (re-run by
+//! [`bind_keys`] installs the customizable macOS menu hotkeys (re-run by
 //! `shell::apply_keymap`, which clears every binding first), and
 //! [`app_menus`] builds the menu bar handed to `cx.set_menus` in `run_app`.
 
@@ -18,6 +18,7 @@ use crate::appearance::{self, AppearanceMode};
 use crate::composer;
 #[cfg(any(debug_assertions, feature = "debug-ui"))]
 use crate::debug::TogglePerformanceHud;
+use crate::settings::{KeymapConfig, ShortcutId, platform_combo};
 
 actions!(
     jolt,
@@ -36,7 +37,7 @@ actions!(
     ]
 );
 
-/// Register the global handlers backing the menu bar and its shortcuts. Call
+/// Register the global handlers backing the menu bar and its hotkeys. Call
 /// once at boot, before `cx.set_menus`.
 pub fn init(cx: &mut App) {
     cx.on_action(quit);
@@ -74,26 +75,34 @@ fn quit(_: &Quit, cx: &mut App) {
     cx.quit();
 }
 
-/// Fixed app-level shortcuts backing the menu key equivalents. These live
-/// outside the customizable keymap; `shell::apply_keymap` calls this after its
-/// `clear_key_bindings` so they survive keymap re-application. macOS only —
-/// on Linux/Windows we keep ctrl-w/ctrl-q free for future in-app use.
-pub fn bind_keys(cx: &mut App) {
+/// Customizable app hotkeys backing native menu key equivalents. macOS only —
+/// on Linux/Windows these menu commands have no app-level accelerator.
+pub fn bind_keys(cx: &mut App, keymap: &KeymapConfig) {
     if !cfg!(target_os = "macos") {
         return;
     }
-    cx.bind_keys(macos_key_bindings());
+    cx.bind_keys(macos_key_bindings(keymap));
 }
 
 /// The binding table behind [`bind_keys`] — `KeyBinding` construction is pure
 /// (no `App`), so unit tests can inspect it directly.
-fn macos_key_bindings() -> Vec<KeyBinding> {
+fn macos_key_bindings(keymap: &KeymapConfig) -> Vec<KeyBinding> {
+    fn binding<A: gpui::Action>(keymap: &KeymapConfig, id: ShortcutId, action: A) -> KeyBinding {
+        let combo = platform_combo(keymap.get(id));
+        let combo = if gpui::Keystroke::parse(&combo).is_ok() {
+            combo
+        } else {
+            platform_combo(id.default_combo())
+        };
+        KeyBinding::new(&combo, action, None)
+    }
+
     vec![
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-h", Hide, None),
-        KeyBinding::new("alt-cmd-h", HideOthers, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
+        binding(keymap, ShortcutId::Quit, Quit),
+        binding(keymap, ShortcutId::Hide, Hide),
+        binding(keymap, ShortcutId::HideOthers, HideOthers),
+        binding(keymap, ShortcutId::Minimize, Minimize),
+        binding(keymap, ShortcutId::CloseWindow, CloseWindow),
     ]
 }
 
@@ -285,10 +294,12 @@ mod tests {
     }
 
     #[test]
-    fn macos_bindings_cover_quit_close_minimize() {
+    fn macos_hotkeys_are_configurable() {
         // `KeyBinding::new` panics on unparseable combos, so constructing the
         // table is itself the parse check.
-        let bindings = macos_key_bindings();
+        let mut keymap = KeymapConfig::default();
+        keymap.set(ShortcutId::Quit, "mod-shift-q".into());
+        let bindings = macos_key_bindings(&keymap);
         let find = |name: &str| {
             bindings
                 .iter()
@@ -302,7 +313,7 @@ mod tests {
                 })
         };
         let combo = |source: &str| vec![Keystroke::parse(source).unwrap()];
-        assert_eq!(find(Quit.name()), Some(combo("cmd-q")));
+        assert_eq!(find(Quit.name()), Some(combo("cmd-shift-q")));
         assert_eq!(find(CloseWindow.name()), Some(combo("cmd-w")));
         assert_eq!(find(Minimize.name()), Some(combo("cmd-m")));
     }

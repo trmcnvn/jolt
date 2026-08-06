@@ -158,6 +158,7 @@ impl ClaudeHarness {
         exe: &PathBuf,
         request: &RunRequest,
         environment: &[(String, String)],
+        persist_session: bool,
     ) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
@@ -205,6 +206,9 @@ impl ClaudeHarness {
         }
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
+        }
+        if !persist_session {
+            cmd.arg("--no-session-persistence");
         }
         let mut settings = serde_json::Map::new();
         if option_is_on(&request.model_options, "fastMode") {
@@ -335,7 +339,7 @@ impl Harness for ClaudeHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let environment = self.environment.resolve(HarnessId::ClaudeCode).await?;
-        let mut cmd = self.build_command(&exe, &request, &environment);
+        let mut cmd = self.build_command(&exe, &request, &environment, controls.persist_session);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -464,7 +468,6 @@ fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str
 /// unreadable, oversized, or unsupported file is skipped — its path ref still
 /// rides the prompt text — never fatal to the run.
 async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
-    use base64::Engine as _;
     let mut blocks = Vec::new();
     for path in paths {
         let bytes = match tokio::fs::read(path).await {
@@ -484,7 +487,7 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
         };
         blocks.push(wire::ImageBlock {
             media_type: media_type.to_string(),
-            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            data: crate::simd_base64::encode(&bytes),
         });
     }
     blocks
@@ -544,6 +547,7 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
+        persist_session: _,
         request_input,
         mut steering,
         bash: _,

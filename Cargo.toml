@@ -86,7 +86,10 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.11"
 notify = "8"
 portable-pty = "0.9"
-libghostty-vt = { version = "0.2", default-features = false }
+# Post-0.2.1 master pins Ghostty ab0b9da, which includes the explicit SIMD
+# printable-run scan from f2a7652 (the optimization described in
+# mitchellh.com/writing/everyone-should-know-simd).
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "72ac98f292879bf9f788fcbb11238c562a1eebe6", default-features = false }
 pulldown-cmark = "0.13"
 unicode-segmentation = "1"
 url = "2"
@@ -101,8 +104,20 @@ lto = "thin"
 strip = "symbols"
 
 [profile.dev]
-# gpui is slow unoptimized; match zed's approach for deps
+# Keep workspace crates quick to compile while optimizing dependencies: gpui is
+# too slow to use unoptimized. Limited debug info and fewer codegen units keep
+# incremental development artifacts manageable without sacrificing useful
+# backtraces or fast rebuilds.
 opt-level = 0
+debug = "limited"
+codegen-units = 16
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Opt in when a debugging session needs full symbols. Keeping this profile
+# non-incremental avoids retaining a second large symbol cache.
+[profile.dbg]
+inherits = "dev"
+debug = "full"
+incremental = false

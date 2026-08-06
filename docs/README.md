@@ -8,7 +8,7 @@ Jolt is a native, multi-device controller for Claude Code, Codex, and Pi. Every 
 - [Using Jolt](using-jolt.md) — spaces, sessions, the composer, terminals, changes, and usage.
 - [Agent harnesses](harnesses.md) — Claude Code, Codex, Pi, model discovery, trust, and harness secrets.
 - [CLI and headless engines](cli.md) — login, daemon management, updates, and sync diagnostics.
-- [Settings](settings.md) — every desktop settings page, shortcuts, notifications, and local persistence.
+- [Settings](settings.md) — every desktop settings page, hotkeys, notifications, and local persistence.
 - [Jolt for iOS](ios.md) — build and use the native mobile viewport.
 
 ## Internals

@@ -40,19 +40,20 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::secrets::SecretsPage;
-use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::shortcuts::{HotkeysEvent, HotkeysPage};
 use crate::settings::terminal::{TerminalPage, TerminalSettingsEvent};
 use crate::settings::vcs::VcsPage;
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, ShortcutId, TERMINAL_DEFAULT_HEIGHT, UiSettings,
-    platform_combo,
+    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, ScopeNavigation, ShortcutId,
+    TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, format_time_ago,
 };
 use crate::terminal::panel::{
-    TerminalPanel, TerminalPanelEvent, ToggleTerminal, clamp_terminal_height,
+    CloseTerminalTab, NewTerminalTab, TerminalPanel, TerminalPanelEvent, ToggleTerminal,
+    clamp_terminal_height,
 };
 use crate::theme::Theme;
 use crate::toast::{Toast, ToastAction, ToastKind};
@@ -61,26 +62,25 @@ use crate::transcript::{self, Transcript};
 mod spaces;
 mod tabs;
 
-use spaces::{AddSpaceFlow, RenameSpaceDialog};
+use spaces::{AddSpaceFlow, RenameSpaceDialog, SessionSearchFlow, SpacesMenu};
 
 actions!(
     shell,
     [
         NewSession,
         ClearInput,
-        ArchiveCurrentSession,
+        CloseCurrentTab,
         OpenSettings,
         ToggleSidebar,
         ToggleChanges,
-        AddSpacePalette
+        AddSpacePalette,
+        SearchSessionsPalette
     ]
 );
 
-const SESSION_SHORTCUT_COUNT: usize = 9;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, gpui::Action)]
 #[action(namespace = shell, no_json, no_register)]
-struct SelectSession(usize);
+struct SelectTab(usize);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout
@@ -125,8 +125,8 @@ pub fn cluster_clearance(is_macos: bool, fullscreen: bool, container_pad: f32) -
 }
 
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
-/// map, then binds the customizable shortcuts from `keymap`. Invalid persisted
-/// combinations fall back to that shortcut's default.
+/// map, then binds every customizable app hotkey from `keymap`. Invalid
+/// persisted combinations fall back to that hotkey's default.
 pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     fn valid_or_default(combo: &str, fallback: &str) -> String {
         let candidate = platform_combo(combo);
@@ -139,10 +139,9 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     }
     cx.clear_key_bindings();
     crate::composer::init(cx);
-    // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
-    // these back the native menu key equivalents and must survive keymap
-    // re-application.
-    crate::app_menus::bind_keys(cx);
+    // App-menu hotkeys back the native menu key equivalents and must survive
+    // keymap re-application.
+    crate::app_menus::bind_keys(cx, keymap);
     cx.bind_keys([
         KeyBinding::new(
             &valid_or_default(&keymap.new_session, ShortcutId::NewSession.default_combo()),
@@ -155,11 +154,8 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             Some("Composer"),
         ),
         KeyBinding::new(
-            &valid_or_default(
-                &keymap.archive_session,
-                ShortcutId::ArchiveSession.default_combo(),
-            ),
-            ArchiveCurrentSession,
+            &valid_or_default(&keymap.close_tab, ShortcutId::CloseTab.default_combo()),
+            CloseCurrentTab,
             None,
         ),
         KeyBinding::new(
@@ -194,33 +190,63 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             ToggleTerminal,
             None,
         ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.new_terminal_tab,
+                ShortcutId::NewTerminalTab.default_combo(),
+            ),
+            NewTerminalTab,
+            Some("Terminal"),
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.close_terminal_tab,
+                ShortcutId::CloseTerminalTab.default_combo(),
+            ),
+            CloseTerminalTab,
+            Some("Terminal"),
+        ),
         // The add-space command center reflects this customizable binding in
-        // its leading shortcut chip; pressing it again dismisses.
+        // its leading hotkey chip; pressing it again dismisses.
         KeyBinding::new(
             &valid_or_default(&keymap.add_space, ShortcutId::AddSpace.default_combo()),
             AddSpacePalette,
             None,
         ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.search_sessions,
+                ShortcutId::SearchSessions.default_combo(),
+            ),
+            SearchSessionsPalette,
+            None,
+        ),
     ]);
-    cx.bind_keys(session_key_bindings());
+    cx.bind_keys(tab_key_bindings(keymap));
     #[cfg(any(debug_assertions, feature = "debug-ui"))]
     cx.bind_keys([KeyBinding::new(
-        &platform_combo("mod-shift-f12"),
+        &valid_or_default(
+            keymap.get(ShortcutId::PerformanceHud),
+            ShortcutId::PerformanceHud.default_combo(),
+        ),
         TogglePerformanceHud,
         None,
     )]);
 }
 
-/// Fixed primary-modifier shortcuts for selecting sessions by their position
-/// in the global sidebar list (Cmd+1…9 on macOS, Ctrl+1…9 elsewhere).
-fn session_key_bindings() -> Vec<KeyBinding> {
-    (0..SESSION_SHORTCUT_COUNT)
-        .map(|index| {
-            KeyBinding::new(
-                &platform_combo(&format!("mod-{}", index + 1)),
-                SelectSession(index),
-                None,
-            )
+/// Customizable hotkeys for selecting open tabs. Cmd-9 targets the last tab.
+fn tab_key_bindings(keymap: &KeymapConfig) -> Vec<KeyBinding> {
+    ShortcutId::TAB_SELECTION
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let combo = platform_combo(keymap.get(id));
+            let combo = if Keystroke::parse(&combo).is_ok() {
+                combo
+            } else {
+                platform_combo(id.default_combo())
+            };
+            KeyBinding::new(&combo, SelectTab(index), None)
         })
         .collect()
 }
@@ -235,7 +261,7 @@ pub enum SettingsSection {
     Terminal,
     Appearance,
     Notifications,
-    Shortcuts,
+    Hotkeys,
     Archived,
 }
 
@@ -248,7 +274,7 @@ impl SettingsSection {
         SettingsSection::Terminal,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
-        SettingsSection::Shortcuts,
+        SettingsSection::Hotkeys,
         SettingsSection::Archived,
     ];
 
@@ -262,7 +288,7 @@ impl SettingsSection {
             SettingsSection::Terminal => "Terminal",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Notifications",
-            SettingsSection::Shortcuts => "Shortcuts",
+            SettingsSection::Hotkeys => "Hotkeys",
             SettingsSection::Archived => "Archived sessions",
         }
     }
@@ -649,13 +675,13 @@ pub struct Shell {
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
-    shortcuts_page: Option<Entity<ShortcutsPage>>,
+    hotkeys_page: Option<Entity<HotkeysPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     secrets_page: Option<Entity<SecretsPage>>,
     vcs_page: Option<Entity<VcsPage>>,
     terminal_page: Option<Entity<TerminalPage>>,
     notifications_sub: Option<Subscription>,
-    shortcuts_sub: Option<Subscription>,
+    hotkeys_sub: Option<Subscription>,
     terminal_settings_sub: Option<Subscription>,
     terminal_panel_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
@@ -672,15 +698,18 @@ pub struct Shell {
     /// The add-space command center (device tabs + folder search), `Some`
     /// while open. Its summon shortcut is configurable.
     add_space: Option<AddSpaceFlow>,
-    /// Last selected chat per space (in-memory, like [`SessionPanels`]) — a
-    /// space switch lands back on the tab you left.
-    space_last_chat: std::collections::HashMap<String, String>,
+    /// Session-title command center, opened from the sidebar or its hotkey.
+    session_search: Option<SessionSearchFlow>,
+    /// Searchable sidebar space filter, local to this viewport.
+    spaces_menu: Option<SpacesMenu>,
+    /// Outside-click dismissal guard for the filter trigger.
+    spaces_menu_dismissed_at: Option<std::time::Instant>,
     /// Session tab currently hovered (close button appears on hover).
     tab_hover: Option<String>,
+    /// Session-tab context menu: (chat id, window position).
+    tab_menu: Option<(String, Point<Pixels>)>,
     /// Session-tab drag-reorder in flight (see `tabs::TabDragState`).
     tab_drag: Option<tabs::TabDragState>,
-    /// Space-row drag-reorder in flight (see `spaces::SpaceDragState`).
-    space_drag: Option<spaces::SpaceDragState>,
     /// Scroll position of the session tab region (drives the edge fades and
     /// the drop-index math under horizontal overflow).
     tabs_scroll: gpui::ScrollHandle,
@@ -691,6 +720,8 @@ pub struct Shell {
     sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
+    /// Last scope whose navigation snapshot is loaded into `settings`.
+    observed_scope: Option<jolt_engine::ScopeKind>,
     /// Highest provider rate-limit warning delivered per account/window. A
     /// reset below the warning threshold allows that window to notify again.
     usage_warning_levels: std::collections::HashMap<String, UsageWarningLevel>,
@@ -765,7 +796,7 @@ pub struct Shell {
     /// focusable child to receive route-level keyboard events.
     settings_focus: FocusHandle,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
-    /// window): keyboard shortcuts dispatch through the window focus chain, so
+    /// window): app hotkeys dispatch through the window focus chain, so
     /// with nothing focused they go dead. Initial focus lands on the composer
     /// and focus lost with no successor routes back to the active screen.
     focus_sub: Option<Subscription>,
@@ -775,6 +806,13 @@ pub struct Shell {
     _account_usage_task: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+}
+
+fn scope_key(scope: jolt_engine::ScopeKind) -> &'static str {
+    match scope {
+        jolt_engine::ScopeKind::Local => "local",
+        jolt_engine::ScopeKind::Account => "account",
+    }
 }
 
 impl Shell {
@@ -853,7 +891,7 @@ impl Shell {
         });
         let data_dir = boot.data_dir.clone();
         let settings = UiSettings::load(&data_dir);
-        // Bind the customizable shortcuts from the persisted keymap.
+        // Bind the customizable hotkeys from the persisted keymap.
         apply_keymap(cx, &settings.keymap);
         // Dev/testing knob: `JOLT_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
@@ -868,7 +906,9 @@ impl Shell {
             Some("settings/terminal") => Route::Settings(SettingsSection::Terminal),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
-            Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
+            Some("settings/hotkeys" | "settings/shortcuts") => {
+                Route::Settings(SettingsSection::Hotkeys)
+            }
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
@@ -913,13 +953,13 @@ impl Shell {
             archived_page: None,
             appearance_page: None,
             notifications_page: None,
-            shortcuts_page: None,
+            hotkeys_page: None,
             accounts_page: None,
             secrets_page: None,
             vcs_page: None,
             terminal_page: None,
             notifications_sub: None,
-            shortcuts_sub: None,
+            hotkeys_sub: None,
             terminal_settings_sub: None,
             terminal_panel_sub: None,
             chat_menu: None,
@@ -930,14 +970,17 @@ impl Shell {
             rename_space_dialog: None,
             delete_space_confirm: None,
             add_space: None,
-            space_last_chat: std::collections::HashMap::new(),
+            session_search: None,
+            spaces_menu: None,
+            spaces_menu_dismissed_at: None,
             tab_hover: None,
+            tab_menu: None,
             tab_drag: None,
-            space_drag: None,
             tabs_scroll: gpui::ScrollHandle::new(),
             tabs_scrolled_to: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
+            observed_scope: None,
             usage_warning_levels: std::collections::HashMap::new(),
             user_menu_open: false,
             user_menu_dismissed_at: None,
@@ -986,7 +1029,78 @@ impl Shell {
 
     // ---- splash ----
 
+    fn sync_scope_navigation(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let Some(scope) = state.read(cx).scope.as_ref().map(|status| status.active) else {
+            return;
+        };
+        if self.observed_scope == Some(scope) {
+            return;
+        }
+
+        let snapshot = ScopeNavigation {
+            last_space_id: self.settings.last_space_id.clone(),
+            open_tabs: self.settings.open_tabs.clone(),
+            active_tab_id: self.settings.active_tab_id.clone(),
+            space_filter: self.settings.space_filter.clone(),
+        };
+        if let Some(previous) = self.observed_scope {
+            self.settings
+                .scope_navigation
+                .insert(scope_key(previous).into(), snapshot);
+        } else if self.settings.scope_navigation.is_empty()
+            && (snapshot.last_space_id.is_some()
+                || snapshot
+                    .open_tabs
+                    .as_ref()
+                    .is_some_and(|tabs| !tabs.is_empty()))
+        {
+            // Existing account-only installs have no scope map. If Account won
+            // splash resolution, assign navigation directly; a Local fallback
+            // preserves it as legacy until that account signs in again.
+            let key = if scope == jolt_engine::ScopeKind::Account {
+                "account"
+            } else {
+                "legacy-account"
+            };
+            self.settings.scope_navigation.insert(key.into(), snapshot);
+        }
+
+        let target = self
+            .settings
+            .scope_navigation
+            .get(scope_key(scope))
+            .cloned()
+            .or_else(|| {
+                (scope == jolt_engine::ScopeKind::Account)
+                    .then(|| {
+                        self.settings
+                            .scope_navigation
+                            .get("legacy-account")
+                            .cloned()
+                    })
+                    .flatten()
+            })
+            .unwrap_or_default();
+        self.settings.last_space_id = target.last_space_id;
+        self.settings.open_tabs = target.open_tabs;
+        self.settings.active_tab_id = target.active_tab_id;
+        self.settings.space_filter = target.space_filter;
+        self.observed_scope = Some(scope);
+        // Scope-bound views own standing RPC streams; recreate them against the
+        // newly routed runtime while leaving both engine runtimes alive.
+        self.terminal = None;
+        self.changes = None;
+        self.devices_page = None;
+        self.archived_page = None;
+        self.add_space = None;
+        self.session_search = None;
+        self.space_boot_applied = false;
+        self.tabs_scrolled_to = None;
+        self.schedule_save(cx);
+    }
+
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        self.sync_scope_navigation(state, cx);
         if !matches!(
             state.read(cx).auth.as_ref(),
             Some(jolt_proto::AuthState::NeedsOrganization { .. })
@@ -1025,24 +1139,22 @@ impl Shell {
                 state.update(cx, |s, cx| s.select_space(Some(last), cx));
             }
         }
-        // Track the per-space last chat + persist the selected space.
+        // Persist the active space for new-session fallback, then reconcile
+        // device-local tabs only after the first registry frames land.
         {
-            let (selected_space, selected_chat, chat_space) = {
-                let s = state.read(cx);
-                let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
-                (
-                    s.selected_space.clone(),
-                    s.selected_chat.clone(),
-                    chat_space,
-                )
-            };
-            if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
-                self.space_last_chat.insert(space, chat);
-            }
+            let selected_space = state.read(cx).selected_space.clone();
             if selected_space != self.settings.last_space_id && selected_space.is_some() {
                 self.settings.last_space_id = selected_space;
                 self.schedule_save(cx);
             }
+        }
+        self.sync_open_tabs(cx);
+        if state.read(cx).spaces_synced
+            && let Some(filter) = self.settings.space_filter.clone()
+            && state.read(cx).space_row(&filter).is_none()
+        {
+            self.settings.space_filter = None;
+            self.schedule_save(cx);
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
         // snap, no tween — the panels belong to the destination chat).
@@ -1435,10 +1547,28 @@ impl Shell {
             // choice.
             let Ok(snapshot) = this.update(cx, |shell, cx| {
                 shell.settings.appearance = crate::appearance::mode(cx);
-                let (ui_font, code_font, terminal_font) = crate::appearance::font_families(cx);
+                let (ui_font, prompt_font, code_font, terminal_font) =
+                    crate::appearance::font_families(cx);
                 shell.settings.ui_font = ui_font.to_string();
+                shell.settings.prompt_font = prompt_font.to_string();
                 shell.settings.code_font = code_font.to_string();
                 shell.settings.terminal_font = terminal_font.to_string();
+                let sizes = crate::appearance::font_sizes(cx);
+                shell.settings.font_size_interface = sizes.interface;
+                shell.settings.font_size_prompt = sizes.prompt;
+                shell.settings.font_size_code = sizes.code;
+                shell.settings.font_size_terminal = sizes.terminal;
+                if let Some(scope) = shell.observed_scope {
+                    shell.settings.scope_navigation.insert(
+                        scope_key(scope).into(),
+                        ScopeNavigation {
+                            last_space_id: shell.settings.last_space_id.clone(),
+                            open_tabs: shell.settings.open_tabs.clone(),
+                            active_tab_id: shell.settings.active_tab_id.clone(),
+                            space_filter: shell.settings.space_filter.clone(),
+                        },
+                    );
+                }
                 shell.settings.clone()
             }) else {
                 return;
@@ -1468,38 +1598,31 @@ impl Shell {
         cx.notify();
     }
 
-    /// Open the unmaterialized new-session tab. This is shared by the tab-strip
-    /// `+` button and the customizable New session shortcut.
+    /// Open the unmaterialized new-session tab. Every entry point shares the
+    /// same target resolver: sidebar filter, last active space, first space.
     fn open_new_session(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(String::new()));
         self.user_menu_open = false;
         self.chat_menu = None;
-        self.state.update(cx, |s, cx| s.select_chat(None, cx));
-        self.sync_changes_watch(cx);
-        cx.notify();
-    }
-
-    /// Leave the new-session canvas for the last session selected in its space.
-    fn restore_last_session(&mut self, cx: &mut Context<Self>) -> bool {
         let target = {
             let state = self.state.read(cx);
-            let Some(space_id) = state.selected_space.as_deref() else {
-                return false;
-            };
-            self.space_last_chat.get(space_id).filter(|chat_id| {
-                state
-                    .visible_chats()
-                    .any(|chat| chat.id == **chat_id && chat.space_id.as_deref() == Some(space_id))
-            })
-        }
-        .cloned();
-        let Some(chat_id) = target else {
-            return false;
+            let valid = |id: &String| state.space_row(id).is_some();
+            self.settings
+                .space_filter
+                .clone()
+                .filter(valid)
+                .or_else(|| self.settings.last_space_id.clone().filter(valid))
+                .or_else(|| state.spaces.first().map(|space| space.id.clone()))
         };
-        self.state
-            .update(cx, |state, cx| state.select_chat(Some(chat_id), cx));
-        true
+        self.state.update(cx, |state, cx| {
+            if target.is_some() {
+                state.select_space(target, cx);
+            }
+            state.select_chat(None, cx);
+        });
+        self.sync_changes_watch(cx);
+        cx.notify();
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -1642,25 +1765,27 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Shortcuts => {
-                if self.shortcuts_page.is_none() {
+            SettingsSection::Hotkeys => {
+                if self.hotkeys_page.is_none() {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
-                    let page = cx.new(|cx| ShortcutsPage::new(state, keymap, cx));
+                    let page = cx.new(|cx| HotkeysPage::new(state, keymap, cx));
                     // Persist + re-apply the keymap whenever the page changes it.
-                    self.shortcuts_sub = Some(cx.subscribe(
+                    self.hotkeys_sub = Some(cx.subscribe(
                         &page,
-                        |this: &mut Shell, _, event: &ShortcutsEvent, cx| {
-                            let ShortcutsEvent::Changed(keymap) = event;
+                        |this: &mut Shell, _, event: &HotkeysEvent, cx| {
+                            let HotkeysEvent::Changed(keymap) = event;
                             this.settings.keymap = keymap.clone();
                             apply_keymap(cx, keymap);
+                            // gpui snapshots menu key equivalents in `set_menus`.
+                            cx.set_menus(crate::app_menus::app_menus());
                             this.schedule_save(cx);
                             cx.notify();
                         },
                     ));
-                    self.shortcuts_page = Some(page);
+                    self.hotkeys_page = Some(page);
                 }
-                match &self.shortcuts_page {
+                match &self.hotkeys_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -1746,6 +1871,7 @@ impl Shell {
 
     fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.chat_menu = None;
+        self.remove_archived_tab(&chat_id, cx);
         self.mutate(
             serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": true }),
             cx,
@@ -1789,6 +1915,68 @@ impl Shell {
             }
         }));
         cx.notify();
+    }
+
+    fn switch_scope(&mut self, scope: jolt_engine::ScopeKind, cx: &mut Context<Self>) {
+        self.user_menu_open = false;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(err) = engine
+                .client()
+                .call(methods::SWITCH_SCOPE, serde_json::json!({ "scope": scope }))
+                .await
+            {
+                tracing::warn!(error = %err, "scope switch failed");
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn resolve_account_link(&mut self, merge: bool, cx: &mut Context<Self>) {
+        if merge {
+            let navigation = ScopeNavigation {
+                last_space_id: self.settings.last_space_id.clone(),
+                open_tabs: self.settings.open_tabs.clone(),
+                active_tab_id: self.settings.active_tab_id.clone(),
+                space_filter: self.settings.space_filter.clone(),
+            };
+            self.settings
+                .scope_navigation
+                .insert("account".into(), navigation);
+            self.settings
+                .scope_navigation
+                .insert("local".into(), ScopeNavigation::default());
+            self.schedule_save(cx);
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.auth_task = Some(cx.spawn(async move |this, cx| {
+            if let Err(err) = engine
+                .client()
+                .call(
+                    methods::RESOLVE_ACCOUNT_LINK,
+                    serde_json::json!({ "merge": merge }),
+                )
+                .await
+            {
+                this.update(cx, |_, cx| {
+                    crate::toast::show(
+                        Toast::new(
+                            "local-account-link-error",
+                            "Couldn’t open the account",
+                            ToastKind::Error,
+                        )
+                        .body(err.to_string()),
+                        cx,
+                    );
+                })
+                .ok();
+            }
+        }));
     }
 
     fn start_sign_in(&mut self, cx: &mut Context<Self>) {
@@ -2137,7 +2325,7 @@ impl Shell {
             SettingsSection::Terminal => icons::TERMINAL,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Notifications => icons::BELL,
-            SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Hotkeys => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
         // Match the user's dragged sidebar width — the pane container clips to
@@ -2310,8 +2498,7 @@ impl Shell {
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
-                let id = select_id.clone();
-                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+                this.open_chat_tab(select_id.clone(), cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -2408,9 +2595,8 @@ impl Shell {
         (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
-    /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
-    /// section (folder + device rows, add-space), the global Active sessions
-    /// list, the notice strip, and the UserMenu (§1.6).
+    /// Chat-mode sidebar: fixed space filter, filtered Sessions list, notices,
+    /// and the user menu.
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let user = self.state.read(cx).auth_user().cloned();
 
@@ -2480,25 +2666,31 @@ impl Shell {
         let glass = theme.is_glass();
         let sidebar_fade = theme.surface;
 
-        let user_line: SharedString = user
-            .as_ref()
-            .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-            .unwrap_or_else(|| SharedString::from("Not signed in"));
-        let user_email: Option<SharedString> = user.as_ref().map(|u| u.email.clone().into());
+        let local_active = self.state.read(cx).active_scope() == jolt_engine::ScopeKind::Local;
+        let user_line: SharedString = if local_active {
+            SharedString::from("Local")
+        } else {
+            user.as_ref()
+                .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
+                .unwrap_or_else(|| SharedString::from("Account"))
+        };
+        let user_email: Option<SharedString> = if local_active {
+            Some(SharedString::from("Stored only on this device"))
+        } else {
+            user.as_ref().map(|u| u.email.clone().into())
+        };
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
-        let spaces_section = self.render_spaces_section(theme, cx);
+        let filter_row = self.render_spaces_filter(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
             .h_full()
             .flex()
             .flex_col()
-            // (No titlebar strip: the unified window titlebar spans the whole
-            // window above this column.)
-            // Spaces + the global Active list share one scroll region. On
-            // glass the whole region paints inside an EdgeFade scope — a true
-            // per-glyph gradient at active overflow edges.
+            // The filter stays outside overflow so its dropdown cannot clip.
+            .child(filter_row)
+            // The filtered Sessions list is the only scrolling sidebar body.
             .child(crate::edge_fade::edge_faded(
                 SIDEBAR_GLASS_FADE_BAND,
                 glass && lists_fade_top,
@@ -2516,16 +2708,36 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
-                            .child(spaces_section)
                             .child(
                                 div()
+                                    .h(px(28.0))
                                     .px(px(Theme::SPACE_SM))
-                                    .pt(px(12.0))
-                                    .pb(px(4.0))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
                                     .text_size(px(11.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from("Sessions")),
+                                    .child(SharedString::from("Sessions"))
+                                    .child(
+                                        div()
+                                            .id("search-sessions")
+                                            .size(px(24.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(6.0))
+                                            .cursor_pointer()
+                                            .hover(|s| {
+                                                s.bg(crate::theme::wash(0.14))
+                                                    .text_color(theme.text)
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.open_session_search(cx)
+                                            }))
+                                            .child(icon(icons::MAGNIFER).size(px(14.0))),
+                                    ),
                             )
                             .child(if !list_items.is_empty() {
                                 div()
@@ -2813,10 +3025,73 @@ impl Shell {
             );
         if open {
             // The menu is exactly as wide as the trigger row: sidebar minus
-            // its gutters. It contains a small muted email line, Settings,
-            // Usage breakdown, Check for update, a separator, and Sign out. Rows
-            // are plain `menuItem`s with muted 16px icons — sign-out carries
-            // no destructive tone.
+            // its gutters. Local and Account share settings/update actions;
+            // only their final scope/auth actions differ.
+            let (active_scope, account_available, scopes_supported) = {
+                let state = self.state.read(cx);
+                (
+                    state.active_scope(),
+                    state.account_available(),
+                    state.scope.is_some(),
+                )
+            };
+            let mut scope_rows: Vec<AnyElement> = match active_scope {
+                jolt_engine::ScopeKind::Account => vec![
+                    popover::menu_row(theme, false, "user-menu-signout")
+                        .id("user-menu-signout")
+                        .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
+                        .child(
+                            icon(icons::LOGOUT_2)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Sign out"))
+                        .into_any_element(),
+                ],
+                jolt_engine::ScopeKind::Local if account_available => vec![
+                    popover::menu_row(theme, false, "user-menu-switch-account")
+                        .id("user-menu-switch-account")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.switch_scope(jolt_engine::ScopeKind::Account, cx)
+                        }))
+                        .child(
+                            icon(icons::GLOBAL)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Switch back to account"))
+                        .into_any_element(),
+                ],
+                jolt_engine::ScopeKind::Local => vec![
+                    popover::menu_row(theme, false, "user-menu-signin")
+                        .id("user-menu-signin")
+                        .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
+                        .child(
+                            icon(icons::GLOBAL)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Sign in"))
+                        .into_any_element(),
+                ],
+            };
+            if active_scope == jolt_engine::ScopeKind::Account && scopes_supported {
+                scope_rows.insert(
+                    0,
+                    popover::menu_row(theme, false, "user-menu-switch-local")
+                        .id("user-menu-switch-local")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.switch_scope(jolt_engine::ScopeKind::Local, cx)
+                        }))
+                        .child(
+                            icon(icons::LAPTOP)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Switch to Local"))
+                        .into_any_element(),
+                );
+            }
             let menu = popover::popover_card(theme)
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2877,17 +3152,7 @@ impl Shell {
                         })),
                 )
                 .child(popover::menu_separator())
-                .child(
-                    popover::menu_row(theme, false, "user-menu-signout")
-                        .id("user-menu-signout")
-                        .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
-                        .child(
-                            icon(icons::LOGOUT_2)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from("Sign out")),
-                )
+                .children(scope_rows)
                 .into_any_element();
             trigger = trigger.child(popover::anchored_menu_above("user-menu-popover", menu));
         }
@@ -3296,6 +3561,54 @@ impl Shell {
             overlays.push(overlay);
         }
 
+        if self
+            .state
+            .read(cx)
+            .scope
+            .as_ref()
+            .is_some_and(|status| status.merge_pending)
+        {
+            let card = popover::dialog_card(&theme)
+                .w(px(480.0))
+                .child(popover::dialog_title(&theme, "Sync your local work?"))
+                .child(div().mt(px(8.0)).child(popover::dialog_body(
+                    &theme,
+                    "Syncing moves your local spaces, sessions, transcripts, and attachments into this account so they’re available on your other devices and iPhone.",
+                )))
+                .child(div().mt(px(8.0)).child(popover::dialog_body(
+                    &theme,
+                    "Repository files, harness and provider credentials, Jolt secrets, full tool inputs, journals, and detailed usage remain on this device.",
+                )))
+                .child(div().mt(px(8.0)).child(popover::dialog_body(
+                    &theme,
+                    "If you keep them Local, these sessions stay only on this device and cannot be viewed or controlled remotely.",
+                )))
+                .child(
+                    div()
+                        .mt(px(18.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Keep Local", "keep-local-data")
+                                .id("keep-local-data")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_account_link(false, cx)
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Sync with account")
+                                .id("sync-local-data")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_account_link(true, cx)
+                                })),
+                        ),
+                )
+                .into_any_element();
+            overlays.push(popover::modal("local-account-link", viewport, card));
+        }
+
         if let Some((chat_id, position)) = self.chat_menu.clone() {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
@@ -3396,8 +3709,14 @@ impl Shell {
             overlays.push(popover::modal("rename-chat-dialog", viewport, card));
         }
 
+        if let Some(menu) = self.render_tab_menu(cx) {
+            overlays.push(menu);
+        }
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
+            overlays.push(overlay);
+        }
+        if let Some(overlay) = self.render_session_search_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
 
@@ -4475,7 +4794,12 @@ impl Render for Shell {
         // window background is the blurred desktop (lib.rs `Blurred`), so the
         // frost paints translucent — the sidebar and card margins read as
         // glass while the opaque card keeps text off it.
-        let (frost, text, font) = (theme.glass(), theme.text, theme.font_sans.clone());
+        let (frost, text, font, interface_font_size) = (
+            theme.glass(),
+            theme.text,
+            theme.font_sans.clone(),
+            theme.font_sizes.interface,
+        );
         let gate = self
             .debug_gate
             .clone()
@@ -4498,7 +4822,7 @@ impl Render for Shell {
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);
 
-        // Keyboard shortcuts (mod-e/b/`) dispatch through the window focus
+        // App hotkeys (mod-e/b/`) dispatch through the window focus
         // chain — with nothing focused they go dead. Land initial focus on the
         // composer, and whenever focus is lost with no successor (e.g. the
         // focused element unmounted), route it back there.
@@ -4530,7 +4854,7 @@ impl Render for Shell {
             .bg(frost)
             .text_color(text)
             .font_family(font)
-            .text_size(px(14.0))
+            .text_size(px(f32::from(interface_font_size)))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
@@ -4541,16 +4865,22 @@ impl Render for Shell {
                     || this.breakdown_dialog.is_some()
                     || this.delete_confirm.is_some()
                     || this.space_menu.is_some()
+                    || this.spaces_menu.is_some()
+                    || this.tab_menu.is_some()
                     || this.rename_space_dialog.is_some()
                     || this.delete_space_confirm.is_some()
-                    || this.add_space.is_some();
+                    || this.add_space.is_some()
+                    || this.session_search.is_some();
                 if event.keystroke.key == "escape"
                     && matches!(this.route, Route::Chat)
                     && this.state.read(cx).selected_chat.is_none()
                     && !shell_overlay_open
-                    && this.restore_last_session(cx)
                 {
-                    cx.stop_propagation();
+                    let had_tabs = !this.open_tab_ids(cx).is_empty();
+                    this.close_current_tab(cx);
+                    if had_tabs {
+                        cx.stop_propagation();
+                    }
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
@@ -4558,7 +4888,7 @@ impl Render for Shell {
                     this.close_settings(cx);
                 }
             }))
-            // Panel shortcuts are chat-scoped chrome and no-op in Settings;
+            // Panel hotkeys are chat-scoped chrome and no-op in Settings;
             // the terminal panel only mounts on session routes. The sidebar
             // toggle stays live everywhere.
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
@@ -4572,19 +4902,17 @@ impl Render for Shell {
                 this.composer
                     .update(cx, |composer, cx| composer.clear_input(cx));
             }))
-            .on_action(cx.listener(|this, _: &ArchiveCurrentSession, _, cx| {
-                if matches!(this.route, Route::Chat)
-                    && let Some(chat_id) = this.state.read(cx).selected_chat.clone()
-                {
-                    this.archive_current_session(chat_id, cx);
+            .on_action(cx.listener(|this, _: &CloseCurrentTab, _, cx| {
+                if matches!(this.route, Route::Chat) {
+                    // On an empty new-session canvas Cmd-W is deliberately a
+                    // no-op; in Settings it propagates to Close Window.
+                    this.close_current_tab(cx);
                 } else {
-                    // Preserve the fixed Cmd+W Close Window binding when there
-                    // is no current session to archive.
                     cx.propagate();
                 }
             }))
-            .on_action(cx.listener(|this, action: &SelectSession, _, cx| {
-                this.select_session_at_list_index(action.0, cx)
+            .on_action(cx.listener(|this, action: &SelectTab, _, cx| {
+                this.select_tab_at_position(action.0, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 this.open_settings(SettingsSection::Devices, cx)
@@ -4600,6 +4928,14 @@ impl Render for Shell {
                     cx.notify();
                 } else {
                     this.open_add_space(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SearchSessionsPalette, _, cx| {
+                if this.session_search.is_some() {
+                    this.session_search = None;
+                    cx.notify();
+                } else {
+                    this.open_session_search(cx);
                 }
             }));
 
@@ -4922,18 +5258,22 @@ mod tests {
 
     #[cfg(any(debug_assertions, feature = "debug-ui"))]
     #[test]
-    fn performance_hud_shortcut_parses_for_the_current_platform() {
-        assert!(Keystroke::parse(&platform_combo("mod-shift-f12")).is_ok());
+    fn performance_hud_hotkey_parses_for_the_current_platform() {
+        let keymap = KeymapConfig::default();
+        assert!(Keystroke::parse(&platform_combo(keymap.get(ShortcutId::PerformanceHud))).is_ok());
     }
 
     #[test]
-    fn number_shortcuts_cover_the_first_nine_sessions() {
-        let bindings = session_key_bindings();
-        assert_eq!(bindings.len(), SESSION_SHORTCUT_COUNT);
+    fn tab_hotkeys_cover_eight_positions_and_last() {
+        let mut keymap = KeymapConfig::default();
+        keymap.set(ShortcutId::SelectTab1, "mod-shift-1".into());
+        let bindings = tab_key_bindings(&keymap);
+        assert_eq!(bindings.len(), ShortcutId::TAB_SELECTION.len());
 
         for (index, binding) in bindings.iter().enumerate() {
-            let expected = Keystroke::parse(&platform_combo(&format!("mod-{}", index + 1)))
-                .expect("number shortcut must parse");
+            let id = ShortcutId::TAB_SELECTION[index];
+            let expected =
+                Keystroke::parse(&platform_combo(keymap.get(id))).expect("tab hotkey must parse");
             let actual = binding
                 .keystrokes()
                 .iter()
@@ -4941,8 +5281,8 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(actual, vec![expected]);
             assert_eq!(
-                binding.action().as_any().downcast_ref::<SelectSession>(),
-                Some(&SelectSession(index))
+                binding.action().as_any().downcast_ref::<SelectTab>(),
+                Some(&SelectTab(index))
             );
         }
     }
@@ -5169,7 +5509,7 @@ mod tests {
     fn nav_settings_sections_are_distinct_entries() {
         let mut nav = NavHistory::new(chat("a"));
         nav.push(NavEntry::Settings(SettingsSection::Devices));
-        nav.push(NavEntry::Settings(SettingsSection::Shortcuts));
+        nav.push(NavEntry::Settings(SettingsSection::Hotkeys));
         assert_eq!(nav.len(), 3, "section changes are navigations");
         assert_eq!(
             nav.back(),

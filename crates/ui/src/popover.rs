@@ -206,6 +206,30 @@ pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElemen
     )
 }
 
+/// Dropdown variant pinned below its trigger rather than covering it.
+pub fn anchored_menu_below(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
+    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+    div()
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .size_0()
+        .child(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(motion::menu_in(
+                        id,
+                        div().occlude().pt(px(6.0)).child(content),
+                    )),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
+        .into_any_element()
+}
+
 /// Open a submenu to the right of its relative menu-row trigger. The gap is
 /// part of the deferred hit region so moving from the row into the submenu
 /// does not expose or activate content underneath it.
@@ -458,14 +482,6 @@ pub fn menu_separator() -> gpui::Div {
         .bg(hairline(0.07))
 }
 
-/// The trailing check on the selected row (jolt `MenuCheck`): 14px,
-/// `text-foreground/70`, pushed to the row end by the caller's flex.
-pub fn menu_check(theme: &Theme) -> impl IntoElement {
-    crate::icons::icon(crate::icons::CHECK)
-        .size(px(14.0))
-        .text_color(theme.text.opacity(0.7))
-}
-
 /// The recessed band tone for a palette/picker header or footer strip — a
 /// translucent black so the glass still reads through (the add-space palette
 /// converged on this; measured subtler tones vanish against the dim scrim).
@@ -479,7 +495,7 @@ pub fn band() -> gpui::Hsla {
 
 /// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
 /// children — the base of [`key_hint`]/[`key_hint_pair`] and the search-bar
-/// shortcut chips (for example, "Cmd+K" and "esc").
+/// hotkey chips (for example, "⌘+K" and "esc").
 pub fn key_cap(_theme: &Theme) -> gpui::Div {
     div()
         .h(px(22.0))

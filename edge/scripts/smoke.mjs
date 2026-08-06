@@ -305,17 +305,17 @@ await new Promise((r) => setTimeout(r, 100));
 {
   const bytes = new TextEncoder().encode(`attachment-${chatId}`);
   const hash = createHash("sha256").update(bytes).digest("hex");
-  const put = await fetch(`${base}/attachments/${hash}?token=${token}`, {
+  const put = await fetch(`${base}/attachments/${chatId}/${hash}?token=${token}`, {
     method: "PUT",
     headers: { "content-type": "image/png" },
     body: bytes
   });
   if (put.status !== 200) fail(`attachment put ${put.status}: ${await put.text()}`);
-  const get = await fetch(`${base}/attachments/${hash}?token=${token}`);
+  const get = await fetch(`${base}/attachments/${chatId}/${hash}?token=${token}`);
   if (get.status !== 200) fail(`attachment get ${get.status}`);
   const round = new Uint8Array(await get.arrayBuffer());
   if (new TextDecoder().decode(round) !== `attachment-${chatId}`) fail("attachment bytes");
-  const bad = await fetch(`${base}/attachments/${"0".repeat(64)}?token=${token}`, {
+  const bad = await fetch(`${base}/attachments/${chatId}/${"0".repeat(64)}?token=${token}`, {
     method: "PUT",
     body: bytes
   });

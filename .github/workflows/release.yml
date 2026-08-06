@@ -42,7 +42,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: package
         run: scripts/package-linux.sh
@@ -64,7 +64,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: build
         run: cargo build --release -p jolt

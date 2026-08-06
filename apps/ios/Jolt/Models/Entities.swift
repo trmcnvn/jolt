@@ -13,6 +13,7 @@ struct DeviceRow: Identifiable, Hashable {
     var platform: String
     var lastSeenAt: Int64?
     var createdAt: Int64?
+    var version: String? = nil
 }
 
 struct Space: Identifiable, Hashable {
@@ -36,6 +37,7 @@ struct ChatConfig: Hashable, Codable {
     var harness: String
     var model: String?
     var reasoning: String?
+    var modelOptions: [String: JSONValue] = [:]
     var sandbox: String?
 }
 
@@ -75,6 +77,7 @@ struct SessionRow: Hashable {
     var chatId: String
     var deviceId: String
     var status: SessionStatus
+    var compacting: Bool = false
     var startedAt: Int64?
     var updatedAt: Int64
 }
@@ -216,6 +219,14 @@ struct FolderListing: Codable {
     }
 }
 
+/// Workspace-relative SearchFiles result. File contents stay on the host.
+struct FileSearchMatch: Codable, Hashable, Identifiable {
+    var path: String
+    var isDir: Bool
+
+    var id: String { "\(isDir ? "dir" : "file"):\(path)" }
+}
+
 /// pickers.rs CheckoutKind — where a new session runs. "Current worktree" is
 /// NOT a third mode: it's `local` when the picked ref is already materialized
 /// as a worktree (the session reuses that checkout's path).
@@ -225,12 +236,29 @@ enum CheckoutKind {
 }
 
 /// jolt-proto RepoRef (entities.rs:193): one selectable ref from ListRefs.
+enum RepoRefKind: String, Codable, Hashable {
+    case branch
+    case bookmark
+    case workingCopy
+}
+
 struct RepoRef: Codable, Hashable, Identifiable {
     var name: String
+    var revision: String? = nil
+    var kind: RepoRefKind = .branch
     var current: Bool = false
     var worktreePath: String?
 
-    var id: String { name }
+    var id: String { revision ?? name }
+    var isJujutsu: Bool { kind != .branch }
+}
+
+struct Worktree: Codable, Hashable {
+    var repoPath: String?
+    var path: String
+    var branch: String
+    var name: String?
+    var checkoutId: String?
 }
 
 // MARK: - Command ledger (commands.rs port)
@@ -244,7 +272,7 @@ struct RunRequest: Codable {
     var prompt: String
     var model: String?
     var reasoning: String?
-    var modelOptions: [String: String] = [:]
+    var modelOptions: [String: JSONValue] = [:]
     var cwd: String
     var sandbox: String = "workspace-write"
     var autoApprove: Bool = true
@@ -256,15 +284,53 @@ struct RunRequest: Codable {
     var attachments: [String] = []
 }
 
+struct ExtractedQuestion: Codable, Hashable {
+    var question: String
+    var context: String?
+}
+
+struct ExtractQuestionsResult: Codable, Hashable {
+    var sourceMessageId: String
+    var questions: [ExtractedQuestion]
+}
+
+struct ShellCommand: Equatable {
+    var command: String
+    var excludeFromContext: Bool
+}
+
+/// A leading `!` includes output in agent context; `!!` keeps it local.
+/// Three or more bangs are ordinary prompt text.
+func parseShellCommand(_ text: String) -> ShellCommand? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("!!!") { return nil }
+    let prefix = trimmed.hasPrefix("!!") ? "!!" : (trimmed.hasPrefix("!") ? "!" : nil)
+    guard let prefix else { return nil }
+    let command = String(trimmed.dropFirst(prefix.count))
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !command.isEmpty else { return nil }
+    return ShellCommand(command: command, excludeFromContext: prefix == "!!")
+}
+
+func hasShellPrefix(_ text: String) -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !trimmed.hasPrefix("!!!") && trimmed.hasPrefix("!")
+}
+
+let broPrompt = "Restate your last message. Stop using jargon and speak coherently. State it more simply and concisely, like one human talking to another."
+
 enum SessionCommandPayload {
     case run(request: RunRequest, messageId: String)
+    case hiddenPrompt(request: RunRequest)
+    case bash(command: String, excludeFromContext: Bool, cwd: String, messageId: String)
     case steer(prompt: String, messageId: String?)
     case interrupt
     case respondInput(requestId: String, answers: [UserInputAnswer])
 
     var kind: String {
         switch self {
-        case .run: return "run"
+        case .run, .hiddenPrompt: return "run"
+        case .bash: return "bash"
         case .steer: return "steer"
         case .interrupt: return "interrupt"
         case .respondInput: return "respondInput"

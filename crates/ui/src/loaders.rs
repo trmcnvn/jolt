@@ -76,7 +76,7 @@ pub fn jolt_loader(
 
 pub use jolt_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 
-/// Display-linked dotted activity orb used while work is in progress.
+/// Display-linked violet activity orb used while work is in progress.
 ///
 /// This is the compact connecting state from `thinking-orbs`: nearby drifting
 /// nodes wire themselves into a constellation carrying a bright packet.
@@ -88,7 +88,7 @@ pub fn activity_orb(
     cx: &mut App,
 ) -> impl IntoElement {
     let _key = key.into();
-    let dark = theme.appearance.is_dark();
+    let orb_color = theme.code_text;
     let time = if cx.reduce_motion() {
         0.6
     } else {
@@ -110,8 +110,7 @@ pub fn activity_orb(
                     bounds.top() + px(size_px * line.y2),
                 ));
                 if let Ok(path) = builder.build() {
-                    let lightness = if dark { 1.0 - line.ink } else { line.ink };
-                    window.paint_path(path, gpui::hsla(0.0, 0.0, lightness, line.opacity));
+                    window.paint_path(path, orb_color.opacity(line.opacity));
                 }
             }
             for dot in &frame.dots {
@@ -123,11 +122,10 @@ pub fn activity_orb(
                     ),
                     gpui::size(px(radius * 2.0), px(radius * 2.0)),
                 );
-                let lightness = if dark { 1.0 - dot.ink } else { dot.ink };
                 window.paint_quad(gpui::quad(
                     dot_bounds,
                     px(radius),
-                    gpui::hsla(0.0, 0.0, lightness, dot.opacity),
+                    orb_color.opacity(dot.opacity * (1.0 - dot.ink)),
                     px(0.0),
                     gpui::transparent_black(),
                     gpui::BorderStyle::default(),

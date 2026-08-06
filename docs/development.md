@@ -6,7 +6,7 @@ Desktop/engine development requires:
 
 - stable Rust with `rustfmt` and Clippy (`rust-toolchain.toml` installs them);
 - platform libraries required by gpui;
-- Zig 0.15.2 for the normal source-build environment;
+- Zig 0.16.0 for the normal source-build environment;
 - Node.js/npm for `edge/`;
 - agent CLIs only when testing their real harness integrations.
 
@@ -28,6 +28,27 @@ Run a headless engine:
 ```
 
 The binary target is named `Jolt`; packaged installers expose it as the lowercase `jolt` command.
+
+Normal development builds use limited debug information and incremental compilation. For a debugging session that needs full symbols, use the isolated, non-incremental `dbg` profile:
+
+```bash
+cargo build --profile dbg -p jolt
+./target/dbg/Jolt
+```
+
+## Build cache
+
+Inspect Rust build artifacts and reclaim rebuildable caches explicitly:
+
+```bash
+scripts/target-cache.sh status
+scripts/target-cache.sh clean-incremental       # dry run
+scripts/target-cache.sh clean-incremental --yes
+scripts/target-cache.sh clean-debug             # dry run of all dev/test artifacts
+scripts/target-cache.sh clean-debug --yes
+```
+
+Cleanup refuses to run while Cargo or rustc is active. It is never automatic. The demo and E2E scripts warn when `target/` exceeds 20 GiB or its incremental cache exceeds 10 GiB; override those thresholds with `JOLT_TARGET_WARN_GIB` and `JOLT_INCREMENTAL_WARN_GIB`.
 
 ## Offline demo
 

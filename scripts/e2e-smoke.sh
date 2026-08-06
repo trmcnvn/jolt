@@ -85,6 +85,7 @@ fi
 # ── 2. Build the binaries (workspace target is warm in CI/dev) ─────────────────
 echo "build: jolt + e2e_driver"
 (cd "$ROOT" && cargo build -q -p jolt -p jolt-rpc --example e2e_driver)
+"$ROOT/scripts/target-cache.sh" warn || true
 JOLT="$ROOT/target/debug/Jolt"
 DRIVER="$ROOT/target/debug/examples/e2e_driver"
 

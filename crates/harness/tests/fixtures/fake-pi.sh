@@ -121,6 +121,13 @@ while IFS= read -r line; do
           emit '{"type":"agent_end","messages":[]}'
           emit '{"type":"agent_settled"}'
           ;;
+        *scenario:ephemeral*)
+          has "$all_args" '--no-session' || { fail "$line" prompt 'missing --no-session'; continue; }
+          respond "$line" prompt '{}'
+          emit '{"type":"agent_start"}'
+          emit '{"type":"agent_end","messages":[]}'
+          emit '{"type":"agent_settled"}'
+          ;;
         *scenario:args*)
           for wanted in '--session-id resume-123' '--approve' '--tools read,grep,find,ls'; do
             has "$all_args" "$wanted" || { fail "$line" prompt "missing arg: $wanted"; continue 2; }

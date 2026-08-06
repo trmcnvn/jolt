@@ -27,9 +27,9 @@
  *   GET  /device/:deviceId/sidecar/:name
  *   POST /device/:deviceId/sidecar/:name
  *   GET  /device/:deviceId/status
- *   PUT  /attachments/:sha256         — content-addressed upload
- *   GET  /attachments/:sha256
- *   HEAD /attachments/:sha256
+ *   PUT  /attachments/:chatId/:sha256 — chat-scoped upload
+ *   GET  /attachments/:chatId/:sha256
+ *   HEAD /attachments/:chatId/:sha256
  */
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
@@ -327,15 +327,26 @@ export default {
       }
     }
 
-    // ── R2 attachments (§1.2): content-addressed, per-user prefix ──────────
-    if (parts[0] === "attachments" && parts[1] && SHA256_RE.test(parts[1])) {
-      const key = `att/${auth.userId}/${parts[1]}`;
+    // ── R2 attachments (§1.2): content-addressed within one chat. The chat
+    // prefix makes every blob owned by the registry row whose deletion purges
+    // it; cross-chat dedupe is deliberately traded for unambiguous cleanup.
+    if (
+      parts[0] === "attachments" &&
+      parts.length === 3 &&
+      parts[1] &&
+      ID_RE.test(parts[1]) &&
+      parts[2] &&
+      SHA256_RE.test(parts[2])
+    ) {
+      const chatId = parts[1];
+      const hash = parts[2];
+      const key = `att/${auth.userId}/${chatId}/${hash}`;
       if (request.method === "PUT") {
         const body = await request.arrayBuffer();
         if (body.byteLength > MAX_ATTACHMENT_BYTES) return json({ error: "too_large" }, 413);
         const digest = await crypto.subtle.digest("SHA-256", body);
         const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-        if (hex !== parts[1]) return json({ error: "hash_mismatch" }, 400);
+        if (hex !== hash) return json({ error: "hash_mismatch" }, 400);
         await env.BLOBS.put(key, body, {
           httpMetadata: {
             contentType: request.headers.get("content-type") ?? "application/octet-stream"

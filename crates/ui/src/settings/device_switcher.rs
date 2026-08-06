@@ -178,7 +178,6 @@ impl Render for DeviceSwitcher {
                                     .child(SharedString::from("You")),
                             )
                         })
-                        .when(active, |element| element.child(popover::menu_check(&theme)))
                         .child(div().size(px(6.0)).rounded_full().flex_none().bg(if local {
                             theme.success
                         } else {

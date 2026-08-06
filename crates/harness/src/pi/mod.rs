@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::Engine as _;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
@@ -503,6 +502,7 @@ async fn run_session(session: Session) {
         kill_grace,
     } = session;
     let RunControls {
+        persist_session,
         request_input,
         mut steering,
         mut bash,
@@ -540,6 +540,9 @@ async fn run_session(session: Session) {
     };
 
     let mut owned_args = Vec::<String>::new();
+    if !persist_session {
+        owned_args.push("--no-session".into());
+    }
     if let Some(resume) = &request.resume {
         owned_args.extend(["--session-id".into(), resume.clone()]);
     }
@@ -1491,7 +1494,7 @@ async fn load_images(paths: &[String]) -> Vec<Value> {
             continue;
         };
         images.push(json!({
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "data": crate::simd_base64::encode(&bytes),
             "mimeType": mime_type,
         }));
     }

@@ -14,7 +14,7 @@
 //! typed API mirrors the old `WorkspaceDoc` surface so `WorkspaceHost` is a
 //! drop-in swap.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use jolt_proto::{Chat, ChatConfig, Device, Session, Space};
 
 use crate::schema::DocError;
-use crate::workspace::{DeletedSpace, WorkspaceState};
+use crate::workspace::{DeletedDevice, DeletedSpace, WorkspaceState};
 
 /// Row kinds — the four sidebar tables.
 pub const KIND_DEVICES: &str = "devices";
@@ -670,6 +670,46 @@ impl RegistryDoc {
             fields([("name", json!(name))]),
         );
         Ok(true)
+    }
+
+    /// Delete a device and every space/chat/session row beneath it in one
+    /// registry batch. Sessions always belong to spaces, so the space ids are
+    /// the complete ownership boundary.
+    pub fn delete_device(&mut self, device_id: &str) -> Result<DeletedDevice, DocError> {
+        let existed = self.row_exists(KIND_DEVICES, device_id);
+        let space_ids: Vec<String> = self
+            .read_spaces()?
+            .into_iter()
+            .filter(|space| space.device_id == device_id)
+            .map(|space| space.id)
+            .collect();
+        let owned_spaces: HashSet<&str> = space_ids.iter().map(String::as_str).collect();
+        let chat_ids: Vec<String> = self
+            .read_chats()?
+            .into_iter()
+            .filter(|chat| {
+                chat.space_id
+                    .as_deref()
+                    .is_some_and(|space_id| owned_spaces.contains(space_id))
+            })
+            .map(|chat| chat.id)
+            .collect();
+        let mut keys: Vec<(&str, &str)> =
+            Vec::with_capacity(chat_ids.len() * 2 + space_ids.len() + 1);
+        for chat_id in &chat_ids {
+            keys.push((KIND_CHATS, chat_id));
+            keys.push((KIND_SESSIONS, chat_id));
+        }
+        for space_id in &space_ids {
+            keys.push((KIND_SPACES, space_id));
+        }
+        keys.push((KIND_DEVICES, device_id));
+        self.delete_row_ops(&keys);
+        Ok(DeletedDevice {
+            existed,
+            space_ids,
+            chat_ids,
+        })
     }
 
     /// Stamp `lastSeenAt` on an existing device row (boot/shutdown only —

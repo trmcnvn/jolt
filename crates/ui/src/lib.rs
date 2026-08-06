@@ -31,6 +31,7 @@ pub mod popover;
 pub mod rail;
 pub mod settings;
 pub mod shell;
+mod simd_base64;
 pub mod state;
 pub mod terminal;
 pub mod theme;
@@ -149,13 +150,14 @@ pub fn run_app(config: UiConfig) {
         appearance::init(
             ui_settings.appearance,
             &ui_settings.ui_font,
+            &ui_settings.prompt_font,
             &ui_settings.code_font,
             &ui_settings.terminal_font,
+            ui_settings.font_sizes(),
             data_dir,
             cx,
         );
         composer::init(cx);
-        terminal::panel::init(cx);
         app_menus::init(cx);
 
         let state = cx.new(|_| state::AppState::new());

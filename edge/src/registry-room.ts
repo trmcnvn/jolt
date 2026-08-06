@@ -31,6 +31,8 @@ const TOMBSTONE_RETAIN_MS = 30 * DAY_MS;
 const MAX_BATCH_OPS = 500;
 /** Serialized inbound frame budget. */
 const MAX_FRAME_BYTES = 1_000_000;
+const ARTIFACT_PURGE_BATCH = 20;
+const ARTIFACT_PURGE_RETRY_MS = 60_000;
 
 interface SocketState {
   userId: string;
@@ -45,6 +47,13 @@ interface PushOutcome {
   ok: number;
   rejected: number;
   lastOkAt: number;
+}
+
+interface ArtifactPurgeRow {
+  chat_id: string;
+  user_id: string;
+  attempts: number;
+  sweeps: number;
 }
 
 export class RegistryRoom implements DurableObject {
@@ -62,6 +71,9 @@ export class RegistryRoom implements DurableObject {
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS rows_seq ON rows (seq)");
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    );
+    ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS artifact_purges (chat_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, attempts INTEGER NOT NULL, sweeps INTEGER NOT NULL, next_attempt_at INTEGER NOT NULL)"
     );
     // Same protocol-level keepalive as SessionRoom — and the same caveat: a
     // pong is runtime-answered and proves nothing about this DO's health.
@@ -170,11 +182,15 @@ export class RegistryRoom implements DurableObject {
       const tombstones = [
         ...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM rows WHERE deleted = 1")
       ][0]?.n as number;
+      const pendingArtifactPurges = [
+        ...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM artifact_purges")
+      ][0]?.n as number;
       return json({
         seq: this.seq(),
         gcFloor: this.gcFloor(),
         rowCount,
         tombstones,
+        pendingArtifactPurges,
         connectedSockets: this.ctx.getWebSockets().length,
         // The ONLY per-device attribution surface — kept from the 2026-08-05
         // incident tooling (SessionRoom's /stats pushOutcomes).
@@ -319,9 +335,12 @@ export class RegistryRoom implements DurableObject {
       touched.set(key, row);
     }
     if (applied > 0) {
-      for (const row of touched.values()) this.saveRow(row);
+      const changedRows = [...touched.values()];
+      const deletedChats = changedRows.filter((row) => row.kind === "chats" && row.deleted);
+      for (const row of changedRows) this.saveRow(row);
+      for (const row of deletedChats) this.enqueueArtifactPurge(row.id, state.userId);
       this.setMeta("seq", String(nextSeq));
-      this.markBackupDirty();
+      this.markBackupDirty(changedRows.some((row) => row.deleted));
     }
     this.recordPush(state.device, true);
     const seq = applied > 0 ? nextSeq : this.seq();
@@ -367,46 +386,149 @@ export class RegistryRoom implements DurableObject {
     this.setMeta("pushOutcomes", JSON.stringify(outcomes));
   }
 
-  private markBackupDirty(): void {
-    this.setMeta("backupDirty", "1");
+  private scheduleAlarm(at: number): void {
     void this.ctx.storage.getAlarm().then((existing) => {
-      if (existing === null) void this.ctx.storage.setAlarm(Date.now() + DAY_MS);
+      if (existing === null || existing > at) void this.ctx.storage.setAlarm(at);
     });
   }
 
-  /** Daily alarm: tombstone GC + nightly R2 backup of the full table. */
-  async alarm(): Promise<void> {
-    if (this.getMeta("backupDirty") !== "1") return; // idle: stop the chain
+  private markBackupDirty(immediate = false): void {
+    this.setMeta("backupDirty", "1");
+    this.scheduleAlarm(Date.now() + (immediate ? 100 : DAY_MS));
+  }
 
-    // 1. Tombstone GC. Raising gcFloor to the purged rows' max seq forces a
-    //    full resync for any cursor that might have missed a purged delete.
-    const horizon = Date.now() - TOMBSTONE_RETAIN_MS;
-    const horizonHlc = `${String(horizon).padStart(13, "0")}-`;
-    let purgedMaxSeq = 0;
+  private enqueueArtifactPurge(chatId: string, userId: string): void {
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO artifact_purges (chat_id, user_id, attempts, sweeps, next_attempt_at) VALUES (?, ?, 0, 0, ?) ON CONFLICT(chat_id) DO NOTHING",
+      chatId,
+      userId,
+      now
+    );
+    this.scheduleAlarm(now + 100);
+  }
+
+  private async retireSession(chatId: string, userId: string): Promise<void> {
+    const room = this.env.SESSION_ROOMS.get(
+      this.env.SESSION_ROOMS.idFromName(`s2/${chatId}`)
+    );
+    const request = new Request(
+      `https://session-room/retire?chatId=${encodeURIComponent(chatId)}`,
+      {
+        method: "POST",
+        headers: { [AUTH_USER_HEADER]: userId }
+      }
+    );
+    const response = await room.fetch(request);
+    if (!response.ok) throw new Error(`session retire failed (${response.status})`);
+  }
+
+  private async deleteAttachmentPrefix(chatId: string, userId: string): Promise<void> {
+    const prefix = `att/${userId}/${chatId}/`;
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.BLOBS.list({ prefix, cursor, limit: 1000 });
+      const keys = page.objects.map((object) => object.key);
+      if (keys.length > 0) await this.env.BLOBS.delete(keys);
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor !== undefined);
+  }
+
+  private async processArtifactPurges(): Promise<void> {
+    const now = Date.now();
+    const rows: ArtifactPurgeRow[] = [];
     for (const raw of this.ctx.storage.sql.exec(
-      "SELECT seq FROM rows WHERE deleted = 1 AND del_hlc < ?",
-      horizonHlc
+      "SELECT chat_id, user_id, attempts, sweeps FROM artifact_purges WHERE next_attempt_at <= ? ORDER BY next_attempt_at LIMIT ?",
+      now,
+      ARTIFACT_PURGE_BATCH
     )) {
-      purgedMaxSeq = Math.max(purgedMaxSeq, raw.seq as number);
+      if (
+        typeof raw.chat_id === "string" &&
+        typeof raw.user_id === "string" &&
+        typeof raw.attempts === "number" &&
+        typeof raw.sweeps === "number"
+      ) {
+        rows.push({
+          chat_id: raw.chat_id,
+          user_id: raw.user_id,
+          attempts: raw.attempts,
+          sweeps: raw.sweeps
+        });
+      }
     }
-    if (purgedMaxSeq > 0) {
-      this.ctx.storage.sql.exec("DELETE FROM rows WHERE deleted = 1 AND del_hlc < ?", horizonHlc);
-      this.setMeta("gcFloor", String(Math.max(this.gcFloor(), purgedMaxSeq)));
-      this.setMeta("lastGcAt", String(Date.now()));
+    for (const row of rows) {
+      try {
+        await this.retireSession(row.chat_id, row.user_id);
+        await this.deleteAttachmentPrefix(row.chat_id, row.user_id);
+        if (row.sweeps === 0) {
+          // UploadCommit mirrors asynchronously after committing the host-local
+          // file. A second sweep outlives any already-in-flight R2 PUT.
+          this.ctx.storage.sql.exec(
+            "UPDATE artifact_purges SET sweeps = 1, attempts = 0, next_attempt_at = ? WHERE chat_id = ?",
+            Date.now() + ARTIFACT_PURGE_RETRY_MS,
+            row.chat_id
+          );
+        } else {
+          this.ctx.storage.sql.exec("DELETE FROM artifact_purges WHERE chat_id = ?", row.chat_id);
+        }
+      } catch (error) {
+        const attempts = row.attempts + 1;
+        const delay = Math.min(DAY_MS, ARTIFACT_PURGE_RETRY_MS * 2 ** Math.min(attempts, 8));
+        this.ctx.storage.sql.exec(
+          "UPDATE artifact_purges SET attempts = ?, next_attempt_at = ? WHERE chat_id = ?",
+          attempts,
+          Date.now() + delay,
+          row.chat_id
+        );
+        console.error("chat artifact purge failed", `chat=${row.chat_id}`, String(error));
+      }
+    }
+  }
+
+  private scheduleNextArtifactPurge(): void {
+    const row = [
+      ...this.ctx.storage.sql.exec("SELECT MIN(next_attempt_at) AS at FROM artifact_purges")
+    ][0];
+    if (typeof row?.at === "number") this.scheduleAlarm(row.at);
+  }
+
+  /** Alarm: queued artifact purges, tombstone GC, and registry R2 backup. */
+  async alarm(): Promise<void> {
+    await this.processArtifactPurges();
+
+    if (this.getMeta("backupDirty") === "1") {
+      // Tombstone GC. Raising gcFloor to the purged rows' max seq forces a
+      // full resync for any cursor that might have missed a purged delete.
+      const horizon = Date.now() - TOMBSTONE_RETAIN_MS;
+      const horizonHlc = `${String(horizon).padStart(13, "0")}-`;
+      let purgedMaxSeq = 0;
+      for (const raw of this.ctx.storage.sql.exec(
+        "SELECT seq FROM rows WHERE deleted = 1 AND del_hlc < ?",
+        horizonHlc
+      )) {
+        purgedMaxSeq = Math.max(purgedMaxSeq, raw.seq as number);
+      }
+      if (purgedMaxSeq > 0) {
+        this.ctx.storage.sql.exec("DELETE FROM rows WHERE deleted = 1 AND del_hlc < ?", horizonHlc);
+        this.setMeta("gcFloor", String(Math.max(this.gcFloor(), purgedMaxSeq)));
+        this.setMeta("lastGcAt", String(Date.now()));
+      }
+
+      // Monotonic latest-state backup. Destructive batches schedule this
+      // immediately so deleted row fields do not linger until the next day.
+      const seq = this.seq();
+      if (seq > Number(this.getMeta("backupSeq") ?? "0")) {
+        const rows = this.rowsSince(0);
+        await this.env.BLOBS.put(
+          `backup/registry/${this.ctx.id.toString()}/latest.json`,
+          JSON.stringify({ seq, at: Date.now(), rows })
+        );
+        this.setMeta("backupSeq", String(seq));
+      }
+      this.setMeta("backupDirty", "0");
     }
 
-    // 2. Nightly R2 backup — monotonic by seq, so a wiped-and-reseeding room
-    //    can never replace the last good copy with a hollow one.
-    const seq = this.seq();
-    if (seq > Number(this.getMeta("backupSeq") ?? "0")) {
-      const rows = this.rowsSince(0);
-      await this.env.BLOBS.put(
-        `backup/registry/${this.ctx.id.toString()}/latest.json`,
-        JSON.stringify({ seq, at: Date.now(), rows })
-      );
-      this.setMeta("backupSeq", String(seq));
-    }
-    this.setMeta("backupDirty", "0");
+    this.scheduleNextArtifactPurge();
   }
 }
 

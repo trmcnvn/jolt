@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
@@ -64,6 +65,35 @@ pub enum SteerOutcome {
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 
+const CONTINUE_AFTER_COMPACTION_PROMPT: &str = "Compaction has just completed, but the session stopped before work resumed. Resume the existing task rather than waiting for another user prompt.\n\nBefore continuing:\n\n1. Reconstruct the original goal, user constraints, decisions made, files changed, commands and tests run, unresolved issues, and intended next action from the compacted conversation.\n2. Reconcile that context with the current repository state. Treat the worktree as authoritative for file state and the conversation as authoritative for user intent.\n3. Briefly state the context you recovered.\n4. Immediately perform the next unfinished step. Do not stop after the recap or ask the user to repeat context unless it is genuinely unavailable or ambiguous.";
+
+#[derive(Default)]
+struct CompactionFollowUp {
+    armed: AtomicBool,
+}
+
+impl CompactionFollowUp {
+    fn observe_agent_event(&self, event: &AgentEvent) {
+        match event {
+            AgentEvent::CompactionFinished => self.armed.store(true, Ordering::SeqCst),
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::AssistantMessageCompleted { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::Steered { .. } => self.cancel_for_user_message(),
+            _ => {}
+        }
+    }
+
+    fn cancel_for_user_message(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
+
+    fn take_on_shutdown(&self) -> bool {
+        self.armed.swap(false, Ordering::SeqCst)
+    }
+}
+
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped, so resume is only injected for runs launched
 /// from the same cwd.
@@ -85,6 +115,7 @@ struct RunHandle {
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+    compaction_follow_up: Arc<CompactionFollowUp>,
 }
 
 struct Inner {
@@ -313,10 +344,18 @@ impl SessionsEngine {
         if let Some(context) = &context {
             request.prompt = format!("{context}\n\n{turn_prompt}");
         }
-        let routed = lock(&self.inner.runs)
-            .get(chat_id)
-            .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()));
-        if let Some((run_id, steerable, steer_tx)) = routed {
+        let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
+            (
+                h.run_id.clone(),
+                h.steerable,
+                h.steer_tx.clone(),
+                h.compaction_follow_up.clone(),
+            )
+        });
+        if let Some((run_id, steerable, steer_tx, compaction_follow_up)) = routed {
+            if write_user_entry {
+                compaction_follow_up.cancel_for_user_message();
+            }
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
@@ -368,6 +407,7 @@ impl SessionsEngine {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        let compaction_follow_up = Arc::new(CompactionFollowUp::default());
 
         // Input bridge: the harness asks questions; we mint the request id, park the
         // resolver for `respond_input`, and surface the event through the run pipeline.
@@ -387,6 +427,7 @@ impl SessionsEngine {
         };
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
+            persist_session: true,
             request_input,
             steering: steer_rx,
             bash: bash_rx,
@@ -404,6 +445,7 @@ impl SessionsEngine {
                 cancel: cancel_tx,
                 engine_tx,
                 pending_inputs,
+                compaction_follow_up: compaction_follow_up.clone(),
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -432,6 +474,7 @@ impl SessionsEngine {
             controls,
             engine_rx,
             cancel_rx,
+            compaction_follow_up,
             RunResumeState {
                 user_message_id: user_id,
                 resume_injected,
@@ -518,10 +561,11 @@ impl SessionsEngine {
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
-            .map(|h| h.steer_tx.clone());
-        let Some(steer_tx) = target else {
+            .map(|h| (h.steer_tx.clone(), h.compaction_follow_up.clone()));
+        let Some((steer_tx, compaction_follow_up)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
+        compaction_follow_up.cancel_for_user_message();
         let harness_prompt = context
             .map(|context| format!("{context}\n\n{prompt}"))
             .unwrap_or_else(|| prompt.to_string());
@@ -1175,6 +1219,7 @@ async fn drive_run(
     controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
+    compaction_follow_up: Arc<CompactionFollowUp>,
     resume_state: RunResumeState,
 ) {
     let device_id = inner.device_id.clone();
@@ -1340,6 +1385,7 @@ async fn drive_run(
         if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
             continue;
         }
+        compaction_follow_up.observe_agent_event(&event);
 
         // Failed-resume fallback: an engine-injected `--resume` naming a session
         // the harness no longer knows dies before ever starting (claude exits
@@ -1517,6 +1563,29 @@ async fn drive_run(
                 // budget: only consecutive crash-revive-crash cycles spend it.
                 inner.journal.clear_resume_attempts(&chat_id);
             }
+            let continue_after_compaction =
+                compaction_follow_up.take_on_shutdown() && *status == DoneStatus::Completed;
+            if continue_after_compaction {
+                let steer_tx = lock(&inner.runs)
+                    .get(&chat_id)
+                    .filter(|handle| handle.run_id == run_id)
+                    .map(|handle| handle.steer_tx.clone());
+                match steer_tx {
+                    Some(steer_tx)
+                        if steer_tx
+                            .try_send(SteerMessage {
+                                prompt: CONTINUE_AFTER_COMPACTION_PROMPT.into(),
+                                message_id: None,
+                            })
+                            .is_ok() =>
+                    {
+                        tracing::info!(chat = %chat_id, "queued continuation after compaction shutdown");
+                    }
+                    _ => {
+                        tracing::warn!(chat = %chat_id, "could not queue continuation after compaction shutdown");
+                    }
+                }
+            }
             // Exchange completed on an untitled chat → name it (fire-and-forget;
             // interrupted/errored turns never trigger naming).
             if *status == DoneStatus::Completed
@@ -1554,4 +1623,30 @@ async fn drive_run(
 
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_follow_up_survives_only_until_user_or_agent_activity() {
+        let follow_up = CompactionFollowUp::default();
+
+        follow_up.observe_agent_event(&AgentEvent::CompactionStarted);
+        assert!(!follow_up.take_on_shutdown());
+        follow_up.observe_agent_event(&AgentEvent::CompactionFinished);
+        assert!(follow_up.take_on_shutdown());
+        assert!(!follow_up.take_on_shutdown());
+
+        follow_up.observe_agent_event(&AgentEvent::CompactionFinished);
+        follow_up.observe_agent_event(&AgentEvent::TextDelta {
+            text: "Continuing normally".into(),
+        });
+        assert!(!follow_up.take_on_shutdown());
+
+        follow_up.observe_agent_event(&AgentEvent::CompactionFinished);
+        follow_up.cancel_for_user_message();
+        assert!(!follow_up.take_on_shutdown());
+    }
 }

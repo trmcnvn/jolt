@@ -2,11 +2,10 @@
 
 import SwiftUI
 
-/// Dotted connecting web: drifting nodes wire themselves into a constellation.
+/// Violet connecting web: drifting nodes wire themselves into a constellation.
 struct ActivityOrb: View {
     var size: CGFloat = 16
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.colorScheme) private var colorScheme
 
     private struct Node {
         let x: Double
@@ -53,10 +52,9 @@ struct ActivityOrb: View {
                         x: dimensions.width * line.end.x,
                         y: dimensions.height * line.end.y
                     ))
-                    let white = colorScheme == .dark ? 1 - line.ink : line.ink
                     context.stroke(
                         path,
-                        with: .color(Color(.sRGB, white: white, opacity: line.opacity)),
+                        with: .color(Theme.inlineCodeText.opacity(line.opacity)),
                         lineWidth: line.width
                     )
                 }
@@ -68,10 +66,11 @@ struct ActivityOrb: View {
                         width: radius * 2,
                         height: radius * 2
                     )
-                    let white = colorScheme == .dark ? 1 - dot.ink : dot.ink
                     context.fill(
                         Path(ellipseIn: rect),
-                        with: .color(Color(.sRGB, white: white, opacity: dot.opacity))
+                        with: .color(
+                            Theme.inlineCodeText.opacity(dot.opacity * (1 - dot.ink))
+                        )
                     )
                 }
             }

@@ -222,6 +222,20 @@ export class SessionRoom implements DurableObject {
     // member may read/write, so the owner gates below are bypassed.
     const workspace = request.headers.get(ROOM_KIND_HEADER) === "workspace";
 
+    if (url.pathname === "/retire" && request.method === "POST" && !workspace) {
+      const owner = this.getMeta("owner");
+      if (owner && owner !== userId) return json({ error: "forbidden" }, 403);
+      if (!owner) this.setMeta("owner", userId);
+      const chatId = url.searchParams.get("chatId") ?? this.getMeta("chatId") ?? "";
+      if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
+      await this.retire(chatId);
+      return json({ ok: true });
+    }
+
+    if (!workspace && this.getMeta("retired") === "1") {
+      return json({ error: "retired" }, 410);
+    }
+
     if (url.pathname === "/ws") {
       const chatId = url.searchParams.get("chatId") ?? "";
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
@@ -402,6 +416,10 @@ export class SessionRoom implements DurableObject {
   // ── WebSocket protocol ────────────────────────────────────────────────────
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    if (this.getMeta("retired") === "1") {
+      ws.close(4411, "session retired");
+      return;
+    }
     if (typeof message === "string") return; // ping/pong handled by auto-response
     let decoded: ProtocolMessage;
     try {
@@ -1043,7 +1061,7 @@ export class SessionRoom implements DurableObject {
   // ── durability: flush, compaction, backups ───────────────────────────────
 
   private scheduleFlush(): void {
-    if (this.flushTimer) return;
+    if (this.getMeta("retired") === "1" || this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
       this.flush().catch((e) => {
@@ -1054,6 +1072,11 @@ export class SessionRoom implements DurableObject {
   }
 
   private async flush(): Promise<void> {
+    if (this.getMeta("retired") === "1") {
+      this.pending = [];
+      this.pendingBytes = 0;
+      return;
+    }
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
@@ -1190,6 +1213,12 @@ export class SessionRoom implements DurableObject {
 
   /** Daily alarm: frontier checkpoint, history trim, R2 backup. */
   async alarm(): Promise<void> {
+    if (this.getMeta("retired") === "1") {
+      const chatId = this.getMeta("chatId");
+      if (chatId) await this.env.BLOBS.delete(`backup/${chatId}/latest.loro`);
+      this.setMeta("backupDirty", "0");
+      return;
+    }
     await this.flush();
     if (this.getMeta("backupDirty") !== "1") return; // idle: stop the chain
     const doc = await this.ensureDoc();
@@ -1254,16 +1283,45 @@ export class SessionRoom implements DurableObject {
           vv.free();
         }
         await this.env.BLOBS.put(`backup/${chatId}/latest.loro`, snapshot);
-        this.setMeta("backupVV", vvB64);
-        this.setMeta("backupDirty", "0");
+        if (this.getMeta("retired") === "1") {
+          await this.env.BLOBS.delete(`backup/${chatId}/latest.loro`);
+        } else {
+          this.setMeta("backupVV", vvB64);
+          this.setMeta("backupDirty", "0");
+        }
       }
     }
     // Re-arm only while there is a reason to wake again; markActivity re-arms
     // on the next write otherwise.
   }
 
+  /** Permanently stop a deleted chat from syncing or recreating its backup. */
+  private async retire(chatId: string): Promise<void> {
+    this.setMeta("retired", "1");
+    this.setMeta("backupDirty", "0");
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+    if (this.docIdleTimer) clearTimeout(this.docIdleTimer);
+    this.docIdleTimer = undefined;
+    this.pending = [];
+    this.pendingBytes = 0;
+    await this.ctx.storage.deleteAlarm();
+    if (chatId) await this.env.BLOBS.delete(`backup/${chatId}/latest.loro`);
+    if (this.doc && isLive(this.doc)) this.doc.free();
+    this.doc = undefined;
+    this.eph = undefined;
+    for (const socket of this.ctx.getWebSockets()) {
+      try {
+        socket.close(4411, "session retired");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
   /** Arm the daily alarm if none is scheduled (called on every write). */
   private markActivity(): void {
+    if (this.getMeta("retired") === "1") return;
     void this.ctx.storage.getAlarm().then((existing) => {
       if (existing === null) void this.ctx.storage.setAlarm(Date.now() + DAY_MS);
     });

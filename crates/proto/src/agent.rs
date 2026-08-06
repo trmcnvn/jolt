@@ -138,6 +138,12 @@ pub enum ToolCall {
     },
     ReadFile {
         path: String,
+        /// Optional 1-based starting line requested by the harness.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
+        /// Optional maximum number of lines requested by the harness.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
     },
     WriteFile {
         path: String,
@@ -337,6 +343,20 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+
+        let old_read =
+            r#"{"type":"toolCall","id":"r1","call":{"kind":"readFile","path":"src/lib.rs"}}"#;
+        assert_eq!(
+            serde_json::from_str::<AgentEvent>(old_read).unwrap(),
+            AgentEvent::ToolCall {
+                id: "r1".into(),
+                call: ToolCall::ReadFile {
+                    path: "src/lib.rs".into(),
+                    offset: None,
+                    limit: None,
+                },
+            }
+        );
     }
 
     #[test]

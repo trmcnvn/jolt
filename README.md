@@ -1,8 +1,8 @@
 # Jolt
 
-Control your coding agents (Claude Code, Codex, Pi) from any of your devices.
+Control your coding agents (Claude Code, Codex, Pi) locally without an account, or sign in to use them from any of your devices.
 
-Every device runs a small engine that keeps your sessions in sync: start an
+The desktop always provides a Local scope that never syncs. When signed in, every device runs a small account engine that keeps your sessions in sync: start an
 agent on one machine, follow and drive it from another. Install the engine as
 a daemon on an always-on machine (a VPS, a spare box) and your agents keep
 working after you close your laptop.
@@ -45,7 +45,7 @@ harness processes. Secrets are device-local and are never synced.
 
 ## Building from source
 
-Building Jolt requires stable Rust and Zig 0.15.2:
+Building Jolt requires stable Rust and Zig 0.16.0:
 
 ```bash
 cargo build -p jolt

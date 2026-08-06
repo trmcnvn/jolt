@@ -11,6 +11,10 @@ fn string(value: &Value, key: &str) -> String {
         .to_owned()
 }
 
+fn positive_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64).filter(|n| *n > 0)
+}
+
 pub(crate) fn tool_start(event: &Value) -> Option<AgentEvent> {
     let id = string(event, "toolCallId");
     let name = string(event, "toolName");
@@ -23,7 +27,11 @@ pub(crate) fn tool_start(event: &Value) -> Option<AgentEvent> {
         "bash" => ToolCall::Exec {
             command: string(&args, "command"),
         },
-        "read" => ToolCall::ReadFile { path: path() },
+        "read" => ToolCall::ReadFile {
+            path: path(),
+            offset: positive_u64(&args, "offset"),
+            limit: positive_u64(&args, "limit"),
+        },
         "write" => ToolCall::WriteFile {
             path: path(),
             content: None,
@@ -177,6 +185,20 @@ mod tests {
                 id: "b1".into(),
                 call: ToolCall::Exec {
                     command: "cargo test".into()
+                }
+            })
+        );
+        assert_eq!(
+            tool_start(&json!({
+                "toolCallId": "r1", "toolName": "read",
+                "args": {"path": "src/lib.rs", "offset": 101, "limit": 50}
+            })),
+            Some(AgentEvent::ToolCall {
+                id: "r1".into(),
+                call: ToolCall::ReadFile {
+                    path: "src/lib.rs".into(),
+                    offset: Some(101),
+                    limit: Some(50)
                 }
             })
         );

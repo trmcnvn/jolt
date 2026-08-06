@@ -406,13 +406,13 @@ impl gpui::Element for TerminalElement {
         let mono = font(theme.font_terminal.clone());
         // Font probe: measure the actual advance of the resolved mono font so
         // cols/rows track real glyph metrics, not a guessed aspect ratio.
-        let font_size = px(TERM_FONT_SIZE);
+        let font_size = px(f32::from(theme.font_sizes.terminal));
         let font_id = window.text_system().resolve_font(&mono);
         let cell_w = window
             .text_system()
             .em_advance(font_id, font_size)
-            .unwrap_or(px(TERM_FONT_SIZE * 0.6));
-        let line_h = px(TERM_LINE_HEIGHT);
+            .unwrap_or(font_size * 0.6);
+        let line_h = px(theme.font_sizes.terminal_line_height());
 
         let inner_w = f32::from(bounds.size.width) - 2.0 * TERM_PADDING;
         let inner_h = f32::from(bounds.size.height) - 2.0 * TERM_PADDING;
@@ -535,7 +535,7 @@ impl gpui::Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let line_h = px(TERM_LINE_HEIGHT);
+        let line_h = px(Theme::of(cx).font_sizes.terminal_line_height());
         let origin = point(
             bounds.left() + px(TERM_PADDING),
             bounds.top() + px(TERM_PADDING),

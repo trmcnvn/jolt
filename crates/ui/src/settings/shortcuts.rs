@@ -1,14 +1,19 @@
-//! Settings → Shortcuts: a table of the rebindable
-//! bindings — click a combo to record (Esc cancels), live conflict detection,
-//! per-row Reset and Restore defaults. Changes emit [`ShortcutsEvent::Changed`];
-//! the shell persists them and re-applies the app keymap.
+//! Settings → Hotkeys: every customizable app command binding. Click a combo
+//! to record (Esc cancels), with live conflict detection, per-row Reset, and
+//! Restore defaults. Hotkeys are grouped into collapsible categories; session
+//! switching starts collapsed. Changes emit [`HotkeysEvent::Changed`]; the
+//! shell persists them and re-applies the app keymap.
+
+use std::collections::HashSet;
 
 use gpui::{
     Context, Entity, EventEmitter, FocusHandle, KeyDownEvent, SharedString, Window, div,
     prelude::*, px,
 };
 
-use crate::settings::{KeymapConfig, ShortcutId, combo_from_keystroke, display_combo};
+use crate::settings::{
+    KeymapConfig, ShortcutId, combo_from_keystroke, display_combo, hotkeys_can_overlap,
+};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -34,38 +39,142 @@ pub fn record_key(key: &str, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> R
 }
 
 #[derive(Debug, Clone)]
-pub enum ShortcutsEvent {
+pub enum HotkeysEvent {
     /// The keymap changed — persist + re-apply.
     Changed(KeymapConfig),
 }
 
-pub struct ShortcutsPage {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HotkeyCategory {
+    SessionActions,
+    TabSwitching,
+    NavigationLayout,
+    AppWindow,
+    Developer,
+}
+
+impl HotkeyCategory {
+    const ALL: [Self; 5] = [
+        Self::SessionActions,
+        Self::TabSwitching,
+        Self::NavigationLayout,
+        Self::AppWindow,
+        Self::Developer,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SessionActions => "Session actions",
+            Self::TabSwitching => "Tab switching",
+            Self::NavigationLayout => "Navigation & layout",
+            Self::AppWindow => "App & window",
+            Self::Developer => "Developer",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::SessionActions => 0,
+            Self::TabSwitching => 1,
+            Self::NavigationLayout => 2,
+            Self::AppWindow => 3,
+            Self::Developer => 4,
+        }
+    }
+
+    fn for_hotkey(id: ShortcutId) -> Self {
+        match id {
+            ShortcutId::NewSession | ShortcutId::ClearInput | ShortcutId::CloseTab => {
+                Self::SessionActions
+            }
+            ShortcutId::SelectTab1
+            | ShortcutId::SelectTab2
+            | ShortcutId::SelectTab3
+            | ShortcutId::SelectTab4
+            | ShortcutId::SelectTab5
+            | ShortcutId::SelectTab6
+            | ShortcutId::SelectTab7
+            | ShortcutId::SelectTab8
+            | ShortcutId::SelectLastTab => Self::TabSwitching,
+            ShortcutId::OpenSettings
+            | ShortcutId::AddSpace
+            | ShortcutId::SearchSessions
+            | ShortcutId::ToggleSidebar
+            | ShortcutId::ToggleChanges
+            | ShortcutId::ToggleTerminal
+            | ShortcutId::NewTerminalTab
+            | ShortcutId::CloseTerminalTab => Self::NavigationLayout,
+            ShortcutId::Quit
+            | ShortcutId::Hide
+            | ShortcutId::HideOthers
+            | ShortcutId::Minimize
+            | ShortcutId::CloseWindow => Self::AppWindow,
+            ShortcutId::PerformanceHud => Self::Developer,
+        }
+    }
+}
+
+fn default_collapsed_categories() -> HashSet<HotkeyCategory> {
+    HashSet::from([HotkeyCategory::TabSwitching])
+}
+
+pub struct HotkeysPage {
     /// Working copy (kept in sync with the shell via `Changed` events).
     keymap: KeymapConfig,
     recording: Option<ShortcutId>,
     /// A rejected record attempt ("{Combo} is already assigned to {label}.") —
     /// conflicts never persist; they're refused at record time, as in jolt.
     conflict_notice: Option<SharedString>,
+    collapsed_categories: HashSet<HotkeyCategory>,
     focus: FocusHandle,
     // The page never talks RPC; state is retained for future per-device keymaps.
     _state: Entity<AppState>,
 }
 
-impl EventEmitter<ShortcutsEvent> for ShortcutsPage {}
+impl EventEmitter<HotkeysEvent> for HotkeysPage {}
 
-impl ShortcutsPage {
+impl HotkeysPage {
     pub fn new(state: Entity<AppState>, keymap: KeymapConfig, cx: &mut Context<Self>) -> Self {
         Self {
             keymap,
             recording: None,
             conflict_notice: None,
+            collapsed_categories: default_collapsed_categories(),
             focus: cx.focus_handle(),
             _state: state,
         }
     }
 
     fn commit(&mut self, cx: &mut Context<Self>) {
-        cx.emit(ShortcutsEvent::Changed(self.keymap.clone()));
+        cx.emit(HotkeysEvent::Changed(self.keymap.clone()));
+        cx.notify();
+    }
+
+    fn set_hotkey(&mut self, id: ShortcutId, combo: String, cx: &mut Context<Self>) {
+        if let Some(owner) = conflict_owner(&self.keymap, id, &combo) {
+            self.conflict_notice = Some(
+                format!(
+                    "{} is already assigned to {}.",
+                    display_combo(&combo),
+                    owner.label()
+                )
+                .into(),
+            );
+            self.recording = None;
+            cx.notify();
+        } else {
+            self.keymap.set(id, combo);
+            self.recording = None;
+            self.conflict_notice = None;
+            self.commit(cx);
+        }
+    }
+
+    fn toggle_category(&mut self, category: HotkeyCategory, cx: &mut Context<Self>) {
+        if !self.collapsed_categories.insert(category) {
+            self.collapsed_categories.remove(&category);
+        }
+        self.recording = None;
         cx.notify();
     }
 
@@ -86,155 +195,216 @@ impl ShortcutsPage {
                 cx.notify();
             }
             RecordOutcome::Ignored => {}
-            RecordOutcome::Set(combo) => {
-                // Refuse a combination already bound elsewhere and name its owner.
-                if let Some(owner) = conflict_owner(&self.keymap, recording, &combo) {
-                    self.conflict_notice = Some(
-                        format!(
-                            "{} is already assigned to {}.",
-                            display_combo(&combo),
-                            owner.label()
-                        )
-                        .into(),
-                    );
-                    self.recording = None;
-                    cx.notify();
-                } else {
-                    self.keymap.set(recording, combo);
-                    self.recording = None;
-                    self.conflict_notice = None;
-                    self.commit(cx);
-                }
-            }
+            RecordOutcome::Set(combo) => self.set_hotkey(recording, combo, cx),
         }
         cx.stop_propagation();
     }
 }
 
-/// The shortcut (other than `id`) already bound to `combo`, if any. Pure.
+/// The hotkey (other than `id`) already bound to `combo`, if any. Pure.
 pub fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Option<ShortcutId> {
-    ShortcutId::ALL
+    ShortcutId::all()
         .into_iter()
-        .find(|&other| other != id && keymap.get(other) == combo)
+        .find(|&other| other != id && !hotkeys_can_overlap(id, other) && keymap.get(other) == combo)
 }
 
-/// One-line purpose copy per shortcut.
+/// One-line purpose copy per hotkey.
 fn description(id: ShortcutId) -> &'static str {
     match id {
         ShortcutId::NewSession => "Open the new session page.",
         ShortcutId::ClearInput => "Clear the current composer input.",
-        ShortcutId::ArchiveSession => "Archive the current session and select its neighbor.",
+        ShortcutId::CloseTab => "Close the current local tab without archiving its session.",
         ShortcutId::OpenSettings => "Open the settings page.",
         ShortcutId::AddSpace => "Open the folder browser to add a space.",
+        ShortcutId::SearchSessions => "Find a session by title.",
         ShortcutId::ToggleSidebar => "Show or hide sessions and settings navigation.",
         ShortcutId::ToggleChanges => "Show or hide changes for the current session.",
         ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
+        ShortcutId::NewTerminalTab => "Open another tab in the focused terminal pane.",
+        ShortcutId::CloseTerminalTab => "Close the active tab in the focused terminal pane.",
+        ShortcutId::SelectTab1
+        | ShortcutId::SelectTab2
+        | ShortcutId::SelectTab3
+        | ShortcutId::SelectTab4
+        | ShortcutId::SelectTab5
+        | ShortcutId::SelectTab6
+        | ShortcutId::SelectTab7
+        | ShortcutId::SelectTab8
+        | ShortcutId::SelectLastTab => "Select this open tab; Mod+9 always selects the last tab.",
+        ShortcutId::Quit => "Quit Jolt.",
+        ShortcutId::Hide => "Hide Jolt.",
+        ShortcutId::HideOthers => "Hide every application except Jolt.",
+        ShortcutId::Minimize => "Minimize the current window.",
+        ShortcutId::CloseWindow => "Close the current window while Settings is open.",
+        ShortcutId::PerformanceHud => "Show or hide developer performance metrics.",
     }
 }
 
-impl Render for ShortcutsPage {
+impl Render for HotkeysPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let recording = self.recording;
-        let customized = self.keymap != KeymapConfig::default();
+        let defaults = KeymapConfig::default();
+        let customized = ShortcutId::all()
+            .into_iter()
+            .any(|id| self.keymap.get(id) != defaults.get(id));
 
-        let rows = ShortcutId::ALL.into_iter().enumerate().map(|(ix, id)| {
-            let combo = self.keymap.get(id).to_string();
-            let is_recording = recording == Some(id);
-            let non_default = combo != id.default_combo();
-            let chip_text: SharedString = if is_recording {
-                "Press keys…".into()
+        let hotkeys = ShortcutId::all();
+        let mut categories = Vec::new();
+        for category in HotkeyCategory::ALL {
+            let category_hotkeys = hotkeys
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, id)| HotkeyCategory::for_hotkey(*id) == category)
+                .collect::<Vec<_>>();
+            if category_hotkeys.is_empty() {
+                continue;
+            }
+
+            let count = category_hotkeys.len();
+            let collapsed = self.collapsed_categories.contains(&category);
+            let chevron = if collapsed {
+                crate::icons::ALT_ARROW_RIGHT
             } else {
-                display_combo(&combo).into()
+                crate::icons::ALT_ARROW_DOWN
             };
-            // Shortcut row: minimum 72px high, label and description left,
-            // Reset only when modified, then the combination
-            // chip — recording inverts it to white-on-black.
-            div()
-                .min_h(px(72.0))
+            let rows = category_hotkeys
+                .into_iter()
+                .map(|(ix, id)| {
+                    let combo = self.keymap.get(id).to_string();
+                    let is_recording = recording == Some(id);
+                    let non_default = combo != id.default_combo();
+                    let chip_text: SharedString = if is_recording {
+                        "Press keys…".into()
+                    } else {
+                        display_combo(&combo).into()
+                    };
+                    // Hotkey row: minimum 72px high, label and description
+                    // left, optional Reset, then the combination chip.
+                    div()
+                        .min_h(px(72.0))
+                        .px(px(20.0))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(20.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(SharedString::from(id.label())),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(2.0))
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(description(id))),
+                                ),
+                        )
+                        .when(non_default && !is_recording, |el| {
+                            el.child(
+                                div()
+                                    .id(("hotkey-reset", ix))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(theme.text))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_hotkey(id, id.default_combo().to_string(), cx);
+                                    }))
+                                    .child(SharedString::from("Reset")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(("hotkey-combo", ix))
+                                .min_w(px(96.0))
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .rounded(px(8.0))
+                                .border_1()
+                                .flex()
+                                .justify_center()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(12.0))
+                                .cursor_pointer()
+                                .map(|el| {
+                                    if is_recording {
+                                        el.border_color(theme.text.opacity(0.3))
+                                            .bg(theme.text)
+                                            .text_color(theme.on_solid)
+                                    } else {
+                                        el.border_color(theme.border)
+                                            .bg(theme.bg)
+                                            .text_color(theme.text)
+                                            .hover(|s| {
+                                                s.border_color(theme.text.opacity(0.2))
+                                                    .bg(crate::theme::ink(0.03))
+                                            })
+                                    }
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.recording = Some(id);
+                                    this.conflict_notice = None;
+                                    window.focus(&this.focus, cx);
+                                    cx.notify();
+                                }))
+                                .child(chip_text),
+                        )
+                })
+                .collect::<Vec<_>>();
+
+            let header = div()
+                .id(("hotkey-category", category.index()))
+                .h(px(48.0))
                 .px(px(20.0))
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(20.0))
-                .when(ix > 0, |el| el.border_t_1().border_color(theme.border))
+                .gap(px(10.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(crate::theme::ink(0.02)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_category(category, cx);
+                }))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text)
-                                .child(SharedString::from(id.label())),
-                        )
-                        .child(
-                            div()
-                                .mt(px(2.0))
-                                .text_size(px(12.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from(description(id))),
-                        ),
+                    crate::icons::icon(chevron)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
                 )
-                .when(non_default && !is_recording, |el| {
-                    el.child(
-                        div()
-                            .id(("shortcut-reset", ix))
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.7))
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(theme.text))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.keymap.reset(id);
-                                this.recording = None;
-                                this.commit(cx);
-                            }))
-                            .child(SharedString::from("Reset")),
-                    )
-                })
                 .child(
                     div()
-                        .id(("shortcut-combo", ix))
-                        .min_w(px(96.0))
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .rounded(px(8.0))
-                        .border_1()
-                        .flex()
-                        .justify_center()
-                        .font_family(theme.font_mono.clone())
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(SharedString::from(category.label())),
+                )
+                .child(
+                    div()
                         .text_size(px(12.0))
-                        .cursor_pointer()
-                        .map(|el| {
-                            if is_recording {
-                                el.border_color(theme.text.opacity(0.3))
-                                    .bg(theme.text)
-                                    .text_color(theme.on_solid)
-                            } else {
-                                el.border_color(theme.border)
-                                    .bg(theme.bg)
-                                    .text_color(theme.text)
-                                    .hover(|s| {
-                                        // `hover:border-foreground/20` — the
-                                        // neutral foreground, not pure white.
-                                        s.border_color(theme.text.opacity(0.2))
-                                            .bg(crate::theme::ink(0.03))
-                                    })
-                            }
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.recording = Some(id);
-                            this.conflict_notice = None;
-                            window.focus(&this.focus, cx);
-                            cx.notify();
-                        }))
-                        .child(chip_text),
-                )
-        });
+                        .text_color(theme.text_muted.opacity(0.65))
+                        .child(SharedString::from(count.to_string())),
+                );
+
+            categories.push(
+                widgets::section_card(&theme)
+                    .mt(px(0.0))
+                    .child(header)
+                    .when(!collapsed, |card| card.children(rows)),
+            );
+        }
 
         // The helper line stays muted even for a rejected conflict because the
         // message names the specific clash.
@@ -243,11 +413,11 @@ impl Render for ShortcutsPage {
         } else if let Some(notice) = self.conflict_notice.clone() {
             notice
         } else {
-            "Shortcuts must be unique.".into()
+            "Hotkeys must be unique.".into()
         };
 
         div()
-            .id("shortcuts-page")
+            .id("hotkeys-page")
             .size_full()
             .overflow_y_scroll()
             .track_focus(&self.focus)
@@ -267,11 +437,11 @@ impl Render for ShortcutsPage {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(widgets::page_header(&theme, "Keyboard shortcuts", None))
+                                    .child(widgets::page_header(&theme, "Hotkeys", None))
                                     .child(
                                         widgets::page_subtitle(
                                             &theme,
-                                            "Click a binding, then press the key combination you \
+                                            "Click a hotkey, then press the key combination you \
                                              want to use. Changes apply immediately and stay on \
                                              this device.",
                                         )
@@ -284,7 +454,7 @@ impl Render for ShortcutsPage {
                                 // customized or while recording.
                                 let disabled = !customized || recording.is_some();
                                 widgets::ghost_action(&theme)
-                                    .id("shortcuts-restore-defaults")
+                                    .id("hotkeys-restore-defaults")
                                     .flex_none()
                                     .when(disabled, |el| el.opacity(0.35))
                                     .when(!disabled, |el| {
@@ -308,7 +478,14 @@ impl Render for ShortcutsPage {
                                     .child(SharedString::from("Restore defaults"))
                             }),
                     )
-                    .child(widgets::section_card(&theme).mt(px(32.0)).children(rows))
+                    .child(
+                        div()
+                            .mt(px(32.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(16.0))
+                            .children(categories),
+                    )
                     .child(
                         div()
                             .mt(px(12.0))
@@ -325,6 +502,41 @@ impl Render for ShortcutsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn categories_cover_every_hotkey() {
+        for id in ShortcutId::all() {
+            let _ = HotkeyCategory::for_hotkey(id);
+        }
+        assert_eq!(
+            HotkeyCategory::for_hotkey(ShortcutId::NewSession),
+            HotkeyCategory::SessionActions
+        );
+        assert_eq!(
+            HotkeyCategory::for_hotkey(ShortcutId::SelectLastTab),
+            HotkeyCategory::TabSwitching
+        );
+        assert_eq!(
+            HotkeyCategory::for_hotkey(ShortcutId::ToggleTerminal),
+            HotkeyCategory::NavigationLayout
+        );
+        assert_eq!(
+            HotkeyCategory::for_hotkey(ShortcutId::SearchSessions),
+            HotkeyCategory::NavigationLayout
+        );
+        assert_eq!(
+            HotkeyCategory::for_hotkey(ShortcutId::CloseWindow),
+            HotkeyCategory::AppWindow
+        );
+        assert_eq!(
+            HotkeyCategory::for_hotkey(ShortcutId::PerformanceHud),
+            HotkeyCategory::Developer
+        );
+        assert_eq!(
+            default_collapsed_categories(),
+            HashSet::from([HotkeyCategory::TabSwitching])
+        );
+    }
 
     #[test]
     fn recording_outcomes() {
@@ -384,6 +596,16 @@ mod tests {
         assert_eq!(
             conflict_owner(&keymap, ShortcutId::ToggleSidebar, "mod-,"),
             Some(ShortcutId::OpenSettings)
+        );
+        // Close Tab and Close Window deliberately share Cmd+W. Chat mode
+        // consumes it; Settings propagates to the native window action.
+        assert_eq!(
+            conflict_owner(
+                &keymap,
+                ShortcutId::CloseTab,
+                keymap.get(ShortcutId::CloseWindow)
+            ),
+            None
         );
     }
 }

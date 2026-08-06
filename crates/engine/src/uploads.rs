@@ -8,9 +8,9 @@
 //! composer appends to the prompt so the agent can read the file from disk.
 //!
 //! On commit the assembled bytes are also mirrored to the edge, best-effort:
-//! `PUT {edge}/attachments/{sha256}` (bearer auth, content-addressed R2 —
+//! `PUT {edge}/attachments/{chatId}/{sha256}` (bearer auth, chat-scoped R2 —
 //! `edge/src/index.ts`). A device that doesn't hold the file locally can fall
-//! back to `GET {edge}/attachments/{sha256}` with the same bearer; native keeps
+//! back to `GET {edge}/attachments/{chatId}/{sha256}` with the same bearer; native keeps
 //! reads local-first (`read_chunk` proxies through the owning device), so the
 //! GET fallback is the disaster path, not the hot path.
 //!
@@ -22,8 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -115,7 +113,15 @@ impl Uploads {
 
     /// Assemble the staged chunks into a durable file and return its absolute
     /// path. Also mirrors the bytes to the edge (content-addressed), best-effort.
-    pub fn commit(&self, upload_id: &str, file_name: &str) -> Result<String, EngineError> {
+    pub fn commit(
+        &self,
+        upload_id: &str,
+        file_name: &str,
+        chat_id: &str,
+    ) -> Result<String, EngineError> {
+        if !valid_chat_id(chat_id) {
+            return Err(EngineError::Other("Invalid chat id".into()));
+        }
         let dir = self.staging_dir(upload_id)?;
         let mut parts = chunk_files(&dir)?;
         if parts.is_empty() {
@@ -131,8 +137,7 @@ impl Uploads {
             }
             joined.push_str(std::fs::read_to_string(path)?.trim());
         }
-        let bytes = BASE64
-            .decode(joined.as_bytes())
+        let bytes = crate::simd_base64::decode(joined.as_bytes())
             .map_err(|e| EngineError::Other(format!("upload is not valid base64: {e}")))?;
         if bytes.len() as u64 > MAX_BYTES {
             let _ = std::fs::remove_dir_all(&dir);
@@ -144,7 +149,7 @@ impl Uploads {
         let path = self.inner.dir.join(format!("{id8}-{name}"));
         std::fs::write(&path, &bytes)?;
         let _ = std::fs::remove_dir_all(&dir);
-        self.mirror_to_edge(&path, bytes);
+        self.mirror_to_edge(&path, chat_id, bytes);
         Ok(path.to_string_lossy().to_string())
     }
 
@@ -177,7 +182,7 @@ impl Uploads {
         Ok(AttachmentChunk {
             name: file.name,
             mime_type: file.mime_type,
-            data: BASE64.encode(&buf),
+            data: crate::simd_base64::encode(&buf),
             next_offset,
             done: next_offset >= size,
         })
@@ -253,9 +258,9 @@ impl Uploads {
         })
     }
 
-    /// Best-effort content-addressed mirror (`PUT /attachments/{sha256}`, bearer
-    /// auth). Failures only log — local commit already succeeded.
-    fn mirror_to_edge(&self, path: &Path, bytes: Vec<u8>) {
+    /// Best-effort chat-scoped mirror (`PUT /attachments/{chatId}/{sha256}`,
+    /// bearer auth). Failures only log — local commit already succeeded.
+    fn mirror_to_edge(&self, path: &Path, chat_id: &str, bytes: Vec<u8>) {
         let Some(edge) = self.inner.edge.clone() else {
             return;
         };
@@ -263,7 +268,10 @@ impl Uploads {
         let mime = mime_by_ext(path)
             .unwrap_or("application/octet-stream")
             .to_string();
-        let url = format!("{}/attachments/{sha}", edge.url.trim_end_matches('/'));
+        let url = format!(
+            "{}/attachments/{chat_id}/{sha}",
+            edge.url.trim_end_matches('/')
+        );
         let http = self.inner.http.clone();
         tokio::spawn(async move {
             // Fresh bearer per request — never the boot-time snapshot.
@@ -298,6 +306,14 @@ struct InspectedFile {
     name: String,
     mime_type: String,
     size: u64,
+}
+
+fn valid_chat_id(chat_id: &str) -> bool {
+    !chat_id.is_empty()
+        && chat_id.len() <= 64
+        && chat_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn chunk_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, EngineError> {

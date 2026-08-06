@@ -23,6 +23,7 @@ enum HarnessCatalog {
     static let harnesses: [HarnessInfo] = [
         HarnessInfo(id: "claude-code", label: "Claude Code"),
         HarnessInfo(id: "codex", label: "Codex"),
+        HarnessInfo(id: "pi", label: "Pi"),
     ]
 
     private static let fullLadder = ["low", "medium", "high", "xhigh", "max", "ultracode", "ultrathink"]
@@ -33,6 +34,9 @@ enum HarnessCatalog {
 
     static func models(for harness: String) -> [ModelInfo] {
         switch harness {
+        case "pi":
+            // Pi's provider-qualified catalog comes from the host at runtime.
+            return []
         case "codex":
             return [
                 ModelInfo(id: "gpt-5.6-sol", label: "GPT-5.6-Sol",
@@ -68,8 +72,8 @@ enum HarnessCatalog {
         }
     }
 
-    static func defaultModel(for harness: String) -> ModelInfo {
-        models(for: harness)[0]
+    static func defaultModel(for harness: String) -> ModelInfo? {
+        models(for: harness).first
     }
 
     /// pickers.rs:126 — X-High when the ladder has it, else High.
@@ -93,7 +97,7 @@ enum HarnessCatalog {
     }
 
     static func modelLabel(harness: String, modelId: String?) -> String {
-        guard let modelId else { return defaultModel(for: harness).label }
+        guard let modelId else { return defaultModel(for: harness)?.label ?? "Select model" }
         return models(for: harness).first { $0.id == modelId }?.label ?? modelId
     }
 }

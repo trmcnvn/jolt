@@ -443,7 +443,9 @@ async fn uploads_chunk_commit_readback_and_jail() {
     uploads
         .append("up-1", &chunks[1], Some(1))
         .expect("chunk 1");
-    let path = uploads.commit("up-1", "photo.png").expect("commit");
+    let path = uploads
+        .commit("up-1", "photo.png", "chat-1")
+        .expect("commit");
     assert!(path.ends_with("up-1-photo.png"), "path: {path}");
     assert_eq!(std::fs::read(&path).expect("committed file"), payload);
 
@@ -470,7 +472,7 @@ async fn uploads_chunk_commit_readback_and_jail() {
         .append("up-2", &chunks[2], Some(2))
         .expect("chunk 2 (hole at 1)");
     assert!(
-        uploads.commit("up-2", "holey.png").is_err(),
+        uploads.commit("up-2", "holey.png", "chat-1").is_err(),
         "hole detected"
     );
 
@@ -502,7 +504,7 @@ async fn uploads_chunk_commit_readback_and_jail() {
 
     // Bogus upload ids never become paths.
     assert!(uploads.append("../evil", "aGk=", None).is_err());
-    assert!(uploads.commit("unknown-upload", "x.png").is_err());
+    assert!(uploads.commit("unknown-upload", "x.png", "chat-1").is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -710,7 +712,7 @@ async fn rpc_dispatch_for_m5c_methods() {
     let committed = client
         .call(
             methods::UPLOAD_COMMIT,
-            serde_json::json!({ "uploadId": "rpc-up", "fileName": "shot.png" }),
+            serde_json::json!({ "uploadId": "rpc-up", "fileName": "shot.png", "chatId": "chat-rpc" }),
         )
         .await
         .expect("UploadCommit");

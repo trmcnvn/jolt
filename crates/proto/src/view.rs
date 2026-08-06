@@ -146,7 +146,8 @@ pub enum GatePhase {
     Loading,
     /// Engine unreachable and embedding failed.
     Failed(String),
-    /// Engine up, but signed out — show the sign-in card.
+    /// Legacy sign-in gate retained for wire compatibility; local-first desktop
+    /// engines no longer enter it when signed out.
     SignIn,
     /// Signed in while the hidden Personal organization is being provisioned.
     OrgGate,
@@ -161,7 +162,6 @@ pub fn gate_phase(connection: &ConnectionStatus, auth: Option<&AuthState>) -> Ga
         ConnectionStatus::Connecting => GatePhase::Loading,
         ConnectionStatus::Failed(err) => GatePhase::Failed(err.clone()),
         ConnectionStatus::Ready => match auth {
-            Some(AuthState::SignedOut) => GatePhase::SignIn,
             Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrgGate,
             _ => GatePhase::Ready,
         },
@@ -326,7 +326,22 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
     use crate::ToolCall;
     match call {
         ToolCall::Exec { command } => ("Run", command.clone()),
-        ToolCall::ReadFile { path } => ("Read", path.clone()),
+        ToolCall::ReadFile {
+            path,
+            offset,
+            limit,
+        } => {
+            let range = match (offset, limit) {
+                (None, None) => return ("Read", path.clone()),
+                (offset, Some(limit)) => {
+                    let start = offset.unwrap_or(1);
+                    let end = start.saturating_add(limit.saturating_sub(1));
+                    format!("{start}-{end}")
+                }
+                (Some(start), None) => format!("{start}+"),
+            };
+            ("Read", format!("{path}:{range}"))
+        }
         ToolCall::WriteFile { path, .. } => ("Write", path.clone()),
         ToolCall::EditFile { path, .. } => ("Edit", path.clone()),
         ToolCall::ApplyPatch { path } => {
@@ -426,6 +441,23 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
         summary.replace_range(0..1, &upper);
     }
     summary
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+
+    #[test]
+    fn read_chip_includes_the_requested_line_range() {
+        assert_eq!(
+            tool_chip_content(&crate::ToolCall::ReadFile {
+                path: "src/lib.rs".into(),
+                offset: Some(101),
+                limit: Some(50),
+            }),
+            ("Read", "src/lib.rs:101-150".to_string())
+        );
+    }
 }
 
 /// The status-dot palette, as oklch triples (L, C, H°).

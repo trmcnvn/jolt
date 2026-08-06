@@ -137,6 +137,14 @@ case "$turnline" in
   fi
   ;;
 
+*scenario:ephemeral*)
+  has "$thread_line" '"ephemeral":true' ||
+    { fail_turn "$tid" "thread should be ephemeral"; exit 0; }
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
 *scenario:approve*)
   # Wire policy is always "never" (unattended parity with the Claude
   # adapter); the requests below are the STRAY-approval path, which must

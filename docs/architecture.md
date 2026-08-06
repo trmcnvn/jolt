@@ -51,7 +51,7 @@ The gpui desktop app is a viewport over the RPC service. On startup it probes th
 - a responding engine becomes a remote local backend over WebSocket;
 - otherwise the app creates an `EngineSupervisor`, uses the same JSON envelopes over an in-memory channel, and best-effort serves that engine on the localhost port.
 
-Authentication RPC remains available before identity-scoped stores are assembled. Once sign-in and hidden organization setup complete, the supervisor creates exactly one runtime for that identity.
+The supervisor resolves the preferred scope behind the splash. It always owns a fully offline Local runtime and, while authenticated, a separate Account runtime. Switching the viewport to Local leaves Account runs, synchronization, and relay hosting alive in the background. Only Account is exposed through the device relay.
 
 ### iOS viewport
 
@@ -80,7 +80,7 @@ The sidebar and session index use a replicated table with four row kinds:
 
 A per-user RegistryRoom is authoritative for current rows. Clients retain an authoritative snapshot plus pending local operations, which are overlaid for optimistic reads and replayed after reconnect. Per-field hybrid logical clocks provide deterministic last-write-wins behavior.
 
-This data is small scalar index state. Transcript content never enters the registry.
+This data is small scalar index state. Transcript content never enters the registry. Chat tombstones also enter a durable artifact-purge queue: the registry retires the chat room and deletes its R2 backup and chat-scoped attachment prefix.
 
 ### Session documents
 
@@ -149,7 +149,6 @@ Default root: `~/.jolt`.
 
 ```text
 ~/.jolt/
-  device-id
   engine.lock
   session.json
   ui-settings.json
@@ -158,19 +157,28 @@ Default root: `~/.jolt`.
   harness-secrets.json        # metadata only; values are in OS credentials
   repos.json
   repos/
-  uploads/
   agent-accounts/
   logs/
   updates/
-  orgs/<org>/<user>/
+  scopes/local/current/
+    local-scope-id
+    device-id
+    docs.sqlite3
+    usage.sqlite
+    journals/*.jsonl
+    uploads/
+  scopes/accounts/<org>/<user>/
+    scope-layout-v1.json
+    device-id
     docs.sqlite3              # doc/registry snapshots + processed commands
     usage.sqlite
     journals/*.jsonl
+    uploads/
 ```
 
 Git worktrees default to `~/.jolt/worktrees`; Jujutsu workspaces default to `~/.jolt/workspaces`.
 
-Identity-scoped stores prevent one WorkOS user or organization from reusing another identity's cached documents on a shared machine.
+Scope-isolated stores prevent Local data from entering edge synchronization and prevent a later WorkOS identity from reusing another account's cached documents. Existing `orgs/<org>/<user>` stores are moved into this layout on first startup; the existing account device identity is preserved and a fresh Local scope is created.
 
 ## Rust workspace
 

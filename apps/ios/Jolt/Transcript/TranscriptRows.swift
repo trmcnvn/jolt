@@ -10,7 +10,7 @@
 import Foundation
 
 enum RowKind {
-    case user(text: String)
+    case user(text: String, blocks: [TopBlock])
     case markdown(block: MDBlock, streaming: Bool)
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
     case inputChip(header: String, resolved: Bool)
@@ -69,7 +69,8 @@ enum TranscriptRowBuilder {
             rows.append(TranscriptRow(id: pending.messageId,
                                       version: fnv1a(pending.text) | 1,
                                       turnStart: true,
-                                      kind: .user(text: pending.text),
+                                      kind: .user(text: pending.text,
+                                                  blocks: userMarkdownBlocks(pending.text)),
                                       entryId: pending.messageId,
                                       timestamp: nil,
                                       partKey: nil))
@@ -97,6 +98,11 @@ enum TranscriptRowBuilder {
         return TranscriptView.gapBlock
     }
 
+    private static func userMarkdownBlocks(_ raw: String) -> [TopBlock] {
+        let text = parseUserMessageImages(raw).text
+        return MarkdownParser.parse(projectFileMentions(text).markdownText)
+    }
+
     private static func rowsForEntry(_ entry: MessageEntry,
                                      into rows: inout [TranscriptRow],
                                      parsers: inout [String: IncrementalMarkdownParser],
@@ -113,7 +119,8 @@ enum TranscriptRowBuilder {
             }.joined(separator: "\n")
             guard !text.isEmpty else { return }
             rows.append(TranscriptRow(id: entry.id, version: fnv1a(text),
-                                      turnStart: true, kind: .user(text: text),
+                                      turnStart: true,
+                                      kind: .user(text: text, blocks: userMarkdownBlocks(text)),
                                       entryId: entry.id, timestamp: entry.createdAt,
                                       partKey: nil))
             return
@@ -267,7 +274,19 @@ extension RenderToolCall {
     var chipDetail: String {
         switch tag {
         case "exec": return string("command") ?? ""
-        case "readFile", "writeFile", "editFile": return shortPath(string("path") ?? "")
+        case "readFile":
+            let path = shortPath(string("path") ?? "")
+            let offset = positiveInt("offset")
+            let limit = positiveInt("limit")
+            guard offset != nil || limit != nil else { return path }
+            let start = offset ?? 1
+            if let limit {
+                let (sum, overflow) = start.addingReportingOverflow(limit - 1)
+                let end = overflow ? Int64.max : sum
+                return "\(path):\(start)-\(end)"
+            }
+            return "\(path):\(start)+"
+        case "writeFile", "editFile": return shortPath(string("path") ?? "")
         case "applyPatch":
             let changes = (fields["changes"] as? [String])?.count ?? 0
             return changes == 1 ? "1 file" : "\(changes) files"
@@ -296,6 +315,11 @@ extension RenderToolCall {
         case "todo": return "checklist"
         default: return "square.grid.2x2"
         }
+    }
+
+    private func positiveInt(_ key: String) -> Int64? {
+        guard let value = fields[key] as? Int64, value > 0 else { return nil }
+        return value
     }
 
     private func shortPath(_ path: String) -> String {

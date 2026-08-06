@@ -6,27 +6,45 @@
 //! theme is.
 //!
 //! Choices live in the [`crate::appearance`] global and repaint every window.
-//! This page only holds ephemeral font-menu state and the installed-font list.
+//! This page only holds ephemeral typography-menu state and the installed-font list.
 
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Context, Hsla, IntoElement, Render, SharedString, Window, div, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, Hsla, IntoElement, KeyDownEvent,
+    Render, SharedString, Subscription, Window, div, prelude::*, px,
 };
 
-use crate::appearance::{self, AppearanceMode, FontRole};
+use crate::appearance::{self, AppearanceMode, FontRole, FontSizeRole};
+use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
 use crate::settings::widgets;
 use crate::theme::{Appearance, DEFAULT_CODE_FONT, DEFAULT_UI_FONT, Theme};
 
 pub struct AppearancePage {
     open_font: Option<FontRole>,
+    open_size: Option<FontSizeRole>,
     font_names: Vec<SharedString>,
+    font_search: Entity<ComposerInput>,
+    font_active: usize,
+    font_focus: FocusHandle,
+    font_scroll: gpui::ScrollHandle,
     menu_dismissed_at: Option<Instant>,
+    size_menu_dismissed_at: Option<Instant>,
+    _font_search_events: Subscription,
 }
 
 impl AppearancePage {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let font_search =
+            cx.new(|cx| ComposerInput::with_context("Search fonts…", "PaletteSearch", cx));
+        let font_search_events = cx.subscribe(&font_search, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                this.font_active = 0;
+                this.font_scroll.scroll_to_item(0);
+                cx.notify();
+            }
+        });
         let mut font_names: Vec<SharedString> = cx
             .text_system()
             .all_font_names()
@@ -52,8 +70,63 @@ impl AppearancePage {
         font_names.dedup();
         Self {
             open_font: None,
+            open_size: None,
             font_names,
+            font_search,
+            font_active: 0,
+            font_focus: cx.focus_handle(),
+            font_scroll: gpui::ScrollHandle::new(),
             menu_dismissed_at: None,
+            size_menu_dismissed_at: None,
+            _font_search_events: font_search_events,
+        }
+    }
+
+    fn filtered_font_indices(&self, cx: &App) -> Vec<usize> {
+        popover::filter_indices(self.font_search.read(cx).text(), &self.font_names)
+    }
+
+    fn select_font(&mut self, role: FontRole, font: SharedString, cx: &mut Context<Self>) {
+        appearance::set_font(role, font.as_ref(), cx);
+        self.open_font = None;
+        cx.notify();
+    }
+
+    fn font_picker_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(role) = self.open_font else {
+            return;
+        };
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        match key {
+            popover::MenuKey::Escape => {
+                self.open_font = None;
+                cx.notify();
+                cx.stop_propagation();
+            }
+            popover::MenuKey::Up | popover::MenuKey::Down => {
+                let count = self.filtered_font_indices(cx).len();
+                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                self.font_active =
+                    popover::menu_step(Some(self.font_active), count, delta).unwrap_or(0);
+                self.font_scroll.scroll_to_item(self.font_active);
+                cx.notify();
+                cx.stop_propagation();
+            }
+            popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
+                let font = self
+                    .filtered_font_indices(cx)
+                    .get(self.font_active)
+                    .map(|&index| self.font_names[index].clone());
+                if let Some(font) = font {
+                    self.select_font(role, font, cx);
+                }
+                cx.stop_propagation();
+            }
+            popover::MenuKey::Backspace | popover::MenuKey::Other => {}
         }
     }
 
@@ -66,9 +139,11 @@ impl AppearancePage {
     ) -> AnyElement {
         let open = self.open_font == Some(role);
         let trigger_font = current.clone();
+        let selected_font = current.clone();
         let mut trigger = div()
             .id(match role {
                 FontRole::Ui => "ui-font-picker",
+                FontRole::Prompt => "prompt-font-picker",
                 FontRole::Code => "code-font-picker",
                 FontRole::Terminal => "terminal-font-picker",
             })
@@ -90,15 +165,26 @@ impl AppearancePage {
             .gap(px(8.0))
             .cursor_pointer()
             .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.03))))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 let just_dismissed = this
                     .menu_dismissed_at
                     .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
-                this.open_font = if this.open_font == Some(role) || just_dismissed {
-                    None
+                if this.open_font == Some(role) || just_dismissed {
+                    this.open_font = None;
                 } else {
-                    Some(role)
-                };
+                    this.open_font = Some(role);
+                    this.open_size = None;
+                    this.font_search
+                        .update(cx, |input, cx| input.set_text("", cx));
+                    this.font_active = this
+                        .font_names
+                        .iter()
+                        .position(|font| font == &selected_font)
+                        .unwrap_or(0);
+                    this.font_scroll.scroll_to_item(this.font_active);
+                    let focus = this.font_search.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
+                }
                 this.menu_dismissed_at = None;
                 cx.notify();
             }))
@@ -120,56 +206,176 @@ impl AppearancePage {
 
         if open {
             let selected = current.clone();
-            let rows = self
-                .font_names
-                .clone()
+            let active = self.font_active;
+            let fonts: Vec<(usize, SharedString)> = self
+                .filtered_font_indices(cx)
                 .into_iter()
-                .enumerate()
-                .map(|(ix, font)| {
-                    let active = font == selected;
-                    let pick = font.clone();
-                    popover::menu_row(theme, active, format!("font-row-{role:?}-{ix}"))
-                        .id((
-                            match role {
-                                FontRole::Ui => "ui-font",
-                                FontRole::Code => "code-font",
-                                FontRole::Terminal => "terminal-font",
-                            },
-                            ix,
-                        ))
-                        .font_family(font.clone())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            appearance::set_font(role, pick.as_ref(), cx);
-                            this.open_font = None;
-                            cx.notify();
-                        }))
-                        .child(div().flex_1().min_w_0().truncate().child(font))
-                        .when(active, |el| el.child(popover::menu_check(theme)))
-                });
-            let menu = popover::popover_card(theme)
-                .w(px(300.0))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                .map(|index| (index, self.font_names[index].clone()))
+                .collect();
+            let list: AnyElement = if fonts.is_empty() {
+                div()
+                    .p(px(Theme::SPACE_SM))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from("No fonts found."))
+                    .into_any_element()
+            } else {
+                div()
+                    .id(match role {
+                        FontRole::Ui => "ui-font-scroll",
+                        FontRole::Prompt => "prompt-font-scroll",
+                        FontRole::Code => "code-font-scroll",
+                        FontRole::Terminal => "terminal-font-scroll",
+                    })
+                    .max_h(px(300.0))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.font_scroll)
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(fonts.into_iter().enumerate().map(
+                        |(row_index, (font_index, font))| {
+                            let is_selected = font == selected;
+                            let pick = font.clone();
+                            popover::menu_row_nav(
+                                theme,
+                                is_selected,
+                                row_index == active,
+                                format!("font-row-{role:?}-{font_index}"),
+                            )
+                            .id((
+                                match role {
+                                    FontRole::Ui => "ui-font",
+                                    FontRole::Prompt => "prompt-font",
+                                    FontRole::Code => "code-font",
+                                    FontRole::Terminal => "terminal-font",
+                                },
+                                font_index,
+                            ))
+                            .font_family(font.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_font(role, pick.clone(), cx);
+                            }))
+                            .child(div().flex_1().min_w_0().truncate().child(font))
+                        },
+                    ))
+                    .into_any_element()
+            };
+            let menu =
+                popover::popover_card(theme)
+                    .w(px(300.0))
+                    .track_focus(&self.font_focus)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        this.font_picker_key(event, cx)
+                    }))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.open_font = None;
+                        this.menu_dismissed_at = Some(Instant::now());
+                        cx.notify();
+                    }))
+                    .flex()
+                    .flex_col()
+                    .child(popover::search_input_frame(
+                        theme,
+                        self.font_search.clone().into_any_element(),
+                    ))
+                    .child(list)
+                    .into_any_element();
+            trigger = trigger.child(popover::anchored_menu("font-family-menu", menu));
+        }
+        trigger.into_any_element()
+    }
+
+    fn size_picker(
+        &mut self,
+        role: FontSizeRole,
+        current: u8,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.open_size == Some(role);
+        let mut trigger = div()
+            .id(match role {
+                FontSizeRole::Interface => "interface-font-size-picker",
+                FontSizeRole::Prompt => "prompt-font-size-picker",
+                FontSizeRole::Code => "code-font-size-picker",
+                FontSizeRole::Terminal => "terminal-font-size-picker",
+            })
+            .relative()
+            .w(px(88.0))
+            .h(px(36.0))
+            .px(px(10.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if open {
+                theme.border_strong
+            } else {
+                theme.border
+            })
+            .bg(theme.bg)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .cursor_pointer()
+            .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.03))))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let just_dismissed = this
+                    .size_menu_dismissed_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
+                if this.open_size == Some(role) || just_dismissed {
+                    this.open_size = None;
+                } else {
+                    this.open_size = Some(role);
                     this.open_font = None;
-                    this.menu_dismissed_at = Some(Instant::now());
+                }
+                this.size_menu_dismissed_at = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(13.0))
+                    .text_color(theme.text)
+                    .child(SharedString::from(format!("{current} px"))),
+            )
+            .child(
+                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            );
+
+        if open {
+            let rows = role.range().map(|size| {
+                popover::menu_row(
+                    theme,
+                    size == current,
+                    format!("font-size-row-{role:?}-{size}"),
+                )
+                .id(("font-size", size as usize))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    appearance::set_font_size(role, size, cx);
+                    this.open_size = None;
                     cx.notify();
                 }))
-                .child(popover::menu_heading(theme, "Installed fonts"))
-                .child(
-                    div()
-                        .id(match role {
-                            FontRole::Ui => "ui-font-scroll",
-                            FontRole::Code => "code-font-scroll",
-                            FontRole::Terminal => "terminal-font-scroll",
-                        })
-                        .max_h(px(300.0))
-                        .overflow_y_scroll()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .children(rows),
-                )
+                .child(SharedString::from(format!("{size} px")))
+            });
+            let menu = popover::popover_card(theme)
+                .id("font-size-options")
+                .w(px(96.0))
+                .max_h(px(320.0))
+                .overflow_y_scroll()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.open_size = None;
+                    this.size_menu_dismissed_at = Some(Instant::now());
+                    cx.notify();
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .children(rows)
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu("font-family-menu", menu));
+            trigger = trigger.child(popover::anchored_menu("font-size-menu", menu));
         }
         trigger.into_any_element()
     }
@@ -320,11 +526,20 @@ impl Render for AppearancePage {
             .try_global::<appearance::AppearanceState>()
             .map(|state| state.system)
             .unwrap_or_default();
-        let (ui_font, code_font, terminal_font) = appearance::font_families(cx);
+        let (ui_font, prompt_font, code_font, terminal_font) = appearance::font_families(cx);
+        let font_sizes = appearance::font_sizes(cx);
         let ui_picker = self.font_picker(FontRole::Ui, ui_font.clone(), &theme, cx);
+        let ui_size_picker =
+            self.size_picker(FontSizeRole::Interface, font_sizes.interface, &theme, cx);
+        let prompt_picker = self.font_picker(FontRole::Prompt, prompt_font.clone(), &theme, cx);
+        let prompt_size_picker =
+            self.size_picker(FontSizeRole::Prompt, font_sizes.prompt, &theme, cx);
         let code_picker = self.font_picker(FontRole::Code, code_font.clone(), &theme, cx);
+        let code_size_picker = self.size_picker(FontSizeRole::Code, font_sizes.code, &theme, cx);
         let terminal_picker =
             self.font_picker(FontRole::Terminal, terminal_font.clone(), &theme, cx);
+        let terminal_size_picker =
+            self.size_picker(FontSizeRole::Terminal, font_sizes.terminal, &theme, cx);
 
         let cards = AppearanceMode::ALL.into_iter().map(|mode| {
             widgets::option_card(&theme, mode.label(), mode == current, preview(mode))
@@ -388,15 +603,58 @@ impl Render for AppearancePage {
                                                     .child(
                                                         div()
                                                             .mt(px(3.0))
-                                                            .font_family(ui_font)
-                                                            .text_size(px(12.0))
+                                                            .font_family(ui_font.clone())
+                                                            .text_size(px(f32::from(
+                                                                font_sizes.interface,
+                                                            )))
                                                             .text_color(theme.text_muted)
                                                             .child(SharedString::from(
                                                                 "The quick brown fox jumps over the lazy dog.",
                                                             )),
                                                     ),
                                             )
-                                            .child(ui_picker),
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .gap(px(8.0))
+                                                    .child(ui_picker)
+                                                    .child(ui_size_picker),
+                                            ),
+                                    )
+                                    .child(
+                                        widgets::card_row(&theme, false)
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(widgets::row_title(
+                                                        &theme,
+                                                        "Prompt font",
+                                                    ))
+                                                    .child(
+                                                        div()
+                                                            .mt(px(3.0))
+                                                            .font_family(prompt_font)
+                                                            .text_size(px(f32::from(
+                                                                font_sizes.prompt,
+                                                            )))
+                                                            .text_color(theme.text_muted)
+                                                            .child(SharedString::from(
+                                                                "Only the box you write prompts in.",
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .gap(px(8.0))
+                                                    .child(prompt_picker)
+                                                    .child(prompt_size_picker),
+                                            ),
                                     )
                                     .child(
                                         widgets::card_row(&theme, false)
@@ -409,14 +667,24 @@ impl Render for AppearancePage {
                                                         div()
                                                             .mt(px(3.0))
                                                             .font_family(code_font)
-                                                            .text_size(px(12.0))
+                                                            .text_size(px(f32::from(
+                                                                font_sizes.code,
+                                                            )))
                                                             .text_color(theme.text_muted)
                                                             .child(SharedString::from(
                                                                 "fn main() { println!(\"Hello\"); }",
                                                             )),
                                                     ),
                                             )
-                                            .child(code_picker),
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .gap(px(8.0))
+                                                    .child(code_picker)
+                                                    .child(code_size_picker),
+                                            ),
                                     )
                                     .child(
                                         widgets::card_row(&theme, false)
@@ -432,14 +700,24 @@ impl Render for AppearancePage {
                                                         div()
                                                             .mt(px(3.0))
                                                             .font_family(terminal_font)
-                                                            .text_size(px(12.0))
+                                                            .text_size(px(f32::from(
+                                                                font_sizes.terminal,
+                                                            )))
                                                             .text_color(theme.text_muted)
                                                             .child(SharedString::from(
                                                                 "$ cargo test --workspace",
                                                             )),
                                                     ),
                                             )
-                                            .child(terminal_picker),
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .gap(px(8.0))
+                                                    .child(terminal_picker)
+                                                    .child(terminal_size_picker),
+                                            ),
                                     ),
                             )
                             .child(
@@ -449,7 +727,7 @@ impl Render for AppearancePage {
                                     .line_height(px(18.0))
                                     .text_color(theme.text_muted)
                                     .child(SharedString::from(
-                                        "Code font applies to code blocks, diffs, and shortcut chips.",
+                                        "Code font applies to code blocks, diffs, and hotkey chips.",
                                     )),
                             ),
                     ),

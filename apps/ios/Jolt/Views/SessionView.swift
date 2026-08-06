@@ -104,7 +104,9 @@ struct SessionView: View {
                     modelId: Binding(
                         get: {
                             chat.config?.model
-                                ?? HarnessCatalog.defaultModel(for: harness).id
+                                ?? catalogs[harness]?.first?.id
+                                ?? HarnessCatalog.defaultModel(for: harness)?.id
+                                ?? ""
                         },
                         set: { newModel in
                             writeConfig(model: newModel, reasoning: chat.config?.reasoning)
@@ -144,12 +146,12 @@ struct SessionView: View {
         }
     }
 
-    /// Live-chat checkout context (git spaces only): read-only kind + the
-    /// switchable ref list.
+    /// Live-chat checkout context: read-only kind plus host-VCS revisions.
     private func checkoutContext(chat: Chat) -> SessionCheckoutContext? {
         guard let space = chatSpace, space.gitDetected, let cwd = chat.cwd else { return nil }
         return SessionCheckoutContext(
             isWorktree: cwd != space.path,
+            isJujutsu: refs.contains(where: \.isJujutsu),
             cwd: cwd,
             refs: refs,
             currentBranch: chat.branch,
@@ -168,7 +170,8 @@ struct SessionView: View {
     private func writeConfig(model newModel: String?, reasoning newReasoning: String?) {
         guard let chat else { return }
         var config = chat.config ?? ChatConfig(harness: "claude-code", model: nil,
-                                               reasoning: nil, sandbox: "workspace-write")
+                                               reasoning: nil, modelOptions: [:],
+                                               sandbox: "workspace-write")
         config.model = newModel
         config.reasoning = newReasoning
         model.setChatConfig(chatId: chat.id, config: config)
@@ -235,10 +238,7 @@ struct SessionView: View {
     }
 
     private func liveStatus(chat: Chat) -> SessionStatus? {
-        if let demo = model.demo {
-            return effectiveStatus(demo.sessions[chat.id], now: nowMs())
-        }
-        return effectiveStatus(model.workspace?.sessions[chat.id], now: nowMs())
+        model.sessionStatus(for: chat)
     }
 
     /// Reserved 24pt status strip (shell.rs render_status_strip) — Working
@@ -253,13 +253,19 @@ struct SessionView: View {
                     ActivityOrb(size: 14)
                     let startedAt = sessionStartedAt(chat: chat)
                     let elapsed = (nowMs() - startedAt) / 1000
-                    Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chat.id), elapsedSecs: elapsed))…")
-                        .font(Theme.sans(12))
-                        .foregroundStyle(Theme.textMuted)
-                    Text(Motion.formatElapsed(elapsed))
-                        .font(Theme.sans(11))
-                        .foregroundStyle(Theme.textFaint)
-                        .monospacedDigit()
+                    if sessionRow(chat: chat)?.compacting == true {
+                        Text("Compacting context…")
+                            .font(Theme.sans(12))
+                            .foregroundStyle(Theme.textMuted)
+                    } else {
+                        Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chat.id), elapsedSecs: elapsed))…")
+                            .font(Theme.sans(12))
+                            .foregroundStyle(Theme.textMuted)
+                        Text(Motion.formatElapsed(elapsed))
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textFaint)
+                            .monospacedDigit()
+                    }
                 case .errored:
                     Text("Run failed")
                         .font(Theme.sans(11))
@@ -274,8 +280,12 @@ struct SessionView: View {
         }
     }
 
+    private func sessionRow(chat: Chat) -> SessionRow? {
+        model.demo?.sessions[chat.id] ?? model.workspace?.sessions[chat.id]
+    }
+
     private func sessionStartedAt(chat: Chat) -> Int64 {
-        let row = model.demo?.sessions[chat.id] ?? model.workspace?.sessions[chat.id]
+        let row = sessionRow(chat: chat)
         return row?.startedAt ?? row?.updatedAt ?? nowMs()
     }
 }

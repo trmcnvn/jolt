@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use chrono::Utc;
 use tokio::sync::watch;
 
-use jolt_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
+use jolt_doc::{DeletedDevice, DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
 use jolt_proto::{Chat, ChatConfig, Device, Session, Space};
 use jolt_sync::{DocsStore, RegistryClient, RegistryTuning};
 
@@ -805,6 +805,10 @@ impl WorkspaceHost {
 
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.rename_device(device_id, name))?)
+    }
+
+    pub fn delete_device(&self, device_id: &str) -> Result<DeletedDevice, EngineError> {
+        Ok(self.mutate(|doc| doc.delete_device(device_id))?)
     }
 
     // ── git metadata (diff-sync host writes) ────────────────────────────────

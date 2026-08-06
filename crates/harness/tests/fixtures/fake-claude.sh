@@ -6,6 +6,7 @@
 # including control-channel round-trips read back from stdin. Driven by
 # crates/harness/tests/claude.rs.
 
+all_args="$*"
 read -r first || exit 1
 
 emit() { printf '%s\n' "$1"; }
@@ -35,6 +36,17 @@ case "$first" in
   # Informational rate-limit status: stays quiet.
   emit '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}'
   emit '{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20},"session_id":"sess-1","total_cost_usd":0.01}'
+  ;;
+
+*scenario:ephemeral*)
+  case "$all_args" in
+  *--no-session-persistence*)
+    emit '{"type":"result","subtype":"success","result":"ephemeral","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ephemeral"}'
+    ;;
+  *)
+    emit '{"type":"result","subtype":"error_during_execution","errors":["missing --no-session-persistence"],"usage":{"input_tokens":0,"output_tokens":0},"session_id":"sess-ephemeral"}'
+    ;;
+  esac
   ;;
 
 *scenario:askuser*)

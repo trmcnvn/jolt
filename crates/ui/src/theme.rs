@@ -39,6 +39,76 @@ use gpui::{App, Global, Hsla, SharedString, hsla};
 pub const DEFAULT_UI_FONT: &str = "Geist";
 pub const DEFAULT_CODE_FONT: &str = "Geist Mono";
 
+pub const MIN_INTERFACE_FONT_SIZE: u8 = 12;
+pub const MAX_INTERFACE_FONT_SIZE: u8 = 20;
+pub const DEFAULT_INTERFACE_FONT_SIZE: u8 = 14;
+pub const MIN_PROMPT_FONT_SIZE: u8 = 12;
+pub const MAX_PROMPT_FONT_SIZE: u8 = 20;
+pub const DEFAULT_PROMPT_FONT_SIZE: u8 = 14;
+pub const MIN_CODE_FONT_SIZE: u8 = 10;
+pub const MAX_CODE_FONT_SIZE: u8 = 18;
+pub const DEFAULT_CODE_FONT_SIZE: u8 = 13;
+pub const MIN_TERMINAL_FONT_SIZE: u8 = 8;
+pub const MAX_TERMINAL_FONT_SIZE: u8 = 20;
+pub const DEFAULT_TERMINAL_FONT_SIZE: u8 = 13;
+
+/// The four independently configurable type scales, in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FontSizes {
+    pub interface: u8,
+    pub prompt: u8,
+    pub code: u8,
+    pub terminal: u8,
+}
+
+impl FontSizes {
+    pub fn clamped(self) -> Self {
+        Self {
+            interface: self
+                .interface
+                .clamp(MIN_INTERFACE_FONT_SIZE, MAX_INTERFACE_FONT_SIZE),
+            prompt: self
+                .prompt
+                .clamp(MIN_PROMPT_FONT_SIZE, MAX_PROMPT_FONT_SIZE),
+            code: self.code.clamp(MIN_CODE_FONT_SIZE, MAX_CODE_FONT_SIZE),
+            terminal: self
+                .terminal
+                .clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE),
+        }
+    }
+
+    pub fn interface_line_height(self) -> f32 {
+        f32::from(self.interface) + 8.0
+    }
+
+    pub fn prompt_line_height(self) -> f32 {
+        f32::from(self.prompt) * 1.625
+    }
+
+    pub fn code_line_height(self) -> f32 {
+        f32::from(self.code) + 5.5
+    }
+
+    pub fn diff_line_height(self) -> f32 {
+        f32::from(self.code) + 9.0
+    }
+
+    pub fn terminal_line_height(self) -> f32 {
+        f32::from(self.terminal) + 5.0
+    }
+}
+
+impl Default for FontSizes {
+    fn default() -> Self {
+        Self {
+            interface: DEFAULT_INTERFACE_FONT_SIZE,
+            prompt: DEFAULT_PROMPT_FONT_SIZE,
+            code: DEFAULT_CODE_FONT_SIZE,
+            terminal: DEFAULT_TERMINAL_FONT_SIZE,
+        }
+    }
+}
+
 /// Which appearance the app is painting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Appearance {
@@ -281,10 +351,14 @@ pub struct Theme {
     /// UI font family (bundling of Geist lands with asset work; until then the
     /// text system falls back to the system sans when the family is missing).
     pub font_sans: SharedString,
+    /// Font family used only by the chat composer.
+    pub font_prompt: SharedString,
     /// Monospace family for code and diffs.
     pub font_mono: SharedString,
     /// Font family used by terminal grids.
     pub font_terminal: SharedString,
+    /// Independent interface, prompt, code, and terminal sizes.
+    pub font_sizes: FontSizes,
     /// Explicit system fallbacks, for callers that want to skip the lookup.
     pub font_sans_fallback: SharedString,
     pub font_mono_fallback: SharedString,
@@ -474,8 +548,10 @@ impl Theme {
             diff_del: oklch(0.704, 0.191, 22.216),   // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
             font_sans: DEFAULT_UI_FONT.into(),
+            font_prompt: DEFAULT_UI_FONT.into(),
             font_mono: DEFAULT_CODE_FONT.into(),
             font_terminal: DEFAULT_CODE_FONT.into(),
+            font_sizes: FontSizes::default(),
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
         }
@@ -553,8 +629,10 @@ impl Theme {
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
             font_sans: DEFAULT_UI_FONT.into(),
+            font_prompt: DEFAULT_UI_FONT.into(),
             font_mono: DEFAULT_CODE_FONT.into(),
             font_terminal: DEFAULT_CODE_FONT.into(),
+            font_sizes: FontSizes::default(),
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
         }
@@ -575,8 +653,10 @@ impl Theme {
         Self::install_with_fonts(
             appearance,
             DEFAULT_UI_FONT,
+            DEFAULT_UI_FONT,
             DEFAULT_CODE_FONT,
             DEFAULT_CODE_FONT,
+            FontSizes::default(),
             cx,
         );
     }
@@ -585,19 +665,25 @@ impl Theme {
     pub fn install_with_fonts(
         appearance: Appearance,
         ui_font: impl Into<SharedString>,
+        prompt_font: impl Into<SharedString>,
         code_font: impl Into<SharedString>,
         terminal_font: impl Into<SharedString>,
+        font_sizes: FontSizes,
         cx: &mut App,
     ) {
         let ui_font = ui_font.into();
+        let prompt_font = prompt_font.into();
         let code_font = code_font.into();
         let terminal_font = terminal_font.into();
+        let font_sizes = font_sizes.clamped();
         let previous = cx.try_global::<Self>();
         let appearance_changed = previous.is_some_and(|theme| theme.appearance != appearance);
         let typography_changed = previous.is_some_and(|theme| {
             theme.font_sans != ui_font
+                || theme.font_prompt != prompt_font
                 || theme.font_mono != code_font
                 || theme.font_terminal != terminal_font
+                || theme.font_sizes != font_sizes
         });
         set_current_appearance(appearance);
         // `set_current_appearance` already invalidates caches when the palette
@@ -608,8 +694,10 @@ impl Theme {
         }
         let mut theme = Self::for_appearance(appearance);
         theme.font_sans = ui_font;
+        theme.font_prompt = prompt_font;
         theme.font_mono = code_font;
         theme.font_terminal = terminal_font;
+        theme.font_sizes = font_sizes;
         cx.set_global(theme);
     }
 
