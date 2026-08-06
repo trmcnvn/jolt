@@ -180,6 +180,46 @@ fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &st
 }
 
 #[tokio::test]
+async fn custom_theme_files_converge_between_hosts() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = assemble(dir_a.path(), "dev-a");
+    let b = assemble(dir_b.path(), "dev-b");
+    let _link = bridge(&a, &b).await;
+
+    let theme_id = "00000000-0000-4000-8000-000000000001";
+    a.workspace
+        .upsert_themes(&[jolt_proto::ThemeFileRecord {
+            id: theme_id.into(),
+            revision: 1,
+            deleted: false,
+            contents: r#"{"revision":1}"#.into(),
+        }])
+        .unwrap();
+    wait_for(
+        || {
+            b.workspace
+                .read_themes()
+                .is_ok_and(|themes| themes.len() == 1)
+        },
+        "theme file on peer",
+    )
+    .await;
+    assert_eq!(b.workspace.read_themes().unwrap()[0].id, theme_id);
+
+    b.workspace.delete_theme(theme_id).unwrap();
+    wait_for(
+        || {
+            a.workspace
+                .read_themes()
+                .is_ok_and(|themes| themes.first().is_some_and(|theme| theme.deleted))
+        },
+        "theme deletion on peer",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn two_engines_share_a_workspace() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
@@ -558,6 +598,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 harness_session_cwd: Some("/tmp/legacy".into()),
                 space_id: Some("space-legacy".into()),
                 last_seen_at: Some(now),
+                goal: None,
             })
             .unwrap();
         legacy

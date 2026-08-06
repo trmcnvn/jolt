@@ -217,6 +217,19 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 .collect();
             tool_lifecycle(phase, id, ToolCall::Todo { items }, false)
         }
+        "collabAgentToolCall" | "collab_agent_tool_call"
+            if matches!(
+                str_field(item, &["tool"]).as_str(),
+                "spawnAgent" | "spawn_agent"
+            ) =>
+        {
+            tool_lifecycle(
+                phase,
+                id,
+                ToolCall::SpawnAgent { agent_type: None },
+                status == "failed",
+            )
+        }
         "error" => vec![AgentEvent::Error {
             message: str_field(item, &["message"]),
         }],
@@ -333,6 +346,49 @@ mod tests {
                 id: "f3".into(),
                 call: ToolCall::ApplyPatch { path: None },
             }]
+        );
+    }
+
+    #[test]
+    fn subagent_spawn_maps_its_lifecycle() {
+        let started = map_item(
+            Phase::Started,
+            &json!({
+                "type": "collabAgentToolCall",
+                "id": "agent-1",
+                "tool": "spawnAgent",
+                "status": "inProgress"
+            }),
+        );
+        assert_eq!(
+            started,
+            vec![AgentEvent::ToolCall {
+                id: "agent-1".into(),
+                call: ToolCall::SpawnAgent { agent_type: None },
+            }]
+        );
+
+        let completed = map_item(
+            Phase::Completed,
+            &json!({
+                "type": "collab_agent_tool_call",
+                "id": "agent-1",
+                "tool": "spawn_agent",
+                "status": "completed"
+            }),
+        );
+        assert_eq!(
+            completed,
+            vec![
+                AgentEvent::ToolCall {
+                    id: "agent-1".into(),
+                    call: ToolCall::SpawnAgent { agent_type: None },
+                },
+                AgentEvent::ToolResult {
+                    id: "agent-1".into(),
+                    is_error: false,
+                },
+            ]
         );
     }
 

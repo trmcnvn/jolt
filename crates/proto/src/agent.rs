@@ -182,6 +182,11 @@ pub enum ToolCall {
         #[serde(default)]
         items: Vec<TodoItem>,
     },
+    #[serde(rename_all = "camelCase")]
+    SpawnAgent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<String>,
+    },
     Mcp {
         server: String,
         tool: String,

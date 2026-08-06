@@ -641,7 +641,7 @@ async fn supervisor_provisions_the_hidden_personal_org_before_runtime_boot() {
     })
     .await
     .expect("runtime serves data RPCs");
-    assert!(dir.path().join("orgs/org_1/user_1").is_dir());
+    assert!(dir.path().join("scopes/accounts/org_1/user_1").is_dir());
     supervisor.shutdown().await;
     boot.abort();
     server.abort();

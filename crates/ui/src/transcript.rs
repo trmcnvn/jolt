@@ -30,13 +30,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent, ListState,
-    ObjectFit, SharedString, StyledImage as _, Subscription, Task, Window, div, img, list,
-    prelude::*, px,
+    AnyElement, ClipboardItem, Context, Entity, EventEmitter, ListAlignment, ListScrollEvent,
+    ListState, ObjectFit, SharedString, StyledImage as _, Subscription, Task, Window, div, img,
+    list, prelude::*, px,
 };
 
 use jolt_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-use jolt_proto::ToolCall;
+use jolt_proto::{ToolCall, TurnDiffManifest};
 
 use crate::markdown::LinkTarget;
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
@@ -225,7 +225,13 @@ pub enum RowKind {
     },
     ToolGroup {
         tools: Arc<Vec<ToolItem>>,
-        auto_open: bool,
+        /// This is the trailing tool group of a streaming reply. Collapsed
+        /// active groups preview their latest tool instead of opening fully.
+        active: bool,
+    },
+    /// Compact, immutable filesystem delta for the owning assistant entry.
+    Changes {
+        diff: Arc<TurnDiffManifest>,
     },
     InputChip {
         /// First question's header. The resolved chip shows it; unresolved
@@ -291,7 +297,14 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
+fn is_file_mutation(call: &ToolCall) -> bool {
+    matches!(
+        call,
+        ToolCall::WriteFile { .. } | ToolCall::EditFile { .. } | ToolCall::ApplyPatch { .. }
+    )
+}
+
+fn tool_fingerprint(tools: &[ToolItem], active: bool) -> u64 {
     let mut acc = Vec::with_capacity(tools.len() * 8 + 1);
     for t in tools {
         let (label, detail) = tool_chip_content(&t.call);
@@ -299,7 +312,7 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         acc.extend_from_slice(&(detail.len() as u32).to_le_bytes());
         acc.push(t.is_error as u8 | (t.resolved as u8) << 1);
     }
-    acc.push(auto_open as u8);
+    acc.push(active as u8);
     fnv1a(&acc)
 }
 
@@ -355,6 +368,10 @@ pub fn rows_for_entry(
     }
 
     // Assistant/system: split parts into block rows, folding consecutive tools.
+    let has_changes = entry
+        .parts
+        .iter()
+        .any(|part| matches!(part, MessagePart::Changes { .. }));
     let last_part_ix = entry.parts.len().saturating_sub(1);
     let mut group_ix = 0usize;
     let mut pending_group: Vec<ToolItem> = Vec::new();
@@ -366,14 +383,14 @@ pub fn rows_for_entry(
                 return;
             }
             let tools = std::mem::take(group);
-            let auto_open = streaming && last_ix == last_part_ix;
+            let active = streaming && last_ix == last_part_ix;
             rows.push(Row {
                 id: format!("{}#g{}", entry.id, group_ix).into(),
-                version: tool_fingerprint(&tools, auto_open),
+                version: tool_fingerprint(&tools, active),
                 turn_start: false,
                 kind: RowKind::ToolGroup {
                     tools: Arc::new(tools),
-                    auto_open,
+                    active,
                 },
                 entry_id: entry.id.clone().into(),
                 timestamp: None,
@@ -389,6 +406,13 @@ pub fn rows_for_entry(
                 resolved,
                 ..
             } => {
+                // Once an authoritative filesystem delta exists, successful
+                // mutation chips are redundant. Failed mutations remain
+                // visible, and active turns retain their latest-tool preview
+                // until the finalized Changes part lands.
+                if has_changes && *resolved && !*is_error && is_file_mutation(call) {
+                    continue;
+                }
                 pending_group.push(ToolItem {
                     call: call.clone(),
                     is_error: *is_error,
@@ -482,6 +506,18 @@ pub fn rows_for_entry(
                             kind: RowKind::ErrorChip {
                                 // Harness-generated; the chip is one line.
                                 message: single_line(message).into(),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                        });
+                    }
+                    MessagePart::Changes { id: part_id, diff } => {
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(diff.catalog_revision.as_bytes()),
+                            turn_start: false,
+                            kind: RowKind::Changes {
+                                diff: Arc::new(diff.clone()),
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -669,6 +705,22 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
     Some((prefix..old.len() - suffix, new.len() - suffix - prefix))
 }
 
+/// Whether a diff only updates existing rows without changing their identity.
+/// These rows can be remeasured in place, preserving the viewport's pixel
+/// offset inside a tall row while its content grows.
+fn rows_changed_in_place(
+    old: &[Row],
+    new: &[Row],
+    old_range: &Range<usize>,
+    new_count: usize,
+) -> bool {
+    old_range.len() == new_count
+        && old[old_range.clone()]
+            .iter()
+            .zip(&new[old_range.start..old_range.start + new_count])
+            .all(|(old, new)| old.id == new.id)
+}
+
 // ---------------------------------------------------------------------------
 // Tool summaries / chips (pure)
 // ---------------------------------------------------------------------------
@@ -695,6 +747,18 @@ pub fn chips_height(count: usize) -> f32 {
         return 0.0;
     }
     CHIPS_TOP_PAD + count as f32 * CHIP_HEIGHT + (count as f32 - 1.0) * CHIP_GAP
+}
+
+/// Tools visible for a group's current fold state. Collapsed active groups
+/// retain only the latest chip; inactive groups retain none.
+fn visible_tool_range(count: usize, open: bool, active: bool) -> Range<usize> {
+    if open {
+        0..count
+    } else if active && count > 0 {
+        count - 1..count
+    } else {
+        count..count
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,7 +1348,7 @@ struct CachedRows {
 
 #[derive(Default, Clone, Copy)]
 struct FoldState {
-    /// User pin (click); `None` follows the auto-open rule.
+    /// User choice (click); `None` uses the collapsed default.
     open: Option<bool>,
     /// Bumped per toggle — keys the 200ms height tween.
     epoch: usize,
@@ -1298,6 +1362,14 @@ struct FoldState {
     /// tween made every once-collapsed group flash open→closed on each
     /// reappearance (user report).
     toggled_at: Option<Instant>,
+}
+
+#[derive(Clone)]
+pub enum TranscriptEvent {
+    OpenTurnDiff {
+        diff: TurnDiffManifest,
+        file_path: Option<String>,
+    },
 }
 
 pub struct Transcript {
@@ -1370,6 +1442,8 @@ pub struct Transcript {
     attachment_retries: HashMap<(String, String), Task<()>>,
     _observe: Subscription,
 }
+
+impl EventEmitter<TranscriptEvent> for Transcript {}
 
 impl Transcript {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -1777,13 +1851,21 @@ impl Transcript {
             }
             Some((old_range, count)) => {
                 // Any replaced row's cached flatten results are stale — and
-                // because live replies splice only the rows whose content hash
+                // because live replies update only the rows whose content hash
                 // changed (the tail), this is O(changed rows) per commit, never
                 // O(reply).
                 for row in &self.rows[old_range.clone()] {
                     self.render_cache.borrow_mut().invalidate_row(&row.id);
                 }
-                self.list.splice(old_range, count);
+                if rows_changed_in_place(&self.rows, &new_rows, &old_range, count) {
+                    // `splice` resets the logical offset to the top when the
+                    // changed row contains the viewport. That makes a tall,
+                    // growing tool group jump up before the bottom spring pulls
+                    // it back down. Remeasure keeps the same pixel anchor.
+                    self.list.remeasure_items(old_range);
+                } else {
+                    self.list.splice(old_range, count);
+                }
             }
         }
         self.rows = new_rows;
@@ -1836,17 +1918,24 @@ impl Transcript {
         rows
     }
 
-    fn toggle_fold(&mut self, row_id: SharedString, tool_count: usize, auto_open: bool) {
+    fn toggle_changes(&mut self, row_id: SharedString) {
+        let entry = self.folds.entry(row_id.clone()).or_default();
+        entry.open = Some(!entry.open.unwrap_or(false));
+        if let Some(index) = self.rows.iter().position(|row| row.id == row_id) {
+            self.list.remeasure_items(index..index + 1);
+        }
+    }
+
+    fn toggle_fold(&mut self, row_id: SharedString, tool_count: usize, active: bool) {
         let entry = self.folds.entry(row_id).or_default();
-        let currently_open = entry.open.unwrap_or(auto_open);
-        entry.from = if currently_open {
-            chips_height(tool_count)
-        } else {
-            0.0
-        };
+        let currently_open = entry.open.unwrap_or(false);
+        entry.from = chips_height(visible_tool_range(tool_count, currently_open, active).len());
         entry.open = Some(!currently_open);
         entry.epoch += 1;
-        entry.toggled_at = Some(Instant::now());
+        // Switching between the active preview and the full list changes which
+        // chips are mounted, so animate only inactive groups where clipping is
+        // visually continuous.
+        entry.toggled_at = (!active).then(Instant::now);
     }
 
     // ---- attachment read-back and transcript cache ----
@@ -2086,6 +2175,8 @@ impl Transcript {
                         now: Instant::now(),
                         copy: Some(self.copy_ui_for(&row.id, cx)),
                         open_link: Some(self.open_link_for(cx)),
+                        streaming: false,
+                        svg_renderer: Some(cx.svg_renderer()),
                     };
                     let highlights = self.code_highlight_for(&row.id, &tree, None, cx);
                     let markdown = render::render_tree(&tree, &opts, &theme, window, &|ix| {
@@ -2122,6 +2213,8 @@ impl Transcript {
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     open_link: Some(self.open_link_for(cx)),
+                    streaming: false,
+                    svg_renderer: Some(cx.svg_renderer()),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -2165,6 +2258,8 @@ impl Transcript {
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     open_link: Some(self.open_link_for(cx)),
+                    streaming: true,
+                    svg_renderer: Some(cx.svg_renderer()),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -2200,9 +2295,10 @@ impl Transcript {
                 }
                 el
             }
-            RowKind::ToolGroup { tools, auto_open } => {
-                self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
+            RowKind::ToolGroup { tools, active } => {
+                self.render_tool_group(&row.id, tools, *active, &theme, cx)
             }
+            RowKind::Changes { diff } => self.render_changes(&row.id, diff, &theme, cx),
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
@@ -2422,17 +2518,191 @@ impl Transcript {
         out
     }
 
+    fn render_changes(
+        &mut self,
+        row_id: &SharedString,
+        diff: &Arc<TurnDiffManifest>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self
+            .folds
+            .get(row_id)
+            .and_then(|fold| fold.open)
+            .unwrap_or(false);
+        let count = diff.files.len();
+        let title = format!("{count} changed file{}", if count == 1 { "" } else { "s" });
+        let toggle_id = row_id.clone();
+        let open_diff = diff.clone();
+
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .id(SharedString::from(format!("{row_id}-toggle")))
+                    .min_w_0()
+                    .flex_1()
+                    .h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(theme.text)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_changes(toggle_id.clone());
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .size(px(18.0))
+                            .flex_none()
+                            .rounded(px(5.0))
+                            .bg(crate::theme::ink(0.06))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted.opacity(0.7))
+                            .child(SharedString::from(if open { "▾" } else { "▸" })),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_color(theme.diff_add)
+                            .child(SharedString::from(format!("+{}", diff.additions))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_color(theme.diff_del)
+                            .child(SharedString::from(format!("−{}", diff.deletions))),
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("{row_id}-open")))
+                    .flex_none()
+                    .px(px(8.0))
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .hover(|style| style.text_color(theme.text).bg(crate::theme::ink(0.04)))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(TranscriptEvent::OpenTurnDiff {
+                            diff: (*open_diff).clone(),
+                            file_path: None,
+                        });
+                    }))
+                    .child("Open diff"),
+            );
+
+        let files = open.then(|| {
+            div()
+                .pt(px(2.0))
+                .pb(px(4.0))
+                .flex()
+                .flex_col()
+                .children(diff.files.iter().map(|file| {
+                    let open_diff = diff.clone();
+                    let path = file.path.clone();
+                    div()
+                        .id(SharedString::from(format!("{row_id}-file-{}", file.id)))
+                        .h(px(28.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .hover(|style| style.bg(crate::theme::ink(0.04)).text_color(theme.text))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(TranscriptEvent::OpenTurnDiff {
+                                diff: (*open_diff).clone(),
+                                file_path: Some(path.clone()),
+                            });
+                        }))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .font_family(theme.font_mono.clone())
+                                .child(file.path.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(theme.font_mono.clone())
+                                .text_color(theme.diff_add)
+                                .child(SharedString::from(format!("+{}", file.additions))),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(theme.font_mono.clone())
+                                .text_color(theme.diff_del)
+                                .child(SharedString::from(format!("−{}", file.deletions))),
+                        )
+                }))
+        });
+
+        div()
+            .mt(px(4.0))
+            .p(px(6.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.border.opacity(0.8))
+            .bg(theme.surface_raised.opacity(0.45))
+            .child(header)
+            .children(files)
+            .into_any_element()
+    }
+
     fn render_tool_group(
         &mut self,
         row_id: &SharedString,
         tools: &Arc<Vec<ToolItem>>,
-        auto_open: bool,
+        active: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
-        let open = fold.open.unwrap_or(auto_open);
-        let target = if open { chips_height(tools.len()) } else { 0.0 };
+        let open = fold.open.unwrap_or(false);
+        let visible_tools = visible_tool_range(tools.len(), open, active);
+        let target = chips_height(visible_tools.len());
+        let animating = !active
+            && fold.epoch > 0
+            && fold
+                .toggled_at
+                .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
+        // Keep all chips mounted while an inactive group collapses so the
+        // existing height tween clips its content instead of shrinking blank
+        // space. Active preview toggles do not animate.
+        let rendered_tools = if animating && fold.from > target {
+            0..tools.len()
+        } else {
+            visible_tools.clone()
+        };
         let summary = tool_group_summary(tools);
 
         let toggle_id = row_id.clone();
@@ -2457,7 +2727,7 @@ impl Transcript {
             .text_color(theme.text_muted)
             .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_fold(toggle_id.clone(), tool_count, auto_open);
+                this.toggle_fold(toggle_id.clone(), tool_count, active);
                 cx.notify();
             }))
             .child(
@@ -2485,18 +2755,18 @@ impl Transcript {
             .flex()
             .flex_col()
             .gap(px(CHIP_GAP))
-            .children(tools.iter().map(|tool| tool_chip(tool, theme)));
+            .children(
+                tools[rendered_tools]
+                    .iter()
+                    .map(|tool| tool_chip(tool, theme)),
+            );
 
         // Fold body: 200ms committed-height tween on a USER toggle only — and
-        // only within a short window of the click. Auto-open (streaming) and
+        // only within a short window of the click. Active-preview changes and
         // content growth never tween, and a SETTLED fold renders at its static
         // height: leaving the tween armed replayed it on every remount, which
         // in a virtualized list means every scroll-back-into-view (only `open`
         // toggles animate — composes with the stick spring).
-        let animating = fold.epoch > 0
-            && fold
-                .toggled_at
-                .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
         let body: AnyElement = if animating {
             let from = fold.from;
             div()
@@ -2686,7 +2956,7 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
 /// The glyph for a tool call from the Solar icon set.
 fn tool_icon_path(call: &ToolCall) -> &'static str {
     match call {
-        ToolCall::Exec { .. } => crate::icons::COMMAND,
+        ToolCall::Exec { .. } => crate::icons::TERMINAL,
         ToolCall::ReadFile { .. } | ToolCall::ApplyPatch { .. } => crate::icons::DOCUMENT,
         ToolCall::WriteFile { .. } => crate::icons::DOCUMENT_ADD,
         ToolCall::EditFile { .. } => crate::icons::PEN,
@@ -2694,6 +2964,7 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
         ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
         ToolCall::Todo { .. } => crate::icons::CHECKLIST,
+        ToolCall::SpawnAgent { .. } => crate::icons::USER,
         ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
     }
 }
@@ -3118,6 +3389,35 @@ mod tests {
         }
     }
 
+    fn turn_diff() -> TurnDiffManifest {
+        TurnDiffManifest {
+            catalog_revision: "revision".into(),
+            chat_id: "chat".into(),
+            assistant_message_id: "m1".into(),
+            device_id: "dev".into(),
+            cwd: "/repo".into(),
+            vcs: jolt_proto::VcsKind::Git,
+            files: vec![jolt_proto::DiffFileDescriptor {
+                id: "file".into(),
+                path: "src/lib.rs".into(),
+                old_path: None,
+                status: "modified".into(),
+                additions: 2,
+                deletions: 1,
+                binary: false,
+                row_count: 3,
+                estimated_bytes: 100,
+                completeness: jolt_proto::DiffCompleteness::Complete,
+                page_ids: vec!["page".into()],
+            }],
+            pages: vec![],
+            additions: 2,
+            deletions: 1,
+            truncated: false,
+            completed_at: chrono::Utc::now(),
+        }
+    }
+
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
 
     #[test]
@@ -3220,33 +3520,33 @@ mod tests {
     }
 
     #[test]
-    fn trailing_group_auto_opens_only_while_streaming() {
+    fn trailing_group_is_active_only_while_streaming() {
         let parts = vec![text_part("t0", "hi"), tool_part("a", "ls")];
         let streaming = assistant("m3", MessageStatus::Streaming, parts.clone());
         let rows = rows_for_entry(&streaming, false, &mut parse);
-        let RowKind::ToolGroup { auto_open, .. } = rows[1].kind else {
+        let RowKind::ToolGroup { active, .. } = rows[1].kind else {
             panic!()
         };
-        assert!(auto_open, "trailing group opens while streaming");
+        assert!(active, "trailing group is active while streaming");
 
         let complete = assistant("m3", MessageStatus::Complete, parts);
         let rows = rows_for_entry(&complete, false, &mut parse);
-        let RowKind::ToolGroup { auto_open, .. } = rows[1].kind else {
+        let RowKind::ToolGroup { active, .. } = rows[1].kind else {
             panic!()
         };
-        assert!(!auto_open);
+        assert!(!active);
 
-        // A non-trailing group never auto-opens.
+        // A non-trailing group is not active.
         let mid = assistant(
             "m4",
             MessageStatus::Streaming,
             vec![tool_part("a", "ls"), text_part("t0", "hi")],
         );
         let rows = rows_for_entry(&mid, false, &mut parse);
-        let RowKind::ToolGroup { auto_open, .. } = rows[0].kind else {
+        let RowKind::ToolGroup { active, .. } = rows[0].kind else {
             panic!()
         };
-        assert!(!auto_open);
+        assert!(!active);
     }
 
     #[test]
@@ -3400,8 +3700,67 @@ mod tests {
         let done = assistant("m1", MessageStatus::Complete, vec![text_part("t0", MD)]);
         let live_rows = rows_for_entry(&live, false, &mut parse);
         let done_rows = rows_for_entry(&done, false, &mut parse);
-        // Same ids; every version flips its streaming bit → one 3-row splice.
+        // Same ids; every version flips its streaming bit → one 3-row change.
         assert_eq!(diff_rows(&live_rows, &done_rows), Some((0..3, 3)));
+    }
+
+    #[test]
+    fn growing_tool_group_is_an_in_place_row_change() {
+        let before = assistant("m1", MessageStatus::Streaming, vec![tool_part("a", "one")]);
+        let after = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![tool_part("a", "one"), tool_part("b", "two")],
+        );
+        let before = rows_for_entry(&before, false, &mut parse);
+        let after = rows_for_entry(&after, false, &mut parse);
+        let (range, count) = diff_rows(&before, &after).expect("tool group changed");
+
+        assert_eq!(range, 0..1);
+        assert_eq!(count, 1);
+        assert!(rows_changed_in_place(&before, &after, &range, count));
+    }
+
+    #[test]
+    fn finalized_changes_replace_successful_mutation_chips() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                MessagePart::Tool {
+                    id: "edit".into(),
+                    call: ToolCall::EditFile {
+                        path: "src/lib.rs".into(),
+                        old_string: None,
+                        new_string: None,
+                    },
+                    is_error: false,
+                    resolved: true,
+                },
+                MessagePart::Tool {
+                    id: "failed".into(),
+                    call: ToolCall::WriteFile {
+                        path: "bad.rs".into(),
+                        content: None,
+                    },
+                    is_error: true,
+                    resolved: true,
+                },
+                MessagePart::Changes {
+                    id: "changes".into(),
+                    diff: turn_diff(),
+                },
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+
+        assert_eq!(rows.len(), 2);
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("failed mutation remains a tool group");
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].is_error);
+        assert!(matches!(rows[1].kind, RowKind::Changes { .. }));
     }
 
     #[test]
@@ -3467,12 +3826,11 @@ mod tests {
 
     #[test]
     fn tool_chip_labels_per_kind() {
-        assert_eq!(
-            tool_chip_content(&ToolCall::Exec {
-                command: "cargo test".into()
-            }),
-            ("Run", "cargo test".to_string())
-        );
+        let run = ToolCall::Exec {
+            command: "cargo test".into(),
+        };
+        assert_eq!(tool_icon_path(&run), crate::icons::TERMINAL);
+        assert_eq!(tool_chip_content(&run), ("Run", "cargo test".to_string()));
         assert_eq!(
             tool_chip_content(&ToolCall::ReadFile {
                 path: "src/lib.rs".into(),
@@ -3600,6 +3958,14 @@ mod tests {
             chips_height(3),
             CHIPS_TOP_PAD + 3.0 * CHIP_HEIGHT + 2.0 * CHIP_GAP
         );
+    }
+
+    #[test]
+    fn collapsed_active_tool_group_previews_only_the_latest_tool() {
+        assert_eq!(visible_tool_range(4, false, true), 3..4);
+        assert_eq!(visible_tool_range(4, false, false), 4..4);
+        assert_eq!(visible_tool_range(4, true, true), 0..4);
+        assert_eq!(visible_tool_range(0, false, true), 0..0);
     }
 
     #[test]

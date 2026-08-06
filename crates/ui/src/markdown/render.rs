@@ -8,22 +8,25 @@
 //! chunk opacity veil over the text runs (see [`super::veil`]) — opacity only,
 //! zero translate, applied after layout-relevant properties are fixed.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
-    StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
-    size,
+    AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, ImageSource, InteractiveText,
+    ObjectFit, RenderImage, SharedString, StyledText, SvgRenderer, TextRun, UnderlineStyle, Window,
+    canvas, div, font, img, point, prelude::*, px, quad, size,
 };
 
 use crate::theme::Theme;
 
 use super::highlight::{Token, TokenClass};
-use super::parser::{Block, BlockTree, InlineRun, TableAlign};
+use super::parser::{Block, BlockTree, InlineRun, MathKind, TableAlign};
+use super::rich::{self, MermaidColors, RichSvg};
 use super::veil::{RowVeil, apply_veil, slice_spans};
 
 /// Gap between markdown blocks inside one message (jolt mdBlockGap).
@@ -82,6 +85,12 @@ pub struct RenderOptions {
     /// Destination routing supplied by the owning surface. The Markdown
     /// renderer has no project cwd or editor preference of its own.
     pub open_link: Option<OpenLinkFn>,
+    /// True while the assistant is still appending. Rich fenced blocks keep
+    /// their source fallback until the response settles, so an unfinished
+    /// graph/formula never flashes errors or expensive partial layouts.
+    pub streaming: bool,
+    /// GPUI's native SVG rasterizer. Optional for non-window tests/previews.
+    pub svg_renderer: Option<SvgRenderer>,
 }
 
 pub type OpenLinkFn = Rc<dyn Fn(&str, &mut Window, &mut gpui::App)>;
@@ -105,6 +114,8 @@ impl RenderOptions {
             now: Instant::now(),
             copy: None,
             open_link: None,
+            streaming: false,
+            svg_renderer: None,
         }
     }
 }
@@ -128,6 +139,7 @@ impl RenderOptions {
 pub struct RenderCache {
     flats: HashMap<(SharedString, usize, usize), Rc<FlatText>>,
     code: HashMap<(SharedString, usize, usize), Rc<CachedCode>>,
+    rich: HashMap<(SharedString, usize, usize), Rc<CachedRich>>,
     /// The [`crate::theme::theme_generation`] these entries were shaped under.
     generation: u32,
 }
@@ -137,7 +149,20 @@ pub struct CachedCode {
     code_len: usize,
     /// Slice-pointer identity + len of the highlight Arc that produced this.
     hl_key: (usize, usize),
+    max_line_width: f32,
     lines: Vec<(SharedString, Vec<TextRun>)>,
+}
+
+struct CachedRich {
+    identity: String,
+    image: Option<RichImage>,
+}
+
+#[derive(Clone)]
+struct RichImage {
+    image: Arc<RenderImage>,
+    width: f32,
+    height: f32,
 }
 
 impl RenderCache {
@@ -145,11 +170,13 @@ impl RenderCache {
     pub fn invalidate_row(&mut self, row: &str) {
         self.flats.retain(|(r, _, _), _| r.as_ref() != row);
         self.code.retain(|(r, _, _), _| r.as_ref() != row);
+        self.rich.retain(|(r, _, _), _| r.as_ref() != row);
     }
 
     pub fn clear(&mut self) {
         self.flats.clear();
         self.code.clear();
+        self.rich.clear();
     }
 
     /// Drop every entry if the palette changed since they were shaped. Cheap
@@ -221,15 +248,25 @@ pub fn render_block(
             let (size, line) = heading_metrics(*level, theme.font_sizes.interface);
             text_element(runs, size, line, true, top_ix, ix, opts, theme)
         }
-        Block::CodeBlock { language, code } => render_code_block(
-            language.as_deref(),
-            code,
-            top_ix,
-            ix,
-            opts,
-            theme,
-            highlight,
-        ),
+        Block::CodeBlock { language, code } => {
+            if !opts.streaming
+                && let Some(rich) =
+                    render_rich_fence(language.as_deref(), code, top_ix, ix, opts, theme)
+            {
+                rich
+            } else {
+                render_code_block(
+                    language.as_deref(),
+                    code,
+                    top_ix,
+                    ix,
+                    opts,
+                    theme,
+                    window,
+                    highlight,
+                )
+            }
+        }
         Block::BlockQuote { children } => div()
             // Accent-tinted quote: indigo rail + a whisper of the same hue
             // behind it (the inline-code treatment, dialed down).
@@ -547,8 +584,13 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         if run.text.is_empty() {
             continue;
         }
+        let visible: Cow<'_, str> = match run.style.math {
+            Some(MathKind::Inline) => Cow::Owned(format!("${}$", run.text)),
+            Some(MathKind::Display) => Cow::Owned(format!("$${}$$", run.text)),
+            None => Cow::Borrowed(&run.text),
+        };
         let start = text.len();
-        text.push_str(&run.text);
+        text.push_str(&visible);
         let mut f = if run.style.code {
             font(theme.font_mono.clone())
         } else {
@@ -596,7 +638,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             }
         }
         out.push(TextRun {
-            len: run.text.len(),
+            len: visible.len(),
             font: f,
             color,
             // Inline code's wash is painted as ROUNDED quads by the canvas
@@ -1036,6 +1078,291 @@ fn midpoint_char_boundary(text: &str, lo: usize, hi: usize) -> Option<usize> {
     (lo < mid && mid < hi).then_some(mid)
 }
 
+fn render_rich_cached(
+    identity: String,
+    top_ix: usize,
+    ix: usize,
+    opts: &RenderOptions,
+    build: impl FnOnce() -> anyhow::Result<RichSvg>,
+) -> Option<RichImage> {
+    if let Some(cache) = &opts.cache {
+        let mut cache = cache.borrow_mut();
+        cache.sync_palette();
+        if let Some(existing) = cache.rich.get(&(opts.row_key.clone(), top_ix, ix))
+            && existing.identity == identity
+        {
+            return existing.image.clone();
+        }
+    }
+
+    // Failures are cached too: malformed model output remains a cheap source
+    // fallback instead of retrying a parser and rasterizer on every frame.
+    let image = opts.svg_renderer.as_ref().and_then(|renderer| {
+        let rich = build().ok()?;
+        let image = renderer
+            .render_single_frame(rich.svg.as_bytes(), 1.0)
+            .ok()?;
+        Some(RichImage {
+            image,
+            width: rich.width,
+            height: rich.height,
+        })
+    });
+    if let Some(cache) = &opts.cache {
+        cache.borrow_mut().rich.insert(
+            (opts.row_key.clone(), top_ix, ix),
+            Rc::new(CachedRich {
+                identity,
+                image: image.clone(),
+            }),
+        );
+    }
+    image
+}
+
+fn math_color(color: Hsla) -> ratex_types::Color {
+    let color = gpui::Rgba::from(color);
+    ratex_types::Color::new(color.r, color.g, color.b, color.a)
+}
+
+fn color_hex(color: Hsla) -> String {
+    let color = gpui::Rgba::from(color);
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (color.r * 255.0).round() as u8,
+        (color.g * 255.0).round() as u8,
+        (color.b * 255.0).round() as u8,
+    )
+}
+
+fn render_math_image(
+    source: &str,
+    inline: bool,
+    font_size: f32,
+    top_ix: usize,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> Option<RichImage> {
+    let identity = format!("math:{inline}:{font_size}:{source}");
+    render_rich_cached(identity, top_ix, ix, opts, || {
+        rich::render_math(source, inline, math_color(theme.text), font_size)
+    })
+}
+
+fn raw_math_run(source: &str, kind: MathKind, mut style: super::parser::InlineStyle) -> InlineRun {
+    style.math = None;
+    let text = match kind {
+        MathKind::Inline => format!("${source}$"),
+        MathKind::Display => format!("$${source}$$"),
+    };
+    InlineRun { text, style }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn math_text_element(
+    runs: &[InlineRun],
+    font_size: f32,
+    line_height: f32,
+    bold_default: bool,
+    top_ix: usize,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> AnyElement {
+    let weight = if bold_default {
+        FontWeight::SEMIBOLD
+    } else {
+        FontWeight::NORMAL
+    };
+    let mut pieces = Vec::new();
+    let mut piece_ix = 0usize;
+    for run in runs {
+        if let Some(kind) = run.style.math {
+            let inline = kind == MathKind::Inline;
+            let cache_ix = ix.saturating_mul(10_000).saturating_add(piece_ix);
+            let child = if let Some(rich) =
+                render_math_image(&run.text, inline, font_size, top_ix, cache_ix, opts, theme)
+            {
+                let image = img(ImageSource::Render(rich.image))
+                    .w(px(rich.width))
+                    .h(px(rich.height))
+                    .object_fit(ObjectFit::Contain);
+                if inline {
+                    div()
+                        .flex_none()
+                        .h(px(rich.height.max(line_height)))
+                        .flex()
+                        .items_center()
+                        .child(image)
+                        .into_any_element()
+                } else {
+                    div()
+                        .id(SharedString::from(format!(
+                            "{}-math{cache_ix}",
+                            opts.row_key
+                        )))
+                        .w_full()
+                        .overflow_x_scroll()
+                        .flex()
+                        .justify_center()
+                        .py(px(4.0))
+                        .child(image)
+                        .into_any_element()
+                }
+            } else {
+                let raw = raw_math_run(&run.text, kind, run.style.clone());
+                let flat = flatten_cached(&[raw], weight, top_ix, cache_ix, opts, theme);
+                flat_text_element(&flat, cache_ix, opts, theme)
+            };
+            pieces.push(child);
+            piece_ix += 1;
+            continue;
+        }
+
+        // A flex item per whitespace-terminated fragment gives formulas true
+        // inline wrapping while retaining the existing styled/selectable text
+        // implementation for every fragment.
+        for fragment in run.text.split_inclusive(char::is_whitespace) {
+            if fragment.is_empty() {
+                continue;
+            }
+            let cache_ix = ix.saturating_mul(10_000).saturating_add(piece_ix);
+            let mut fragment_run = run.clone();
+            fragment_run.text = fragment.to_string();
+            let flat = flatten_cached(&[fragment_run], weight, top_ix, cache_ix, opts, theme);
+            pieces.push(flat_text_element(&flat, cache_ix, opts, theme));
+            piece_ix += 1;
+        }
+    }
+    div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_baseline()
+        .text_size(px(font_size))
+        .line_height(px(line_height))
+        .children(pieces)
+        .into_any_element()
+}
+
+fn render_rich_fence(
+    language: Option<&str>,
+    source: &str,
+    top_ix: usize,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> Option<AnyElement> {
+    let language = language?.to_ascii_lowercase();
+    let rich = match language.as_str() {
+        "math" | "latex" | "tex" => render_math_image(
+            source,
+            false,
+            f32::from(theme.font_sizes.interface) + 2.0,
+            top_ix,
+            ix,
+            opts,
+            theme,
+        ),
+        "mermaid" => {
+            let canvas = color_hex(theme.bg);
+            let surface = color_hex(theme.surface);
+            let surface_alt = color_hex(theme.surface_raised);
+            let text = color_hex(theme.text);
+            let muted = color_hex(theme.text_muted);
+            let border = color_hex(theme.border_strong);
+            let line = color_hex(theme.text_dim);
+            let accent = color_hex(theme.accent);
+            let font_family = theme.font_sans.as_ref();
+            let identity = format!("mermaid:{font_family}:{source}");
+            render_rich_cached(identity, top_ix, ix, opts, || {
+                rich::render_mermaid(
+                    source,
+                    &MermaidColors {
+                        canvas: &canvas,
+                        surface: &surface,
+                        surface_alt: &surface_alt,
+                        text: &text,
+                        muted: &muted,
+                        border: &border,
+                        line: &line,
+                        accent: &accent,
+                    },
+                    font_family,
+                    &format!("jolt-{top_ix}-{ix}"),
+                )
+            })
+        }
+        _ => return None,
+    }?;
+
+    let copy_button = opts.copy.clone().map(|copy| {
+        let copied = copy.copied_ix == Some(ix);
+        let source: SharedString = source.to_string().into();
+        let handler = copy.handler.clone();
+        div()
+            .id(SharedString::from(format!(
+                "{}-rich-copy{ix}",
+                opts.row_key
+            )))
+            .absolute()
+            .top(px(6.0))
+            .right(px(7.0))
+            .h(px(22.0))
+            .px(px(7.0))
+            .rounded(px(5.0))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .cursor_pointer()
+            .bg(crate::theme::ink(0.08))
+            .text_size(px(10.5))
+            .text_color(theme.text_muted)
+            .on_click(move |_, window, cx| handler(ix, source.clone(), window, cx))
+            .child(
+                crate::icons::icon(if copied {
+                    crate::icons::CHECK
+                } else {
+                    crate::icons::COPY
+                })
+                .size(px(12.0))
+                // GPUI SVGs do not reliably inherit `currentColor` from the
+                // parent div; tint the mask directly, as the ordinary code
+                // block copy control does.
+                .text_color(theme.text_muted),
+            )
+            .when(copied, |el| el.child(SharedString::from("Copied")))
+    });
+    Some(
+        div()
+            .relative()
+            .w_full()
+            .rounded(px(10.0))
+            .bg(theme.bg)
+            .border_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .child(
+                div()
+                    .id(SharedString::from(format!("{}-rich{ix}", opts.row_key)))
+                    .w_full()
+                    .overflow_x_scroll()
+                    .p(px(10.0))
+                    .child(
+                        img(ImageSource::Render(rich.image))
+                            .w(px(rich.width))
+                            .h(px(rich.height))
+                            .max_w_full()
+                            .object_fit(ObjectFit::Contain),
+                    ),
+            )
+            .children(copy_button)
+            .into_any_element(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn text_element(
     runs: &[InlineRun],
@@ -1047,6 +1374,18 @@ fn text_element(
     opts: &RenderOptions,
     theme: &Theme,
 ) -> AnyElement {
+    if runs.iter().any(|run| run.style.math.is_some()) {
+        return math_text_element(
+            runs,
+            size,
+            line_height,
+            bold_default,
+            top_ix,
+            ix,
+            opts,
+            theme,
+        );
+    }
     let weight = if bold_default {
         FontWeight::SEMIBOLD
     } else {
@@ -1069,6 +1408,7 @@ fn render_code_block(
     ix: usize,
     opts: &RenderOptions,
     theme: &Theme,
+    window: &Window,
     highlight: CodeHighlight,
 ) -> AnyElement {
     let mono = font(theme.font_mono.clone());
@@ -1076,6 +1416,7 @@ fn render_code_block(
     // length + highlight slice identity — a fresh highlight Arc re-derives).
     let hl_key = highlight.map_or((0, 0), |h| (h.as_ptr() as usize, h.len()));
     let build = || {
+        let mut max_line_width = 0.0_f32;
         let lines: Vec<(SharedString, Vec<TextRun>)> = code
             .split('\n')
             .enumerate()
@@ -1084,15 +1425,27 @@ fn render_code_block(
                     .and_then(|h| h.get(li))
                     .map(|t| &t[..])
                     .unwrap_or(&[]);
-                (
-                    SharedString::from(line.to_string()),
-                    runs_for_code_line(line, tokens, &mono, theme),
-                )
+                let line: SharedString = line.to_string().into();
+                let runs = runs_for_code_line(&line, tokens, &mono, theme);
+                let width = f32::from(
+                    window
+                        .text_system()
+                        .shape_line(
+                            line.clone(),
+                            px(f32::from(theme.font_sizes.code)),
+                            &runs,
+                            None,
+                        )
+                        .width(),
+                );
+                max_line_width = max_line_width.max(width);
+                (line, runs)
             })
             .collect();
         Rc::new(CachedCode {
             code_len: code.len(),
             hl_key,
+            max_line_width,
             lines,
         })
     };
@@ -1164,6 +1517,35 @@ fn render_code_block(
             )
             .when(copied, |el| el.child(SharedString::from("Copied")))
     });
+    let code_lines = div()
+        // GPUI's column layout otherwise stretches every line to the viewport,
+        // so painted text past that width is clipped without becoming scroll
+        // overflow. Preserve the shaped max-content width explicitly.
+        .w_full()
+        .min_w(px(cached.max_line_width))
+        .flex()
+        .flex_col()
+        .children((0..cached.lines.len()).scan(0usize, move |off, li| {
+            let (line, runs) = &cached.lines[li];
+            let start = *off;
+            *off = start + line.len() + 1; // +1 for the '\n'
+            let local = slice_spans(&veil_spans, start, start + line.len());
+            let runs = apply_veil(runs.clone(), &local);
+            let styled = StyledText::new(line.clone()).with_runs(runs);
+            let selection_key = format!("{selection_row_key}:code{ix}:{li}").into();
+            Some(
+                div()
+                    .h(px(theme.font_sizes.code_line_height()))
+                    .flex_none()
+                    .child(selectable_styled_text(
+                        selection_key,
+                        line.clone(),
+                        styled,
+                        selection_wash,
+                    )),
+            )
+        }));
+
     div()
         .rounded(px(10.0))
         // Faint white wash over the near-black code surface, with a hairline
@@ -1197,28 +1579,7 @@ fn render_code_block(
                 .text_size(px(f32::from(theme.font_sizes.code)))
                 .line_height(px(theme.font_sizes.code_line_height()))
                 .whitespace_nowrap()
-                .flex()
-                .flex_col()
-                .children((0..cached.lines.len()).scan(0usize, move |off, li| {
-                    let (line, runs) = &cached.lines[li];
-                    let start = *off;
-                    *off = start + line.len() + 1; // +1 for the '\n'
-                    let local = slice_spans(&veil_spans, start, start + line.len());
-                    let runs = apply_veil(runs.clone(), &local);
-                    let styled = StyledText::new(line.clone()).with_runs(runs);
-                    let selection_key = format!("{selection_row_key}:code{ix}:{li}").into();
-                    Some(
-                        div()
-                            .h(px(theme.font_sizes.code_line_height()))
-                            .flex_none()
-                            .child(selectable_styled_text(
-                                selection_key,
-                                line.clone(),
-                                styled,
-                                selection_wash,
-                            )),
-                    )
-                })),
+                .child(code_lines),
         )
         // Overlay LAST so it paints above the header/body.
         .children(copy_button)

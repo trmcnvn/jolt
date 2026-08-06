@@ -654,6 +654,8 @@ pub(crate) struct RawChat {
     space_id: Option<String>,
     #[serde(default)]
     last_seen_at: Option<i64>,
+    #[serde(default)]
+    goal: Option<jolt_proto::Goal>,
 }
 
 impl From<RawChat> for Chat {
@@ -674,6 +676,7 @@ impl From<RawChat> for Chat {
             harness_session_cwd: raw.harness_session_cwd,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
+            goal: raw.goal,
         }
     }
 }
@@ -748,6 +751,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            goal: None,
         }
     }
 

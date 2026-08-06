@@ -8,6 +8,56 @@ use serde::{Deserialize, Serialize};
 
 use crate::{HarnessId, ReasoningLevel, SandboxLevel};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Goal {
+    pub id: String,
+    pub revision: u64,
+    pub control_nonce: String,
+    pub objective: String,
+    pub status: GoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub elapsed_active_ms: u64,
+    #[serde(default)]
+    pub turns: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker_key: Option<String>,
+    #[serde(default)]
+    pub blocker_streak: u8,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeFileRecord {
+    pub id: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub deleted: bool,
+    /// Complete versioned custom-theme JSON. Empty only for a deletion marker.
+    /// The viewport owns its schema; registry transport otherwise treats it as
+    /// an opaque file payload.
+    pub contents: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
@@ -120,6 +170,9 @@ pub struct Chat {
     /// device clears the badge everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// Jolt-owned long-running objective state. The chat host is the sole writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<Goal>,
 }
 
 impl Chat {
@@ -313,28 +366,6 @@ pub struct DiffFileSummary {
     pub deletions: u32,
     #[serde(default)]
     pub binary: bool,
-}
-
-/// Working-tree diff for a checkout — latest-only sidecar, 3MiB patch cap.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CheckoutDiff {
-    pub checkout_id: String,
-    pub device_id: String,
-    pub cwd: String,
-    #[serde(default)]
-    pub vcs: VcsKind,
-    /// VCS-specific checkout label (for example `Working copy · zlztoplq`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub patch: String,
-    pub files: Vec<DiffFileSummary>,
-    pub additions: u32,
-    pub deletions: u32,
-    /// True when the patch was truncated at the byte cap ("Partial snapshot").
-    pub truncated: bool,
-    pub checksum: String,
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -266,6 +266,7 @@ extension RenderToolCall {
         case "webFetch": return "Fetch"
         case "webSearch": return "Web"
         case "todo": return "Todo"
+        case "spawnAgent": return "Agent"
         case "mcp": return "MCP"
         default: return "Tool"
         }
@@ -296,6 +297,11 @@ extension RenderToolCall {
         case "webSearch": return string("query") ?? ""
         case "todo":
             return string("summary") ?? "task list"
+        case "spawnAgent":
+            guard let agentType = string("agentType"), !agentType.isEmpty else {
+                return "Spawned subagent"
+            }
+            return "Spawned \(agentType) subagent"
         case "mcp":
             let server = string("server").map { "\($0) · " } ?? ""
             return server + (string("tool") ?? "")
@@ -313,6 +319,7 @@ extension RenderToolCall {
         case "glob": return "folder"
         case "webFetch", "webSearch": return "globe"
         case "todo": return "checklist"
+        case "spawnAgent": return "person.2"
         default: return "square.grid.2x2"
         }
     }
@@ -341,7 +348,9 @@ func toolGroupSummary(_ tools: [ToolItem]) -> String {
     if reads > 0 { segments.append(reads == 1 ? "read 1 file" : "read \(reads) files") }
     let searches = tools.filter { ["search", "glob", "webSearch", "webFetch"].contains($0.call.tag) }.count
     if searches > 0 { segments.append(searches == 1 ? "1 search" : "\(searches) searches") }
-    let other = tools.count - runs - edits - reads - searches
+    let agents = tools.filter { $0.call.tag == "spawnAgent" }.count
+    if agents > 0 { segments.append(agents == 1 ? "spawned 1 agent" : "spawned \(agents) agents") }
+    let other = tools.count - runs - edits - reads - searches - agents
     if other > 0 { segments.append(other == 1 ? "1 tool" : "\(other) tools") }
     let failed = tools.filter(\.isError).count
     if failed > 0 { segments.append("\(failed) failed") }

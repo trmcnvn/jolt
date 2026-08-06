@@ -43,7 +43,7 @@ Op {
 }
 ```
 
-Rows use the `devices`, `spaces`, `chats`, and `sessions` kinds. Each field has an independent clock. Setting a field to JSON `null` removes the value while retaining the clocked write.
+Rows use the `devices`, `spaces`, `chats`, `sessions`, and `themes` kinds. Theme rows carry opaque versioned custom-theme files; each installation keeps its own on-disk copy, while active selections and other appearance settings remain device-local. Revisioned deletion markers prevent stale hosts from restoring removed themes, and irreconcilable edits are retained under separate IDs as named conflict copies. Each field has an independent clock. Setting a field to JSON `null` removes the value while retaining the clocked write.
 
 Hybrid logical clocks are fixed-width strings:
 
@@ -105,13 +105,15 @@ The per-chat Durable Object keeps:
 - a current Loro snapshot;
 - a buffered update log;
 - a compact transcript catalog, byte-bounded historical pages, and a mutable tail projection;
-- the latest working-copy diff sidecar;
+- the latest working-copy diff manifest and references to immutable, byte-bounded patch pages;
 - ephemeral presence;
 - daily R2 backups.
 
 Dirty update rows flush on a short cadence. Logical updates larger than Durable Object SQLite's row limit are split across continuation rows and reassembled before replay. When the update log reaches the configured threshold, the room folds it losslessly into the snapshot. Daily checkpoint-based trimming discards history beyond the three-day retention frontier while preserving current state. A joining client behind a shallow snapshot's retained frontier receives the full snapshot instead of an unusable partial diff.
 
 The host engine keeps local snapshots and an LRU of open documents. `WatchTranscriptV2` opens with compact whole-session metadata and enough trailing pages to cover at least 64 messages, then sends sequenced deltas only for the mutable live page. Historical pages are fetched by opaque ID and cached under a device byte budget. The older full-reset watch remains only for client compatibility. Retiring a deleted chat closes its room, prevents stale clients from recreating backups, and removes `backup/<chatId>/latest.loro`.
+
+Checkout diffs use the same projection shape without transcript-style line deltas. `WatchCheckoutDiffV2` is scoped to one chat checkout and sends a complete file/page manifest; expanded bodies load through `GetCheckoutDiffPage`. Pages are self-contained unified-patch fragments split at file, hunk, then line boundaries and addressed by SHA-256. The edge stores chat manifests in SessionRoom and deduplicates page bodies per user checkout in R2, deleting pages dropped by the latest checkout manifest. Files omitted by the bounded capture remain visible in the manifest with an explicit partial state.
 
 ### Writer discipline
 

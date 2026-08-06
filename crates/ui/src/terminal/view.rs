@@ -47,7 +47,7 @@ pub fn terminal_bg_for(appearance: Appearance) -> Hsla {
 }
 
 pub fn terminal_bg(theme: &Theme) -> Hsla {
-    terminal_bg_for(theme.appearance)
+    theme.terminal_bg
 }
 
 /// Neutral selection wash that preserves ANSI hue while changing lightness.
@@ -140,8 +140,9 @@ pub fn indexed_rgb(appearance: Appearance, index: u8) -> (u8, u8, u8) {
 /// Resolve a cell color to paint against the theme.
 pub fn resolve_color(color: CellColor, theme: &Theme) -> Hsla {
     match color {
-        CellColor::Foreground => theme.text,
-        CellColor::Background => terminal_bg_for(theme.appearance),
+        CellColor::Foreground => theme.terminal_fg,
+        CellColor::Background => theme.terminal_bg,
+        CellColor::Indexed(ix @ 0..=15) => theme.terminal_ansi[ix as usize],
         CellColor::Indexed(ix) => {
             let (r, g, b) = indexed_rgb(theme.appearance, ix);
             rgb8(r, g, b)
@@ -464,7 +465,7 @@ impl gpui::Element for TerminalElement {
                                 point(origin.x + cell_w * start as f32, y),
                                 size(cell_w * (col - start) as f32, line_h),
                             ),
-                            terminal_selection_for(theme.appearance),
+                            theme.terminal_selection,
                         ));
                         selection_start = None;
                     }

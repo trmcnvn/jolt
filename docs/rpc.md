@@ -76,7 +76,9 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | `ListHarnesses` | unary | yes | Static harness descriptors without forcing CLI discovery |
 | `ListModels` | unary | yes | Models from one installed harness |
 | `ListCommands` | unary | yes | Jolt composer commands for the target session context |
-| `QueueCommand` | unary | yes | Append a durable run/bash/steer/interrupt/respond-input command |
+| `QueueCommand` | unary | yes | Append a durable run/queue/bash/steer/interrupt/respond-input command |
+| `CancelQueuedPrompt` | unary | no | Cancel a queue item still pending on its issuing device |
+| `WatchQueuedPrompts` | stream | no | Pending queued turns from the locally synced chat doc |
 | `WatchTranscriptV2` | stream | yes | Compact whole-session manifest + trailing pages, then sequenced live-page deltas |
 | `GetTranscriptPage` | unary | yes | Fetch one historical page by opaque page ID |
 | `WatchDocMessages` | stream | yes | Compatibility stream for older clients: initial full reset, then entry/text deltas |
@@ -92,6 +94,8 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | `WatchDevices` | stream | no | Current device rows |
 | `WatchSessions` | stream | no | Local + registry live session rows |
 | `WatchSpaces` | stream | no | Current space rows |
+| `WatchThemes` / `ListThemes` | stream / unary | no | Account-registry copies of installation-level custom theme files |
+| `UpsertThemes` / `DeleteTheme` | unary | no | Reconcile custom theme files without syncing active appearance settings |
 | `Mutate` | unary | no | Create/rename/delete spaces and chats; config, checkout, archive, seen, device updates |
 | `ProbeSync` | unary | no | Ask workspace/open chat clients to verify room liveness |
 | `SyncStatus` | unary | no | Per-room push/ack/rejoin/probe/resync diagnostics |
@@ -130,7 +134,11 @@ These methods are local IPC only. DeviceRoom relay traffic is permanently routed
 | `ListFolders`, `SearchFiles` | unary | yes |
 | `CreateWorktree`, `DeleteWorktree` | unary | yes |
 | `VcsSettings`, `SetVcsBackend` | unary | yes |
-| `WatchCheckoutDiffs` | stream | yes |
+| `WatchCheckoutDiffV2` | stream | yes |
+| `GetCheckoutDiffPage` | unary | yes |
+| `GetTurnDiffPage` | unary | yes |
+
+`WatchCheckoutDiffV2` is checkout-specific by `chatId`. It opens with an atomic compact manifest; later frames replace only that manifest. Expanded file bodies load as immutable, SHA-256-addressed raw-patch pages through `GetCheckoutDiffPage`. Sequence or catalog mismatch causes a fresh bootstrap. `GetTurnDiffPage` loads an immutable page captured for one assistant transcript entry, addressed by chat, assistant message, catalog revision, and page ID.
 
 File search roots are resolved from synced chat/space rows and verified against the owning repository checkout before walking. Results contain paths only, never file contents.
 
@@ -182,12 +190,15 @@ Uploads are staged and committed on the chat's host device. Attachment reads are
 
 - `run {request, messageId}`
 - `hiddenPrompt {request}`
+- `queue {request, messageId}`
+- `resumeQueue`
 - `bash {command, excludeFromContext, cwd, messageId}`
 - `steer {prompt, messageId?}`
 - `interrupt`
 - `respondInput {requestId, answers}`
+- `goal {operation}` where operation is create, edit, pause, resume, or clear; mutations after create include `goalId` and `expectedRevision`
 
-A `RunRequest` carries prompt, concrete model/reasoning/options, cwd, sandbox, approval choice, optional harness resume ID, and host-staged attachment paths.
+A `RunRequest` carries prompt, concrete model/reasoning/options, cwd, sandbox, approval choice, optional harness resume ID, and host-staged attachment paths. Queue commands remain pending while a turn is active, drain together in FIFO order at the next clean turn boundary, and pause after interruption or error until `resumeQueue` is issued.
 
 ## Stream behavior
 

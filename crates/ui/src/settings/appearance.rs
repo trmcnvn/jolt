@@ -20,6 +20,16 @@ use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
 use crate::settings::widgets;
 use crate::theme::{Appearance, DEFAULT_CODE_FONT, DEFAULT_UI_FONT, Theme};
+use crate::themes::{
+    EditableTheme, ThemeColorGroup, ThemeColorRole, ThemeSummary, format_hex_color, parse_hex_color,
+};
+
+struct ThemeEditor {
+    draft: EditableTheme,
+    appearance: Appearance,
+    role: ThemeColorRole,
+    error: Option<SharedString>,
+}
 
 pub struct AppearancePage {
     open_font: Option<FontRole>,
@@ -31,11 +41,17 @@ pub struct AppearancePage {
     font_scroll: gpui::ScrollHandle,
     menu_dismissed_at: Option<Instant>,
     size_menu_dismissed_at: Option<Instant>,
+    theme_editor: Option<ThemeEditor>,
+    theme_name: Entity<ComposerInput>,
+    theme_color: Entity<ComposerInput>,
     _font_search_events: Subscription,
+    _theme_name_events: Subscription,
+    _theme_color_events: Subscription,
 }
 
 impl AppearancePage {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        appearance::reload_theme_files(cx);
         let font_search =
             cx.new(|cx| ComposerInput::with_context("Search fonts…", "PaletteSearch", cx));
         let font_search_events = cx.subscribe(&font_search, |this: &mut Self, _, event, cx| {
@@ -44,6 +60,39 @@ impl AppearancePage {
                 this.font_scroll.scroll_to_item(0);
                 cx.notify();
             }
+        });
+        let theme_name = cx.new(|cx| ComposerInput::with_context("Theme name", "ThemeName", cx));
+        let theme_color =
+            cx.new(|cx| ComposerInput::with_context("#RRGGBB or #RRGGBBAA", "ThemeColor", cx));
+        let theme_name_events = cx.subscribe(&theme_name, |this: &mut Self, input, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited)
+                && let Some(editor) = &mut this.theme_editor
+            {
+                editor.draft.name = input.read(cx).text().to_string();
+                editor.error = None;
+                cx.notify();
+            }
+        });
+        let theme_color_events = cx.subscribe(&theme_color, |this: &mut Self, input, event, cx| {
+            if !matches!(event, ComposerInputEvent::Edited) {
+                return;
+            }
+            let Some(editor) = &mut this.theme_editor else {
+                return;
+            };
+            match parse_hex_color(input.read(cx).text()) {
+                Ok(color) => {
+                    let theme = match editor.appearance {
+                        Appearance::Light => &mut editor.draft.light,
+                        Appearance::Dark => &mut editor.draft.dark,
+                    };
+                    editor.role.set_color(theme, color);
+                    editor.error = None;
+                    appearance::preview_theme(theme.clone(), cx);
+                }
+                Err(err) => editor.error = Some(err.to_string().into()),
+            }
+            cx.notify();
         });
         let mut font_names: Vec<SharedString> = cx
             .text_system()
@@ -78,7 +127,12 @@ impl AppearancePage {
             font_scroll: gpui::ScrollHandle::new(),
             menu_dismissed_at: None,
             size_menu_dismissed_at: None,
+            theme_editor: None,
+            theme_name,
+            theme_color,
             _font_search_events: font_search_events,
+            _theme_name_events: theme_name_events,
+            _theme_color_events: theme_color_events,
         }
     }
 
@@ -379,6 +433,478 @@ impl AppearancePage {
         }
         trigger.into_any_element()
     }
+
+    fn open_theme_editor(&mut self, id: &str, cx: &mut Context<Self>) {
+        let draft = appearance::editable_theme(id, cx);
+        let appearance = Theme::of(cx).appearance;
+        let role = ThemeColorRole::Background;
+        let color = role.color(match appearance {
+            Appearance::Light => &draft.light,
+            Appearance::Dark => &draft.dark,
+        });
+        self.theme_editor = Some(ThemeEditor {
+            draft: draft.clone(),
+            appearance,
+            role,
+            error: None,
+        });
+        self.theme_name
+            .update(cx, |input, cx| input.set_text(draft.name, cx));
+        self.theme_color
+            .update(cx, |input, cx| input.set_text(format_hex_color(color), cx));
+        appearance::preview_theme(
+            match appearance {
+                Appearance::Light => draft.light,
+                Appearance::Dark => draft.dark,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn close_theme_editor(&mut self, cx: &mut Context<Self>) {
+        self.theme_editor = None;
+        appearance::clear_theme_preview(cx);
+        cx.notify();
+    }
+
+    fn set_editor_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.theme_editor else {
+            return;
+        };
+        editor.appearance = appearance;
+        editor.error = None;
+        let theme = match appearance {
+            Appearance::Light => &editor.draft.light,
+            Appearance::Dark => &editor.draft.dark,
+        };
+        self.theme_color.update(cx, |input, cx| {
+            input.set_text(format_hex_color(editor.role.color(theme)), cx)
+        });
+        appearance::preview_theme(theme.clone(), cx);
+        cx.notify();
+    }
+
+    fn select_theme_color(&mut self, role: ThemeColorRole, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.theme_editor else {
+            return;
+        };
+        editor.role = role;
+        editor.error = None;
+        let theme = match editor.appearance {
+            Appearance::Light => &editor.draft.light,
+            Appearance::Dark => &editor.draft.dark,
+        };
+        self.theme_color.update(cx, |input, cx| {
+            input.set_text(format_hex_color(role.color(theme)), cx)
+        });
+        cx.notify();
+    }
+
+    fn save_theme_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.theme_editor else {
+            return;
+        };
+        editor.draft.name = self.theme_name.read(cx).text().trim().to_string();
+        if editor.draft.name.is_empty() {
+            editor.error = Some("Enter a theme name.".into());
+            cx.notify();
+            return;
+        }
+        match appearance::save_custom_theme(&editor.draft, cx) {
+            Ok(_) => {
+                self.theme_editor = None;
+                cx.notify();
+            }
+            Err(err) => {
+                if let Some(editor) = &mut self.theme_editor {
+                    editor.error = Some(format!("Couldn’t save theme: {err}").into());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn delete_theme(&mut self, id: &str, cx: &mut Context<Self>) {
+        match appearance::delete_custom_theme(id, cx) {
+            Ok(_) => {
+                self.theme_editor = None;
+                cx.notify();
+            }
+            Err(err) => {
+                if let Some(editor) = &mut self.theme_editor {
+                    editor.error = Some(format!("Couldn’t delete theme: {err}").into());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn theme_card(
+        &mut self,
+        definition: ThemeSummary,
+        light_selected: bool,
+        dark_selected: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let light_id = definition.id.clone();
+        let dark_id = definition.id.clone();
+        let pair_id = definition.id.clone();
+        let edit_id = definition.id.clone();
+        let delete_id = definition.id.clone();
+        let builtin = definition.builtin;
+        let preview = div()
+            .h(px(112.0))
+            .w_full()
+            .flex()
+            .flex_row()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id(SharedString::from(format!("theme-light-{}", definition.id)))
+                    .relative()
+                    .w_1_2()
+                    .h_full()
+                    .rounded_tl(px(widgets::OPTION_CARD_RADIUS))
+                    .rounded_bl(px(widgets::OPTION_CARD_RADIUS))
+                    .border_2()
+                    .border_color(if light_selected {
+                        theme.accent
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        appearance::set_theme(Appearance::Light, &light_id, cx);
+                        cx.notify();
+                    }))
+                    .child(miniature(&definition.light, Corners::Left))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(8.0))
+                            .left(px(8.0))
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded_full()
+                            .bg(definition.light.surface_overlay)
+                            .text_size(px(10.0))
+                            .text_color(definition.light.text_muted)
+                            .child("Light"),
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("theme-dark-{}", definition.id)))
+                    .relative()
+                    .w_1_2()
+                    .h_full()
+                    .rounded_tr(px(widgets::OPTION_CARD_RADIUS))
+                    .rounded_br(px(widgets::OPTION_CARD_RADIUS))
+                    .border_2()
+                    .border_color(if dark_selected {
+                        theme.accent
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        appearance::set_theme(Appearance::Dark, &dark_id, cx);
+                        cx.notify();
+                    }))
+                    .child(miniature(&definition.dark, Corners::Right))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(8.0))
+                            .right(px(8.0))
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded_full()
+                            .bg(definition.dark.surface_overlay)
+                            .text_size(px(10.0))
+                            .text_color(definition.dark.text_muted)
+                            .child("Dark"),
+                    ),
+            );
+        div()
+            .w(px(244.0))
+            .flex_none()
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_card)
+            .overflow_hidden()
+            .child(preview)
+            .child(
+                div()
+                    .p(px(10.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(definition.name)),
+                    )
+                    .child(
+                        popover::btn_ghost(theme, "Use both", format!("theme-pair-{pair_id}"))
+                            .id(SharedString::from(format!("theme-pair-{pair_id}")))
+                            .px(px(7.0))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                appearance::set_theme_pair(&pair_id, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("theme-edit-{edit_id}")))
+                            .p(px(5.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(crate::theme::ink(0.06)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_theme_editor(&edit_id, cx)
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::PEN)
+                                    .size(px(13.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+                    .when(!builtin, |row| {
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("theme-delete-{delete_id}")))
+                                .p(px(5.0))
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(crate::theme::ink(0.06)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.delete_theme(&delete_id, cx)
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                        .size(px(13.0))
+                                        .text_color(theme.danger),
+                                ),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_theme_editor(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let editor = self.theme_editor.as_ref()?;
+        let appearance = editor.appearance;
+        let selected_role = editor.role;
+        let error = editor.error.clone();
+        let editing_id = editor.draft.id.clone();
+        let active_theme = match appearance {
+            Appearance::Light => &editor.draft.light,
+            Appearance::Dark => &editor.draft.dark,
+        };
+        let color_rows = ThemeColorGroup::ALL.into_iter().map(|group| {
+            let rows = ThemeColorRole::ALL
+                .iter()
+                .copied()
+                .filter(move |role| role.group() == group)
+                .map(|role| {
+                    let selected = role == selected_role;
+                    let color = role.color(active_theme);
+                    div()
+                        .id(SharedString::from(format!(
+                            "theme-color-role-{}",
+                            role.key()
+                        )))
+                        .px(px(10.0))
+                        .py(px(7.0))
+                        .rounded(px(7.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(9.0))
+                        .cursor_pointer()
+                        .bg(if selected {
+                            crate::theme::card_selected_bg()
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .hover(|style| style.bg(crate::theme::ink(0.05)))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.select_theme_color(role, cx)),
+                        )
+                        .child(
+                            div()
+                                .size(px(18.0))
+                                .rounded(px(5.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(color),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(12.0))
+                                .text_color(theme.text)
+                                .child(role.label()),
+                        )
+                        .child(
+                            div()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(format_hex_color(color))),
+                        )
+                });
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .px(px(6.0))
+                        .pt(px(10.0))
+                        .pb(px(4.0))
+                        .text_size(px(11.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text_faint)
+                        .child(group.label()),
+                )
+                .children(rows)
+        });
+        let card = popover::dialog_card(&theme)
+            .w(px(680.0))
+            .child(popover::dialog_title(&theme, "Edit theme"))
+            .child(div().mt(px(12.0)).child(popover::dialog_field(
+                self.theme_name.clone().into_any_element(),
+            )))
+            .child(div().mt(px(12.0)).flex().flex_row().gap(px(6.0)).children(
+                [Appearance::Light, Appearance::Dark].map(|variant| {
+                    let selected = variant == appearance;
+                    div()
+                        .id(match variant {
+                            Appearance::Light => "theme-editor-light",
+                            Appearance::Dark => "theme-editor-dark",
+                        })
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .rounded(px(8.0))
+                        .bg(if selected {
+                            crate::theme::card_selected_bg()
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .text_size(px(12.0))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_editor_appearance(variant, cx)
+                        }))
+                        .child(match variant {
+                            Appearance::Light => "Light",
+                            Appearance::Dark => "Dark",
+                        })
+                }),
+            ))
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .size(px(26.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(selected_role.color(active_theme)),
+                    )
+                    .child(div().w(px(220.0)).child(popover::dialog_field(
+                        self.theme_color.clone().into_any_element(),
+                    )))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(selected_role.label()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("theme-editor-color-list")
+                    .mt(px(10.0))
+                    .max_h(px(330.0))
+                    .overflow_y_scroll()
+                    .pr(px(4.0))
+                    .children(color_rows),
+            )
+            .when_some(error, |card, error| {
+                card.child(
+                    div()
+                        .mt(px(8.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.danger)
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .child(div().when_some(editing_id, |row, id| {
+                        row.child(
+                            popover::btn_danger(&theme, "Delete")
+                                .id("theme-editor-delete")
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.delete_theme(&id, cx)),
+                                ),
+                        )
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .child(
+                                popover::btn_ghost(&theme, "Cancel", "theme-editor-cancel")
+                                    .id("theme-editor-cancel")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.close_theme_editor(cx)),
+                                    ),
+                            )
+                            .child(
+                                popover::btn_primary(&theme, "Save")
+                                    .id("theme-editor-save")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.save_theme_editor(cx)),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("theme-editor-dialog", viewport, card))
+    }
 }
 
 /// One placeholder bar in the miniature, width given as a fraction of its
@@ -466,7 +992,7 @@ fn miniature(theme: &Theme, corners: Corners) -> AnyElement {
 /// The System card: light on the left, dark on the right. Each half is a
 /// complete miniature clipped to its side, which is what makes the card read as
 /// "whichever one the system is on".
-fn miniature_split() -> AnyElement {
+fn miniature_split(light: &Theme, dark: &Theme) -> AnyElement {
     div()
         .size_full()
         .flex()
@@ -476,14 +1002,14 @@ fn miniature_split() -> AnyElement {
                 .w_1_2()
                 .h_full()
                 .overflow_hidden()
-                .child(miniature(&Theme::light(), Corners::Left)),
+                .child(miniature(light, Corners::Left)),
         )
         .child(
             div()
                 .w_1_2()
                 .h_full()
                 .overflow_hidden()
-                .child(miniature(&Theme::dark(), Corners::Right)),
+                .child(miniature(dark, Corners::Right)),
         )
         .into_any_element()
 }
@@ -492,11 +1018,11 @@ fn miniature_split() -> AnyElement {
 ///
 /// The one place `Theme::light()`/`Theme::dark()` are legitimately built outside
 /// the installed global: a preview has to show the palette you are *not* using.
-fn preview(mode: AppearanceMode) -> AnyElement {
+fn preview(mode: AppearanceMode, light: &Theme, dark: &Theme) -> AnyElement {
     match mode {
-        AppearanceMode::System => miniature_split(),
-        AppearanceMode::Light => miniature(&Theme::light(), Corners::All),
-        AppearanceMode::Dark => miniature(&Theme::dark(), Corners::All),
+        AppearanceMode::System => miniature_split(light, dark),
+        AppearanceMode::Light => miniature(light, Corners::All),
+        AppearanceMode::Dark => miniature(dark, Corners::All),
     }
 }
 
@@ -519,9 +1045,12 @@ fn helper(mode: AppearanceMode, system: Appearance) -> SharedString {
 }
 
 impl Render for AppearancePage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let current = appearance::mode(cx);
+        let (light_theme_id, dark_theme_id) = appearance::theme_ids(cx);
+        let selected_light = appearance::theme_for(&light_theme_id, Appearance::Light, cx);
+        let selected_dark = appearance::theme_for(&dark_theme_id, Appearance::Dark, cx);
         let system = cx
             .try_global::<appearance::AppearanceState>()
             .map(|state| state.system)
@@ -541,14 +1070,35 @@ impl Render for AppearancePage {
         let terminal_size_picker =
             self.size_picker(FontSizeRole::Terminal, font_sizes.terminal, &theme, cx);
 
-        let cards = AppearanceMode::ALL.into_iter().map(|mode| {
-            widgets::option_card(&theme, mode.label(), mode == current, preview(mode))
+        let mut cards = Vec::new();
+        for mode in AppearanceMode::ALL {
+            cards.push(
+                widgets::option_card(
+                    &theme,
+                    mode.label(),
+                    mode == current,
+                    preview(mode, &selected_light, &selected_dark),
+                )
                 .id(SharedString::from(format!("appearance-{}", mode.label())))
                 .on_click(cx.listener(move |_, _, _, cx| {
                     appearance::set_mode(mode, cx);
                     cx.notify();
-                }))
-        });
+                })),
+            );
+        }
+        let mut theme_cards = Vec::new();
+        for definition in appearance::themes(cx) {
+            let light_selected = definition.id == light_theme_id;
+            let dark_selected = definition.id == dark_theme_id;
+            theme_cards.push(self.theme_card(
+                definition,
+                light_selected,
+                dark_selected,
+                &theme,
+                cx,
+            ));
+        }
+        let editor = self.render_theme_editor(window.viewport_size(), cx);
 
         div()
             .id("appearance-page")
@@ -560,8 +1110,8 @@ impl Render for AppearancePage {
                     .child(
                         widgets::page_subtitle(
                             &theme,
-                            "Choose Jolt’s colors and typography. These settings stay on this \
-                             device.",
+                            "Choose Jolt’s colors and typography. Custom themes are stored as \
+                             files on this device.",
                         )
                         .max_w(px(512.0))
                         .line_height(px(20.0)),
@@ -572,7 +1122,7 @@ impl Render for AppearancePage {
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
-                            .child(widgets::field_label(&theme, "Theme"))
+                            .child(widgets::field_label(&theme, "Color scheme"))
                             .child(widgets::option_card_row().children(cards)),
                     )
                     .child(
@@ -582,6 +1132,30 @@ impl Render for AppearancePage {
                             .text_color(theme.text_muted)
                             .line_height(px(18.0))
                             .child(helper(current, system)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(32.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.0))
+                            .child(widgets::field_label(&theme, "Themes"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .flex_wrap()
+                                    .gap(px(14.0))
+                                    .children(theme_cards),
+                            )
+                            .child(
+                                div()
+                                    .px(px(4.0))
+                                    .text_size(px(12.0))
+                                    .line_height(px(18.0))
+                                    .text_color(theme.text_muted)
+                                    .child("Choose each half independently, or use both variants together."),
+                            ),
                     )
                     .child(
                         div()
@@ -732,6 +1306,7 @@ impl Render for AppearancePage {
                             ),
                     ),
             )
+            .children(editor)
     }
 }
 

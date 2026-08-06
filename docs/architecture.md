@@ -98,6 +98,8 @@ The host engine writes transcript entries and command outcomes. Authorized viewe
 
 Viewport transcript state is a derived projection: a compact whole-session manifest, byte-bounded historical pages, and a mutable live tail. Desktop builds the projection beside its local canonical document; iOS and remote viewers consume the edge projection. Unloaded pages remain estimated-height placeholders, so navigation and scrollbar range cover the complete conversation without decoding it.
 
+The desktop Changes pane follows the same bounded-projection principle. The host captures one checkout snapshot, builds a compact complete file manifest, and splits retained unified patch text into immutable content-addressed pages. The pane renders collapsed headers without parsing bodies, fetches pages only for expanded viewport ranges, and virtualizes file headers, hunk headers, notices, lines, and unloaded placeholders in one list. Assistant turns additionally capture the complete non-ignored VCS tree before and after execution, preserving pre-existing working-copy changes while deriving an immutable net turn delta. Its compact manifest travels with the transcript entry; content-addressed pages remain in the host's turn-diff store and load through the same desktop viewer. Edge manifests are chat-authorized while page bodies are deduplicated per checkout. iOS has no diff surface and does not consume this projection.
+
 ### Durable command plane
 
 Run, shell, steer, interrupt, and input-answer operations are session-document entries. The chat's host device:
@@ -155,6 +157,7 @@ Default root: `~/.jolt`.
   engine.lock
   session.json
   ui-settings.json
+  themes/*.json              # installation-level paired custom palettes
   composer-defaults.json
   vcs-settings.json
   harness-secrets.json        # metadata only; values are in OS credentials

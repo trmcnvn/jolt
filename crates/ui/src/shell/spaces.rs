@@ -192,6 +192,24 @@ impl Shell {
         rows
     }
 
+    /// Open the space filter from its app shortcut, expanding the chat sidebar
+    /// first when needed.
+    pub(super) fn open_spaces_dropdown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::Chat) || self.spaces_menu.is_some() {
+            return;
+        }
+        if self.settings.sidebar_collapsed {
+            let from = self.sidebar_target();
+            self.settings.sidebar_collapsed = false;
+            self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
+            self.schedule_save(cx);
+        }
+        self.add_space = None;
+        self.session_search = None;
+        self.user_menu_open = false;
+        self.open_spaces_menu(window, cx);
+    }
+
     fn open_spaces_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
         // to the card's key handler.
@@ -859,7 +877,29 @@ impl Shell {
                         .gap(px(2.0))
                         .children(rows.into_iter().enumerate().map(|(index, row)| {
                             let chat_id = row.chat_id.clone();
-                            let dot = status_dot_color(row.status, &theme);
+                            let status_rail: AnyElement = if row.status == ChatIndicator::Working {
+                                div()
+                                    .w(px(6.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(loaders::activity_orb(
+                                        format!("session-search-working-{chat_id}"),
+                                        &theme,
+                                        16.0,
+                                        cx.entity_id(),
+                                        cx,
+                                    ))
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .size(px(6.0))
+                                    .rounded_full()
+                                    .flex_none()
+                                    .bg(status_dot_color(row.status, &theme))
+                                    .into_any_element()
+                            };
                             let title: SharedString = row.title.into();
                             let location: SharedString = row.location.into();
                             let time_ago: SharedString = row.time_ago.into();
@@ -878,7 +918,7 @@ impl Shell {
                                 this.session_search = None;
                                 this.open_chat_tab(chat_id.clone(), cx);
                             }))
-                            .child(div().size(px(6.0)).rounded_full().flex_none().bg(dot))
+                            .child(status_rail)
                             .child(
                                 div()
                                     .flex_1()

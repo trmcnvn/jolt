@@ -35,9 +35,9 @@ The desktop shows an attention-sorted session list and device-local, cross-space
 
 ## The desktop shell
 
-- **Left sidebar:** searchable space filter, filtered sessions, title search (`Mod+Shift+F`), add-space action, and user menu.
+- **Left sidebar:** searchable space filter (`Mod+Shift+K`), filtered sessions, title search (`Mod+Shift+F`), add-space action, and user menu.
 - **Session tabs:** device-local open sessions across spaces; tabs can be reordered or closed without changing session state.
-- **Conversation:** virtualized transcript with Markdown, code highlighting, grouped tools, input requests, errors, attachments, and a message rail on wide layouts.
+- **Conversation:** virtualized transcript with Markdown, code highlighting, grouped tools, input requests, errors, attachments, and a message rail on wide layouts. `Mod+Shift+Up/Down` moves between user prompts, including unloaded history.
 - **Composer:** prompt input, harness/model controls, checkout controls, attachments, context usage, and send/steer/stop state.
 - **Terminal panel:** session-scoped PTY tabs hosted on the session's device.
 - **Changes pane:** the latest working-copy patch for the session checkout.
@@ -81,6 +81,9 @@ Type `/` as the first message token to open Jolt's command completion menu.
 | --- | --- |
 | `/answer` | Extract answerable questions from the latest completed assistant response and present them one at a time. Answers are compiled into the next turn. |
 | `/bro` | Ask the active harness to restate the latest assistant response plainly and concisely. |
+| `/goal` | Open the goal manager. |
+
+Create, edit, budget, pause, resume, and clear goals through the goal manager; there are no `/goal` subcommands. Opening it from the new-session canvas creates the session when the goal is submitted. The composer shows objective, status, and token usage while a goal exists. Goals work with Claude Code, Codex, and Pi; Jolt injects the goal contract and schedules hidden continuation turns rather than relying on a harness-specific command.
 
 These are Jolt commands, not a passthrough to an agent CLI's interactive command parser.
 
@@ -128,6 +131,8 @@ Live status is freshness-gated so a crashed engine cannot leave a permanent Work
 Terminal tabs are PTYs on the host device. Detaching or hiding the panel does not close the shell. Output has a bounded replay window so a viewport can reconnect and continue from a sequence number. Drag to select cells, double-click words, or triple-click lines; copy with `Cmd+C` on macOS or `Ctrl+Shift+C` elsewhere.
 
 The Changes pane shows the latest bounded working-copy diff for the checkout. It supports per-file folding, additions/deletions, syntax highlighting, binary markers, and a partial-snapshot notice when the patch reaches its size cap.
+
+Completed assistant turns that changed files also show a collapsed `N changed files +A −D` card in the transcript. Expanding it lists files; selecting a file or **Open diff** opens that immutable turn delta in the Changes pane. Successful edit/write chips are replaced by the card, while failed mutation chips remain visible.
 
 ## Usage
 

@@ -17,10 +17,10 @@
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
@@ -116,6 +116,8 @@ struct RunHandle {
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
     compaction_follow_up: Arc<CompactionFollowUp>,
+    pending_external_turns: Arc<AtomicUsize>,
+    turn_diff_baselines: Arc<Mutex<VecDeque<Option<crate::TurnDiffBaseline>>>>,
 }
 
 struct Inner {
@@ -127,6 +129,9 @@ struct Inner {
     doc_host: OnceLock<DocHost>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    /// Chats whose previous turn completed cleanly (or whose paused queue was
+    /// explicitly resumed) and are draining the whole pending queue batch.
+    queued_turn_drains: Mutex<HashSet<String>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -141,6 +146,8 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
+    /// Immutable per-assistant-entry filesystem deltas (desktop-only viewer).
+    turn_diffs: OnceLock<crate::TurnDiffStore>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -169,14 +176,45 @@ impl SessionsEngine {
                 usage_contexts: Mutex::new(HashMap::new()),
                 doc_host: OnceLock::new(),
                 runs: Mutex::new(HashMap::new()),
+                queued_turn_drains: Mutex::new(HashSet::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
+                turn_diffs: OnceLock::new(),
             }),
         }
+    }
+
+    pub fn set_turn_diffs(&self, store: crate::TurnDiffStore) {
+        let _ = self.inner.turn_diffs.set(store);
+    }
+
+    async fn capture_turn_diff_baseline(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+    ) -> Option<crate::TurnDiffBaseline> {
+        capture_turn_diff_baseline(&self.inner, chat_id, cwd).await
+    }
+
+    pub async fn turn_diff_page(
+        &self,
+        chat_id: &str,
+        assistant_message_id: &str,
+        catalog_revision: &str,
+        page_id: &str,
+    ) -> Result<Option<jolt_proto::CheckoutDiffPage>, EngineError> {
+        let store = self
+            .inner
+            .turn_diffs
+            .get()
+            .ok_or_else(|| EngineError::Other("turn diff store unavailable".into()))?;
+        store
+            .page(chat_id, assistant_message_id, catalog_revision, page_id)
+            .await
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -233,6 +271,34 @@ impl SessionsEngine {
     /// The last request dispatched for a chat (steer→new-turn fallback).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
+    }
+
+    /// Whether a clean turn boundary has opened this chat's queue drain. The
+    /// gate stays open while every item in that FIFO batch is routed into the
+    /// harness mailbox, even after the first item marks the session Working.
+    pub(crate) fn queued_turn_ready(&self, chat_id: &str) -> bool {
+        lock(&self.inner.queued_turn_drains).contains(chat_id)
+    }
+
+    /// Close a queue drain once the command ledger has no more eligible items.
+    pub(crate) fn finish_queued_turn_drain(&self, chat_id: &str) {
+        lock(&self.inner.queued_turn_drains).remove(chat_id);
+    }
+
+    /// Explicitly resume a queue paused by an interruption or error. Ignore a
+    /// stale resume that races another turn becoming active.
+    pub(crate) fn resume_queued_turns(&self, chat_id: &str) {
+        let busy = lock(&self.inner.statuses)
+            .get(chat_id)
+            .is_some_and(|session| {
+                matches!(
+                    session.status,
+                    SessionStatus::Working | SessionStatus::AwaitingInput
+                )
+            });
+        if !busy {
+            lock(&self.inner.queued_turn_drains).insert(chat_id.to_string());
+        }
     }
 
     /// Subscribe to a chat's live event stream: returns the journal replay after
@@ -341,6 +407,16 @@ impl SessionsEngine {
         write_user_entry: bool,
     ) -> Result<String, EngineError> {
         let turn_prompt = request.prompt.clone();
+        let goal_context = self
+            .inner
+            .workspace()
+            .and_then(|workspace| workspace.chat_goal(chat_id))
+            .filter(|goal| goal.status == jolt_proto::GoalStatus::Active)
+            .map(|goal| crate::goals::context(&goal));
+        let context = match (context, goal_context) {
+            (Some(existing), Some(goal)) => Some(format!("{existing}\n\n{goal}")),
+            (existing, goal) => existing.or(goal),
+        };
         if let Some(context) = &context {
             request.prompt = format!("{context}\n\n{turn_prompt}");
         }
@@ -350,9 +426,19 @@ impl SessionsEngine {
                 h.steerable,
                 h.steer_tx.clone(),
                 h.compaction_follow_up.clone(),
+                h.pending_external_turns.clone(),
+                h.turn_diff_baselines.clone(),
             )
         });
-        if let Some((run_id, steerable, steer_tx, compaction_follow_up)) = routed {
+        if let Some((
+            run_id,
+            steerable,
+            steer_tx,
+            compaction_follow_up,
+            pending_external_turns,
+            turn_diff_baselines,
+        )) = routed
+        {
             if write_user_entry {
                 compaction_follow_up.cancel_for_user_message();
             }
@@ -360,6 +446,15 @@ impl SessionsEngine {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
             };
+            let turn_diff_baseline = if steerable {
+                self.capture_turn_diff_baseline(chat_id, &request.cwd).await
+            } else {
+                None
+            };
+            if steerable {
+                pending_external_turns.fetch_add(1, Ordering::AcqRel);
+                lock(&turn_diff_baselines).push_back(turn_diff_baseline);
+            }
             if steerable && steer_tx.try_send(message).is_ok() {
                 if write_user_entry {
                     let user_id = message_id.unwrap_or_else(new_id);
@@ -376,6 +471,10 @@ impl SessionsEngine {
                     self.inner.note_message(chat_id, &turn_prompt);
                 }
                 return Ok(run_id);
+            }
+            if steerable {
+                pending_external_turns.fetch_sub(1, Ordering::AcqRel);
+                lock(&turn_diff_baselines).pop_back();
             }
             // Mailbox closed (runtime mid-teardown / non-steering harness): replace it.
             self.interrupt(chat_id).await?;
@@ -408,6 +507,10 @@ impl SessionsEngine {
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
         let compaction_follow_up = Arc::new(CompactionFollowUp::default());
+        let pending_external_turns = Arc::new(AtomicUsize::new(0));
+        let turn_diff_baselines = Arc::new(Mutex::new(VecDeque::new()));
+        let initial_turn_diff_baseline =
+            self.capture_turn_diff_baseline(chat_id, &request.cwd).await;
 
         // Input bridge: the harness asks questions; we mint the request id, park the
         // resolver for `respond_input`, and surface the event through the run pipeline.
@@ -446,6 +549,8 @@ impl SessionsEngine {
                 engine_tx,
                 pending_inputs,
                 compaction_follow_up: compaction_follow_up.clone(),
+                pending_external_turns: pending_external_turns.clone(),
+                turn_diff_baselines: turn_diff_baselines.clone(),
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -475,6 +580,9 @@ impl SessionsEngine {
             engine_rx,
             cancel_rx,
             compaction_follow_up,
+            pending_external_turns,
+            turn_diff_baselines,
+            initial_turn_diff_baseline,
             RunResumeState {
                 user_message_id: user_id,
                 resume_injected,
@@ -561,11 +669,30 @@ impl SessionsEngine {
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
-            .map(|h| (h.steer_tx.clone(), h.compaction_follow_up.clone()));
-        let Some((steer_tx, compaction_follow_up)) = target else {
+            .map(|h| {
+                (
+                    h.steer_tx.clone(),
+                    h.compaction_follow_up.clone(),
+                    h.pending_external_turns.clone(),
+                    h.turn_diff_baselines.clone(),
+                )
+            });
+        let Some((steer_tx, compaction_follow_up, pending_external_turns, turn_diff_baselines)) =
+            target
+        else {
             return Ok(SteerOutcome::NotSteerable);
         };
         compaction_follow_up.cancel_for_user_message();
+        let goal_context = self
+            .inner
+            .workspace()
+            .and_then(|workspace| workspace.chat_goal(chat_id))
+            .filter(|goal| goal.status == jolt_proto::GoalStatus::Active)
+            .map(|goal| crate::goals::context(&goal));
+        let context = match (context, goal_context) {
+            (Some(existing), Some(goal)) => Some(format!("{existing}\n\n{goal}")),
+            (existing, goal) => existing.or(goal),
+        };
         let harness_prompt = context
             .map(|context| format!("{context}\n\n{prompt}"))
             .unwrap_or_else(|| prompt.to_string());
@@ -573,7 +700,18 @@ impl SessionsEngine {
             prompt: harness_prompt,
             message_id: message_id.clone(),
         };
+        let cwd = lock(&self.inner.last_requests)
+            .get(chat_id)
+            .map(|request| request.cwd.clone());
+        let turn_diff_baseline = match cwd {
+            Some(cwd) => self.capture_turn_diff_baseline(chat_id, &cwd).await,
+            None => None,
+        };
+        pending_external_turns.fetch_add(1, Ordering::AcqRel);
+        lock(&turn_diff_baselines).push_back(turn_diff_baseline);
         if steer_tx.try_send(message).is_err() {
+            pending_external_turns.fetch_sub(1, Ordering::AcqRel);
+            lock(&turn_diff_baselines).pop_back();
             return Ok(SteerOutcome::NotSteerable);
         }
         // Accepted: the steer prompt becomes a user entry immediately (client-minted id).
@@ -701,7 +839,18 @@ impl SessionsEngine {
                         .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
                 })
                 .unwrap_or(false);
-            let will_resume = fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
+            let goal_paused_after_restart = self
+                .inner
+                .workspace()
+                .and_then(|workspace| workspace.chat_goal(&chat_id))
+                .is_some_and(|goal| {
+                    goal.status == jolt_proto::GoalStatus::Paused
+                        && goal.status_message.as_deref() == Some("Paused after Jolt restarted")
+                });
+            let will_resume = fresh
+                && prompt.is_some()
+                && attempts < MAX_AUTO_RESUME
+                && !goal_paused_after_restart;
 
             let note = if will_resume {
                 "Run interrupted by engine restart — resuming"
@@ -1197,6 +1346,47 @@ async fn run_local_bash(request: &BashRequest) -> Result<BashResult, EngineError
     })
 }
 
+async fn capture_turn_diff_baseline(
+    inner: &Inner,
+    chat_id: &str,
+    cwd: &str,
+) -> Option<crate::TurnDiffBaseline> {
+    let store = inner.turn_diffs.get()?;
+    match store.capture_baseline(Path::new(cwd)).await {
+        Ok(baseline) => Some(baseline),
+        Err(error) => {
+            tracing::warn!(chat = %chat_id, %error, "turn diff baseline capture failed");
+            None
+        }
+    }
+}
+
+async fn append_turn_diff(
+    inner: &Inner,
+    chat_id: &str,
+    assistant_message_id: &str,
+    cwd: &str,
+    baseline: Option<&crate::TurnDiffBaseline>,
+    folded: &mut Vec<MessagePart>,
+) {
+    let (Some(store), Some(baseline)) = (inner.turn_diffs.get(), baseline) else {
+        return;
+    };
+    match store
+        .finalize(chat_id, assistant_message_id, Path::new(cwd), baseline)
+        .await
+    {
+        Ok(Some(diff)) => folded.push(MessagePart::Changes {
+            id: "changes".into(),
+            diff,
+        }),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(chat = %chat_id, message = %assistant_message_id, %error, "turn diff finalization failed");
+        }
+    }
+}
+
 /// Resume bookkeeping for one run task: the turn prompt stays separate from
 /// hidden shell context for titling and a failed-resume retry; only
 /// engine-injected resume ids are retried fresh.
@@ -1220,6 +1410,9 @@ async fn drive_run(
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     compaction_follow_up: Arc<CompactionFollowUp>,
+    pending_external_turns: Arc<AtomicUsize>,
+    turn_diff_baselines: Arc<Mutex<VecDeque<Option<crate::TurnDiffBaseline>>>>,
+    initial_turn_diff_baseline: Option<crate::TurnDiffBaseline>,
     resume_state: RunResumeState,
 ) {
     let device_id = inner.device_id.clone();
@@ -1261,6 +1454,7 @@ async fn drive_run(
     let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
     let mut entry_id = new_id();
+    let mut active_turn_diff_baseline = initial_turn_diff_baseline;
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
     let mut dirty = false;
@@ -1291,6 +1485,9 @@ async fn drive_run(
     const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
+    let mut goal_turn_started = tokio::time::Instant::now();
+    let mut goal_turn_tokens = 0u64;
+    let mut goal_turn_error: Option<String> = None;
 
     let final_status = loop {
         let event: AgentEvent = tokio::select! {
@@ -1360,8 +1557,11 @@ async fn drive_run(
             },
             _ = tokio::time::sleep_until(flush_at), if dirty => {
                 // Coalesced STREAM_COMMIT_MS tick: one doc commit per window.
+                // Hold back a possible private goal-control tail so it never
+                // flashes in transcript watches while the response streams.
+                let visible = goal_visible_parts(&folded);
                 if let Err(err) = sync_segment(
-                    doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
+                    doc_ref, &mut writer, &entry_id, &device_id, segment_started, &visible,
                 ) {
                     tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
                 }
@@ -1376,6 +1576,14 @@ async fn drive_run(
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
         if idle_since.take().is_some() {
+            pending_external_turns
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    pending.checked_sub(1)
+                })
+                .ok();
+            if active_turn_diff_baseline.is_none() {
+                active_turn_diff_baseline = lock(&turn_diff_baselines).pop_front().flatten();
+            }
             inner.set_status(&chat_id, SessionStatus::Working, true);
         }
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
@@ -1448,6 +1656,15 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
+            append_turn_diff(
+                &inner,
+                &chat_id,
+                &entry_id,
+                &run_cwd,
+                active_turn_diff_baseline.as_ref(),
+                &mut folded,
+            )
+            .await;
             if let Err(err) = finish_segment(
                 doc_ref,
                 writer.take(),
@@ -1464,6 +1681,12 @@ async fn drive_run(
             dirty = false;
             entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
             segment_started = now_ms();
+            // A queued baseline was captured before the steer entered the
+            // harness. Recapture at the observed boundary so late work from
+            // the previous segment cannot leak into this one.
+            lock(&turn_diff_baselines).pop_front();
+            active_turn_diff_baseline =
+                capture_turn_diff_baseline(&inner, &chat_id, &run_cwd).await;
             continue;
         }
 
@@ -1514,6 +1737,16 @@ async fn drive_run(
             AgentEvent::CompactionFinished => {
                 inner.set_compacting(&chat_id, false);
             }
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                goal_turn_tokens = goal_turn_tokens
+                    .saturating_add(*input_tokens)
+                    .saturating_add(*output_tokens);
+            }
+            AgentEvent::Error { message } => goal_turn_error = Some(message.clone()),
             _ => {}
         }
 
@@ -1526,11 +1759,36 @@ async fn drive_run(
             fold_event_into_parts(&mut folded, &event);
         }
 
-        if let AgentEvent::Done { status, .. } = &event {
+        if let AgentEvent::Done { status, error, .. } = &event {
+            let goal_control = take_goal_control(&mut folded);
+            let goal_after_turn = finish_goal_turn(
+                &inner,
+                &chat_id,
+                *status,
+                error.as_deref().or(goal_turn_error.as_deref()),
+                goal_control,
+                goal_turn_tokens,
+                goal_turn_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+            goal_turn_tokens = 0;
+            goal_turn_started = tokio::time::Instant::now();
+            goal_turn_error = None;
             let message_status = match status {
                 DoneStatus::Interrupted => MessageStatus::Aborted,
                 DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
             };
+            append_turn_diff(
+                &inner,
+                &chat_id,
+                &entry_id,
+                &run_cwd,
+                active_turn_diff_baseline.as_ref(),
+                &mut folded,
+            )
+            .await;
             // No dangling chips: a run that ends for ANY reason (completed,
             // errored, interrupted) terminally resolves its input parts — an
             // unresolved question must not outlive the run that asked it
@@ -1565,6 +1823,7 @@ async fn drive_run(
             }
             let continue_after_compaction =
                 compaction_follow_up.take_on_shutdown() && *status == DoneStatus::Completed;
+            let mut internal_follow_up_queued = false;
             if continue_after_compaction {
                 let steer_tx = lock(&inner.runs)
                     .get(&chat_id)
@@ -1579,10 +1838,45 @@ async fn drive_run(
                             })
                             .is_ok() =>
                     {
+                        internal_follow_up_queued = true;
                         tracing::info!(chat = %chat_id, "queued continuation after compaction shutdown");
                     }
                     _ => {
                         tracing::warn!(chat = %chat_id, "could not queue continuation after compaction shutdown");
+                    }
+                }
+            }
+            if !internal_follow_up_queued
+                && *status == DoneStatus::Completed
+                && let Some(goal) =
+                    goal_after_turn.filter(|goal| goal.status == jolt_proto::GoalStatus::Active)
+            {
+                let user_queue_pending =
+                    doc_ref
+                        .read_commands()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|command| {
+                            command.status == jolt_doc::SessionCommandStatus::Pending
+                                && matches!(
+                                    command.payload,
+                                    jolt_doc::SessionCommandPayload::Queue { .. }
+                                )
+                        });
+                if !user_queue_pending && pending_external_turns.load(Ordering::Acquire) == 0 {
+                    let steer_tx = lock(&inner.runs)
+                        .get(&chat_id)
+                        .filter(|handle| handle.run_id == run_id)
+                        .map(|handle| handle.steer_tx.clone());
+                    if steer_tx.is_some_and(|steer_tx| {
+                        steer_tx
+                            .try_send(SteerMessage {
+                                prompt: crate::goals::continuation(&goal),
+                                message_id: None,
+                            })
+                            .is_ok()
+                    }) {
+                        internal_follow_up_queued = true;
                     }
                 }
             }
@@ -1602,10 +1896,23 @@ async fn drive_run(
                 dirty = false;
                 entry_id = new_id();
                 segment_started = now_ms();
+                active_turn_diff_baseline = lock(&turn_diff_baselines).pop_front().flatten();
+                if internal_follow_up_queued && active_turn_diff_baseline.is_none() {
+                    active_turn_diff_baseline =
+                        capture_turn_diff_baseline(&inner, &chat_id, &run_cwd).await;
+                }
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
                 inner.set_status(&chat_id, SessionStatus::Idle, false);
+                // A hidden compaction continuation already owns the next turn;
+                // its eventual clean Done will release the next user queue item.
+                if !internal_follow_up_queued {
+                    lock(&inner.queued_turn_drains).insert(chat_id.clone());
+                    if let Some(host) = inner.doc_host.get() {
+                        host.kick_commands(&chat_id);
+                    }
+                }
                 continue;
             }
             break match status {
@@ -1623,6 +1930,115 @@ async fn drive_run(
 
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
+}
+
+fn goal_visible_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
+    let mut visible = parts.to_vec();
+    for part in &mut visible {
+        if let MessagePart::Text { text, .. } = part {
+            crate::goals::hide_control_tail(text);
+        }
+    }
+    visible
+}
+
+fn take_goal_control(parts: &mut [MessagePart]) -> Option<crate::goals::GoalControl> {
+    let mut result = None;
+    for part in parts.iter_mut().rev() {
+        if let MessagePart::Text { text, .. } = part {
+            let control = crate::goals::extract_control(text);
+            crate::goals::hide_control_tail(text);
+            if result.is_none() {
+                result = control;
+            }
+        }
+    }
+    result
+}
+
+fn finish_goal_turn(
+    inner: &Inner,
+    chat_id: &str,
+    done: DoneStatus,
+    error: Option<&str>,
+    control: Option<crate::goals::GoalControl>,
+    tokens: u64,
+    elapsed_ms: u64,
+) -> Option<jolt_proto::Goal> {
+    let workspace = inner.workspace()?;
+    let mut goal = workspace.chat_goal(chat_id)?;
+    if goal.status != jolt_proto::GoalStatus::Active {
+        return Some(goal);
+    }
+
+    goal.tokens_used = goal.tokens_used.saturating_add(tokens);
+    goal.elapsed_active_ms = goal.elapsed_active_ms.saturating_add(elapsed_ms.max(1));
+    goal.turns = goal.turns.saturating_add(1);
+    goal.updated_at_ms = now_ms();
+
+    if done == DoneStatus::Interrupted {
+        goal.status = jolt_proto::GoalStatus::Paused;
+        goal.status_message = Some("Goal turn interrupted".into());
+    } else if done == DoneStatus::Errored || error.is_some() {
+        let message = error.unwrap_or("Harness turn failed");
+        goal.status = if message.to_ascii_lowercase().contains("rate")
+            || message.to_ascii_lowercase().contains("quota")
+            || message.to_ascii_lowercase().contains("usage")
+        {
+            jolt_proto::GoalStatus::UsageLimited
+        } else {
+            jolt_proto::GoalStatus::Paused
+        };
+        goal.status_message = Some(message.to_string());
+    } else {
+        let control = control.filter(|control| control.matches(&goal));
+        match control {
+            Some(control)
+                if control.outcome == crate::goals::GoalOutcome::Complete
+                    && !control.summary.trim().is_empty() =>
+            {
+                goal.status = jolt_proto::GoalStatus::Complete;
+                goal.status_message = Some(control.summary);
+                goal.blocker_key = None;
+                goal.blocker_streak = 0;
+            }
+            Some(control) if control.outcome == crate::goals::GoalOutcome::Blocked => {
+                let key = control.blocker_key.filter(|key| !key.trim().is_empty());
+                if key.is_some() && key == goal.blocker_key {
+                    goal.blocker_streak = goal.blocker_streak.saturating_add(1);
+                } else {
+                    goal.blocker_key = key;
+                    goal.blocker_streak = 1;
+                }
+                if goal.blocker_key.is_some() && goal.blocker_streak >= 3 {
+                    goal.status = jolt_proto::GoalStatus::Blocked;
+                    goal.status_message =
+                        (!control.summary.trim().is_empty()).then_some(control.summary);
+                }
+            }
+            _ => {
+                goal.blocker_key = None;
+                goal.blocker_streak = 0;
+            }
+        }
+    }
+
+    if goal.status == jolt_proto::GoalStatus::Active
+        && goal
+            .token_budget
+            .is_some_and(|budget| goal.tokens_used >= budget)
+    {
+        goal.status = jolt_proto::GoalStatus::BudgetLimited;
+        goal.status_message = Some("Token budget reached".into());
+    }
+    if goal.status == jolt_proto::GoalStatus::Active {
+        goal.control_nonce = new_id();
+    }
+    goal.revision = goal.revision.saturating_add(1);
+    if let Err(error) = workspace.set_chat_goal(chat_id, Some(&goal)) {
+        tracing::warn!(chat = %chat_id, %error, "goal state write failed");
+    }
+    Some(goal)
 }
 
 #[cfg(test)]

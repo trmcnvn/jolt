@@ -6,6 +6,8 @@
 // (lines × 18 + padding) and syntax highlighting is a pure recolor.
 
 import SwiftUI
+import RaTeX
+import BeautifulMermaid
 
 enum MD {
     static let textSize: CGFloat = 14
@@ -37,7 +39,12 @@ extension [InlineRun] {
                     baseColor: Color = Theme.text) -> AttributedString {
         var result = AttributedString()
         for run in self {
-            var piece = AttributedString(run.text)
+            let visible = switch run.style.math {
+            case .inline: "$\(run.text)$"
+            case .display: "$$\(run.text)$$"
+            case nil: run.text
+            }
+            var piece = AttributedString(visible)
             if run.style.code {
                 piece.font = Theme.mono(size - 1.5)
                 piece.foregroundColor = Theme.inlineCodeText
@@ -142,33 +149,53 @@ struct MarkdownBlockView: View {
     /// Assistant rows fill the transcript column; user-bubble blocks keep
     /// their intrinsic width up to the bubble's cap.
     var fillsWidth = true
+    /// Live tail rows keep rich fenced blocks as source until their closing
+    /// fence and the response itself are both settled.
+    var streaming = false
 
     var body: some View {
         switch block {
         case .paragraph(let runs):
-            runs.styled()
-                .textRenderer(InlineCodeRenderer())
-                .lineSpacing(MD.lineHeight - MD.textSize - 4)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
-                .tint(Theme.text)
+            if runs.contains(where: { $0.style.math != nil }) {
+                MathRunsView(runs: runs, size: MD.textSize, lineHeight: MD.lineHeight)
+                    .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
+            } else {
+                runs.styled()
+                    .textRenderer(InlineCodeRenderer())
+                    .lineSpacing(MD.lineHeight - MD.textSize - 4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
+                    .tint(Theme.text)
+            }
 
         case .heading(let level, let runs):
             let m = MD.headingMetrics(level)
-            runs.styled(size: m.size, weight: .semibold)
-                .textRenderer(InlineCodeRenderer())
-                .lineSpacing(m.line - m.size - 4)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
+            if runs.contains(where: { $0.style.math != nil }) {
+                MathRunsView(runs: runs, size: m.size, lineHeight: m.line, weight: .semibold)
+                    .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
+            } else {
+                runs.styled(size: m.size, weight: .semibold)
+                    .textRenderer(InlineCodeRenderer())
+                    .lineSpacing(m.line - m.size - 4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
+            }
 
         case .codeBlock(let language, let code):
-            CodeBlockView(language: language, code: code, cacheKey: cacheKey)
+            if !streaming, ["math", "latex", "tex"].contains(language?.lowercased() ?? "") {
+                MathBlockView(source: code, cacheKey: cacheKey)
+            } else if !streaming, language?.lowercased() == "mermaid" {
+                MermaidBlockView(source: code, cacheKey: cacheKey)
+            } else {
+                CodeBlockView(language: language, code: code, cacheKey: cacheKey)
+            }
 
         case .blockquote(let children):
-            BlockquoteView(children: children, cacheKey: cacheKey)
+            BlockquoteView(children: children, cacheKey: cacheKey, streaming: streaming)
 
         case .list(let orderedStart, let items):
-            ListBlockView(orderedStart: orderedStart, items: items, cacheKey: cacheKey)
+            ListBlockView(orderedStart: orderedStart, items: items,
+                          cacheKey: cacheKey, streaming: streaming)
 
         case .table(let header, let rows, let align):
             TableBlockView(header: header, rows: rows, align: align)
@@ -177,6 +204,287 @@ struct MarkdownBlockView: View {
             Rectangle()
                 .fill(Theme.border)
                 .frame(height: 1)
+        }
+    }
+}
+
+// MARK: - Math
+
+private enum MathRunChunk {
+    case inline([InlineRun])
+    case display(InlineRun)
+}
+
+private struct MathRunsView: View {
+    let runs: [InlineRun]
+    let size: CGFloat
+    let lineHeight: CGFloat
+    var weight: Font.Weight = .regular
+
+    private var chunks: [MathRunChunk] {
+        var result: [MathRunChunk] = []
+        var inline: [InlineRun] = []
+        func flush() {
+            guard !inline.isEmpty else { return }
+            result.append(.inline(inline))
+            inline = []
+        }
+        for run in runs {
+            if run.style.math == .display {
+                flush()
+                result.append(.display(run))
+            } else {
+                inline.append(run)
+            }
+        }
+        flush()
+        return result
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(chunks.enumerated()), id: \.offset) { _, chunk in
+                switch chunk {
+                case .inline(let runs):
+                    MathFlowLayout(horizontalSpacing: 3, lineSpacing: 4) {
+                        ForEach(Array(fragments(runs).enumerated()), id: \.offset) { _, run in
+                            if run.style.math == .inline {
+                                FormulaOrSource(run: run, size: size, displayMode: false)
+                            } else {
+                                [run].styled(size: size, weight: weight)
+                                    .textRenderer(InlineCodeRenderer())
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, minHeight: lineHeight, alignment: .leading)
+
+                case .display(let run):
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        FormulaOrSource(run: run, size: size + 2, displayMode: true)
+                            .padding(.horizontal, 4)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                }
+            }
+        }
+        .tint(Theme.text)
+    }
+
+    private func fragments(_ runs: [InlineRun]) -> [InlineRun] {
+        runs.flatMap { run -> [InlineRun] in
+            guard run.style.math == nil else { return [run] }
+            return run.text.split(whereSeparator: \.isWhitespace).map { word in
+                var fragment = run
+                fragment.text = String(word)
+                return fragment
+            }
+        }
+    }
+}
+
+private struct FormulaOrSource: View {
+    let run: InlineRun
+    let size: CGFloat
+    let displayMode: Bool
+
+    private var isValid: Bool {
+        (try? RaTeXEngine.shared.parse(
+            run.text,
+            displayMode: displayMode,
+            color: UIColor(Theme.text)
+        )) != nil
+    }
+
+    var body: some View {
+        if isValid {
+            RaTeXFormula(
+                latex: run.text,
+                fontSize: size,
+                displayMode: displayMode,
+                color: Theme.text
+            )
+            .contextMenu {
+                Button {
+                    UIPasteboard.general.string = run.text
+                } label: {
+                    Label("Copy formula", systemImage: "doc.on.doc")
+                }
+            }
+        } else {
+            Text(displayMode ? "$$\(run.text)$$" : "$\(run.text)$")
+                .font(Theme.mono(size - 1))
+                .foregroundStyle(Theme.textMuted)
+        }
+    }
+}
+
+/// Baseline-aware wrapping layout, using the ascent value published by
+/// `RaTeXFormula` for formula children and SwiftUI's native text baseline for
+/// prose children.
+private struct MathFlowLayout: Layout {
+    var horizontalSpacing: CGFloat = 3
+    var lineSpacing: CGFloat = 4
+
+    typealias Cache = [[(index: Int, size: CGSize)]]
+    func makeCache(subviews: Subviews) -> Cache { [] }
+
+    func sizeThatFits(proposal: ProposedViewSize,
+                      subviews: Subviews,
+                      cache: inout Cache) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        cache = lines(for: subviews, maxWidth: maxWidth)
+        let height = cache.enumerated().reduce(CGFloat.zero) { total, item in
+            total + (item.element.map(\.size.height).max() ?? 0)
+                + (item.offset + 1 < cache.count ? lineSpacing : 0)
+        }
+        return CGSize(width: maxWidth.isFinite ? maxWidth : cacheWidth(cache), height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect,
+                       proposal: ProposedViewSize,
+                       subviews: Subviews,
+                       cache: inout Cache) {
+        if cache.isEmpty { cache = lines(for: subviews, maxWidth: bounds.width) }
+        var y = bounds.minY
+        for line in cache {
+            let baselines = line.map { item -> CGFloat in
+                let formula = subviews[item.index][RaTeXFormulaAscentKey.self]
+                if formula > 0 { return formula }
+                let dimensions = subviews[item.index]
+                    .dimensions(in: ProposedViewSize(item.size))
+                let native = dimensions[.firstTextBaseline]
+                return native > 0 ? native : item.size.height / 2
+            }
+            let baseline = baselines.max() ?? 0
+            let height = line.map(\.size.height).max() ?? 0
+            var x = bounds.minX
+            for (position, item) in line.enumerated() {
+                subviews[item.index].place(
+                    at: CGPoint(x: x, y: y + baseline - baselines[position]),
+                    proposal: ProposedViewSize(item.size)
+                )
+                x += item.size.width + horizontalSpacing
+            }
+            y += height + lineSpacing
+        }
+    }
+
+    private func lines(for subviews: Subviews, maxWidth: CGFloat) -> Cache {
+        var result: Cache = []
+        var line: [(index: Int, size: CGSize)] = []
+        var width: CGFloat = 0
+        for (index, subview) in subviews.enumerated() {
+            let size = subview.sizeThatFits(.unspecified)
+            let needed = line.isEmpty ? size.width : size.width + horizontalSpacing
+            if width + needed > maxWidth, !line.isEmpty {
+                result.append(line)
+                line = [(index, size)]
+                width = size.width
+            } else {
+                line.append((index, size))
+                width += needed
+            }
+        }
+        if !line.isEmpty { result.append(line) }
+        return result
+    }
+
+    private func cacheWidth(_ cache: Cache) -> CGFloat {
+        cache.map { line in
+            line.map(\.size.width).reduce(0, +)
+                + CGFloat(max(0, line.count - 1)) * horizontalSpacing
+        }.max() ?? 0
+    }
+}
+
+private struct MathBlockView: View {
+    let source: String
+    var cacheKey = ""
+
+    var body: some View {
+        Group {
+            if (try? RaTeXEngine.shared.parse(
+                source,
+                displayMode: true,
+                color: UIColor(Theme.text)
+            )) != nil {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    RaTeXFormula(latex: source, fontSize: MD.textSize + 2,
+                                 displayMode: true, color: Theme.text)
+                        .padding(12)
+                }
+            } else {
+                CodeBlockView(language: "math", code: source, cacheKey: cacheKey)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .background(whiteAlpha(0.02))
+        .clipShape(RoundedRectangle(cornerRadius: Theme.panelRadius))
+        .overlay(RoundedRectangle(cornerRadius: Theme.panelRadius)
+            .strokeBorder(Theme.border, lineWidth: 1))
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = source
+            } label: {
+                Label("Copy formula", systemImage: "doc.on.doc")
+            }
+        }
+    }
+}
+
+private struct MermaidBlockView: View {
+    let source: String
+    var cacheKey = ""
+    @State private var parseError: Error?
+    @State private var bounds = CGRect.zero
+
+    private var diagramTheme: DiagramTheme {
+        DiagramTheme(
+            background: UIColor(Theme.bg),
+            foreground: UIColor(Theme.text),
+            line: UIColor(Theme.textMuted),
+            accent: UIColor(Theme.accent),
+            muted: UIColor(Theme.textMuted),
+            surface: UIColor(Theme.surface),
+            border: UIColor(Theme.borderStrong),
+            font: UIFont(name: Theme.fontSansName, size: MD.textSize)
+                ?? .systemFont(ofSize: MD.textSize),
+            cornerRadius: 8
+        )
+    }
+
+    var body: some View {
+        Group {
+            if parseError != nil {
+                CodeBlockView(language: "mermaid", code: source, cacheKey: cacheKey)
+            } else {
+                let width = max(bounds.width, 300)
+                let naturalHeight = max(bounds.height, 180)
+                ScrollView([.horizontal, .vertical], showsIndicators: false) {
+                    MermaidDiagramView(
+                        source: source,
+                        theme: diagramTheme,
+                        parseError: $parseError,
+                        diagramBounds: $bounds
+                    )
+                    .frame(width: width, height: naturalHeight)
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: min(naturalHeight, 560))
+                .padding(10)
+            }
+        }
+        .background(Theme.bg)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.panelRadius))
+        .overlay(RoundedRectangle(cornerRadius: Theme.panelRadius)
+            .strokeBorder(Theme.border, lineWidth: 1))
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = source
+            } label: {
+                Label("Copy Mermaid source", systemImage: "doc.on.doc")
+            }
         }
     }
 }
@@ -281,11 +589,13 @@ private extension AttributedString {
 struct BlockquoteView: View {
     let children: [MDBlock]
     var cacheKey: String = ""
+    var streaming = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(children.enumerated()), id: \.offset) { ix, child in
-                MarkdownBlockView(block: child, cacheKey: "\(cacheKey)/q\(ix)")
+                MarkdownBlockView(block: child, cacheKey: "\(cacheKey)/q\(ix)",
+                                  streaming: streaming)
                     .foregroundStyle(Theme.textMuted)
             }
         }
@@ -310,6 +620,7 @@ struct ListBlockView: View {
     let orderedStart: Int?
     let items: [MDListItem]
     var cacheKey: String = ""
+    var streaming = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -319,7 +630,8 @@ struct ListBlockView: View {
                         .frame(minWidth: 18, alignment: .trailing)
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(Array(item.children.enumerated()), id: \.offset) { cix, child in
-                            MarkdownBlockView(block: child, cacheKey: "\(cacheKey)/l\(ix).\(cix)")
+                            MarkdownBlockView(block: child, cacheKey: "\(cacheKey)/l\(ix).\(cix)",
+                                              streaming: streaming)
                         }
                     }
                 }

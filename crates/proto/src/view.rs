@@ -361,6 +361,16 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             let done = items.iter().filter(|i| i.done).count();
             ("Todo", format!("{done}/{} done", items.len()))
         }
+        ToolCall::SpawnAgent { agent_type } => (
+            "Agent",
+            agent_type
+                .as_deref()
+                .filter(|kind| !kind.is_empty())
+                .map_or_else(
+                    || "Spawned subagent".to_string(),
+                    |kind| format!("Spawned {kind} subagent"),
+                ),
+        ),
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
         ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
     }
@@ -378,6 +388,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     let mut searches = 0usize;
     let mut fetches = 0usize;
     let mut todos = 0usize;
+    let mut agents = 0usize;
     let mut other = 0usize;
     let mut failed = 0usize;
     for (call, is_error) in tools {
@@ -403,6 +414,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
             }
             ToolCall::WebFetch { .. } => fetches += 1,
             ToolCall::Todo { .. } => todos += 1,
+            ToolCall::SpawnAgent { .. } => agents += 1,
             ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => other += 1,
         }
     }
@@ -424,6 +436,9 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     }
     if todos > 0 {
         segments.push("updated todos".to_string());
+    }
+    if agents > 0 {
+        segments.push(format!("spawned {}", plural(agents, "agent", "agents")));
     }
     if other > 0 {
         segments.push(format!("called {}", plural(other, "tool", "tools")));
@@ -456,6 +471,21 @@ mod tool_tests {
                 limit: Some(50),
             }),
             ("Read", "src/lib.rs:101-150".to_string())
+        );
+    }
+
+    #[test]
+    fn spawned_agent_has_a_first_class_label() {
+        let call = crate::ToolCall::SpawnAgent {
+            agent_type: Some("Explore".into()),
+        };
+        assert_eq!(
+            tool_chip_content(&call),
+            ("Agent", "Spawned Explore subagent".to_string())
+        );
+        assert_eq!(
+            tool_group_summary(&[(call, false)]),
+            "Spawned 1 agent".to_string()
         );
     }
 }

@@ -12,16 +12,48 @@ use serde::{Deserialize, Serialize};
 
 use jolt_proto::{RunRequest, UserInputAnswer};
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum GoalOperation {
+    Create {
+        objective: String,
+        #[serde(default)]
+        token_budget: Option<u64>,
+    },
+    Edit {
+        goal_id: String,
+        expected_revision: u64,
+        objective: String,
+        #[serde(default)]
+        token_budget: Option<u64>,
+    },
+    Pause {
+        goal_id: String,
+        expected_revision: u64,
+    },
+    Resume {
+        goal_id: String,
+        expected_revision: u64,
+    },
+    Clear {
+        goal_id: String,
+        expected_revision: u64,
+    },
+}
+
 use crate::constants::COMMAND_DEFAULT_TTL_MS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionCommandKind {
     Run,
+    Queue,
+    ResumeQueue,
     Bash,
     Steer,
     Interrupt,
     RespondInput,
+    Goal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +83,17 @@ pub enum SessionCommandPayload {
     HiddenPrompt {
         request: RunRequest,
     },
+    /// A user prompt held by Jolt until the current turn completes. Unlike a
+    /// steer, it is not delivered into that active turn; the pending FIFO batch
+    /// drains together when the next turn boundary opens.
+    #[serde(rename_all = "camelCase")]
+    Queue {
+        request: RunRequest,
+        /// Client-minted message id written only when the queued turn starts.
+        message_id: String,
+    },
+    /// Resume a queue paused by an interrupted or errored turn.
+    ResumeQueue {},
     #[serde(rename_all = "camelCase")]
     Bash {
         command: String,
@@ -70,6 +113,9 @@ pub enum SessionCommandPayload {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    Goal {
+        operation: GoalOperation,
+    },
 }
 
 impl SessionCommandPayload {
@@ -78,10 +124,13 @@ impl SessionCommandPayload {
             SessionCommandPayload::Run { .. } | SessionCommandPayload::HiddenPrompt { .. } => {
                 SessionCommandKind::Run
             }
+            SessionCommandPayload::Queue { .. } => SessionCommandKind::Queue,
+            SessionCommandPayload::ResumeQueue {} => SessionCommandKind::ResumeQueue,
             SessionCommandPayload::Bash { .. } => SessionCommandKind::Bash,
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
+            SessionCommandPayload::Goal { .. } => SessionCommandKind::Goal,
         }
     }
 }
@@ -111,6 +160,18 @@ pub struct SessionCommandEntry {
     pub resolution: Option<String>,
 }
 
+/// Pending queued turn projected to clients without exposing the full run
+/// configuration carried by the command ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedPrompt {
+    pub command_id: String,
+    pub message_id: String,
+    pub prompt: String,
+    pub issued_at: i64,
+    pub cancellable: bool,
+}
+
 impl SessionCommandEntry {
     pub fn kind(&self) -> SessionCommandKind {
         self.payload.kind()
@@ -125,6 +186,29 @@ impl SessionCommandEntry {
 /// Rule 2: only the composer that issued a still-pending command may cancel it.
 pub fn can_composer_cancel(entry: &SessionCommandEntry, device_id: &str) -> bool {
     entry.status == SessionCommandStatus::Pending && entry.issued_by == device_id
+}
+
+/// Project pending queue commands in FIFO document order.
+pub fn queued_prompts(entries: &[SessionCommandEntry], device_id: &str) -> Vec<QueuedPrompt> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let SessionCommandPayload::Queue {
+                request,
+                message_id,
+            } = &entry.payload
+            else {
+                return None;
+            };
+            (entry.status == SessionCommandStatus::Pending).then(|| QueuedPrompt {
+                command_id: entry.id.clone(),
+                message_id: message_id.clone(),
+                prompt: request.prompt.clone(),
+                issued_at: entry.issued_at,
+                cancellable: can_composer_cancel(entry, device_id),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +392,36 @@ mod tests {
         let cx1 = cx(&entries, &NEVER, &NEVER, 3_000, None);
         assert_eq!(evaluate_command(&r1, &cx1), CommandDisposition::Execute);
         assert_eq!(evaluate_command(&r2, &cx1), CommandDisposition::Execute);
+    }
+
+    #[test]
+    fn queued_prompt_projection_is_fifo_and_device_scoped() {
+        let mut first = entry(
+            "q1",
+            SessionCommandPayload::Queue {
+                request: run_request(),
+                message_id: "m1".into(),
+            },
+            1_000,
+        );
+        first.issued_by = "device-a".into();
+        let mut second = entry(
+            "q2",
+            SessionCommandPayload::Queue {
+                request: RunRequest {
+                    prompt: "second".into(),
+                    ..run_request()
+                },
+                message_id: "m2".into(),
+            },
+            2_000,
+        );
+        second.issued_by = "device-b".into();
+        let prompts = queued_prompts(&[first, second], "device-a");
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].prompt, "hello");
+        assert!(prompts[0].cancellable);
+        assert!(!prompts[1].cancellable);
     }
 
     #[test]

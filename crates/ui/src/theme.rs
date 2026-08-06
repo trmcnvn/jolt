@@ -218,6 +218,10 @@ pub const INK_HAIRLINE_SCALE: f32 = 1.35;
 /// The app theme. Two concrete instances — [`Theme::dark`] and [`Theme::light`].
 #[derive(Debug, Clone)]
 pub struct Theme {
+    /// Stable family id and revision of the palette that produced these tokens.
+    /// Typography is tracked separately.
+    pub palette_id: SharedString,
+    pub palette_revision: u64,
     /// Which appearance these tokens were built for.
     pub appearance: Appearance,
 
@@ -229,6 +233,8 @@ pub struct Theme {
     /// *down* (grey) — chrome recedes from the content plane in both, which is
     /// the direction a naive invert gets backwards.
     pub surface: Hsla,
+    /// Tint painted over the platform blur for titlebar and sidebar chrome.
+    pub glass_tint: Hsla,
     /// Raised surface: opaque pills and chips that sit proud of the panel.
     /// Dark: lighter than `surface`. Light: white, separated by `border` +
     /// shadow rather than by lightness.
@@ -347,6 +353,12 @@ pub struct Theme {
     /// Diff: hunk-header wash (bluish grey).
     pub diff_hunk_bg: Hsla,
 
+    // ---- terminal ----
+    pub terminal_bg: Hsla,
+    pub terminal_fg: Hsla,
+    pub terminal_selection: Hsla,
+    pub terminal_ansi: [Hsla; 16],
+
     // ---- fonts ----
     /// UI font family (bundling of Geist lands with asset work; until then the
     /// text system falls back to the system sans when the family is missing).
@@ -415,24 +427,14 @@ impl Theme {
     /// [`Self::GLASS_ALPHA_LIGHT`]. On opaque platforms this IS the surface
     /// tone (no tint swap).
     pub fn glass(&self) -> Hsla {
-        match self.appearance {
-            Appearance::Dark => {
-                if Self::GLASS_ALPHA < 1.0 {
-                    grey(8).opacity(Self::GLASS_ALPHA)
-                } else {
-                    self.surface
-                }
-            }
-            Appearance::Light => {
-                if Self::GLASS_ALPHA_LIGHT < 1.0 {
-                    // 0xfa, not the surface's 0xf4-ish grey: at 90% coverage
-                    // the tint IS the sidebar tone, and the darker grey read
-                    // as a dingy pane next to the white content card.
-                    grey(0xfa).opacity(Self::GLASS_ALPHA_LIGHT)
-                } else {
-                    self.surface
-                }
-            }
+        let alpha = match self.appearance {
+            Appearance::Dark => Self::GLASS_ALPHA,
+            Appearance::Light => Self::GLASS_ALPHA_LIGHT,
+        };
+        if alpha < 1.0 {
+            self.glass_tint.opacity(alpha)
+        } else {
+            self.surface
         }
     }
 
@@ -505,9 +507,12 @@ impl Theme {
     /// Build the dark theme: main panel `#060606`, shell/sidebar `#0d0d0d`.
     pub fn dark() -> Self {
         Self {
+            palette_id: "jolt".into(),
+            palette_revision: 0,
             appearance: Appearance::Dark,
             bg: grey(6),       // main panel — sampled #060606
             surface: grey(13), // shell / sidebar — sampled #0d0d0d
+            glass_tint: grey(8),
             surface_raised: neutral(0.235),
             surface_card: grey(0x0e),
             surface_dialog: grey(0x10),
@@ -547,6 +552,10 @@ impl Theme {
             diff_add: oklch(0.765, 0.177, 163.223),  // emerald-400
             diff_del: oklch(0.704, 0.191, 22.216),   // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
+            terminal_bg: rgb8(0x09, 0x09, 0x09),
+            terminal_fg: neutral(0.922),
+            terminal_selection: hsla(0.0, 0.0, 1.0, 0.22),
+            terminal_ansi: ansi16_dark(),
             font_sans: DEFAULT_UI_FONT.into(),
             font_prompt: DEFAULT_UI_FONT.into(),
             font_mono: DEFAULT_CODE_FONT.into(),
@@ -567,12 +576,15 @@ impl Theme {
     /// white instead of glowing.
     pub fn light() -> Self {
         Self {
+            palette_id: "jolt".into(),
+            palette_revision: 0,
             appearance: Appearance::Light,
             bg: grey(0xff), // main panel — clean white
             // Deeper than ~neutral-100 looks on paper: the content card is pure
             // white and sits *inside* this surface, so too small a step leaves the
             // whole window one flat sheet with a hairline drawn on it.
             surface: neutral(0.968),
+            glass_tint: grey(0xfa),
             // A real grey, NOT white. This is the opaque-plate tone — user
             // message bubbles, the jump-to-bottom pill — and those sit directly
             // on the white content plane with no border or shadow to save them.
@@ -628,6 +640,10 @@ impl Theme {
             diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
+            terminal_bg: rgb8(0xfa, 0xfa, 0xfa),
+            terminal_fg: neutral(0.25),
+            terminal_selection: hsla(0.0, 0.0, 0.0, 0.16),
+            terminal_ansi: ansi16_light(),
             font_sans: DEFAULT_UI_FONT.into(),
             font_prompt: DEFAULT_UI_FONT.into(),
             font_mono: DEFAULT_CODE_FONT.into(),
@@ -671,28 +687,53 @@ impl Theme {
         font_sizes: FontSizes,
         cx: &mut App,
     ) {
+        Self::install_resolved_with_fonts(
+            Self::for_appearance(appearance),
+            ui_font,
+            prompt_font,
+            code_font,
+            terminal_font,
+            font_sizes,
+            cx,
+        );
+    }
+
+    /// Install an already-resolved built-in, custom, or editor-preview palette.
+    pub fn install_resolved_with_fonts(
+        mut theme: Self,
+        ui_font: impl Into<SharedString>,
+        prompt_font: impl Into<SharedString>,
+        code_font: impl Into<SharedString>,
+        terminal_font: impl Into<SharedString>,
+        font_sizes: FontSizes,
+        cx: &mut App,
+    ) {
         let ui_font = ui_font.into();
         let prompt_font = prompt_font.into();
         let code_font = code_font.into();
         let terminal_font = terminal_font.into();
         let font_sizes = font_sizes.clamped();
         let previous = cx.try_global::<Self>();
-        let appearance_changed = previous.is_some_and(|theme| theme.appearance != appearance);
-        let typography_changed = previous.is_some_and(|theme| {
-            theme.font_sans != ui_font
-                || theme.font_prompt != prompt_font
-                || theme.font_mono != code_font
-                || theme.font_terminal != terminal_font
-                || theme.font_sizes != font_sizes
+        let appearance_changed =
+            previous.is_some_and(|current| current.appearance != theme.appearance);
+        let palette_changed = previous.is_some_and(|current| {
+            current.palette_id != theme.palette_id
+                || current.palette_revision != theme.palette_revision
         });
-        set_current_appearance(appearance);
-        // `set_current_appearance` already invalidates caches when the palette
-        // changes. A font-only change needs the same generation bump so shaped
-        // transcript/code rows are rebuilt with the new metrics.
-        if typography_changed && !appearance_changed {
+        let typography_changed = previous.is_some_and(|current| {
+            current.font_sans != ui_font
+                || current.font_prompt != prompt_font
+                || current.font_mono != code_font
+                || current.font_terminal != terminal_font
+                || current.font_sizes != font_sizes
+        });
+        set_current_appearance(theme.appearance);
+        // `set_current_appearance` handles appearance changes. Same-appearance
+        // palette swaps and typography changes must also invalidate resolved
+        // markdown and shaped-text caches.
+        if !appearance_changed && (palette_changed || typography_changed) {
             THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
         }
-        let mut theme = Self::for_appearance(appearance);
         theme.font_sans = ui_font;
         theme.font_prompt = prompt_font;
         theme.font_mono = code_font;
@@ -932,6 +973,54 @@ pub fn card_selected_shadows() -> Vec<gpui::BoxShadow> {
 /// — for surfaces matched against reference-screenshot samples.
 pub fn grey(value: u8) -> Hsla {
     hsla(0.0, 0.0, value as f32 / 255.0, 1.0)
+}
+
+/// An opaque sRGB color from 8-bit channel values.
+pub fn rgb8(r: u8, g: u8, b: u8) -> Hsla {
+    let (h, s, l) = rgb_to_hsl(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    hsla(h, s, l, 1.0)
+}
+
+fn ansi16_dark() -> [Hsla; 16] {
+    [
+        rgb8(0x24, 0x24, 0x24),
+        rgb8(0xf8, 0x71, 0x71),
+        rgb8(0x4a, 0xde, 0x80),
+        rgb8(0xfa, 0xcc, 0x15),
+        rgb8(0x60, 0xa5, 0xfa),
+        rgb8(0xc0, 0x84, 0xfc),
+        rgb8(0x22, 0xd3, 0xee),
+        rgb8(0xd4, 0xd4, 0xd8),
+        rgb8(0x52, 0x52, 0x5b),
+        rgb8(0xfc, 0xa5, 0xa5),
+        rgb8(0x86, 0xef, 0xac),
+        rgb8(0xfd, 0xe0, 0x47),
+        rgb8(0x93, 0xc5, 0xfd),
+        rgb8(0xd8, 0xb4, 0xfe),
+        rgb8(0x67, 0xe8, 0xf9),
+        rgb8(0xfa, 0xfa, 0xfa),
+    ]
+}
+
+fn ansi16_light() -> [Hsla; 16] {
+    [
+        rgb8(0x1f, 0x1f, 0x1f),
+        rgb8(0xdc, 0x26, 0x26),
+        rgb8(0x16, 0xa3, 0x4a),
+        rgb8(0xb4, 0x53, 0x09),
+        rgb8(0x25, 0x63, 0xeb),
+        rgb8(0x93, 0x33, 0xea),
+        rgb8(0x0e, 0x74, 0x90),
+        rgb8(0x3f, 0x3f, 0x46),
+        rgb8(0x71, 0x71, 0x7a),
+        rgb8(0xb9, 0x1c, 0x1c),
+        rgb8(0x15, 0x80, 0x3d),
+        rgb8(0x92, 0x40, 0x0e),
+        rgb8(0x1d, 0x4e, 0xd8),
+        rgb8(0x7e, 0x22, 0xce),
+        rgb8(0x15, 0x5e, 0x75),
+        rgb8(0x18, 0x18, 0x1b),
+    ]
 }
 
 /// Convert an oklch color (CSS notation: L 0..1, C, H in degrees) to gpui Hsla.

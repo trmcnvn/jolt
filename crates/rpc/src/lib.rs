@@ -37,6 +37,8 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    pub const CANCEL_QUEUED_PROMPT: &str = "CancelQueuedPrompt";
+    pub const WATCH_QUEUED_PROMPTS: &str = "WatchQueuedPrompts";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Tail-first transcript stream: compact manifest + trailing pages, then
     /// sequenced live-page deltas.
@@ -63,6 +65,12 @@ pub mod methods {
     pub const USAGE_BREAKDOWN: &str = "UsageBreakdown";
     /// Spaces registry (device+folder pairs) from the workspace doc.
     pub const WATCH_SPACES: &str = "WatchSpaces";
+    /// Installation-level custom theme files, synchronized through the signed-in
+    /// account registry but retained on every host after sign-out.
+    pub const WATCH_THEMES: &str = "WatchThemes";
+    pub const LIST_THEMES: &str = "ListThemes";
+    pub const UPSERT_THEMES: &str = "UpsertThemes";
+    pub const DELETE_THEME: &str = "DeleteTheme";
     /// Entity mutations against the workspace document.
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
@@ -105,9 +113,12 @@ pub mod methods {
     pub const WRITE_TERMINAL: &str = "WriteTerminal";
     pub const RESIZE_TERMINAL: &str = "ResizeTerminal";
     pub const CLOSE_TERMINAL: &str = "CloseTerminal";
-    /// Checkout-diff stream for the target device's chats (DataRpc,
-    /// relay-forwardable — diffs are produced where the checkout lives).
-    pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
+    /// Checkout-specific paged diff projection, produced where the checkout lives.
+    pub const WATCH_CHECKOUT_DIFF_V2: &str = "WatchCheckoutDiffV2";
+    /// Fetch one immutable page from the current checkout diff catalog.
+    pub const GET_CHECKOUT_DIFF_PAGE: &str = "GetCheckoutDiffPage";
+    /// Fetch one immutable page captured for an assistant transcript entry.
+    pub const GET_TURN_DIFF_PAGE: &str = "GetTurnDiffPage";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";

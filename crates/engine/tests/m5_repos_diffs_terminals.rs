@@ -8,6 +8,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use jolt_engine::doc_host::EdgeConfig;
 use jolt_engine::{EngineCore, HarnessRegistry, Repos, Terminals, capture_diff};
 use jolt_proto::TerminalEvent;
 use jolt_rpc::methods;
@@ -309,6 +310,8 @@ async fn diff_capture_tracked_untracked_and_checksum() {
     // Modify tracked + add untracked.
     std::fs::write(repo_dir.join("a.txt"), "one\nTWO\nthree\n").expect("modify a.txt");
     std::fs::write(repo_dir.join("b.txt"), "brand new\nline two\n").expect("untracked b.txt");
+    std::fs::create_dir_all(repo_dir.join("nested/deep")).expect("nested directory");
+    std::fs::write(repo_dir.join("nested/deep/c.txt"), "nested\n").expect("nested untracked file");
     let snapshot = capture_diff(&repos, &repo_dir).await.expect("capture");
     assert!(snapshot.patch.contains("a/a.txt"), "tracked diff present");
     assert!(snapshot.patch.contains("+TWO"));
@@ -335,7 +338,15 @@ async fn diff_capture_tracked_untracked_and_checksum() {
         .expect("b.txt summary");
     assert_eq!(b.status, "added");
     assert_eq!(b.additions, 2);
-    assert!(snapshot.additions >= 4);
+    assert!(
+        snapshot
+            .files
+            .iter()
+            .any(|file| file.path == "nested/deep/c.txt"),
+        "nested untracked files are enumerated individually"
+    );
+    assert!(snapshot.patch.contains("diff --git a/nested/deep/c.txt"));
+    assert!(snapshot.additions >= 5);
 
     // Checksum: stable across identical captures, changed by any edit.
     let again = capture_diff(&repos, &repo_dir).await.expect("recapture");
@@ -495,25 +506,34 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
         .expect("chat row");
     core.diff_sync.reconcile_now().await;
 
-    // Initial snapshot lands after the debounce; poll the watch.
-    let mut diffs_rx = core.diff_sync.watch_diffs();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let diff = loop {
-        {
-            let diffs = diffs_rx.borrow().clone();
-            if let Some(diff) = diffs.first() {
-                break diff.clone();
-            }
-        }
-        tokio::time::timeout_at(deadline, diffs_rx.changed())
-            .await
-            .expect("diff published before timeout")
-            .expect("watch alive");
-    };
+    let (bootstrap, mut diffs_rx) = core
+        .diff_sync
+        .watch_diff("chat-diff")
+        .await
+        .expect("open diff projection");
+    let diff = bootstrap.manifest;
     assert_eq!(diff.device_id, core.device_id);
-    assert!(diff.patch.contains("+edited"));
     assert!(!diff.checkout_id.is_empty());
-    assert!(!diff.checksum.is_empty());
+    let page_id = diff.files[0].page_ids[0].clone();
+    assert_eq!(
+        core.diff_sync
+            .current_manifest("chat-diff")
+            .expect("current manifest")
+            .catalog_revision,
+        diff.catalog_revision
+    );
+    let page = core
+        .diff_sync
+        .diff_page("chat-diff", &diff.catalog_revision, &page_id)
+        .expect("read page")
+        .expect("page exists");
+    assert!(page.patch.contains("+edited"));
+    assert!(
+        core.diff_sync
+            .diff_page("chat-diff", "stale", &page_id)
+            .is_err(),
+        "page reads are scoped to the expected catalog revision"
+    );
 
     // Row upkeep: branch + checkoutId stamped on the workspace chat row.
     let chat = core
@@ -524,26 +544,115 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     assert_eq!(chat.branch.as_deref(), Some("main"));
     assert_eq!(chat.checkout_id.as_deref(), Some(diff.checkout_id.as_str()));
 
-    // File watcher path: another edit re-publishes without a manual kick.
-    let before = diff.checksum.clone();
+    // File watcher path: another edit publishes a replacement manifest.
+    let before = diff.catalog_revision;
     std::fs::write(repo_dir.join("watched.txt"), "fresh untracked\n").expect("new file");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        {
-            let diffs = diffs_rx.borrow().clone();
-            if let Some(diff) = diffs.first()
-                && diff.checksum != before
-            {
-                assert!(diff.patch.contains("watched.txt"));
-                break;
-            }
-        }
-        tokio::time::timeout_at(deadline, diffs_rx.changed())
+        let frame = tokio::time::timeout_at(deadline, diffs_rx.recv())
             .await
             .expect("watcher-driven publish before timeout")
             .expect("watch alive");
+        if let jolt_proto::CheckoutDiffWatchFrame::Manifest { manifest, .. } = frame
+            && manifest.catalog_revision != before
+        {
+            let watched = manifest
+                .files
+                .iter()
+                .find(|file| file.path == "watched.txt")
+                .expect("untracked file descriptor");
+            let page = core
+                .diff_sync
+                .diff_page(
+                    "chat-diff",
+                    &manifest.catalog_revision,
+                    &watched.page_ids[0],
+                )
+                .expect("read watched page")
+                .expect("watched page exists");
+            assert!(page.patch.contains("watched.txt"));
+            break;
+        }
     }
     core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opening_diff_does_not_wait_for_edge_publication() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled edge");
+    let edge_url = format!("http://{}", listener.local_addr().expect("edge address"));
+    let (diff_started_tx, mut diff_started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let diff_started_tx = diff_started_tx.clone();
+            tokio::spawn(async move {
+                let mut request = [0u8; 8 * 1024];
+                let Ok(Ok(read)) =
+                    tokio::time::timeout(Duration::from_secs(2), socket.read(&mut request)).await
+                else {
+                    return;
+                };
+                if request[..read].starts_with(b"POST /diff/") {
+                    let _ = diff_started_tx.send(());
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nslow edge\n").expect("dirty tree");
+
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let core = EngineCore::assemble(
+        &data_dir,
+        Arc::new(HarnessRegistry::new()),
+        jolt_proto::HarnessId::Mock,
+        Some(EdgeConfig::with_static_token(edge_url, "test-token")),
+    )
+    .expect("engine assembles");
+    core.repos
+        .set_vcs(jolt_proto::VcsKind::Git)
+        .expect("Git test backend");
+    core.workspace
+        .create_space(
+            "space-diff-edge",
+            &core.device_id,
+            &repo_dir.to_string_lossy(),
+            None,
+            true,
+        )
+        .expect("space row");
+    core.workspace
+        .create_chat("chat-diff-edge", "space-diff-edge", None, None)
+        .expect("chat row");
+    core.diff_sync.reconcile_now().await;
+
+    tokio::time::timeout(Duration::from_secs(5), diff_started_rx.recv())
+        .await
+        .expect("edge publication starts")
+        .expect("edge publication signal");
+    let (bootstrap, _) = tokio::time::timeout(
+        Duration::from_secs(1),
+        core.diff_sync.watch_diff("chat-diff-edge"),
+    )
+    .await
+    .expect("local bootstrap must not wait for stalled edge")
+    .expect("open diff projection");
+    assert!(!bootstrap.manifest.files.is_empty());
+
+    core.shutdown().await;
+    server.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -878,17 +987,6 @@ async fn rpc_dispatch_for_m5_methods() {
     assert_eq!(deleted["ok"], true);
     assert!(!PathBuf::from(&worktree_path).exists());
 
-    // WatchCheckoutDiffs: streams the current (empty) diff set immediately.
-    let mut diffs_stream = client
-        .subscribe(methods::WATCH_CHECKOUT_DIFFS, serde_json::Value::Null)
-        .await
-        .expect("WatchCheckoutDiffs");
-    let first = tokio::time::timeout(Duration::from_secs(5), diffs_stream.recv())
-        .await
-        .expect("first diffs item")
-        .expect("stream alive");
-    assert!(first.is_array());
-
     // Terminals: the chat's cwd (via its space) becomes the PTY cwd.
     client
         .call(
@@ -914,6 +1012,49 @@ async fn rpc_dispatch_for_m5_methods() {
         )
         .await
         .expect("createChat");
+
+    // The checkout-specific stream opens with an atomic manifest bootstrap.
+    std::fs::write(
+        PathBuf::from(&repo_path).join("rpc-diff.txt"),
+        "paged diff\n",
+    )
+    .expect("write diff fixture");
+    core.diff_sync.reconcile_now().await;
+    let mut diffs_stream = client
+        .subscribe(
+            methods::WATCH_CHECKOUT_DIFF_V2,
+            serde_json::json!({ "chatId": "chat-term" }),
+        )
+        .await
+        .expect("WatchCheckoutDiffV2");
+    let first = tokio::time::timeout(Duration::from_secs(5), diffs_stream.recv())
+        .await
+        .expect("first diff item")
+        .expect("stream alive");
+    assert_eq!(first["type"], "bootstrap");
+    let manifest = &first["bootstrap"]["manifest"];
+    let page_id = manifest["files"]
+        .as_array()
+        .and_then(|files| files.iter().find(|file| file["path"] == "rpc-diff.txt"))
+        .and_then(|file| file["pageIds"][0].as_str())
+        .expect("page id");
+    let page = client
+        .call(
+            methods::GET_CHECKOUT_DIFF_PAGE,
+            serde_json::json!({
+                "chatId": "chat-term",
+                "catalogRevision": manifest["catalogRevision"],
+                "pageId": page_id,
+            }),
+        )
+        .await
+        .expect("GetCheckoutDiffPage");
+    assert!(
+        page["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("rpc-diff.txt"))
+    );
+
     let session = client
         .call(
             methods::OPEN_TERMINAL,

@@ -16,8 +16,10 @@ use jolt_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod diff_projection;
 pub mod diff_sync;
 pub mod doc_host;
+mod goals;
 pub mod instance_lock;
 mod model_selection;
 mod question_extraction;
@@ -32,6 +34,7 @@ mod simd_base64;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;
+pub mod turn_diffs;
 pub mod uploads;
 pub mod usage;
 pub mod vcs;
@@ -39,7 +42,11 @@ pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
-pub use diff_sync::{CheckoutDiffSync, DiffSidecar, DiffSnapshot, capture_diff};
+pub use diff_projection::{DIFF_PAGE_MAX_BYTES, DIFF_PAGE_TARGET_BYTES, DiffProjection};
+pub use diff_sync::{
+    CheckoutDiffSync, DiffSidecar, DiffSnapshot, TurnDiffBaseline, capture_diff, capture_turn_diff,
+    capture_turn_diff_baseline,
+};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
@@ -52,6 +59,7 @@ pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
+pub use turn_diffs::TurnDiffStore;
 pub use uploads::{AttachmentChunk, Uploads};
 pub use usage::UsageStore;
 pub use vcs::Vcs;
@@ -247,7 +255,13 @@ impl EngineCore {
         let journal = Arc::new(RunJournal::open(identity_dir.join("journals"))?);
         let usage = UsageStore::open(&identity_dir.join("usage.sqlite"), device_id.clone())
             .map_err(|error| EngineError::Other(format!("usage store: {error}")))?;
+        let repos = Repos::new(data_dir, &device_id);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone(), usage);
+        sessions.set_turn_diffs(TurnDiffStore::new(
+            identity_dir.join("turn-diffs"),
+            repos.clone(),
+            device_id.clone(),
+        ));
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -270,12 +284,16 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        match workspace.pause_active_goals_after_restart() {
+            Ok(0) => {}
+            Ok(paused) => tracing::info!(paused, "active goals paused on boot"),
+            Err(err) => tracing::error!(error = %err, "active-goal recovery failed"),
+        }
         match sessions.recover_stale() {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
         }
-        let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
         let uploads = Uploads::new(identity_dir, edge.clone());
         let agent_accounts = services.agent_accounts;
@@ -891,6 +909,17 @@ impl RpcService for EngineSupervisor {
             }
             _ if rpc::AuthRpc::handles(method) => {
                 return self.auth_rpc.handle(method, params).await;
+            }
+            _ if rpc::theme_sync_method(method) => {
+                let account_service = lock(&self.account)
+                    .as_ref()
+                    .map(|runtime| runtime.core().rpc_service());
+                let Some(account_service) = account_service else {
+                    return Err(RpcError::Failed(
+                        "theme sync requires a signed-in account".into(),
+                    ));
+                };
+                return account_service.handle(method, params).await;
             }
             _ => {}
         }

@@ -18,8 +18,8 @@
  *   discarded permanently, state is fully preserved (§3.1).
  * - `tail` blob — materialized last-N-messages JSON, recomputed lazily on
  *   GET /tail when dirty (§5 L2).
- * - `diff` blob — latest-only working-tree diff sidecar, overwritten on each
- *   host publish (§6.1).
+ * - `diff-v2` blob — latest checkout manifest; immutable page bodies live in
+ *   checkout-deduplicated R2 objects and are authorized through this room.
  * - Ephemeral presence (%EPH room) is memory-only by construction.
  *
  * Hibernation discipline: no wall-clock JS timers except the flush debounce
@@ -47,11 +47,14 @@ import {
   DO_FLUSH_MS,
   RETAIN_DAYS,
   materializeTail,
+  parseDiffSidecar,
   projectTranscript,
   readMessageEntries,
   readMessageEntryRange,
   refreshTranscriptLivePage,
   transcriptBootstrap,
+  type CheckoutDiffPage,
+  type StoredDiffSidecar,
   type TranscriptProjection
 } from "./session-doc";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
@@ -128,7 +131,7 @@ const isWasmUseAfterFree = (e: unknown): boolean =>
 
 interface SocketState {
   userId: string;
-  kind?: "transcript";
+  kind?: "transcript" | "diff";
   /** Joined sub-rooms by crdt magic ("%LOR", "%EPH"). */
   rooms: string[];
   /** True for sockets on a workspace-doc room — org membership was enforced
@@ -199,6 +202,7 @@ export class SessionRoom implements DurableObject {
   private pendingBytes = 0;
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
   private transcriptSequence = 0;
+  private diffSequence = 0;
   private lastTranscriptProjection: TranscriptProjection | undefined;
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
@@ -323,6 +327,25 @@ export class SessionRoom implements DurableObject {
         sequence: this.transcriptSequence
       };
       pair[1].send(JSON.stringify({ type: "bootstrap", bootstrap }));
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
+    if (url.pathname === "/diff/ws") {
+      if (!workspace) {
+        if (!owner) return json({ error: "not_found" }, 404);
+        if (owner !== userId) return json({ error: "forbidden" }, 403);
+      }
+      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+        return json({ error: "expected_websocket" }, 426);
+      }
+      const sidecar = getJsonBlob<StoredDiffSidecar>(this.blobs, "diff-v2");
+      if (!sidecar) return json({ error: "not_found" }, 404);
+      const pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1]);
+      pair[1].serializeAttachment({ userId, rooms: [], kind: "diff" } satisfies SocketState);
+      pair[1].send(JSON.stringify({
+        type: "bootstrap",
+        bootstrap: { sequence: this.diffSequence, manifest: sidecar.manifest, pages: [] }
+      }));
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     if (url.pathname === "/stats" && request.method === "GET") {
@@ -456,17 +479,56 @@ export class SessionRoom implements DurableObject {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
-      const diff = getJsonBlob<unknown>(this.blobs, "diff");
+      const diff = getJsonBlob<StoredDiffSidecar>(this.blobs, "diff-v2");
       return diff === undefined ? json({ error: "not_found" }, 404) : json(diff);
     }
+    if (url.pathname === "/diff/page" && request.method === "GET") {
+      if (!workspace) {
+        if (!owner) return json({ error: "not_found" }, 404);
+        if (owner !== userId) return json({ error: "forbidden" }, 403);
+      }
+      const id = url.searchParams.get("id");
+      if (!id) return json({ error: "missing_page_id" }, 400);
+      const sidecar = getJsonBlob<StoredDiffSidecar>(this.blobs, "diff-v2");
+      if (!sidecar?.manifest.pages.some((page) => page.id === id)) {
+        return json({ error: "page_not_found" }, 404);
+      }
+      const page = getJsonBlob<CheckoutDiffPage>(this.blobs, `diff-page:${id}`);
+      return page === undefined ? json({ error: "page_not_found" }, 404) : json(page);
+    }
     if (url.pathname === "/diff" && request.method === "POST") {
-      // The host may publish before any room join has claimed the doc.
       if (!workspace) {
         if (!owner) this.setMeta("owner", userId);
         else if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
-      putJsonBlob(this.blobs, "diff", await request.json());
-      return json({ ok: true });
+      const sidecar = parseDiffSidecar(await request.json());
+      if (!sidecar) return json({ error: "invalid_diff_sidecar" }, 400);
+      const previous = getJsonBlob<StoredDiffSidecar>(this.blobs, "diff-v2");
+      const referenced = new Set(sidecar.manifest.pages.map((page) => page.id));
+      for (const page of sidecar.pages) {
+        if (page.catalogRevision !== sidecar.manifest.catalogRevision || !referenced.has(page.id)) {
+          return json({ error: "invalid_diff_page" }, 400);
+        }
+        putJsonBlob(this.blobs, `diff-page:${page.id}`, page);
+      }
+      for (const page of previous?.manifest.pages ?? []) {
+        if (!referenced.has(page.id)) this.blobs.delete(`diff-page:${page.id}`);
+      }
+      const stored: StoredDiffSidecar = { ...sidecar, pages: [] };
+      putJsonBlob(this.blobs, "diff-v2", stored);
+      this.blobs.delete("diff");
+      this.diffSequence += 1;
+      const payload = JSON.stringify({
+        type: "manifest",
+        sequence: this.diffSequence,
+        manifest: sidecar.manifest
+      });
+      for (const socket of this.ctx.getWebSockets()) {
+        const state = socket.deserializeAttachment() as SocketState | null;
+        if (state?.kind !== "diff") continue;
+        try { socket.send(payload); } catch { try { socket.close(1011, "diff delivery failed"); } catch { /* closed */ } }
+      }
+      return json({ ok: true, catalogRevision: sidecar.manifest.catalogRevision });
     }
     if (url.pathname === "/snapshot" && request.method === "GET") {
       // Repair/inspection read: the doc's full current snapshot bytes.
@@ -554,7 +616,7 @@ export class SessionRoom implements DurableObject {
       return;
     }
     const socketState = ws.deserializeAttachment() as SocketState | null;
-    if (socketState?.kind === "transcript") return;
+    if (socketState?.kind === "transcript" || socketState?.kind === "diff") return;
     if (typeof message === "string") return; // ping/pong handled by auto-response
     let decoded: ProtocolMessage;
     try {

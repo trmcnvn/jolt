@@ -1,6 +1,24 @@
 {
-  "originHash" : "380352fac03a7214383e6d1d9e08892ba627e39d90edf146409a5ecc5842bfe8",
+  "originHash" : "cf8c3d19a2c14407c05f649752f2510b2eb937d94f6706a5d9668717811e8b5c",
   "pins" : [
+    {
+      "identity" : "beautiful-mermaid-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/lukilabs/beautiful-mermaid-swift",
+      "state" : {
+        "revision" : "6a23a29e91af8f5b3e9fc09945332ca193bd69ec",
+        "version" : "1.0.4"
+      }
+    },
+    {
+      "identity" : "elk-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/lukilabs/elk-swift",
+      "state" : {
+        "revision" : "32f8042e3509a4819f00ff9cd46e829ec2b26da0",
+        "version" : "1.0.2"
+      }
+    },
     {
       "identity" : "loro-swift",
       "kind" : "remoteSourceControl",
@@ -8,6 +26,15 @@
       "state" : {
         "revision" : "625f3e696fca4be3ae77de8b3404fa6753554f21",
         "version" : "1.13.3"
+      }
+    },
+    {
+      "identity" : "ratex",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/erweixin/RaTeX",
+      "state" : {
+        "revision" : "ae391d727ac615437c63c308f4538d971a84bede",
+        "version" : "0.1.14"
       }
     },
     {

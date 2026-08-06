@@ -41,6 +41,27 @@ struct ChatConfig: Hashable, Codable {
     var sandbox: String?
 }
 
+enum GoalStatus: String, Hashable, Codable {
+    case active, paused, blocked, usageLimited, budgetLimited, complete
+}
+
+struct Goal: Hashable, Codable {
+    var id: String
+    var revision: UInt64
+    var controlNonce: String?
+    var objective: String
+    var status: GoalStatus
+    var statusMessage: String?
+    var tokenBudget: UInt64?
+    var tokensUsed: UInt64
+    var elapsedActiveMs: UInt64
+    var turns: UInt32
+    var blockerKey: String?
+    var blockerStreak: UInt8
+    var createdAtMs: Int64
+    var updatedAtMs: Int64
+}
+
 struct Chat: Identifiable, Hashable {
     var id: String
     var deviceId: String
@@ -55,6 +76,7 @@ struct Chat: Identifiable, Hashable {
     var createdAt: Int64
     var spaceId: String?
     var lastSeenAt: Int64?
+    var goal: Goal? = nil
 
     var displayTitle: String {
         if let title, !title.isEmpty { return title }
@@ -322,6 +344,8 @@ let broPrompt = "Restate your last message. Stop using jargon and speak coherent
 enum SessionCommandPayload {
     case run(request: RunRequest, messageId: String)
     case hiddenPrompt(request: RunRequest)
+    case queue(request: RunRequest, messageId: String)
+    case resumeQueue
     case bash(command: String, excludeFromContext: Bool, cwd: String, messageId: String)
     case steer(prompt: String, messageId: String?)
     case interrupt
@@ -330,6 +354,8 @@ enum SessionCommandPayload {
     var kind: String {
         switch self {
         case .run, .hiddenPrompt: return "run"
+        case .queue: return "queue"
+        case .resumeQueue: return "resumeQueue"
         case .bash: return "bash"
         case .steer: return "steer"
         case .interrupt: return "interrupt"

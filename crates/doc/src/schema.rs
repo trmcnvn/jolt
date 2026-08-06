@@ -71,6 +71,8 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff: Option<serde_json::Value>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -114,6 +116,12 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             message: Some(message.clone()),
             ..Default::default()
         },
+        MessagePart::Changes { id, diff } => DocPartJson {
+            id: id.clone(),
+            kind: "changes".into(),
+            diff: Some(serde_json::to_value(diff)?),
+            ..Default::default()
+        },
     })
 }
 
@@ -144,6 +152,13 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "error" => MessagePart::Error {
             id: p.id,
             message: p.message.unwrap_or_default(),
+        },
+        "changes" => match p.diff.and_then(|diff| serde_json::from_value(diff).ok()) {
+            Some(diff) => MessagePart::Changes { id: p.id, diff },
+            None => MessagePart::Text {
+                id: p.id,
+                text: String::new(),
+            },
         },
         _ => MessagePart::Text {
             id: p.id,
@@ -638,6 +653,9 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
+    if let Some(diff) = &doc_part.diff {
+        map.insert("diff", loro_value_from_json(diff))?;
+    }
     Ok(())
 }
 
@@ -857,6 +875,9 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
+    if let Some(diff) = &doc_part.diff {
+        map.insert("diff", loro_value_from_json(diff))?;
+    }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
@@ -940,6 +961,46 @@ mod tests {
             }]
         );
         assert_eq!(doc.chat_id().as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn changes_part_round_trips() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let diff = jolt_proto::TurnDiffManifest {
+            catalog_revision: "revision".into(),
+            chat_id: "chat-1".into(),
+            assistant_message_id: "m1".into(),
+            device_id: "dev-a".into(),
+            cwd: "/repo".into(),
+            vcs: jolt_proto::VcsKind::Git,
+            files: vec![],
+            pages: vec![],
+            additions: 2,
+            deletions: 1,
+            truncated: false,
+            completed_at: chrono::Utc::now(),
+        };
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Changes {
+                id: "changes".into(),
+                diff: diff.clone(),
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            doc.read_entries().unwrap()[0].parts,
+            vec![MessagePart::Changes {
+                id: "changes".into(),
+                diff,
+            }]
+        );
     }
 
     #[test]

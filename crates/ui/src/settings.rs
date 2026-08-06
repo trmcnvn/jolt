@@ -16,9 +16,9 @@ pub mod archived;
 pub mod composer;
 mod device_switcher;
 pub mod devices;
+pub mod hotkeys;
 pub mod notifications;
 pub mod secrets;
-pub mod shortcuts;
 pub mod terminal;
 pub mod vcs;
 pub mod widgets;
@@ -102,6 +102,10 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Theme family used whenever the effective appearance is light.
+    pub light_theme: String,
+    /// Theme family used whenever the effective appearance is dark.
+    pub dark_theme: String,
     /// Font family for application chrome, prose, and controls.
     pub ui_font: String,
     /// Font family used only by the chat composer.
@@ -144,6 +148,8 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            light_theme: crate::themes::JOLT_THEME_ID.into(),
+            dark_theme: crate::themes::JOLT_THEME_ID.into(),
             ui_font: crate::theme::DEFAULT_UI_FONT.into(),
             prompt_font: crate::theme::DEFAULT_UI_FONT.into(),
             code_font: crate::theme::DEFAULT_CODE_FONT.into(),
@@ -167,7 +173,10 @@ pub enum ShortcutId {
     NewSession,
     ClearInput,
     CloseTab,
+    PreviousTranscriptTurn,
+    NextTranscriptTurn,
     OpenSettings,
+    OpenSpacesDropdown,
     AddSpace,
     SearchSessions,
     ToggleSidebar,
@@ -211,7 +220,10 @@ impl ShortcutId {
             ShortcutId::NewSession,
             ShortcutId::ClearInput,
             ShortcutId::CloseTab,
+            ShortcutId::PreviousTranscriptTurn,
+            ShortcutId::NextTranscriptTurn,
             ShortcutId::OpenSettings,
+            ShortcutId::OpenSpacesDropdown,
             ShortcutId::AddSpace,
             ShortcutId::SearchSessions,
             ShortcutId::ToggleSidebar,
@@ -242,7 +254,10 @@ impl ShortcutId {
             ShortcutId::NewSession => "New session",
             ShortcutId::ClearInput => "Clear input",
             ShortcutId::CloseTab => "Close current tab",
+            ShortcutId::PreviousTranscriptTurn => "Previous transcript prompt",
+            ShortcutId::NextTranscriptTurn => "Next transcript prompt",
             ShortcutId::OpenSettings => "Open settings",
+            ShortcutId::OpenSpacesDropdown => "Open spaces dropdown",
             ShortcutId::AddSpace => "Add space",
             ShortcutId::SearchSessions => "Search sessions",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
@@ -273,7 +288,10 @@ impl ShortcutId {
             ShortcutId::NewSession => "mod-n",
             ShortcutId::ClearInput => "mod-c",
             ShortcutId::CloseTab => "mod-w",
+            ShortcutId::PreviousTranscriptTurn => "mod-shift-up",
+            ShortcutId::NextTranscriptTurn => "mod-shift-down",
             ShortcutId::OpenSettings => "mod-,",
+            ShortcutId::OpenSpacesDropdown => "mod-shift-k",
             ShortcutId::AddSpace => "mod-k",
             ShortcutId::SearchSessions => "mod-shift-f",
             ShortcutId::ToggleSidebar => "mod-e",
@@ -309,7 +327,10 @@ pub struct KeymapConfig {
     pub new_session: String,
     pub clear_input: String,
     pub close_tab: String,
+    pub previous_transcript_turn: String,
+    pub next_transcript_turn: String,
     pub open_settings: String,
+    pub open_spaces_dropdown: String,
     pub add_space: String,
     pub search_sessions: String,
     pub toggle_sidebar: String,
@@ -340,7 +361,10 @@ impl Default for KeymapConfig {
             new_session: ShortcutId::NewSession.default_combo().into(),
             clear_input: ShortcutId::ClearInput.default_combo().into(),
             close_tab: ShortcutId::CloseTab.default_combo().into(),
+            previous_transcript_turn: ShortcutId::PreviousTranscriptTurn.default_combo().into(),
+            next_transcript_turn: ShortcutId::NextTranscriptTurn.default_combo().into(),
             open_settings: ShortcutId::OpenSettings.default_combo().into(),
+            open_spaces_dropdown: ShortcutId::OpenSpacesDropdown.default_combo().into(),
             add_space: ShortcutId::AddSpace.default_combo().into(),
             search_sessions: ShortcutId::SearchSessions.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
@@ -373,7 +397,10 @@ impl KeymapConfig {
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::ClearInput => &self.clear_input,
             ShortcutId::CloseTab => &self.close_tab,
+            ShortcutId::PreviousTranscriptTurn => &self.previous_transcript_turn,
+            ShortcutId::NextTranscriptTurn => &self.next_transcript_turn,
             ShortcutId::OpenSettings => &self.open_settings,
+            ShortcutId::OpenSpacesDropdown => &self.open_spaces_dropdown,
             ShortcutId::AddSpace => &self.add_space,
             ShortcutId::SearchSessions => &self.search_sessions,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
@@ -404,7 +431,10 @@ impl KeymapConfig {
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::ClearInput => self.clear_input = combo,
             ShortcutId::CloseTab => self.close_tab = combo,
+            ShortcutId::PreviousTranscriptTurn => self.previous_transcript_turn = combo,
+            ShortcutId::NextTranscriptTurn => self.next_transcript_turn = combo,
             ShortcutId::OpenSettings => self.open_settings = combo,
+            ShortcutId::OpenSpacesDropdown => self.open_spaces_dropdown = combo,
             ShortcutId::AddSpace => self.add_space = combo,
             ShortcutId::SearchSessions => self.search_sessions = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
@@ -557,6 +587,12 @@ impl UiSettings {
         if self.prompt_font.trim().is_empty() {
             self.prompt_font = self.ui_font.clone();
         }
+        if self.light_theme.trim().is_empty() {
+            self.light_theme = crate::themes::JOLT_THEME_ID.into();
+        }
+        if self.dark_theme.trim().is_empty() {
+            self.dark_theme = crate::themes::JOLT_THEME_ID.into();
+        }
         let sizes = self.font_sizes().clamped();
         self.font_size_interface = sizes.interface;
         self.font_size_prompt = sizes.prompt;
@@ -649,6 +685,8 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            light_theme: crate::themes::CATPPUCCIN_THEME_ID.into(),
+            dark_theme: crate::themes::ROSE_PINE_THEME_ID.into(),
             ui_font: "Avenir Next".into(),
             prompt_font: "Iosevka".into(),
             code_font: "Menlo".into(),
@@ -767,7 +805,13 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
         assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
         assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-w");
+        assert_eq!(
+            keymap.get(ShortcutId::PreviousTranscriptTurn),
+            "mod-shift-up"
+        );
+        assert_eq!(keymap.get(ShortcutId::NextTranscriptTurn), "mod-shift-down");
         assert_eq!(keymap.get(ShortcutId::OpenSettings), "mod-,");
+        assert_eq!(keymap.get(ShortcutId::OpenSpacesDropdown), "mod-shift-k");
         assert_eq!(keymap.get(ShortcutId::AddSpace), "mod-k");
         assert_eq!(keymap.get(ShortcutId::SearchSessions), "mod-shift-f");
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-e");
@@ -832,6 +876,7 @@ mod tests {
         assert!(!conflicts.contains(&ShortcutId::ToggleTerminal));
         assert!(!conflicts.contains(&ShortcutId::AddSpace));
         assert!(!conflicts.contains(&ShortcutId::SearchSessions));
+        assert!(!conflicts.contains(&ShortcutId::OpenSpacesDropdown));
         assert!(!conflicts.contains(&ShortcutId::OpenSettings));
         assert!(!conflicts.contains(&ShortcutId::NewSession));
         assert!(!conflicts.contains(&ShortcutId::ClearInput));
@@ -890,7 +935,13 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
         assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
         assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-w");
+        assert_eq!(
+            keymap.get(ShortcutId::PreviousTranscriptTurn),
+            "mod-shift-up"
+        );
+        assert_eq!(keymap.get(ShortcutId::NextTranscriptTurn), "mod-shift-down");
         assert_eq!(keymap.get(ShortcutId::OpenSettings), "mod-,");
+        assert_eq!(keymap.get(ShortcutId::OpenSpacesDropdown), "mod-shift-k");
         assert_eq!(keymap.get(ShortcutId::AddSpace), "mod-k");
         assert_eq!(keymap.get(ShortcutId::SearchSessions), "mod-shift-f");
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-e");

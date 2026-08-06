@@ -75,6 +75,71 @@ fn mock_script() -> Vec<AgentEvent> {
     ]
 }
 
+struct EditingHarness;
+
+#[async_trait]
+impl Harness for EditingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Editing"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        std::fs::write(
+            std::path::Path::new(&request.cwd).join("changed.txt"),
+            "after\n",
+        )
+        .map_err(HarnessError::Io)?;
+        let events = vec![
+            AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock".into(),
+                tools: vec![],
+                cwd: request.cwd,
+                session_id: "editing-session".into(),
+                assistant_message_id: "assistant".into(),
+            },
+            AgentEvent::ToolCall {
+                id: "edit".into(),
+                call: ToolCall::EditFile {
+                    path: "changed.txt".into(),
+                    old_string: Some("before\n".into()),
+                    new_string: Some("after\n".into()),
+                },
+            },
+            AgentEvent::ToolResult {
+                id: "edit".into(),
+                is_error: false,
+            },
+            done(DoneStatus::Completed),
+        ];
+        Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+    }
+}
+
 /// Scripted harness with a per-event delay; optionally hangs after the script until its
 /// interrupt token cancels, then ends with `Done{interrupted}`.
 struct ScriptedHarness {
@@ -367,6 +432,111 @@ impl Harness for PromptCapturingHarness {
     }
 }
 
+struct QueuedTurnHarness {
+    prompts: Arc<Mutex<Vec<String>>>,
+    release_first: Arc<tokio::sync::Notify>,
+    release_queued: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Harness for QueuedTurnHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Queued turns"
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        if request.prompt.starts_with("Reply with ONLY a concise") {
+            return Ok(futures::stream::iter(vec![
+                Ok(AgentEvent::TextDelta {
+                    text: "Queue test".into(),
+                }),
+                Ok(done(DoneStatus::Completed)),
+            ])
+            .boxed());
+        }
+        self.prompts.lock().unwrap().push(request.prompt);
+        let prompts = self.prompts.clone();
+        let release_first = self.release_first.clone();
+        let release_queued = self.release_queued.clone();
+        let mut steering = controls.steering;
+        let interrupt = controls.interrupt;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            if tx
+                .send(Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock".into(),
+                    tools: Vec::new(),
+                    cwd: "/tmp".into(),
+                    session_id: "queued-session".into(),
+                    assistant_message_id: "queued-a-0".into(),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            release_first.notified().await;
+            if tx.send(Ok(done(DoneStatus::Completed))).await.is_err() {
+                return;
+            }
+            let mut turn = 1usize;
+            loop {
+                tokio::select! {
+                    message = steering.recv() => {
+                        let Some(message) = message else { return };
+                        prompts.lock().unwrap().push(message.prompt);
+                        if turn == 1 {
+                            release_queued.notified().await;
+                        }
+                        for event in [
+                            AgentEvent::Steered {
+                                assistant_message_id: Some(format!("queued-a-{}", turn - 1)),
+                                next_assistant_message_id: Some(format!("queued-a-{turn}")),
+                            },
+                            done(DoneStatus::Completed),
+                        ] {
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                        turn += 1;
+                    }
+                    _ = interrupt.cancelled() => return,
+                }
+            }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
 struct BashHarness {
     seen: Arc<Mutex<Vec<BashRequest>>>,
     release: Option<Arc<tokio::sync::Notify>>,
@@ -506,6 +676,232 @@ fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, 
         .into_iter()
         .find(|c| c.id == id)
         .map(|c| (c.status, c.resolution))
+}
+
+#[tokio::test]
+async fn queued_messages_drain_fifo_as_one_batch_at_the_next_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let release_queued = Arc::new(tokio::sync::Notify::new());
+    let core = assemble(
+        dir.path(),
+        Arc::new(QueuedTurnHarness {
+            prompts: prompts.clone(),
+            release_first: release_first.clone(),
+            release_queued: release_queued.clone(),
+        }),
+    );
+
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "run-first",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-first".into(),
+        },
+    );
+    wait_for(|| !prompts.lock().unwrap().is_empty(), "first turn").await;
+    assert_eq!(prompts.lock().unwrap().as_slice(), ["first"]);
+
+    let first_queue = "queue-second";
+    queue_as_viewer(
+        handle.doc(),
+        first_queue,
+        SessionCommandPayload::Queue {
+            request: run_request("second"),
+            message_id: "m-second".into(),
+        },
+    );
+    let third_queue = "queue-third";
+    queue_as_viewer(
+        handle.doc(),
+        third_queue,
+        SessionCommandPayload::Queue {
+            request: run_request("third"),
+            message_id: "m-third".into(),
+        },
+    );
+    wait_for(
+        || {
+            command_status(&core, first_queue)
+                .is_some_and(|value| value.0 == SessionCommandStatus::Pending)
+        },
+        "queued command to remain pending",
+    )
+    .await;
+    assert!(!entries(&core).iter().any(|entry| entry.id == "m-second"));
+
+    release_first.notify_one();
+    wait_for(
+        || prompts.lock().unwrap().as_slice() == ["first", "second"],
+        "first queued prompt",
+    )
+    .await;
+    wait_for(
+        || {
+            [first_queue, third_queue].iter().all(|id| {
+                command_status(&core, id)
+                    .is_some_and(|value| value.0 == SessionCommandStatus::Applied)
+            })
+        },
+        "whole queue to drain before the queued turn settles",
+    )
+    .await;
+    release_queued.notify_one();
+    wait_for(
+        || prompts.lock().unwrap().as_slice() == ["first", "second", "third"],
+        "queued prompts in FIFO order",
+    )
+    .await;
+    let user_ids: Vec<_> = entries(&core)
+        .into_iter()
+        .filter(|entry| entry.role == MessageRole::User)
+        .map(|entry| entry.id)
+        .collect();
+    assert_eq!(user_ids, ["m-first", "m-second", "m-third"]);
+}
+
+#[tokio::test]
+async fn pending_queued_message_can_be_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let core = assemble(
+        dir.path(),
+        Arc::new(QueuedTurnHarness {
+            prompts: prompts.clone(),
+            release_first: release_first.clone(),
+            release_queued: Arc::new(tokio::sync::Notify::new()),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "run-first",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-first".into(),
+        },
+    );
+    wait_for(|| !prompts.lock().unwrap().is_empty(), "first turn").await;
+    assert_eq!(prompts.lock().unwrap().as_slice(), ["first"]);
+    let queued = core
+        .doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Queue {
+                request: run_request("cancel me"),
+                message_id: "m-cancelled".into(),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || {
+            command_status(&core, &queued)
+                .is_some_and(|value| value.0 == SessionCommandStatus::Pending)
+        },
+        "pending queue item",
+    )
+    .await;
+    assert!(core.doc_host.cancel_queued_prompt(CHAT, &queued).unwrap());
+    release_first.notify_one();
+    wait_for(
+        || {
+            command_status(&core, &queued)
+                .is_some_and(|value| value.0 == SessionCommandStatus::Cancelled)
+        },
+        "queue cancellation",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(prompts.lock().unwrap().as_slice(), ["first"]);
+    assert!(!entries(&core).iter().any(|entry| entry.id == "m-cancelled"));
+}
+
+#[tokio::test]
+async fn completed_turn_persists_an_authoritative_filesystem_diff() {
+    let data = tempfile::tempdir().unwrap();
+    let checkout = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "jolt@example.invalid"]);
+    git(&["config", "user.name", "Jolt Test"]);
+    std::fs::write(checkout.path().join("changed.txt"), "before\n").unwrap();
+    std::fs::write(checkout.path().join("preexisting.txt"), "committed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "initial"]);
+    std::fs::write(
+        checkout.path().join("preexisting.txt"),
+        "dirty before turn\n",
+    )
+    .unwrap();
+
+    let core = assemble(data.path(), Arc::new(EditingHarness));
+    core.repos.set_vcs(jolt_proto::VcsKind::Git).unwrap();
+    core.doc_host.open(CHAT).unwrap();
+    let mut request = run_request("edit it");
+    request.cwd = checkout.path().to_string_lossy().into_owned();
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, request, Some("user".into()))
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Complete)
+                    && entry
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, MessagePart::Changes { .. }))
+            })
+        },
+        "turn diff",
+    )
+    .await;
+
+    let assistant = entries(&core)
+        .into_iter()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .unwrap();
+    let diff = assistant
+        .parts
+        .iter()
+        .find_map(|part| match part {
+            MessagePart::Changes { diff, .. } => Some(diff),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].path, "changed.txt");
+    let page = core
+        .sessions
+        .turn_diff_page(
+            CHAT,
+            &assistant.id,
+            &diff.catalog_revision,
+            &diff.pages[0].id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(page.patch.contains("-before"));
+    assert!(page.patch.contains("+after"));
+    assert!(!page.patch.contains("preexisting.txt"));
 }
 
 #[tokio::test]
@@ -1442,6 +1838,12 @@ async fn rpc_surface_over_in_memory_transport() {
             {
                 "name": "bro",
                 "description": "Restate the latest assistant response in plain language",
+                "source": "jolt"
+            },
+            {
+                "name": "goal",
+                "description": "Open the long-running goal manager",
+                "argumentHint": "<objective>|pause|resume|clear",
                 "source": "jolt"
             }
         ])
@@ -2575,9 +2977,10 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     );
     wait_for(
         || {
-            entries(&core)
-                .iter()
-                .any(|e| e.status == Some(MessageStatus::Complete))
+            entries(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Complete)
+            })
         },
         "run completes",
     )

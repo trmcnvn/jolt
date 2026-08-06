@@ -180,9 +180,21 @@ struct ComposerView: View {
     @State private var commandBusy = false
     @State private var composerError: String?
     @State private var extractedAnswers: ExtractedAnswerFlow?
+    @State private var goalExpanded = false
+    @State private var showGoalSheet = false
 
     var body: some View {
         VStack(spacing: 6) {
+            if let goal = chat.goal {
+                GoalCard(
+                    goal: goal,
+                    expanded: $goalExpanded,
+                    onEdit: { showGoalSheet = true },
+                    onPause: { store.pauseGoal(goal) },
+                    onResume: { store.resumeGoal(goal) },
+                    onClear: { store.clearGoal(goal) }
+                )
+            }
             if let composerError {
                 Text(composerError)
                     .font(Theme.sans(12))
@@ -226,6 +238,9 @@ struct ComposerView: View {
         }
         .onChange(of: text) { refreshMentions() }
         .onChange(of: selection) { refreshMentions() }
+        .sheet(isPresented: $showGoalSheet) {
+            GoalManagementSheet(store: store, goal: chat.goal)
+        }
     }
 
     /// Load picked photos into staged attachments (HEIC transcodes to JPEG;
@@ -259,6 +274,16 @@ struct ComposerView: View {
         let staged = attachments
         guard !prompt.isEmpty || !staged.isEmpty else { return }
 
+        if isGoalCommand(prompt) {
+            guard staged.isEmpty else {
+                composerError = "Remove attachments before using /goal."
+                return
+            }
+            composerError = nil
+            clearDraft()
+            showGoalSheet = true
+            return
+        }
         if !runLive, prompt == "/answer" {
             beginAnswerQuestions()
             return
@@ -330,6 +355,7 @@ struct ComposerView: View {
             let commands = [
                 HarnessInfo(id: "answer", label: "Answer questions from the latest response"),
                 HarnessInfo(id: "bro", label: "Restate the latest response plainly"),
+                HarnessInfo(id: "goal", label: "Open the long-running goal manager"),
             ].filter { query.isEmpty || $0.id.hasPrefix(query) }
             if !commands.isEmpty {
                 VStack(spacing: 0) {
@@ -459,6 +485,215 @@ struct ComposerView: View {
         // Re-clear once that has drained; a keystroke can't land inside the
         // same main-actor turn, so this can never eat real input.
         Task { @MainActor in text = "" }
+    }
+}
+
+func isGoalCommand(_ prompt: String) -> Bool {
+    prompt.trimmingCharacters(in: .whitespacesAndNewlines) == "/goal"
+}
+
+private struct GoalCard: View {
+    let goal: Goal
+    @Binding var expanded: Bool
+    let onEdit: () -> Void
+    let onPause: () -> Void
+    let onResume: () -> Void
+    let onClear: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button { expanded.toggle() } label: {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 7, height: 7)
+                    Text(statusLabel)
+                        .font(Theme.sans(10).weight(.semibold))
+                        .foregroundStyle(statusColor)
+                    Text(goal.objective)
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(tokenLabel)
+                        .font(Theme.sans(10))
+                        .foregroundStyle(Theme.textMuted)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 38)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text(goal.objective)
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.text)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let message = goal.statusMessage {
+                        Text(message)
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                    HStack(spacing: 7) {
+                        goalButton(goal.status == .complete ? "New goal" : "Edit", action: onEdit)
+                        if goal.status == .active {
+                            goalButton("Pause", action: onPause)
+                        } else if [.paused, .blocked, .usageLimited].contains(goal.status) {
+                            goalButton("Resume", action: onResume)
+                        }
+                        goalButton("Clear", action: onClear)
+                    }
+                }
+                .padding(12)
+                .overlay(alignment: .top) { Rectangle().fill(Theme.border).frame(height: 1) }
+            }
+        }
+        .background(Theme.surfaceRaised.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(statusColor.opacity(0.28)))
+        .padding(.horizontal, 16)
+    }
+
+    private var statusLabel: String {
+        switch goal.status {
+        case .active: "ACTIVE"
+        case .paused: "PAUSED"
+        case .blocked: "BLOCKED"
+        case .usageLimited: "USAGE LIMITED"
+        case .budgetLimited: "BUDGET REACHED"
+        case .complete: "COMPLETE"
+        }
+    }
+
+    private var statusColor: Color {
+        switch goal.status {
+        case .active: Theme.accent
+        case .complete: Theme.statusCompleted
+        default: Theme.warning
+        }
+    }
+
+    private var tokenLabel: String {
+        if let budget = goal.tokenBudget {
+            return "\(goal.tokensUsed.formatted()) / \(budget.formatted()) tokens"
+        }
+        return "\(goal.tokensUsed.formatted()) tokens"
+    }
+
+    private func goalButton(_ label: String, action: @escaping () -> Void) -> some View {
+        Button(label, action: action)
+            .font(Theme.sans(11))
+            .foregroundStyle(Theme.text)
+            .padding(.horizontal, 10)
+            .frame(height: 27)
+            .background(whiteAlpha(0.07), in: RoundedRectangle(cornerRadius: 7))
+            .buttonStyle(.plain)
+    }
+}
+
+private struct GoalManagementSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let store: SessionStore
+    let goal: Goal?
+
+    @State private var objective: String
+    @State private var budget: String
+    @State private var error: String?
+
+    init(store: SessionStore, goal: Goal?) {
+        self.store = store
+        self.goal = goal
+        let editing = goal?.status != .complete ? goal : nil
+        _objective = State(initialValue: editing?.objective ?? "")
+        _budget = State(initialValue: editing?.tokenBudget.map { String($0) } ?? "")
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                TextField("Goal objective", text: $objective, axis: .vertical)
+                    .lineLimit(3...8)
+                    .font(Theme.sans(14))
+                    .padding(12)
+                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 10))
+                TextField("Token budget (optional)", text: $budget)
+                    .keyboardType(.numberPad)
+                    .font(Theme.sans(14))
+                    .padding(12)
+                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 10))
+                if let error {
+                    Text(error)
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.danger)
+                }
+                if let goal = managedGoal {
+                    HStack(spacing: 10) {
+                        if goal.status == .active {
+                            Button("Pause") {
+                                store.pauseGoal(goal)
+                                dismiss()
+                            }
+                        } else if [.paused, .blocked, .usageLimited].contains(goal.status) {
+                            Button("Resume") {
+                                store.resumeGoal(goal)
+                                dismiss()
+                            }
+                        }
+                        Button("Clear", role: .destructive) {
+                            store.clearGoal(goal)
+                            dismiss()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+                Spacer()
+            }
+            .padding(20)
+            .background(Theme.bg)
+            .navigationTitle(managedGoal == nil ? "Create goal" : "Manage goal")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(managedGoal == nil ? "Create" : "Save", action: save)
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private var managedGoal: Goal? {
+        goal?.status == .complete ? nil : goal
+    }
+
+    private func save() {
+        let trimmed = objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            error = "Goal objective is required."
+            return
+        }
+        let tokenBudget: UInt64?
+        if budget.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            tokenBudget = nil
+        } else if let value = UInt64(budget), value > 0 {
+            tokenBudget = value
+        } else {
+            error = "Token budget must be a positive integer."
+            return
+        }
+        if let goal = managedGoal {
+            if let tokenBudget, tokenBudget <= goal.tokensUsed {
+                error = "Token budget must exceed the tokens already used."
+                return
+            }
+            store.editGoal(goal, objective: trimmed, tokenBudget: tokenBudget)
+        } else {
+            store.createGoal(objective: trimmed, tokenBudget: tokenBudget)
+        }
+        dismiss()
     }
 }
 

@@ -93,7 +93,7 @@ impl Harness for MockHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         // Optional pacing knob for demos/manual testing: `JOLT_MOCK_DELAY_MS`
         // spaces the scripted events out so live-run UI states (working
-        // indicator, streaming fade, trailing tool-group auto-open) are
+        // indicator, streaming fade, active tool-group preview) are
         // observable. Unset (the default, and in tests) streams instantly.
         let delay_ms = std::env::var("JOLT_MOCK_DELAY_MS")
             .ok()

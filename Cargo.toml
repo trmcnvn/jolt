@@ -84,6 +84,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.11"
+memchr = "2.8"
 notify = "8"
 portable-pty = "0.9"
 # Post-0.2.1 master pins Ghostty ab0b9da, which includes the explicit SIMD
@@ -91,6 +92,11 @@ portable-pty = "0.9"
 # mitchellh.com/writing/everyone-should-know-simd).
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "72ac98f292879bf9f788fcbb11238c562a1eebe6", default-features = false }
 pulldown-cmark = "0.13"
+merman = { version = "0.7", features = ["render"] }
+ratex-layout = "0.1.14"
+ratex-parser = "0.1.14"
+ratex-svg = { version = "0.1.14", features = ["embed-fonts"] }
+ratex-types = "0.1.14"
 unicode-segmentation = "1"
 url = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }

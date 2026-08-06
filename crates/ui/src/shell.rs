@@ -38,9 +38,9 @@ use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::hotkeys::{HotkeysEvent, HotkeysPage};
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::secrets::SecretsPage;
-use crate::settings::shortcuts::{HotkeysEvent, HotkeysPage};
 use crate::settings::terminal::{TerminalPage, TerminalSettingsEvent};
 use crate::settings::vcs::VcsPage;
 use crate::settings::{
@@ -57,7 +57,7 @@ use crate::terminal::panel::{
 };
 use crate::theme::Theme;
 use crate::toast::{Toast, ToastAction, ToastKind};
-use crate::transcript::{self, Transcript};
+use crate::transcript::{self, Transcript, TranscriptEvent};
 
 mod spaces;
 mod tabs;
@@ -70,7 +70,10 @@ actions!(
         NewSession,
         ClearInput,
         CloseCurrentTab,
+        PreviousTranscriptTurn,
+        NextTranscriptTurn,
         OpenSettings,
+        OpenSpacesDropdown,
         ToggleSidebar,
         ToggleChanges,
         AddSpacePalette,
@@ -160,10 +163,34 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         ),
         KeyBinding::new(
             &valid_or_default(
+                &keymap.previous_transcript_turn,
+                ShortcutId::PreviousTranscriptTurn.default_combo(),
+            ),
+            PreviousTranscriptTurn,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.next_transcript_turn,
+                ShortcutId::NextTranscriptTurn.default_combo(),
+            ),
+            NextTranscriptTurn,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
                 &keymap.open_settings,
                 ShortcutId::OpenSettings.default_combo(),
             ),
             OpenSettings,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.open_spaces_dropdown,
+                ShortcutId::OpenSpacesDropdown.default_combo(),
+            ),
+            OpenSpacesDropdown,
             None,
         ),
         KeyBinding::new(
@@ -340,6 +367,10 @@ impl SessionPanels {
         let entry = self.map.entry(key.to_string()).or_default();
         entry.changes_open = !entry.changes_open;
         entry.changes_open
+    }
+
+    pub fn open_changes(&mut self, key: &str) {
+        self.map.entry(key.to_string()).or_default().changes_open = true;
     }
 }
 
@@ -806,6 +837,7 @@ pub struct Shell {
     _account_usage_task: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+    _transcript_events: Subscription,
 }
 
 fn scope_key(scope: jolt_engine::ScopeKind) -> &'static str {
@@ -823,6 +855,14 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let transcript_events = cx.subscribe(
+            &transcript,
+            |this: &mut Shell, _, event: &TranscriptEvent, cx| match event {
+                TranscriptEvent::OpenTurnDiff { diff, file_path } => {
+                    this.open_turn_diff(diff.clone(), file_path.as_deref(), cx);
+                }
+            },
+        );
         // Own-send re-engages the stick-to-bottom pin with a smooth scroll.
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
@@ -1024,6 +1064,7 @@ impl Shell {
             _account_usage_task: account_usage_task,
             _state_observation: observation,
             _composer_events: composer_events,
+            _transcript_events: transcript_events,
         }
     }
 
@@ -1375,7 +1416,7 @@ impl Shell {
         let open = self.panels.toggle_changes(&key);
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if open {
-            // Lazy: the Changes entity (and its WatchCheckoutDiffs) exists only
+            // Lazy: the Changes entity (and its WatchCheckoutDiffV2) exists only
             // once the pane has been opened.
             let changes = self.changes_pane(cx);
             changes.update(cx, |changes, cx| {
@@ -1385,6 +1426,28 @@ impl Shell {
         } else if let Some(changes) = self.changes.clone() {
             changes.update(cx, Changes::stop_watch);
         }
+        cx.notify();
+    }
+
+    fn open_turn_diff(
+        &mut self,
+        diff: jolt_proto::TurnDiffManifest,
+        file_path: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.read(cx).selected_chat.as_deref() != Some(diff.chat_id.as_str()) {
+            return;
+        }
+        let from = self.right_target(cx);
+        let key = self.panel_key(cx);
+        self.panels.open_changes(&key);
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        let target = (self.state.read(cx).local_device_id.as_deref()
+            != Some(diff.device_id.as_str()))
+        .then(|| diff.device_id.clone());
+        self.changes_pane(cx).update(cx, |changes, cx| {
+            changes.show_turn_diff(diff, target, file_path, cx);
+        });
         cx.notify();
     }
 
@@ -1547,6 +1610,9 @@ impl Shell {
             // choice.
             let Ok(snapshot) = this.update(cx, |shell, cx| {
                 shell.settings.appearance = crate::appearance::mode(cx);
+                let (light_theme, dark_theme) = crate::appearance::theme_ids(cx);
+                shell.settings.light_theme = light_theme;
+                shell.settings.dark_theme = dark_theme;
                 let (ui_font, prompt_font, code_font, terminal_font) =
                     crate::appearance::font_families(cx);
                 shell.settings.ui_font = ui_font.to_string();
@@ -2711,7 +2777,7 @@ impl Shell {
                             .child(
                                 div()
                                     .h(px(28.0))
-                                    .px(px(Theme::SPACE_SM))
+                                    .pl(px(Theme::SPACE_SM))
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -2729,14 +2795,20 @@ impl Shell {
                                             .justify_center()
                                             .rounded(px(6.0))
                                             .cursor_pointer()
-                                            .hover(|s| {
-                                                s.bg(crate::theme::wash(0.14))
-                                                    .text_color(theme.text)
-                                            })
+                                            .bg(motion::hover_blend(
+                                                "search-sessions",
+                                                crate::theme::wash(0.0),
+                                                crate::theme::wash(0.14),
+                                            ))
+                                            .on_hover(motion::hover_listener("search-sessions"))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.open_session_search(cx)
                                             }))
-                                            .child(icon(icons::MAGNIFER).size(px(14.0))),
+                                            .child(
+                                                icon(icons::MAGNIFER)
+                                                    .size(px(14.0))
+                                                    .text_color(theme.text_muted.opacity(0.7)),
+                                            ),
                                     ),
                             )
                             .child(if !list_items.is_empty() {
@@ -4897,6 +4969,9 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &OpenSpacesDropdown, window, cx| {
+                this.open_spaces_dropdown(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
             .on_action(cx.listener(|this, _: &ClearInput, _, cx| {
                 this.composer
@@ -4907,6 +4982,26 @@ impl Render for Shell {
                     // On an empty new-session canvas Cmd-W is deliberately a
                     // no-op; in Settings it propagates to Close Window.
                     this.close_current_tab(cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PreviousTranscriptTurn, _, cx| {
+                if matches!(this.route, Route::Chat) && this.state.read(cx).selected_chat.is_some()
+                {
+                    this.transcript.update(cx, |transcript, cx| {
+                        transcript.navigate_rail(rail::RailDirection::Previous, cx)
+                    });
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NextTranscriptTurn, _, cx| {
+                if matches!(this.route, Route::Chat) && this.state.read(cx).selected_chat.is_some()
+                {
+                    this.transcript.update(cx, |transcript, cx| {
+                        transcript.navigate_rail(rail::RailDirection::Next, cx)
+                    });
                 } else {
                     cx.propagate();
                 }

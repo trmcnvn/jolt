@@ -13,8 +13,10 @@
  *   GET  /auth/cli/callback           — headless sign-in paste-code page
  *   GET  /session/:chatId/ws          — loro-protocol room (wss upgrade)
  *   GET  /tail/:chatId                — L2 instant-open tail JSON (§5)
- *   GET  /diff/:chatId                — latest working-tree diff (§6.1)
- *   POST /diff/:chatId                — host publishes the diff sidecar
+ *   GET  /diff/:chatId                — latest paged working-tree manifest
+ *   GET  /diff/:chatId/page?id=       — one immutable patch page
+ *   GET  /diff/:chatId/ws             — manifest update stream
+ *   POST /diff/:chatId                — host publishes manifest + missing pages
  *   GET  /snapshot/:chatId            — repair: read current doc snapshot
  *   POST /append/:chatId              — repair: merge-import a Loro update
  *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss; legacy clients)
@@ -37,6 +39,7 @@ import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
+import { parseDiffSidecar, type CheckoutDiffPage, type StoredDiffSidecar } from "./session-doc";
 import installSh from "./install.sh";
 
 export { SessionRoom, DeviceRoom, RegistryRoom };
@@ -201,7 +204,67 @@ export default {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/stats", "");
     }
     if (parts[0] === "diff" && parts[1] && ID_RE.test(parts[1])) {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/diff", "");
+      const chatId = parts[1];
+      if (parts[2] === "page" && request.method === "GET") {
+        const pageId = url.searchParams.get("id") ?? "";
+        if (!SHA256_RE.test(pageId)) return json({ error: "invalid_page_id" }, 400);
+        const manifestResponse = await forward(
+          env.SESSION_ROOMS,
+          `s2/${chatId}`,
+          request,
+          auth.userId,
+          "/diff",
+          ""
+        );
+        if (!manifestResponse.ok) return manifestResponse;
+        const stored = await manifestResponse.json<StoredDiffSidecar>();
+        if (!stored.manifest.pages.some((page) => page.id === pageId)) {
+          return json({ error: "page_not_found" }, 404);
+        }
+        const object = await env.BLOBS.get(
+          `diff-pages/${auth.userId}/${stored.manifest.checkoutId}/${pageId}`
+        );
+        return object ? new Response(object.body, { headers: { "content-type": "application/json" } }) : json({ error: "page_not_found" }, 404);
+      }
+      if (request.method === "POST" && parts[2] === undefined) {
+        const sidecar = parseDiffSidecar(await request.clone().json());
+        if (!sidecar || sidecar.chatId !== chatId || !ID_RE.test(sidecar.manifest.checkoutId)) {
+          return json({ error: "invalid_diff_sidecar" }, 400);
+        }
+        const prefix = `diff-pages/${auth.userId}/${sidecar.manifest.checkoutId}`;
+        const previousIndex = await env.BLOBS.get(`${prefix}/manifest.json`);
+        const previousPageIds = previousIndex
+          ? await previousIndex.json<{ pageIds: string[] }>().then((value) => value.pageIds).catch(() => [])
+          : [];
+        for (const page of sidecar.pages) {
+          const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(page.patch));
+          const hash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+          if (hash !== page.id) return json({ error: "diff_page_hash_mismatch" }, 400);
+          const key = `${prefix}/${page.id}`;
+          if (await env.BLOBS.head(key) === null) {
+            await env.BLOBS.put(key, JSON.stringify(page satisfies CheckoutDiffPage), {
+              httpMetadata: { contentType: "application/json" },
+              customMetadata: { checkoutId: sidecar.manifest.checkoutId }
+            });
+          }
+        }
+        const currentPageIds = sidecar.manifest.pages.map((page) => page.id);
+        await env.BLOBS.put(`${prefix}/manifest.json`, JSON.stringify({ pageIds: currentPageIds }), {
+          httpMetadata: { contentType: "application/json" }
+        });
+        await Promise.all(previousPageIds
+          .filter((pageId) => !currentPageIds.includes(pageId))
+          .map((pageId) => env.BLOBS.delete(`${prefix}/${pageId}`)));
+        const stored: StoredDiffSidecar = { ...sidecar, pages: [] };
+        const forwarded = new Request(request.url, {
+          method: "POST",
+          headers: request.headers,
+          body: JSON.stringify(stored)
+        });
+        return forward(env.SESSION_ROOMS, `s2/${chatId}`, forwarded, auth.userId, "/diff", "");
+      }
+      const path = parts[2] === "ws" ? "/diff/ws" : "/diff";
+      return forward(env.SESSION_ROOMS, `s2/${chatId}`, request, auth.userId, path);
     }
     if (parts[0] === "snapshot" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/snapshot", "");

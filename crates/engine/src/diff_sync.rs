@@ -3,19 +3,18 @@
 //! Chats do not own working-copy state: a concrete VCS checkout does. This service
 //! groups this device's chats by their canonical checkout identity (`chat.cwd` →
 //! [`Repos::checkout_identity`]), computes one bounded atomic snapshot per checkout,
-//! and publishes it three ways:
+//! and publishes it through checkout-specific paged projections:
 //!
-//! - the local `WatchCheckoutDiffs` stream (a watch channel of every checkout's
-//!   latest [`CheckoutDiff`]);
-//! - a [`DiffSidecar`] JSON `POST {edge}/diff/{chatId}` for every syncing chat of
-//!   the checkout (bearer = engine edge token), so "review pending changes while
-//!   the host sleeps" works;
+//! - `WatchCheckoutDiffV2` sends a compact manifest for one chat checkout;
+//! - `GetCheckoutDiffPage` fetches immutable SHA-256-addressed patch pages;
+//! - a [`DiffSidecar`] JSON `POST {edge}/diff/{chatId}` stores the manifest and
+//!   checkout-deduplicated pages for offline review;
 //! - `chat.branch` upkeep: each snapshot reconciles mismatched workspace chat rows' `branch` (and
 //!   `checkoutId` at reconcile time).
 //!
-//! Recursive `notify` watchers provide low-latency Git updates. While the Changes
-//! stream has subscribers, every checkout is also refreshed every five seconds;
-//! this is the primary refresh path for JJ and repairs dropped native events.
+//! Recursive `notify` watchers provide low-latency Git updates. A checkout with
+//! Changes subscribers is also refreshed every five seconds; this is the primary
+//! refresh path for JJ and repairs dropped native events.
 //! Snapshots carry a sha256 checksum; an unchanged checksum publishes nothing.
 
 use std::collections::{HashMap, HashSet};
@@ -26,11 +25,14 @@ use std::time::Duration;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
-use jolt_proto::{Chat, CheckoutDiff, DiffFileSummary, VcsKind};
+use jolt_proto::{
+    Chat, CheckoutDiffBootstrap, CheckoutDiffPage, CheckoutDiffWatchFrame, DiffFileSummary, VcsKind,
+};
 
 use crate::EngineError;
+use crate::diff_projection::DiffProjection;
 use crate::doc_host::EdgeConfig;
 use crate::repos::{CheckoutIdentity, Repos};
 use crate::vcs::compose_command_path;
@@ -62,18 +64,12 @@ pub struct DiffSidecar {
     pub chat_id: String,
     pub device_id: String,
     pub checkout_path: String,
-    pub vcs: VcsKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,
-    pub patch: String,
-    pub files: Vec<DiffFileSummary>,
-    pub additions: u32,
-    pub deletions: u32,
-    pub truncated: bool,
+    pub manifest: jolt_proto::CheckoutDiffManifest,
+    pub pages: Vec<CheckoutDiffPage>,
     /// Epoch millis.
     pub published_at: i64,
 }
@@ -93,11 +89,27 @@ pub struct DiffSnapshot {
     pub checksum: String,
 }
 
+/// Immutable VCS object captured before an assistant turn mutates the checkout.
+/// The object includes pre-existing working-copy changes, so the finalized diff
+/// contains only the net filesystem delta produced during that turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnDiffBaseline {
+    vcs: VcsKind,
+    revision: String,
+}
+
 struct CheckoutEntry {
     identity: CheckoutIdentity,
     chats: Mutex<Vec<Chat>>,
     /// Last published checksum — unchanged snapshots publish nothing.
     checksum: Mutex<Option<String>>,
+    projection: Mutex<Option<Arc<DiffProjection>>>,
+    edge_page_ids: Mutex<HashSet<String>>,
+    published_chats: Mutex<HashSet<String>>,
+    sequence: Mutex<u64>,
+    diff_tx: broadcast::Sender<CheckoutDiffWatchFrame>,
+    sync_lock: tokio::sync::Mutex<()>,
+    edge_publish_lock: tokio::sync::Mutex<()>,
     /// Kick channel into the entry's debounce/sync task.
     kick_tx: mpsc::UnboundedSender<()>,
     /// Keeps the recursive fs watchers alive; dropped on entry close.
@@ -111,7 +123,7 @@ struct DiffSyncInner {
     edge: Option<EdgeConfig>,
     http: reqwest::Client,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
-    diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
+    chat_entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -132,7 +144,6 @@ impl CheckoutDiffSync {
         device_id: &str,
         edge: Option<EdgeConfig>,
     ) -> Self {
-        let (diffs_tx, _) = watch::channel(Vec::new());
         let sync = Self {
             inner: Arc::new(DiffSyncInner {
                 repos,
@@ -141,7 +152,7 @@ impl CheckoutDiffSync {
                 edge,
                 http: reqwest::Client::new(),
                 entries: Mutex::new(HashMap::new()),
-                diffs_tx,
+                chat_entries: Mutex::new(HashMap::new()),
             }),
         };
         tokio::spawn(diff_sync_task(
@@ -151,9 +162,127 @@ impl CheckoutDiffSync {
         sync
     }
 
-    /// `WatchCheckoutDiffs` source: every tracked checkout's latest diff.
-    pub fn watch_diffs(&self) -> watch::Receiver<Vec<CheckoutDiff>> {
-        self.inner.diffs_tx.subscribe()
+    /// Open one checkout-specific projection by chat id. Bootstrap and
+    /// subscription are created while the checkout sync lock is held, so no
+    /// manifest update can land between them.
+    pub async fn watch_diff(
+        &self,
+        chat_id: &str,
+    ) -> Result<
+        (
+            CheckoutDiffBootstrap,
+            broadcast::Receiver<CheckoutDiffWatchFrame>,
+        ),
+        EngineError,
+    > {
+        let entry = self.ensure_entry_for_chat(chat_id).await?;
+        // Subscribe before the first capture so a concurrent workspace
+        // reconcile cannot retire this newly-created entry. Frames produced by
+        // that capture are drained under the sync lock; the returned bootstrap
+        // is the atomic opening state.
+        let mut receiver = entry.diff_tx.subscribe();
+        let _sync = entry.sync_lock.lock().await;
+        if lock(&entry.projection).is_none() {
+            sync_entry_locked(&self.inner, &entry).await?;
+        }
+        while receiver.try_recv().is_ok() {}
+        let projection = lock(&entry.projection)
+            .clone()
+            .ok_or_else(|| EngineError::Other("diff projection unavailable".into()))?;
+        let sequence = *lock(&entry.sequence);
+        Ok((projection.bootstrap(sequence), receiver))
+    }
+
+    pub fn current_manifest(&self, chat_id: &str) -> Option<jolt_proto::CheckoutDiffManifest> {
+        let entry = self.entry_for_chat(chat_id)?;
+        lock(&entry.projection)
+            .as_ref()
+            .map(|projection| projection.manifest.clone())
+    }
+
+    pub fn diff_page(
+        &self,
+        chat_id: &str,
+        catalog_revision: &str,
+        page_id: &str,
+    ) -> Result<Option<CheckoutDiffPage>, EngineError> {
+        let entry = self
+            .entry_for_chat(chat_id)
+            .ok_or_else(|| EngineError::Other(format!("chat {chat_id} has no local checkout")))?;
+        let projection = lock(&entry.projection).clone();
+        let Some(projection) = projection else {
+            return Ok(None);
+        };
+        if projection.manifest.catalog_revision != catalog_revision {
+            return Err(EngineError::Other("stale diff catalog revision".into()));
+        }
+        let page = projection.page(page_id);
+        if page.is_none() {
+            tracing::warn!(
+                requested = %page_id,
+                catalog = %catalog_revision,
+                descriptors = projection.manifest.pages.len(),
+                "diff page is referenced by no current payload"
+            );
+        }
+        Ok(page)
+    }
+
+    fn entry_for_chat(&self, chat_id: &str) -> Option<Arc<CheckoutEntry>> {
+        // Prefer the entry's attached rows: workspace projections can briefly
+        // lag a just-created local row, while the checkout subscription is
+        // already valid and must stay alive.
+        let direct = lock(&self.inner.chat_entries).get(chat_id).cloned();
+        if direct.is_some() {
+            return direct;
+        }
+        let chat = self.inner.workspace.chat(chat_id).ok().flatten()?;
+        let entries = lock(&self.inner.entries);
+        chat.checkout_id
+            .as_deref()
+            .and_then(|id| entries.get(id).cloned())
+            .or_else(|| {
+                let cwd = Path::new(chat.cwd.as_deref()?);
+                entries
+                    .values()
+                    .find(|entry| entry.identity.root == cwd)
+                    .cloned()
+            })
+    }
+
+    async fn ensure_entry_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Arc<CheckoutEntry>, EngineError> {
+        if let Some(entry) = self.entry_for_chat(chat_id) {
+            return Ok(entry);
+        }
+        let chat = self
+            .inner
+            .workspace
+            .chat(chat_id)
+            .map_err(|error| EngineError::Other(error.to_string()))?
+            .ok_or_else(|| EngineError::Other(format!("chat {chat_id} not found")))?;
+        if chat.device_id != self.inner.device_id {
+            return Err(EngineError::Other(format!(
+                "chat {chat_id} is hosted on another device"
+            )));
+        }
+        let cwd = chat
+            .cwd
+            .as_deref()
+            .ok_or_else(|| EngineError::Other(format!("chat {chat_id} has no checkout")))?;
+        let identity = self.inner.repos.checkout_identity(Path::new(cwd)).await?;
+        if let Some(entry) = lock(&self.inner.entries).get(&identity.id).cloned() {
+            let mut chats = lock(&entry.chats);
+            if !chats.iter().any(|candidate| candidate.id == chat.id) {
+                chats.push(chat.clone());
+            }
+            drop(chats);
+            lock(&self.inner.chat_entries).insert(chat.id.clone(), entry.clone());
+            return Ok(entry);
+        }
+        Ok(add_entry(&self.inner, identity, vec![chat]))
     }
 
     /// Regroup this device's chats by checkout identity, then (re)build watchers.
@@ -205,21 +334,29 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
             .push(chat);
     }
 
-    // Close entries whose checkout no longer has chats; drop their published diff.
-    let removed: Vec<String> = {
+    // Retire entries only when no projection watcher holds a lease. A watcher
+    // subscribes before its first capture, so a stale workspace frame cannot
+    // tear down an opening stream.
+    let removed: Vec<Arc<CheckoutEntry>> = {
         let mut entries = lock(&inner.entries);
-        let removed: Vec<String> = entries
-            .keys()
-            .filter(|id| !groups.contains_key(*id))
-            .cloned()
+        let removed: Vec<_> = entries
+            .iter()
+            .filter(|(id, entry)| !groups.contains_key(*id) && entry.diff_tx.receiver_count() == 0)
+            .map(|(_, entry)| entry.clone())
             .collect();
-        for id in &removed {
-            entries.remove(id); // dropping the entry drops watchers + ends its task
-        }
+        entries.retain(|_, entry| {
+            !removed
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, entry))
+        });
         removed
     };
     if !removed.is_empty() {
-        publish_watch(inner);
+        lock(&inner.chat_entries).retain(|_, entry| {
+            !removed
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, entry))
+        });
     }
 
     // Update surviving entries; add new ones (initial sync kicked on add).
@@ -234,11 +371,16 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
                     *held = chats;
                     has_new
                 };
+                for chat in lock(&entry.chats).iter() {
+                    lock(&inner.chat_entries).insert(chat.id.clone(), entry.clone());
+                }
                 if has_new {
                     let _ = entry.kick_tx.send(()); // new chat needs a sidecar now
                 }
             }
-            None => add_entry(inner, identity, chats),
+            None => {
+                add_entry(inner, identity, chats);
+            }
         }
     }
 }
@@ -272,8 +414,15 @@ fn exceeds_watch_budget(root: &Path) -> bool {
     false
 }
 
-fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<Chat>) {
+fn add_entry(
+    inner: &Arc<DiffSyncInner>,
+    identity: CheckoutIdentity,
+    chats: Vec<Chat>,
+) -> Arc<CheckoutEntry> {
+    let chat_rows = chats.clone();
+    let chat_ids: Vec<String> = chats.iter().map(|chat| chat.id.clone()).collect();
     let (kick_tx, kick_rx) = mpsc::unbounded_channel();
+    let (diff_tx, _) = broadcast::channel(16);
 
     // Recursive watchers on the worktree root and (for linked worktrees) the git
     // dir — HEAD/index churn and file edits both land here. Failures are fine:
@@ -327,15 +476,46 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         identity,
         chats: Mutex::new(chats),
         checksum: Mutex::new(None),
+        projection: Mutex::new(None),
+        edge_page_ids: Mutex::new(HashSet::new()),
+        published_chats: Mutex::new(HashSet::new()),
+        sequence: Mutex::new(0),
+        diff_tx,
+        sync_lock: tokio::sync::Mutex::new(()),
+        edge_publish_lock: tokio::sync::Mutex::new(()),
         kick_tx: kick_tx.clone(),
         _watchers: watchers,
     });
-    lock(&inner.entries).insert(entry.identity.id.clone(), entry.clone());
+    let selected = {
+        let mut entries = lock(&inner.entries);
+        entries
+            .entry(entry.identity.id.clone())
+            .or_insert_with(|| entry.clone())
+            .clone()
+    };
+    if !Arc::ptr_eq(&selected, &entry) {
+        let mut attached = lock(&selected.chats);
+        for chat in chat_rows {
+            if !attached.iter().any(|candidate| candidate.id == chat.id) {
+                attached.push(chat);
+            }
+        }
+        drop(attached);
+        for chat_id in chat_ids {
+            lock(&inner.chat_entries).insert(chat_id, selected.clone());
+        }
+        return selected;
+    }
+    for chat_id in chat_ids {
+        lock(&inner.chat_entries).insert(chat_id, entry.clone());
+    }
     tokio::spawn(entry_task(
         Arc::downgrade(inner),
         Arc::downgrade(&entry),
         kick_rx,
     ));
+    let _ = kick_tx.send(());
+    entry
 }
 
 /// Per-checkout task: trailing-debounce fs kicks, then compute + publish. Runs
@@ -357,7 +537,7 @@ async fn entry_task(
         let (Some(inner), Some(entry)) = (inner.upgrade(), entry.upgrade()) else {
             return;
         };
-        if inner.diffs_tx.receiver_count() == 0 {
+        if entry.diff_tx.receiver_count() == 0 && inner.edge.is_none() {
             continue;
         }
         sync_entry(&inner, &entry).await;
@@ -369,17 +549,18 @@ async fn entry_task(
 // ---------------------------------------------------------------------------
 
 async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
-    let snapshot = match capture_diff(&inner.repos, &entry.identity.root).await {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            tracing::debug!(checkout = %entry.identity.root.display(), error = %err,
-                "diff-sync: capture failed");
-            return;
-        }
-    };
+    let _sync = entry.sync_lock.lock().await;
+    if let Err(err) = sync_entry_locked(inner, entry).await {
+        tracing::debug!(checkout = %entry.identity.root.display(), error = %err,
+            "diff-sync: capture failed");
+    }
+}
 
-    // chat.branch upkeep — the git-dir watcher covers HEAD, so every snapshot
-    // reconciles mismatched rows (repair tick covers dropped events).
+async fn sync_entry_locked(
+    inner: &Arc<DiffSyncInner>,
+    entry: &Arc<CheckoutEntry>,
+) -> Result<(), EngineError> {
+    let snapshot = capture_diff(&inner.repos, &entry.identity.root).await?;
     let chats = lock(&entry.chats).clone();
     for chat in &chats {
         if chat.branch.as_deref() != Some(snapshot.branch.as_str())
@@ -389,99 +570,136 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
         }
     }
 
-    if lock(&entry.checksum).as_deref() == Some(snapshot.checksum.as_str()) {
-        return; // unchanged — publish nothing
+    let changed = lock(&entry.checksum).as_deref() != Some(snapshot.checksum.as_str())
+        || lock(&entry.projection).is_none();
+    let needs_sidecar = inner.edge.is_some()
+        && chats
+            .iter()
+            .any(|chat| !lock(&entry.published_chats).contains(&chat.id));
+    if !changed && !needs_sidecar {
+        return Ok(());
     }
-    *lock(&entry.checksum) = Some(snapshot.checksum.clone());
-
-    let diff = CheckoutDiff {
-        checkout_id: entry.identity.id.clone(),
-        device_id: inner.device_id.clone(),
-        cwd: entry.identity.root.to_string_lossy().to_string(),
-        vcs: snapshot.vcs,
-        label: snapshot.label.clone(),
-        patch: snapshot.patch.clone(),
-        files: snapshot.files.clone(),
-        additions: snapshot.additions,
-        deletions: snapshot.deletions,
-        truncated: snapshot.truncated,
-        checksum: snapshot.checksum.clone(),
-        updated_at: chrono::Utc::now(),
+    let updated_at = chrono::Utc::now();
+    let projection = if changed {
+        let projection = Arc::new(DiffProjection::build(
+            &entry.identity.id,
+            &inner.device_id,
+            &entry.identity.root.to_string_lossy(),
+            &snapshot,
+            updated_at,
+        ));
+        *lock(&entry.checksum) = Some(snapshot.checksum.clone());
+        *lock(&entry.projection) = Some(projection.clone());
+        let sequence = {
+            let mut sequence = lock(&entry.sequence);
+            *sequence = sequence.wrapping_add(1);
+            *sequence
+        };
+        let _ = entry.diff_tx.send(CheckoutDiffWatchFrame::Manifest {
+            sequence,
+            manifest: projection.manifest.clone(),
+        });
+        projection
+    } else {
+        lock(&entry.projection)
+            .clone()
+            .ok_or_else(|| EngineError::Other("diff projection unavailable".into()))?
     };
-    {
-        let entries = lock(&inner.entries);
-        if !entries.contains_key(&entry.identity.id) {
-            return; // closed while computing
-        }
-    }
-    publish_watch_with(inner, Some(diff));
 
-    // Latest-only sidecar to every syncing chat's session DO slot.
-    if let Some(edge) = &inner.edge {
-        for chat in &chats {
-            let sidecar = DiffSidecar {
-                chat_id: chat.id.clone(),
-                device_id: inner.device_id.clone(),
-                checkout_path: entry.identity.root.to_string_lossy().to_string(),
-                vcs: snapshot.vcs,
-                label: snapshot.label.clone(),
-                branch: Some(snapshot.branch.clone()),
-                head_sha: snapshot.head_sha.clone(),
-                patch: snapshot.patch.clone(),
-                files: snapshot.files.clone(),
-                additions: snapshot.additions,
-                deletions: snapshot.deletions,
-                truncated: snapshot.truncated,
-                published_at: chrono::Utc::now().timestamp_millis(),
-            };
-            let url = format!("{}/diff/{}", edge.url.trim_end_matches('/'), chat.id);
-            // Fresh bearer per request — never the boot-time snapshot.
-            let Some(bearer) = edge.bearer().await else {
-                tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (signed out)");
-                continue;
-            };
-            let result = inner
-                .http
-                .post(&url)
-                .bearer_auth(&bearer)
-                .json(&sidecar)
-                .send()
-                .await;
-            match result {
-                Ok(response) if !response.status().is_success() => {
-                    tracing::debug!(chat = %chat.id, status = %response.status(),
-                        "diff-sync: sidecar publish rejected");
-                }
-                Err(err) => {
-                    tracing::debug!(chat = %chat.id, error = %err, "diff-sync: sidecar publish failed");
-                }
-                Ok(_) => {}
+    if inner.edge.is_some() {
+        let inner = Arc::clone(inner);
+        let entry = Arc::clone(entry);
+        let sequence = *lock(&entry.sequence);
+        tokio::spawn(async move {
+            publish_edge_sidecars(
+                inner, entry, snapshot, projection, chats, changed, sequence, updated_at,
+            )
+            .await;
+        });
+    }
+    Ok(())
+}
+
+/// Upload immutable pages and chat manifests away from the local projection
+/// lock. Opening the Changes pane must never wait for authentication, network
+/// latency, or R2 writes. Jobs serialize per checkout and stale jobs are
+/// discarded before upload so a late task cannot replace a newer manifest.
+async fn publish_edge_sidecars(
+    inner: Arc<DiffSyncInner>,
+    entry: Arc<CheckoutEntry>,
+    snapshot: DiffSnapshot,
+    projection: Arc<DiffProjection>,
+    chats: Vec<Chat>,
+    changed: bool,
+    sequence: u64,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) {
+    let _publish = entry.edge_publish_lock.lock().await;
+    if *lock(&entry.sequence) != sequence {
+        return;
+    }
+    let Some(edge) = &inner.edge else {
+        return;
+    };
+    let current_page_ids: HashSet<_> = projection
+        .manifest
+        .pages
+        .iter()
+        .map(|page| page.id.clone())
+        .collect();
+    let known_page_ids = lock(&entry.edge_page_ids).clone();
+    let pages: Vec<_> = projection
+        .pages()
+        .filter(|page| !known_page_ids.contains(&page.id))
+        .cloned()
+        .collect();
+    let mut pages_uploaded = pages.is_empty();
+    for chat in &chats {
+        if !changed && lock(&entry.published_chats).contains(&chat.id) {
+            continue;
+        }
+        let sidecar = DiffSidecar {
+            chat_id: chat.id.clone(),
+            device_id: inner.device_id.clone(),
+            checkout_path: entry.identity.root.to_string_lossy().to_string(),
+            branch: Some(snapshot.branch.clone()),
+            head_sha: snapshot.head_sha.clone(),
+            manifest: projection.manifest.clone(),
+            pages: if pages_uploaded {
+                Vec::new()
+            } else {
+                pages.clone()
+            },
+            published_at: updated_at.timestamp_millis(),
+        };
+        let url = format!("{}/diff/{}", edge.url.trim_end_matches('/'), chat.id);
+        let Some(bearer) = edge.bearer().await else {
+            tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (signed out)");
+            continue;
+        };
+        let result = inner
+            .http
+            .post(&url)
+            .bearer_auth(&bearer)
+            .json(&sidecar)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await;
+        match result {
+            Ok(response) if !response.status().is_success() => {
+                tracing::debug!(chat = %chat.id, status = %response.status(),
+                    "diff-sync: sidecar publish rejected");
+            }
+            Err(err) => {
+                tracing::debug!(chat = %chat.id, error = %err, "diff-sync: sidecar publish failed");
+            }
+            Ok(_) => {
+                pages_uploaded = true;
+                *lock(&entry.edge_page_ids) = current_page_ids.clone();
+                lock(&entry.published_chats).insert(chat.id.clone());
             }
         }
     }
-}
-
-/// Re-emit the watch channel from the current entries' cached diffs, replacing (or
-/// inserting) `updated`.
-fn publish_watch_with(inner: &Arc<DiffSyncInner>, updated: Option<CheckoutDiff>) {
-    let live: HashSet<String> = lock(&inner.entries).keys().cloned().collect();
-    inner.diffs_tx.send_modify(|diffs| {
-        diffs.retain(|d| live.contains(&d.checkout_id));
-        if let Some(updated) = updated {
-            match diffs
-                .iter_mut()
-                .find(|d| d.checkout_id == updated.checkout_id)
-            {
-                Some(slot) => *slot = updated,
-                None => diffs.push(updated),
-            }
-        }
-        diffs.sort_by(|a, b| a.checkout_id.cmp(&b.checkout_id));
-    });
-}
-
-fn publish_watch(inner: &Arc<DiffSyncInner>) {
-    publish_watch_with(inner, None);
 }
 
 /// Chat-watch follower + active-pane refresh tick. Holds only weak handles so dropping the
@@ -507,16 +725,16 @@ async fn diff_sync_task(inner: Weak<DiffSyncInner>, mut chats_rx: watch::Receive
                 let Some(inner) = inner.upgrade() else { break };
                 let chats = chats_rx.borrow().clone();
                 reconcile(&inner, chats).await;
-                if inner.diffs_tx.receiver_count() > 0 {
-                    for entry in lock(&inner.entries).values() {
+                for entry in lock(&inner.entries).values() {
+                    if entry.diff_tx.receiver_count() > 0 || inner.edge.is_some() {
                         let _ = entry.kick_tx.send(());
                     }
                 }
             }
             _ = active_refresh.tick() => {
                 let Some(inner) = inner.upgrade() else { break };
-                if inner.diffs_tx.receiver_count() > 0 {
-                    for entry in lock(&inner.entries).values() {
+                for entry in lock(&inner.entries).values() {
+                    if entry.diff_tx.receiver_count() > 0 {
                         let _ = entry.kick_tx.send(());
                     }
                 }
@@ -542,6 +760,16 @@ async fn capture_command(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<Capture, EngineError> {
+    capture_command_with_index(repos, cwd, args, max_bytes, None).await
+}
+
+async fn capture_command_with_index(
+    repos: &Repos,
+    cwd: &Path,
+    args: &[&str],
+    max_bytes: usize,
+    git_index: Option<&Path>,
+) -> Result<Capture, EngineError> {
     let backend = repos.vcs_command()?;
     let mut cmd = tokio::process::Command::new(&backend.executable);
     if backend.kind == VcsKind::Git {
@@ -550,6 +778,9 @@ async fn capture_command(
         cmd.current_dir(cwd);
     }
     cmd.args(args);
+    if let Some(index) = git_index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
     compose_command_path(&mut cmd, &backend.executable);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
@@ -710,6 +941,277 @@ fn untracked_patch(path: &str, content: &str) -> String {
     )
 }
 
+struct TemporaryGitIndex(PathBuf);
+
+impl TemporaryGitIndex {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!("jolt-turn-diff-{}.index", uuid::Uuid::new_v4())))
+    }
+}
+
+impl Drop for TemporaryGitIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Capture the complete non-ignored working tree as an immutable VCS object.
+/// Git uses an isolated temporary index, leaving the user's real index intact;
+/// JJ snapshots the working copy into its current commit.
+pub async fn capture_turn_diff_baseline(
+    repos: &Repos,
+    root: &Path,
+) -> Result<TurnDiffBaseline, EngineError> {
+    match repos.vcs_kind() {
+        Some(VcsKind::Git) => Ok(TurnDiffBaseline {
+            vcs: VcsKind::Git,
+            revision: capture_git_worktree_tree(repos, root).await?,
+        }),
+        Some(VcsKind::Jujutsu) => {
+            let revision = capture_command(
+                repos,
+                root,
+                &[
+                    "--no-pager",
+                    "--color=never",
+                    "log",
+                    "-r",
+                    "@",
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+                512,
+            )
+            .await?;
+            let revision = String::from_utf8_lossy(&revision.stdout).trim().to_string();
+            if revision.is_empty() {
+                return Err(EngineError::Other(
+                    "Jujutsu working-copy commit is unavailable".into(),
+                ));
+            }
+            Ok(TurnDiffBaseline {
+                vcs: VcsKind::Jujutsu,
+                revision,
+            })
+        }
+        None => Err(EngineError::Other(
+            "No supported VCS executable found".into(),
+        )),
+    }
+}
+
+/// Finalize the net filesystem diff from a turn baseline to the current tree.
+pub async fn capture_turn_diff(
+    repos: &Repos,
+    root: &Path,
+    baseline: &TurnDiffBaseline,
+) -> Result<DiffSnapshot, EngineError> {
+    if repos.vcs_kind() != Some(baseline.vcs) {
+        return Err(EngineError::Other(
+            "checkout VCS changed while capturing turn diff".into(),
+        ));
+    }
+    match baseline.vcs {
+        VcsKind::Git => capture_git_turn_diff(repos, root, &baseline.revision).await,
+        VcsKind::Jujutsu => capture_jj_turn_diff(repos, root, &baseline.revision).await,
+    }
+}
+
+async fn capture_git_worktree_tree(repos: &Repos, root: &Path) -> Result<String, EngineError> {
+    let index = TemporaryGitIndex::new();
+    capture_command_with_index(repos, root, &["read-tree", "--empty"], 256, Some(&index.0)).await?;
+    capture_command_with_index(repos, root, &["add", "-A", "--", "."], 256, Some(&index.0)).await?;
+    let tree =
+        capture_command_with_index(repos, root, &["write-tree"], 256, Some(&index.0)).await?;
+    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+    if tree.is_empty() {
+        return Err(EngineError::Other(
+            "Git working-tree snapshot is unavailable".into(),
+        ));
+    }
+    Ok(tree)
+}
+
+async fn capture_git_turn_diff(
+    repos: &Repos,
+    root: &Path,
+    baseline: &str,
+) -> Result<DiffSnapshot, EngineError> {
+    let target = capture_git_worktree_tree(repos, root).await?;
+    let names = capture_command(
+        repos,
+        root,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            baseline,
+            &target,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let nums = capture_command(
+        repos,
+        root,
+        &[
+            "diff",
+            "--numstat",
+            "-z",
+            "--find-renames",
+            baseline,
+            &target,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let captured = capture_command(
+        repos,
+        root,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--find-renames",
+            "--unified=3",
+            baseline,
+            &target,
+            "--",
+        ],
+        MAX_PATCH_BYTES,
+    )
+    .await?;
+    let mut patch = String::from_utf8_lossy(&captured.stdout).to_string();
+    let truncated = captured.truncated || names.truncated || nums.truncated;
+    if captured.truncated {
+        patch.truncate(patch.rfind('\n').unwrap_or(0));
+        patch.push_str("\n# Jolt diff truncated\n");
+    }
+    let mut files = parse_name_status(&names.stdout);
+    apply_numstat(&mut files, &nums.stdout);
+    Ok(turn_snapshot(
+        VcsKind::Git,
+        Some(target),
+        patch,
+        files,
+        truncated,
+    ))
+}
+
+async fn capture_jj_turn_diff(
+    repos: &Repos,
+    root: &Path,
+    baseline: &str,
+) -> Result<DiffSnapshot, EngineError> {
+    // This first command snapshots the current working copy before either diff
+    // command reads it.
+    let target = capture_command(
+        repos,
+        root,
+        &[
+            "--no-pager",
+            "--color=never",
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+        512,
+    )
+    .await?;
+    let target = String::from_utf8_lossy(&target.stdout).trim().to_string();
+    let listed = capture_command(
+        repos,
+        root,
+        &[
+            "--no-pager",
+            "--color=never",
+            "--ignore-working-copy",
+            "diff",
+            "--from",
+            baseline,
+            "--to",
+            &target,
+            "-T",
+            "status ++ \"\\t\" ++ source.path() ++ \"\\t\" ++ target.path() ++ \"\\n\"",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let captured = capture_command(
+        repos,
+        root,
+        &[
+            "--no-pager",
+            "--color=never",
+            "--ignore-working-copy",
+            "diff",
+            "--from",
+            baseline,
+            "--to",
+            &target,
+            "--git",
+            "--context",
+            "3",
+        ],
+        MAX_PATCH_BYTES,
+    )
+    .await?;
+    let mut patch = String::from_utf8_lossy(&captured.stdout).to_string();
+    let truncated = captured.truncated || listed.truncated;
+    if captured.truncated {
+        patch.truncate(patch.rfind('\n').unwrap_or(0));
+        patch.push_str("\n# Jolt diff truncated\n");
+    }
+    let mut files = parse_jj_files(&listed.stdout);
+    apply_patch_stats_by_order(&mut files, &patch);
+    Ok(turn_snapshot(
+        VcsKind::Jujutsu,
+        Some(target),
+        patch,
+        files,
+        truncated,
+    ))
+}
+
+fn turn_snapshot(
+    vcs: VcsKind,
+    revision: Option<String>,
+    patch: String,
+    files: Vec<DiffFileSummary>,
+    truncated: bool,
+) -> DiffSnapshot {
+    let additions = files.iter().map(|file| file.additions).sum();
+    let deletions = files.iter().map(|file| file.deletions).sum();
+    let mut hasher = Sha256::new();
+    hasher.update([vcs as u8]);
+    hasher.update([0]);
+    hasher.update(revision.as_deref().unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(patch.as_bytes());
+    hasher.update([0]);
+    hasher.update(serde_json::to_vec(&files).unwrap_or_default());
+    hasher.update(if truncated { b"1" } else { b"0" });
+    DiffSnapshot {
+        vcs,
+        label: Some("Turn changes".into()),
+        branch: String::new(),
+        head_sha: revision,
+        patch,
+        files,
+        additions,
+        deletions,
+        truncated,
+        checksum: crate::repos::hex(&hasher.finalize()),
+    }
+}
+
 /// One bounded atomic snapshot: tracked diff vs HEAD (or the empty tree) with
 /// renames, plus untracked files (via `git status --porcelain`, index untouched)
 /// as synthesized new-file hunks. 3MiB patch cap with a `truncated` flag; sha256
@@ -773,7 +1275,13 @@ async fn capture_git_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
     let status = capture_command(
         repos,
         root,
-        &["--no-optional-locks", "status", "--porcelain", "-z"],
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+        ],
         2 * 1024 * 1024,
     )
     .await?;
@@ -1019,6 +1527,68 @@ async fn capture_jj_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, Eng
         truncated,
         checksum: crate::repos::hex(&hasher.finalize()),
     })
+}
+
+#[cfg(test)]
+mod turn_diff_tests {
+    use std::collections::HashSet;
+    use std::process::Command;
+
+    use super::{capture_turn_diff, capture_turn_diff_baseline};
+    use crate::repos::Repos;
+
+    fn git(root: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[tokio::test]
+    async fn turn_diff_excludes_preexisting_changes_and_preserves_the_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "jolt@example.invalid"]);
+        git(&root, &["config", "user.name", "Jolt Test"]);
+        std::fs::write(root.join("tracked.txt"), "committed\n").unwrap();
+        std::fs::write(root.join("staged.txt"), "staged\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "initial"]);
+
+        std::fs::write(root.join("tracked.txt"), "dirty before\n").unwrap();
+        std::fs::write(root.join("untouched-before.txt"), "existing\n").unwrap();
+        std::fs::write(root.join("staged.txt"), "staged before\n").unwrap();
+        git(&root, &["add", "staged.txt"]);
+        let status_before = git(&root, &["status", "--porcelain"]);
+
+        let repos =
+            Repos::with_worktrees_root(temp.path(), "device", temp.path().join("worktrees"));
+        let baseline = capture_turn_diff_baseline(&repos, &root).await.unwrap();
+        assert_eq!(git(&root, &["status", "--porcelain"]), status_before);
+
+        std::fs::write(root.join("tracked.txt"), "dirty after\n").unwrap();
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        let snapshot = capture_turn_diff(&repos, &root, &baseline).await.unwrap();
+        let paths: HashSet<_> = snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+
+        assert_eq!(paths, HashSet::from(["tracked.txt", "new.txt"]));
+        assert!(!snapshot.patch.contains("untouched-before.txt"));
+        assert!(!snapshot.patch.contains("staged.txt"));
+    }
 }
 
 #[cfg(test)]

@@ -84,9 +84,11 @@ impl HotkeyCategory {
 
     fn for_hotkey(id: ShortcutId) -> Self {
         match id {
-            ShortcutId::NewSession | ShortcutId::ClearInput | ShortcutId::CloseTab => {
-                Self::SessionActions
-            }
+            ShortcutId::NewSession
+            | ShortcutId::ClearInput
+            | ShortcutId::CloseTab
+            | ShortcutId::PreviousTranscriptTurn
+            | ShortcutId::NextTranscriptTurn => Self::SessionActions,
             ShortcutId::SelectTab1
             | ShortcutId::SelectTab2
             | ShortcutId::SelectTab3
@@ -97,6 +99,7 @@ impl HotkeyCategory {
             | ShortcutId::SelectTab8
             | ShortcutId::SelectLastTab => Self::TabSwitching,
             ShortcutId::OpenSettings
+            | ShortcutId::OpenSpacesDropdown
             | ShortcutId::AddSpace
             | ShortcutId::SearchSessions
             | ShortcutId::ToggleSidebar
@@ -214,7 +217,10 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::NewSession => "Open the new session page.",
         ShortcutId::ClearInput => "Clear the current composer input.",
         ShortcutId::CloseTab => "Close the current local tab without archiving its session.",
+        ShortcutId::PreviousTranscriptTurn => "Scroll to the previous user prompt.",
+        ShortcutId::NextTranscriptTurn => "Scroll to the next user prompt.",
         ShortcutId::OpenSettings => "Open the settings page.",
+        ShortcutId::OpenSpacesDropdown => "Open the sidebar space filter.",
         ShortcutId::AddSpace => "Open the folder browser to add a space.",
         ShortcutId::SearchSessions => "Find a session by title.",
         ShortcutId::ToggleSidebar => "Show or hide sessions and settings navigation.",
@@ -513,6 +519,10 @@ mod tests {
             HotkeyCategory::SessionActions
         );
         assert_eq!(
+            HotkeyCategory::for_hotkey(ShortcutId::PreviousTranscriptTurn),
+            HotkeyCategory::SessionActions
+        );
+        assert_eq!(
             HotkeyCategory::for_hotkey(ShortcutId::SelectLastTab),
             HotkeyCategory::TabSwitching
         );
@@ -522,6 +532,10 @@ mod tests {
         );
         assert_eq!(
             HotkeyCategory::for_hotkey(ShortcutId::SearchSessions),
+            HotkeyCategory::NavigationLayout
+        );
+        assert_eq!(
+            HotkeyCategory::for_hotkey(ShortcutId::OpenSpacesDropdown),
             HotkeyCategory::NavigationLayout
         );
         assert_eq!(

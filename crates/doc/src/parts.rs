@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use jolt_proto::{AgentEvent, ToolCall, UserInputQuestion};
+use jolt_proto::{AgentEvent, ToolCall, TurnDiffManifest, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -45,6 +45,11 @@ pub enum MessagePart {
         id: String,
         message: String,
     },
+    /// Immutable net filesystem changes attributed to this assistant entry.
+    Changes {
+        id: String,
+        diff: TurnDiffManifest,
+    },
 }
 
 impl MessagePart {
@@ -53,7 +58,8 @@ impl MessagePart {
             MessagePart::Text { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
-            | MessagePart::Error { id, .. } => id,
+            | MessagePart::Error { id, .. }
+            | MessagePart::Changes { id, .. } => id,
         }
     }
 
@@ -65,6 +71,9 @@ impl MessagePart {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
             }
             MessagePart::Error { message, .. } => message.len(),
+            MessagePart::Changes { diff, .. } => {
+                serde_json::to_vec(diff).map_or(0, |value| value.len())
+            }
         }
     }
 }

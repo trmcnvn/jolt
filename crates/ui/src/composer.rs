@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -25,11 +26,12 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use jolt_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry,
+    GoalOperation, MessagePart, MessageRole, MessageStatus, SessionCommandPayload,
+    SessionMessageEntry,
 };
 use jolt_proto::{
     AgentCommand, AgentCommandSource, ExtractQuestionsResult, ExtractedQuestion, FileSearchMatch,
-    RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
+    GoalStatus, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
 };
 use jolt_rpc::{RpcError, methods};
 
@@ -155,7 +157,11 @@ const COMMAND_CACHE_FAILURE_RETRY: Duration = Duration::from_secs(15);
 const COMMAND_CACHE_CAPACITY: usize = 16;
 
 const DEFAULT_PLACEHOLDER: &str = "What do you want to work on?";
-const BUSY_PLACEHOLDER: &str = "Send a follow-up to steer the conversation";
+const BUSY_PLACEHOLDER: &str = if cfg!(target_os = "macos") {
+    "Enter steers now · ⌘+Enter queues next"
+} else {
+    "Enter steers now · Ctrl+Enter queues next"
+};
 
 fn composer_placeholder(is_busy: bool) -> &'static str {
     if is_busy {
@@ -457,6 +463,13 @@ pub enum SendButtonMode {
     Steer,
     /// Live run, nothing typed: red stop square.
     Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendIntent {
+    Run,
+    Steer,
+    Queue,
 }
 
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
@@ -821,6 +834,7 @@ actions!(
         Paste,
         Newline,
         Submit,
+        QueueSubmit,
         Undo,
         Redo,
         MentionTab,
@@ -1289,6 +1303,15 @@ pub fn init(cx: &mut App) {
     let ctx = Some("Composer");
     let mut bindings = vec![
         KeyBinding::new("enter", Submit, ctx),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-enter"
+            } else {
+                "ctrl-enter"
+            },
+            QueueSubmit,
+            ctx,
+        ),
         KeyBinding::new("tab", MentionTab, ctx),
         KeyBinding::new("escape", MentionEscape, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
@@ -1433,6 +1456,7 @@ pub fn init(cx: &mut App) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerInputEvent {
     Submitted,
+    QueueSubmitted,
     Edited,
     CursorMoved,
     ViewportChanged,
@@ -2363,6 +2387,14 @@ impl ComposerInput {
             ComposerInputEvent::MentionAccept
         } else {
             ComposerInputEvent::Submitted
+        });
+    }
+
+    fn queue_submit(&mut self, _: &QueueSubmit, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(if self.mention_has_selection {
+            ComposerInputEvent::MentionAccept
+        } else {
+            ComposerInputEvent::QueueSubmitted
         });
     }
 
@@ -3343,6 +3375,7 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::queue_submit))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -3514,6 +3547,10 @@ const ANSWER_QUESTIONS_COMMAND: &str = "answer";
 const BRO_COMMAND: &str = "bro";
 const BRO_PROMPT: &str = "Restate your last message. Stop using jargon and speak coherently. State it more simply and concisely, like one human talking to another.";
 
+fn is_goal_command(text: &str) -> bool {
+    text.trim() == "/goal"
+}
+
 fn filtered_commands(catalog: &[AgentCommand], query: &str) -> Vec<AgentCommand> {
     let query = query.to_lowercase();
     let mut commands: Vec<_> = catalog
@@ -3647,6 +3684,15 @@ fn mention_error_message(err: &RpcError) -> SharedString {
     }
 }
 
+struct GoalDialog {
+    objective: Entity<ComposerInput>,
+    budget: Entity<ComposerInput>,
+    goal_id: Option<String>,
+    expected_revision: Option<u64>,
+    tokens_used: u64,
+    _objective_events: Subscription,
+}
+
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
@@ -3676,6 +3722,8 @@ pub struct Composer {
     command_cache: HashMap<CommandCacheKey, CommandCacheEntry>,
     command_scroll: gpui::ScrollHandle,
     current_key: String,
+    goal_expanded: bool,
+    goal_dialog: Option<GoalDialog>,
     sending: bool,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
@@ -3694,6 +3742,9 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    /// Serializes detached Cmd/Ctrl+Enter sends so attachment upload latency
+    /// cannot reorder queue entries.
+    queue_send_lock: Arc<tokio::sync::Mutex<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -3747,6 +3798,7 @@ impl Composer {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
+            ComposerInputEvent::QueueSubmitted => this.on_queue_submit(cx),
             ComposerInputEvent::Edited => {
                 this.leave_message_history_after_edit(cx);
                 this.on_input_edited(cx);
@@ -3787,6 +3839,8 @@ impl Composer {
             command_cache: HashMap::new(),
             command_scroll: gpui::ScrollHandle::new(),
             current_key,
+            goal_expanded: false,
+            goal_dialog: None,
             sending: false,
             failure: None,
             wizard: None,
@@ -3800,6 +3854,7 @@ impl Composer {
             answered_requests: HashSet::new(),
             advance_task: None,
             send_task: None,
+            queue_send_lock: Arc::new(tokio::sync::Mutex::new(())),
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,
@@ -5053,7 +5108,7 @@ impl Composer {
         match outcome {
             Some(Ok(message)) => {
                 self.close_extracted_answers(cx);
-                self.send(message, false, cx);
+                self.send(message, SendIntent::Run, cx);
             }
             Some(Err(next)) => {
                 self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
@@ -5270,6 +5325,211 @@ impl Composer {
         });
     }
 
+    fn open_goal_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_chat.is_none()
+            && self.state.read(cx).selected_space_row().is_none()
+        {
+            self.failure = Some("Add a space before creating a goal".into());
+            return;
+        }
+        let existing = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.goal.clone())
+            .filter(|goal| goal.status != GoalStatus::Complete);
+        let objective = cx.new(|cx| ComposerInput::new("Goal objective", cx));
+        let budget = cx.new(|cx| ComposerInput::new("Token budget (optional)", cx));
+        if let Some(goal) = &existing {
+            objective.update(cx, |input, cx| input.set_text(goal.objective.clone(), cx));
+            if let Some(value) = goal.token_budget {
+                budget.update(cx, |input, cx| input.set_text(value.to_string(), cx));
+            }
+        }
+        let events = cx.subscribe(&objective, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.submit_goal_dialog(cx);
+            }
+        });
+        self.goal_dialog = Some(GoalDialog {
+            objective,
+            budget,
+            goal_id: existing.as_ref().map(|goal| goal.id.clone()),
+            expected_revision: existing.as_ref().map(|goal| goal.revision),
+            tokens_used: existing.as_ref().map_or(0, |goal| goal.tokens_used),
+            _objective_events: events,
+        });
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.remove(&self.current_key);
+        self.reset_command(cx);
+        cx.notify();
+    }
+
+    fn submit_goal_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.goal_dialog.as_ref() else {
+            return;
+        };
+        let objective = dialog.objective.read(cx).text().trim().to_string();
+        if objective.is_empty() {
+            self.failure = Some("Goal objective is required".into());
+            cx.notify();
+            return;
+        }
+        let budget_text = dialog.budget.read(cx).text().trim().to_string();
+        let token_budget = if budget_text.is_empty() {
+            None
+        } else {
+            match budget_text.parse::<u64>() {
+                Ok(value) if value > 0 => Some(value),
+                _ => {
+                    self.failure = Some("Token budget must be a positive integer".into());
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        if token_budget.is_some_and(|budget| budget <= dialog.tokens_used) {
+            self.failure = Some("Token budget must exceed the tokens already used".into());
+            cx.notify();
+            return;
+        }
+        let operation = match (&dialog.goal_id, dialog.expected_revision) {
+            (Some(goal_id), Some(expected_revision)) => GoalOperation::Edit {
+                goal_id: goal_id.clone(),
+                expected_revision,
+                objective,
+                token_budget,
+            },
+            _ => GoalOperation::Create {
+                objective,
+                token_budget,
+            },
+        };
+        self.goal_dialog = None;
+        self.goal_expanded = true;
+        self.queue_goal_operation(operation, cx);
+    }
+
+    fn queue_goal_operation(&mut self, operation: GoalOperation, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            return;
+        };
+        let existing = self.state.read(cx).selected_chat_row().cloned();
+        let new_space = existing
+            .is_none()
+            .then(|| self.state.read(cx).selected_space_row().cloned())
+            .flatten();
+        let checkout_plan = self.pickers.read(cx).checkout_plan();
+        let local_device_id = self.state.read(cx).local_device_id.clone();
+        let Some((chat_id, device_id, create_chat)) = existing
+            .map(|chat| (chat.id, chat.device_id, None))
+            .or_else(|| {
+                let space = new_space?;
+                let chat_id = uuid::Uuid::new_v4().to_string();
+                let config = self.pickers.read(cx).resolved(cx).chat_config();
+                let remote = local_device_id.as_deref() != Some(space.device_id.as_str());
+                Some((
+                    chat_id.clone(),
+                    space.device_id,
+                    Some((chat_id, space.id, config, space.path, checkout_plan, remote)),
+                ))
+            })
+        else {
+            self.failure = Some("Add a space before creating a goal".into());
+            return;
+        };
+        if create_chat.is_some() {
+            self.state
+                .update(cx, |state, cx| state.select_chat(Some(chat_id.clone()), cx));
+            cx.emit(ComposerEvent::Sent {
+                chat_id: chat_id.clone(),
+            });
+        }
+        cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = async {
+                if let Some((chat_id, space_id, config, space_path, plan, remote)) = create_chat {
+                    let mut cwd = space_path.clone();
+                    let branch = match plan {
+                        crate::pickers::CheckoutPlan::CurrentCheckout { branch } => branch,
+                        crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
+                            cwd = path;
+                            Some(branch)
+                        }
+                        crate::pickers::CheckoutPlan::NewWorktree { base: None } => None,
+                        crate::pickers::CheckoutPlan::NewWorktree { base: Some(base) } => {
+                            let mut worktree = serde_json::json!({
+                                "repoPath": space_path,
+                                "branch": base,
+                            });
+                            if remote && let Some(object) = worktree.as_object_mut() {
+                                object.insert(
+                                    "targetDeviceId".into(),
+                                    serde_json::Value::String(device_id.clone()),
+                                );
+                            }
+                            let value = engine
+                                .client()
+                                .call(methods::CREATE_WORKTREE, worktree)
+                                .await
+                                .map_err(|error| format!("Worktree failed: {error}"))?;
+                            let worktree: jolt_proto::Worktree = serde_json::from_value(value)
+                                .map_err(|error| format!("Worktree reply malformed: {error}"))?;
+                            cwd = worktree.path;
+                            Some(worktree.branch)
+                        }
+                    };
+                    let mut params = serde_json::json!({
+                        "op": "createChat",
+                        "chatId": chat_id,
+                        "spaceId": space_id,
+                        "cwd": cwd,
+                    });
+                    if let Some(object) = params.as_object_mut() {
+                        if let Some(config) = config {
+                            object.insert(
+                                "config".into(),
+                                serde_json::to_value(config)
+                                    .map_err(|error| format!("Goal config failed: {error}"))?,
+                            );
+                        }
+                        if let Some(branch) = branch {
+                            object.insert("branch".into(), serde_json::Value::String(branch));
+                        }
+                    }
+                    engine
+                        .client()
+                        .call(methods::MUTATE, params)
+                        .await
+                        .map_err(|error| format!("Couldn't create goal session: {error}"))?;
+                }
+                engine
+                    .client()
+                    .call(
+                        methods::QUEUE_COMMAND,
+                        serde_json::json!({
+                            "chatId": chat_id,
+                            "targetDeviceId": device_id,
+                            "command": SessionCommandPayload::Goal { operation },
+                        }),
+                    )
+                    .await
+                    .map_err(|error| format!("Couldn't update goal: {error}"))?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                this.update(cx, |composer, cx| {
+                    composer.failure = Some(error.into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn on_submit(&mut self, cx: &mut Context<Self>) {
         if matches!(
             self.extracted_answers.as_ref().map(|flow| &flow.state),
@@ -5284,6 +5544,10 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
+        if is_goal_command(&text) {
+            self.open_goal_dialog(cx);
+            return;
+        }
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
             _ if text.is_empty() && self.staged().is_empty() => {}
@@ -5299,17 +5563,33 @@ impl Composer {
                 self.drafts.remove(&self.current_key);
                 self.start_bro(cx);
             }
-            SendButtonMode::Send => self.send(text, false, cx),
-            SendButtonMode::Steer => self.send(text, true, cx),
+            SendButtonMode::Send => self.send(text, SendIntent::Run, cx),
+            SendButtonMode::Steer => self.send(text, SendIntent::Steer, cx),
         }
     }
 
-    /// Queue a Run, Steer, or Pi Bash doc command. Agent prompts get an
+    fn on_queue_submit(&mut self, cx: &mut Context<Self>) {
+        if self.wizard.is_some()
+            || self.extracted_answers.is_some()
+            || !self.run_live(cx)
+            || shell_scope(self.input.read(cx).text()).is_some()
+        {
+            self.on_submit(cx);
+            return;
+        }
+        let text = self.input.read(cx).text().trim().to_string();
+        if text.is_empty() && self.staged().is_empty() {
+            return;
+        }
+        self.send(text, SendIntent::Queue, cx);
+    }
+
+    /// Queue a Run, Steer, or deferred-turn doc command. Agent prompts get an
     /// optimistic echo; direct shell output appears when execution completes.
     /// New chats thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+    fn send(&mut self, text: String, intent: SendIntent, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
@@ -5341,6 +5621,8 @@ impl Composer {
             return;
         }
         let is_shell = shell.is_some();
+        let steer_cmd = intent == SendIntent::Steer && !is_new && !is_shell;
+        let queue_cmd = intent == SendIntent::Queue && !is_new && !is_shell;
         let existing_cwd = self
             .state
             .read(cx)
@@ -5441,29 +5723,31 @@ impl Composer {
                 continuation_of: None,
             },
         };
-        self.state.update(cx, |s, cx| {
-            if is_new {
-                s.select_chat(Some(chat_id.clone()), cx);
-            }
-            s.push_echo(&chat_id, echo);
-            s.begin_pending_send(&chat_id, &message_id, sent_at);
-            cx.notify();
-        });
-        let expiry_chat_id = chat_id.clone();
-        let expiry_message_id = message_id.clone();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(PENDING_SEND_TTL_MS as u64))
-                .await;
-            this.update(cx, |composer, cx| {
-                composer.state.update(cx, |state, cx| {
-                    state.end_pending_send(&expiry_chat_id, &expiry_message_id);
-                    cx.notify();
-                });
+        if !queue_cmd {
+            self.state.update(cx, |s, cx| {
+                if is_new {
+                    s.select_chat(Some(chat_id.clone()), cx);
+                }
+                s.push_echo(&chat_id, echo);
+                s.begin_pending_send(&chat_id, &message_id, sent_at);
+                cx.notify();
+            });
+            let expiry_chat_id = chat_id.clone();
+            let expiry_message_id = message_id.clone();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(PENDING_SEND_TTL_MS as u64))
+                    .await;
+                this.update(cx, |composer, cx| {
+                    composer.state.update(cx, |state, cx| {
+                        state.end_pending_send(&expiry_chat_id, &expiry_message_id);
+                        cx.notify();
+                    });
+                })
+                .ok();
             })
-            .ok();
-        })
-        .detach();
+            .detach();
+        }
 
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
@@ -5475,11 +5759,16 @@ impl Composer {
         });
         cx.notify();
 
-        let steer_cmd = steer && !is_new && !is_shell;
         let restore_text = text.clone();
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
-        self.send_task = Some(cx.spawn(async move |this, cx| {
+        let queue_send_lock = self.queue_send_lock.clone();
+        let send_task = cx.spawn(async move |this, cx| {
+            let _queue_order = if queue_cmd {
+                Some(queue_send_lock.lock().await)
+            } else {
+                None
+            };
             let result: Result<(), String> = async {
                 // Resolve the working directory: existing chats keep theirs;
                 // new chats run per the checkout plan (t3code env-mode): the
@@ -5610,30 +5899,32 @@ impl Composer {
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
-                    // Refresh the echo in place with the attachment refs
-                    // (same id, same clock — the bubble grows its thumbnails
-                    // without flickering).
-                    let refreshed = SessionMessageEntry {
-                        id: message_id.clone(),
-                        role: jolt_doc::MessageRole::User,
-                        parts: vec![MessagePart::Text {
-                            id: "t0".into(),
-                            text: content.clone(),
-                        }],
-                        created_at,
-                        device_id: "local".into(),
-                        status: None,
-                        continuation_of: None,
-                    };
-                    let echo_chat_id = chat_id.clone();
-                    this.update(cx, |composer, cx| {
-                        composer.state.update(cx, |s, cx| {
-                            s.remove_echo(&echo_chat_id, &message_id);
-                            s.push_echo(&echo_chat_id, refreshed);
-                            cx.notify();
-                        });
-                    })
-                    .ok();
+                    if !queue_cmd {
+                        // Refresh the echo in place with the attachment refs
+                        // (same id, same clock — the bubble grows its thumbnails
+                        // without flickering).
+                        let refreshed = SessionMessageEntry {
+                            id: message_id.clone(),
+                            role: jolt_doc::MessageRole::User,
+                            parts: vec![MessagePart::Text {
+                                id: "t0".into(),
+                                text: content.clone(),
+                            }],
+                            created_at,
+                            device_id: "local".into(),
+                            status: None,
+                            continuation_of: None,
+                        };
+                        let echo_chat_id = chat_id.clone();
+                        this.update(cx, |composer, cx| {
+                            composer.state.update(cx, |s, cx| {
+                                s.remove_echo(&echo_chat_id, &message_id);
+                                s.push_echo(&echo_chat_id, refreshed);
+                                cx.notify();
+                            });
+                        })
+                        .ok();
+                    }
                 }
 
                 let command = if let Some(shell) = &shell {
@@ -5649,19 +5940,27 @@ impl Composer {
                         message_id: Some(message_id.clone()),
                     }
                 } else {
-                    SessionCommandPayload::Run {
-                        request: RunRequest {
-                            prompt: content.clone(),
-                            model: resolved.model.clone(),
-                            reasoning: resolved.reasoning,
-                            model_options: resolved.model_options.clone(),
-                            cwd,
-                            sandbox: SandboxLevel::WorkspaceWrite,
-                            auto_approve: false,
-                            resume: None,
-                            attachments: attachment_paths,
-                        },
-                        message_id: message_id.clone(),
+                    let request = RunRequest {
+                        prompt: content.clone(),
+                        model: resolved.model.clone(),
+                        reasoning: resolved.reasoning,
+                        model_options: resolved.model_options.clone(),
+                        cwd,
+                        sandbox: SandboxLevel::WorkspaceWrite,
+                        auto_approve: false,
+                        resume: None,
+                        attachments: attachment_paths,
+                    };
+                    if queue_cmd {
+                        SessionCommandPayload::Queue {
+                            request,
+                            message_id: message_id.clone(),
+                        }
+                    } else {
+                        SessionCommandPayload::Run {
+                            request,
+                            message_id: message_id.clone(),
+                        }
                     }
                 };
                 let command = serde_json::to_value(&command)
@@ -5703,7 +6002,73 @@ impl Composer {
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        if queue_cmd {
+            // Queueing is intentionally multi-shot: submitting another item
+            // must not cancel an upload/RPC still finishing for the previous one.
+            send_task.detach();
+        } else {
+            self.send_task = Some(send_task);
+        }
+    }
+
+    fn cancel_queued_prompt(&mut self, command_id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CANCEL_QUEUED_PROMPT,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "commandId": command_id,
+                    }),
+                )
+                .await;
+            if let Err(error) = result {
+                this.update(cx, |composer, cx| {
+                    composer.failure =
+                        Some(format!("Couldn't cancel queued message: {error}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn resume_queue(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::QUEUE_COMMAND,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "command": { "kind": "resumeQueue" },
+                    }),
+                )
+                .await;
+            if let Err(error) = result {
+                this.update(cx, |composer, cx| {
+                    composer.failure = Some(format!("Couldn't resume queue: {error}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn cancel_bro(&mut self, cx: &mut Context<Self>) {
@@ -6367,6 +6732,427 @@ impl Composer {
             .into_any_element()
     }
 
+    fn render_goal_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let dialog = self.goal_dialog.as_ref()?;
+        let objective = dialog.objective.clone();
+        let budget = dialog.budget.clone();
+        let goal = self.state.read(cx).selected_chat_row()?.goal.clone();
+        let editing = dialog.goal_id.is_some();
+        let mut actions = div().flex().flex_row().items_center().gap(px(8.0));
+        if let Some(goal) = goal.filter(|_| editing) {
+            if goal.status == GoalStatus::Active {
+                let operation = GoalOperation::Pause {
+                    goal_id: goal.id.clone(),
+                    expected_revision: goal.revision,
+                };
+                actions = actions.child(
+                    crate::popover::btn_ghost(&theme, "Pause", "goal-dialog-pause")
+                        .id("goal-dialog-pause")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.goal_dialog = None;
+                            this.queue_goal_operation(operation.clone(), cx);
+                        })),
+                );
+            } else if matches!(
+                goal.status,
+                GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::UsageLimited
+            ) {
+                let operation = GoalOperation::Resume {
+                    goal_id: goal.id.clone(),
+                    expected_revision: goal.revision,
+                };
+                actions = actions.child(
+                    crate::popover::btn_ghost(&theme, "Resume", "goal-dialog-resume")
+                        .id("goal-dialog-resume")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.goal_dialog = None;
+                            this.queue_goal_operation(operation.clone(), cx);
+                        })),
+                );
+            }
+            let operation = GoalOperation::Clear {
+                goal_id: goal.id,
+                expected_revision: goal.revision,
+            };
+            actions = actions.child(
+                crate::popover::btn_danger(&theme, "Clear")
+                    .id("goal-dialog-clear")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.goal_dialog = None;
+                        this.queue_goal_operation(operation.clone(), cx);
+                    })),
+            );
+        }
+        let card = crate::popover::dialog_card(&theme)
+            .child(crate::popover::dialog_title(
+                &theme,
+                if editing {
+                    "Manage goal"
+                } else {
+                    "Create goal"
+                },
+            ))
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .child(crate::popover::dialog_field(objective.into_any_element())),
+            )
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .child(crate::popover::dialog_field(budget.into_any_element())),
+            )
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(actions)
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .child(
+                                crate::popover::btn_ghost(&theme, "Cancel", "goal-dialog-cancel")
+                                    .id("goal-dialog-cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.goal_dialog = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                crate::popover::btn_primary(
+                                    &theme,
+                                    if editing { "Save" } else { "Create" },
+                                )
+                                .id("goal-dialog-save")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.submit_goal_dialog(cx)),
+                                ),
+                            ),
+                    ),
+            )
+            .into_any_element();
+        Some(crate::popover::modal("goal-dialog", viewport, card))
+    }
+
+    fn render_goal(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let goal = self.state.read(cx).selected_chat_row()?.goal.clone()?;
+        let theme = Theme::of(cx).clone();
+        let (status, color) = match goal.status {
+            GoalStatus::Active => ("ACTIVE", theme.accent),
+            GoalStatus::Paused => ("PAUSED", theme.warning),
+            GoalStatus::Blocked => ("BLOCKED", theme.warning),
+            GoalStatus::UsageLimited => ("USAGE LIMITED", theme.warning),
+            GoalStatus::BudgetLimited => ("BUDGET REACHED", theme.warning),
+            GoalStatus::Complete => ("COMPLETE", theme.success),
+        };
+        let usage = goal.token_budget.map_or_else(
+            || format!("{} tokens", goal.tokens_used),
+            |budget| format!("{} / {} tokens", goal.tokens_used, budget),
+        );
+        let expanded = self.goal_expanded;
+        let mut card = div()
+            .id("goal-card")
+            .mx(px(4.0))
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(color.opacity(0.30))
+            .bg(theme.input_bg)
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("goal-card-header")
+                    .h(px(38.0))
+                    .px(px(11.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.goal_expanded = !this.goal_expanded;
+                        cx.notify();
+                    }))
+                    .child(div().size(px(7.0)).rounded_full().bg(color))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(status),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .text_color(theme.text)
+                            .child(SharedString::from(goal.objective.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(usage)),
+                    ),
+            );
+        if expanded {
+            let can_pause = goal.status == GoalStatus::Active;
+            let can_resume = matches!(
+                goal.status,
+                GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::UsageLimited
+            );
+            let action = |id: &'static str,
+                          label: &'static str,
+                          operation: GoalOperation,
+                          cx: &mut Context<Self>| {
+                div()
+                    .id(id)
+                    .px(px(9.0))
+                    .h(px(25.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .bg(crate::theme::ink(0.07))
+                    .hover(|style| style.bg(crate::theme::ink(0.12)))
+                    .text_size(px(11.0))
+                    .text_color(theme.text)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.queue_goal_operation(operation.clone(), cx)
+                    }))
+                    .child(label)
+            };
+            let goal_id = goal.id.clone();
+            let revision = goal.revision;
+            card = card.child(
+                div()
+                    .border_t_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .p(px(11.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(9.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text.opacity(0.88))
+                            .child(SharedString::from(goal.objective)),
+                    )
+                    .when_some(goal.status_message, |body, message| {
+                        body.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(message)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .id("edit-goal")
+                                    .px(px(9.0))
+                                    .h(px(25.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(7.0))
+                                    .cursor_pointer()
+                                    .bg(crate::theme::ink(0.07))
+                                    .hover(|style| style.bg(crate::theme::ink(0.12)))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_goal_dialog(cx)),
+                                    )
+                                    .child(if goal.status == GoalStatus::Complete {
+                                        "New goal"
+                                    } else {
+                                        "Edit"
+                                    }),
+                            )
+                            .when(can_pause, |row| {
+                                row.child(action(
+                                    "pause-goal",
+                                    "Pause",
+                                    GoalOperation::Pause {
+                                        goal_id: goal_id.clone(),
+                                        expected_revision: revision,
+                                    },
+                                    cx,
+                                ))
+                            })
+                            .when(can_resume, |row| {
+                                row.child(action(
+                                    "resume-goal",
+                                    "Resume",
+                                    GoalOperation::Resume {
+                                        goal_id: goal_id.clone(),
+                                        expected_revision: revision,
+                                    },
+                                    cx,
+                                ))
+                            })
+                            .child(action(
+                                "clear-goal",
+                                "Clear",
+                                GoalOperation::Clear {
+                                    goal_id,
+                                    expected_revision: revision,
+                                },
+                                cx,
+                            )),
+                    ),
+            );
+        }
+        Some(card.into_any_element())
+    }
+
+    fn render_queue(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let queued = self.state.read(cx).queued_prompts.clone();
+        if queued.is_empty() {
+            return None;
+        }
+        let theme = Theme::of(cx);
+        let paused = !self.run_live(cx);
+        let count = queued.len();
+        let rows = queued.into_iter().enumerate().map(|(index, prompt)| {
+            let command_id = prompt.command_id.clone();
+            let label = prompt
+                .prompt
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("Queued message")
+                .trim()
+                .to_string();
+            div()
+                .id(("queued-prompt", index))
+                .h(px(34.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .rounded(px(9.0))
+                .bg(crate::theme::ink(0.035))
+                .child(
+                    div()
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(theme.text.opacity(0.08))
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from((index + 1).to_string())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(theme.text.opacity(0.86))
+                        .child(SharedString::from(label)),
+                )
+                .when(prompt.cancellable, |row| {
+                    row.child(
+                        div()
+                            .id(("cancel-queued-prompt", index))
+                            .size(px(22.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(crate::theme::ink(0.10)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.cancel_queued_prompt(command_id.clone(), cx)
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::CLOSE)
+                                    .size(px(12.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+                })
+        });
+        Some(
+            div()
+                .id("queued-prompts")
+                .mx(px(4.0))
+                .rounded(px(14.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.input_bg)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(34.0))
+                        .px(px(11.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(if paused {
+                                    format!("QUEUE PAUSED · {count}")
+                                } else {
+                                    format!("NEXT UP · {count}")
+                                })),
+                        )
+                        .when(paused, |header| {
+                            header.child(
+                                div()
+                                    .id("resume-queued-prompts")
+                                    .px(px(8.0))
+                                    .h(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(7.0))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text)
+                                    .bg(crate::theme::ink(0.07))
+                                    .hover(|style| style.bg(crate::theme::ink(0.12)))
+                                    .on_click(cx.listener(|this, _, _, cx| this.resume_queue(cx)))
+                                    .child("Resume"),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .id("queued-prompts-scroll")
+                        .max_h(px(136.0))
+                        .overflow_y_scroll()
+                        .px(px(6.0))
+                        .pb(px(6.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
@@ -6873,6 +7659,14 @@ impl Render for Composer {
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
+        let container = match self.render_goal(cx) {
+            Some(goal) => container.child(goal),
+            None => container,
+        };
+        let container = match self.render_queue(cx) {
+            Some(queue) => container.child(queue),
+            None => container,
+        };
         let container = container.child(motion::fade_quick("composer-input", body));
         // Ref/workspace toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
@@ -6899,7 +7693,10 @@ impl Render for Composer {
                 },
             ));
         }
-        container
+        match self.render_goal_dialog(window.viewport_size(), cx) {
+            Some(dialog) => container.child(dialog),
+            None => container,
+        }
     }
 }
 
@@ -7233,6 +8030,12 @@ mod tests {
             BRO_PROMPT,
             "Restate your last message. Stop using jargon and speak coherently. State it more simply and concisely, like one human talking to another."
         );
+        assert!(is_goal_command("/goal"));
+        assert!(!is_goal_command("/goal pause"));
+        assert!(!is_goal_command(
+            "/goal --tokens 12000 finish the migration"
+        ));
+        assert!(!is_goal_command("/goalkeeper"));
     }
 
     #[test]
@@ -7765,10 +8568,8 @@ mod tests {
     #[test]
     fn busy_composer_invites_a_follow_up() {
         assert_eq!(composer_placeholder(false), DEFAULT_PLACEHOLDER);
-        assert_eq!(
-            composer_placeholder(true),
-            "Send a follow-up to steer the conversation"
-        );
+        assert_eq!(composer_placeholder(true), BUSY_PLACEHOLDER);
+        assert!(BUSY_PLACEHOLDER.contains("queues next"));
     }
 
     #[test]

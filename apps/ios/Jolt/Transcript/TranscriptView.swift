@@ -437,13 +437,14 @@ struct MarkdownRowView: View {
             }
             .onDisappear { veils.drop(row.id) }
         } else {
-            MarkdownBlockView(block: block, cacheKey: row.id)
+            MarkdownBlockView(block: block, cacheKey: row.id, streaming: streaming)
         }
     }
 
     private var isVeilable: Bool {
         switch block {
-        case .paragraph, .heading: return true
+        case .paragraph(let runs), .heading(_, let runs):
+            return !runs.contains(where: { $0.style.math != nil })
         default: return false
         }
     }

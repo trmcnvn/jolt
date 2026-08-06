@@ -185,6 +185,27 @@ final class WorkspaceStore {
                                         modelOptions: c["modelOptions"]?.objectValue ?? [:],
                                         sandbox: c["sandbox"]?.stringValue)
             }
+            var goal: Goal?
+            if let g = f["goal"]?.objectValue,
+               let id = g["id"]?.stringValue,
+               let objective = g["objective"]?.stringValue,
+               let statusValue = g["status"]?.stringValue,
+               let status = GoalStatus(rawValue: statusValue) {
+                goal = Goal(id: id,
+                            revision: UInt64(max(0, g["revision"]?.int64Value ?? 0)),
+                            controlNonce: g["controlNonce"]?.stringValue,
+                            objective: objective,
+                            status: status,
+                            statusMessage: g["statusMessage"]?.stringValue,
+                            tokenBudget: g["tokenBudget"]?.int64Value.map { UInt64(max(0, $0)) },
+                            tokensUsed: UInt64(max(0, g["tokensUsed"]?.int64Value ?? 0)),
+                            elapsedActiveMs: UInt64(max(0, g["elapsedActiveMs"]?.int64Value ?? 0)),
+                            turns: UInt32(clamping: g["turns"]?.int64Value ?? 0),
+                            blockerKey: g["blockerKey"]?.stringValue,
+                            blockerStreak: UInt8(clamping: g["blockerStreak"]?.int64Value ?? 0),
+                            createdAtMs: g["createdAtMs"]?.int64Value ?? 0,
+                            updatedAtMs: g["updatedAtMs"]?.int64Value ?? 0)
+            }
             return Chat(id: f["id"]?.stringValue ?? row.id, deviceId: deviceId,
                         title: f["title"]?.stringValue,
                         archived: f["archived"]?.boolValue ?? false,
@@ -196,7 +217,8 @@ final class WorkspaceStore {
                         lastMessageAt: f["lastMessageAt"]?.int64Value,
                         createdAt: f["createdAt"]?.int64Value ?? 0,
                         spaceId: f["spaceId"]?.stringValue,
-                        lastSeenAt: f["lastSeenAt"]?.int64Value)
+                        lastSeenAt: f["lastSeenAt"]?.int64Value,
+                        goal: goal)
         }
 
         var rows: [String: SessionRow] = [:]

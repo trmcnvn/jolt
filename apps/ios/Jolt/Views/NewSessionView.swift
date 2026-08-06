@@ -42,6 +42,7 @@ struct NewSessionView: View {
     @State private var attachments: [StagedAttachment] = []
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPhotoPicker = false
+    @State private var showGoalSheet = false
     @State private var sendError: String?
     @FocusState private var focused: Bool
 
@@ -100,6 +101,9 @@ struct NewSessionView: View {
         .background(Theme.bg.ignoresSafeArea())
         .navigationTitle("New session")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showGoalSheet) {
+            NewGoalSheet(onCreate: createGoalSession)
+        }
         .toolbar {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
@@ -426,6 +430,14 @@ struct NewSessionView: View {
             sendError = "Remove attachments before running a shell command."
             return
         }
+        if isGoalCommand(prompt) {
+            guard staged.isEmpty else {
+                sendError = "Remove attachments before creating a goal."
+                return
+            }
+            showGoalSheet = true
+            return
+        }
         if prompt == "/answer" || prompt == "/bro" {
             sendError = "Start the session before using this command."
             return
@@ -503,6 +515,47 @@ struct NewSessionView: View {
         }
     }
 
+    private func createGoalSession(objective: String, tokenBudget: UInt64?) {
+        guard let space, let selectedModel else { return }
+        busy = true
+        sendError = nil
+        let config = ChatConfig(harness: harness, model: selectedModel.id,
+                                reasoning: reasoning, modelOptions: [:],
+                                sandbox: "workspace-write")
+        Task { @MainActor in
+            defer { busy = false }
+            var cwd: String?
+            var branch = selectedRefRow?.name
+            if checkoutKind == .newWorktree, let base = selectedRefRow {
+                guard let worktree = await model.createWorktree(space: space, base: base) else {
+                    sendError = isJujutsu
+                        ? "Couldn't create the Jujutsu workspace."
+                        : "Couldn't create the Git worktree."
+                    return
+                }
+                cwd = worktree.path
+                branch = worktree.branch
+            } else if checkoutKind == .local {
+                cwd = selectedRefRow?.worktreePath
+            }
+            guard let chatId = model.createChat(space: space, config: config,
+                                                branch: branch, cwd: cwd),
+                  let chat = model.chat(id: chatId),
+                  let store = model.sessionStore(for: chat) else {
+                sendError = "Couldn't create the goal session."
+                return
+            }
+            store.createGoal(objective: objective, tokenBudget: tokenBudget)
+            mentions.reset()
+            draft = ""
+            selection = nil
+            if path.last == .newSession(spaceId: spaceId) {
+                path.removeLast()
+            }
+            path.append(.chat(chatId))
+        }
+    }
+
     private func stage(_ items: [PhotosPickerItem]) {
         Task { @MainActor in
             var failed = 0
@@ -523,6 +576,69 @@ struct NewSessionView: View {
                 sendError = nil
             }
         }
+    }
+}
+
+private struct NewGoalSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let onCreate: (String, UInt64?) -> Void
+
+    @State private var objective = ""
+    @State private var budget = ""
+    @State private var error: String?
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                TextField("Goal objective", text: $objective, axis: .vertical)
+                    .lineLimit(3...8)
+                    .font(Theme.sans(14))
+                    .padding(12)
+                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 10))
+                TextField("Token budget (optional)", text: $budget)
+                    .keyboardType(.numberPad)
+                    .font(Theme.sans(14))
+                    .padding(12)
+                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 10))
+                if let error {
+                    Text(error)
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.danger)
+                }
+                Spacer()
+            }
+            .padding(20)
+            .background(Theme.bg)
+            .navigationTitle("Create goal")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create", action: create)
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private func create() {
+        let trimmed = objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            error = "Goal objective is required."
+            return
+        }
+        let tokenBudget: UInt64?
+        if budget.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            tokenBudget = nil
+        } else if let value = UInt64(budget), value > 0 {
+            tokenBudget = value
+        } else {
+            error = "Token budget must be a positive integer."
+            return
+        }
+        onCreate(trimmed, tokenBudget)
+        dismiss()
     }
 }
 

@@ -21,7 +21,8 @@
 //! - Repos: `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
-//!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//!   {repoPath, worktreePath}`; `WatchCheckoutDiffV2` → checkout manifest stream;
+//!   `GetCheckoutDiffPage` → immutable patch page
 //! - Terminals: `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
@@ -95,6 +96,23 @@ struct TranscriptPageParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DiffPageParams {
+    chat_id: String,
+    catalog_revision: String,
+    page_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnDiffPageParams {
+    chat_id: String,
+    assistant_message_id: String,
+    catalog_revision: String,
+    page_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
 }
@@ -107,6 +125,7 @@ struct ListCommandsParams {
 
 const ANSWER_QUESTIONS_COMMAND: &str = "answer";
 const BRO_COMMAND: &str = "bro";
+const GOAL_COMMAND: &str = "goal";
 
 fn jolt_commands() -> Vec<AgentCommand> {
     vec![
@@ -122,6 +141,12 @@ fn jolt_commands() -> Vec<AgentCommand> {
             argument_hint: None,
             source: AgentCommandSource::Jolt,
         },
+        AgentCommand {
+            name: GOAL_COMMAND.into(),
+            description: Some("Open the long-running goal manager".into()),
+            argument_hint: Some("<objective>|pause|resume|clear".into()),
+            source: AgentCommandSource::Jolt,
+        },
     ]
 }
 
@@ -130,6 +155,13 @@ fn jolt_commands() -> Vec<AgentCommand> {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelQueuedPromptParams {
+    chat_id: String,
+    command_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +247,7 @@ fn tool_file_path(call: &ToolCall) -> Option<&str> {
         | ToolCall::WebFetch { .. }
         | ToolCall::WebSearch { .. }
         | ToolCall::Todo { .. }
+        | ToolCall::SpawnAgent { .. }
         | ToolCall::Mcp { .. }
         | ToolCall::Unknown { .. } => None,
     }
@@ -619,25 +652,13 @@ impl EngineRpc {
             }
         }
 
-        if let Ok(Some(chat)) = self.workspace.chat(chat_id) {
-            let diffs = self.diff_sync.watch_diffs().borrow().clone();
-            let diff = chat
-                .checkout_id
-                .as_deref()
-                .and_then(|id| diffs.iter().find(|diff| diff.checkout_id == id))
-                .or_else(|| {
-                    chat.cwd
-                        .as_deref()
-                        .and_then(|cwd| diffs.iter().find(|diff| diff.cwd == cwd))
-                });
-            if let Some(diff) = diff {
-                for file in &diff.files {
-                    if paths.len() == FILE_SEARCH_FEATURED_PATHS {
-                        break;
-                    }
-                    if seen.insert(file.path.clone()) {
-                        paths.push(file.path.clone());
-                    }
+        if let Some(diff) = self.diff_sync.current_manifest(chat_id) {
+            for file in &diff.files {
+                if paths.len() == FILE_SEARCH_FEATURED_PATHS {
+                    break;
+                }
+                if seen.insert(file.path.clone()) {
+                    paths.push(file.path.clone());
                 }
             }
         }
@@ -820,6 +841,10 @@ fn local_only(method: &str) -> bool {
         methods::LIST_HARNESS_SECRETS
             | methods::UPSERT_HARNESS_SECRET
             | methods::DELETE_HARNESS_SECRET
+            | methods::WATCH_THEMES
+            | methods::LIST_THEMES
+            | methods::UPSERT_THEMES
+            | methods::DELETE_THEME
     )
 }
 
@@ -844,6 +869,16 @@ pub(crate) fn relay_service(inner: std::sync::Arc<EngineRpc>) -> std::sync::Arc<
 /// ControlRpc methods that honor `targetDeviceId`. Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
+pub(crate) fn theme_sync_method(method: &str) -> bool {
+    matches!(
+        method,
+        methods::WATCH_THEMES
+            | methods::LIST_THEMES
+            | methods::UPSERT_THEMES
+            | methods::DELETE_THEME
+    )
+}
+
 fn forwardable(method: &str) -> bool {
     matches!(
         method,
@@ -872,7 +907,9 @@ fn forwardable(method: &str) -> bool {
             | methods::VCS_SETTINGS
             | methods::SET_VCS_BACKEND
             // Checkout diffs are produced on the device holding the checkout.
-            | methods::WATCH_CHECKOUT_DIFFS
+            | methods::WATCH_CHECKOUT_DIFF_V2
+            | methods::GET_CHECKOUT_DIFF_PAGE
+            | methods::GET_TURN_DIFF_PAGE
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
             | methods::SUBSCRIBE_TERMINAL
@@ -907,7 +944,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_TRANSCRIPT_V2
             | methods::WATCH_CHAT_USAGE
             | methods::SUBSCRIBE_TERMINAL
-            | methods::WATCH_CHECKOUT_DIFFS
+            | methods::WATCH_CHECKOUT_DIFF_V2
             | methods::UPDATE_STATUS
     )
 }
@@ -958,6 +995,30 @@ fn transcript_stream(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
+        }
+    })
+    .boxed()
+}
+
+fn diff_stream(
+    bootstrap: jolt_proto::CheckoutDiffBootstrap,
+    rx: tokio::sync::broadcast::Receiver<jolt_proto::CheckoutDiffWatchFrame>,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold((Some(bootstrap), rx), |(opening, mut rx)| async move {
+        if let Some(bootstrap) = opening {
+            let frame = jolt_proto::CheckoutDiffWatchFrame::Bootstrap { bootstrap };
+            return serde_json::to_value(frame)
+                .ok()
+                .map(|value| (value, (None, rx)));
+        }
+        match rx.recv().await {
+            Ok(frame) => serde_json::to_value(frame)
+                .ok()
+                .map(|value| (value, (None, rx))),
+            Err(
+                tokio::sync::broadcast::error::RecvError::Lagged(_)
+                | tokio::sync::broadcast::error::RecvError::Closed,
+            ) => None,
         }
     })
     .boxed()
@@ -1119,6 +1180,22 @@ impl RpcService for EngineRpc {
                     .queue_command(&p.chat_id, p.command)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            methods::CANCEL_QUEUED_PROMPT => {
+                let p: CancelQueuedPromptParams = parse_params(params)?;
+                let cancelled = self
+                    .doc_host
+                    .cancel_queued_prompt(&p.chat_id, &p.command_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "cancelled": cancelled }))
+            }
+            methods::WATCH_QUEUED_PROMPTS => {
+                let p: ChatParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                Ok(RpcReply::Stream(watch_stream(handle.watch_queue())))
             }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;
@@ -1307,6 +1384,37 @@ impl RpcService for EngineRpc {
             methods::WATCH_SPACES => Ok(RpcReply::Stream(watch_stream(
                 self.workspace.watch_spaces(),
             ))),
+            methods::WATCH_THEMES => Ok(RpcReply::Stream(watch_stream(
+                self.workspace.watch_themes(),
+            ))),
+            methods::LIST_THEMES => RpcReply::value(
+                &self
+                    .workspace
+                    .read_themes()
+                    .map_err(|err| RpcError::Failed(err.to_string()))?,
+            ),
+            methods::UPSERT_THEMES => {
+                #[derive(Deserialize)]
+                struct Params {
+                    themes: Vec<jolt_proto::ThemeFileRecord>,
+                }
+                let params: Params = parse_params(params)?;
+                self.workspace
+                    .upsert_themes(&params.themes)
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::DELETE_THEME => {
+                #[derive(Deserialize)]
+                struct Params {
+                    id: String,
+                }
+                let params: Params = parse_params(params)?;
+                self.workspace
+                    .delete_theme(&params.id)
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::WATCH_SESSIONS => {
                 // Local live statuses merged with remote devices' workspace rows.
                 let merged = self
@@ -1331,10 +1439,48 @@ impl RpcService for EngineRpc {
                 self.mutate(p)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::WATCH_CHECKOUT_DIFFS => {
-                let stream = watch_stream(self.diff_sync.watch_diffs());
-                self.diff_sync.sync_all();
-                Ok(RpcReply::Stream(stream))
+            methods::WATCH_CHECKOUT_DIFF_V2 => {
+                let p: ChatParams = parse_params(params)?;
+                let (bootstrap, receiver) = self
+                    .diff_sync
+                    .watch_diff(&p.chat_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                Ok(RpcReply::Stream(diff_stream(bootstrap, receiver)))
+            }
+            methods::GET_CHECKOUT_DIFF_PAGE => {
+                let p: DiffPageParams = parse_params(params)?;
+                match self
+                    .diff_sync
+                    .diff_page(&p.chat_id, &p.catalog_revision, &p.page_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                {
+                    Some(page) => RpcReply::value(&page),
+                    None => Err(RpcError::BadParams(format!(
+                        "unknown checkout diff page {}",
+                        p.page_id
+                    ))),
+                }
+            }
+            methods::GET_TURN_DIFF_PAGE => {
+                let p: TurnDiffPageParams = parse_params(params)?;
+                match self
+                    .sessions
+                    .turn_diff_page(
+                        &p.chat_id,
+                        &p.assistant_message_id,
+                        &p.catalog_revision,
+                        &p.page_id,
+                    )
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                {
+                    Some(page) => RpcReply::value(&page),
+                    None => Err(RpcError::BadParams(format!(
+                        "unknown turn diff page {}",
+                        p.page_id
+                    ))),
+                }
             }
             methods::VCS_SETTINGS => RpcReply::value(&self.repos.vcs_settings()),
             methods::SET_VCS_BACKEND => {
@@ -1674,6 +1820,7 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::LIST_COMMANDS));
         assert!(forwardable(methods::SEARCH_FILES));
+        assert!(forwardable(methods::GET_TURN_DIFF_PAGE));
         assert!(!forwardable(methods::UPSERT_HARNESS_SECRET));
         assert!(local_only(methods::UPSERT_HARNESS_SECRET));
     }
@@ -1681,9 +1828,10 @@ mod tests {
     #[test]
     fn command_catalog_contains_only_native_jolt_commands() {
         let commands = jolt_commands();
-        assert_eq!(commands.len(), 2);
+        assert_eq!(commands.len(), 3);
         assert_eq!(commands[0].name, "answer");
         assert_eq!(commands[1].name, "bro");
+        assert_eq!(commands[2].name, "goal");
         assert!(
             commands
                 .iter()

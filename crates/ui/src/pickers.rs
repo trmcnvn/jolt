@@ -278,6 +278,14 @@ fn context_pressure(usage: Option<&UsageSummary>) -> ContextPressure {
     }
 }
 
+fn search_active_index(query: &str, selected_index: usize) -> usize {
+    if query.trim().is_empty() {
+        selected_index
+    } else {
+        0
+    }
+}
+
 fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}m", tokens as f64 / 1_000_000.0)
@@ -413,10 +421,18 @@ impl Pickers {
         let search = cx.new(|cx| ComposerInput::new("Search…", cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => {
-                this.active = 0;
+                // Clearing the shared input on open emits this after `toggle`;
+                // an empty filter must retain the picker's selected-row cursor.
+                let selected_index = this
+                    .open
+                    .map(|kind| this.initial_active_index(kind, cx))
+                    .unwrap_or(0);
+                this.active = search_active_index(this.search.read(cx).text(), selected_index);
                 cx.notify();
             }
-            ComposerInputEvent::Submitted => this.on_search_submit(cx),
+            ComposerInputEvent::Submitted | ComposerInputEvent::QueueSubmitted => {
+                this.on_search_submit(cx)
+            }
             // Pasted images/files don't apply to a search box.
             ComposerInputEvent::PastedImages(_)
             | ComposerInputEvent::PastedPaths(_)
@@ -622,6 +638,23 @@ impl Pickers {
         }
     }
 
+    fn selected_model_index(&self, cx: &App) -> usize {
+        let Some(selected) = self.selected_model(cx) else {
+            return 0;
+        };
+        let Some(models) = self
+            .effective_harness(cx)
+            .and_then(|harness| self.models.get(&harness))
+            .and_then(Loadable::ready)
+        else {
+            return 0;
+        };
+        models
+            .iter()
+            .position(|model| model.id == selected.id)
+            .unwrap_or(0)
+    }
+
     /// The explicit (non-default) option picks: the chat's persisted
     /// selections for existing chats, the draft's for the new-chat canvas.
     fn explicit_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
@@ -669,6 +702,19 @@ impl Pickers {
         }
     }
 
+    fn initial_active_index(&self, kind: PickerKind, cx: &App) -> usize {
+        match kind {
+            PickerKind::Checkout => match self.config.checkout {
+                CheckoutKind::Local => 0,
+                CheckoutKind::NewWorktree => 1,
+            },
+            PickerKind::Branch => self.selected_ref_index(cx),
+            PickerKind::HarnessModel | PickerKind::Traits => self.selected_model_index(cx),
+            PickerKind::Space => self.selected_space_index(cx),
+            PickerKind::Usage => 0,
+        }
+    }
+
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
         // Model + traits merged into ONE menu (user request): the traits chip
         // opens the combined harness/model/reasoning popover.
@@ -697,17 +743,9 @@ impl Pickers {
         });
         // The keyboard-nav highlight starts ON the selected row — row 0
         // otherwise reads as a second active row (user report).
-        self.active = match kind {
-            PickerKind::Checkout => match self.config.checkout {
-                CheckoutKind::Local => 0,
-                CheckoutKind::NewWorktree => 1,
-            },
-            PickerKind::Branch => self.selected_ref_index(cx),
-            PickerKind::Space => self.selected_space_index(cx),
-            _ => 0,
-        };
+        self.active = self.initial_active_index(kind, cx);
         if kind == PickerKind::HarnessModel {
-            self.model_scroll.set_offset(gpui::Point::default());
+            self.model_scroll.scroll_to_item(self.active);
         }
         // Searchable pickers focus the filter input (it sits inside the frame,
         // so the frame's key handler still sees arrows/Enter); the rest focus
@@ -839,6 +877,10 @@ impl Pickers {
                     }
                 }
                 pickers.models.insert(harness, loaded);
+                if pickers.open == Some(PickerKind::HarnessModel) {
+                    pickers.active = pickers.selected_model_index(cx);
+                    pickers.model_scroll.scroll_to_item(pickers.active);
+                }
                 cx.notify();
             })
             .ok();
@@ -2986,6 +3028,13 @@ mod tests {
             current,
             worktree_path: worktree_path.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn empty_search_keeps_the_selected_row_active() {
+        assert_eq!(search_active_index("", 2), 2);
+        assert_eq!(search_active_index("   ", 2), 2);
+        assert_eq!(search_active_index("jo", 2), 0);
     }
 
     #[test]

@@ -1,5 +1,10 @@
 //! Embedded icon assets + the gpui [`AssetSource`] that serves them.
 //!
+//! The asset source also exposes Jolt's embedded Geist fonts at the two
+//! fallback paths GPUI's SVG renderer requests. GPUI keeps a font database for
+//! SVG text separate from its native text system, so registering the fonts at
+//! app startup is not enough to make them available to Mermaid diagrams.
+//!
 //! Most glyphs come from the **Solar Icons** set (Linear weight) by 480 Design,
 //! licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/);
 //! attribution: "Solar Icons by 480 Design".
@@ -29,6 +34,14 @@ macro_rules! icon_assets {
         impl AssetSource for Assets {
             fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
                 Ok(match path {
+                    // Compatibility shim for GPUI's hard-coded SVG fallback
+                    // asset paths. The family names come from the font files,
+                    // so these load as Geist / Geist Mono rather than aliases
+                    // for IBM Plex Sans / Lilex.
+                    "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf" =>
+                        Some(Cow::Borrowed(crate::FONT_GEIST)),
+                    "fonts/lilex/Lilex-Regular.ttf" =>
+                        Some(Cow::Borrowed(crate::FONT_GEIST_MONO)),
                     $(concat!("icons/", $path, ".svg") => Some(Cow::Borrowed(
                         include_bytes!(concat!("../assets/icons/", $path, ".svg")).as_slice(),
                     )),)+
@@ -37,7 +50,11 @@ macro_rules! icon_assets {
             }
 
             fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-                let all = [$(concat!("icons/", $path, ".svg")),+];
+                let all = [
+                    "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
+                    "fonts/lilex/Lilex-Regular.ttf",
+                    $(concat!("icons/", $path, ".svg")),+
+                ];
                 Ok(all
                     .iter()
                     .filter(|p| p.starts_with(path))
@@ -159,8 +176,22 @@ mod tests {
     }
 
     #[test]
+    fn svg_fallback_paths_serve_embedded_geist_fonts() {
+        let sans = Assets
+            .load("fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf")
+            .unwrap()
+            .unwrap();
+        let mono = Assets
+            .load("fonts/lilex/Lilex-Regular.ttf")
+            .unwrap()
+            .unwrap();
+        assert_eq!(sans.as_ref(), crate::FONT_GEIST);
+        assert_eq!(mono.as_ref(), crate::FONT_GEIST_MONO);
+    }
+
+    #[test]
     fn list_filters_by_prefix() {
         assert!(!Assets.list("icons/").unwrap().is_empty());
-        assert!(Assets.list("fonts/").unwrap().is_empty());
+        assert_eq!(Assets.list("fonts/").unwrap().len(), 2);
     }
 }

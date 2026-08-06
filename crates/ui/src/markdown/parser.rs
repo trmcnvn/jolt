@@ -26,8 +26,17 @@ pub struct InlineStyle {
     pub italic: bool,
     pub code: bool,
     pub strikethrough: bool,
+    /// A TeX formula. The run text is the source without its delimiters.
+    pub math: Option<MathKind>,
     /// Destination URL when inside a link.
     pub link: Option<String>,
+}
+
+/// Whether a formula participates in the surrounding line or owns a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathKind {
+    Inline,
+    Display,
 }
 
 /// One run of identically-styled inline text.
@@ -105,12 +114,302 @@ impl BlockTree {
 // ---------------------------------------------------------------------------
 
 fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_MATH
+}
+
+// CommonMark consumes the backslash in `\(` before its event stream is
+// exposed. Turn TeX pairs into `$` math with one-byte control markers. The
+// replacement is still exactly two bytes, keeping every incremental-parser
+// range aligned with the original source, while pulldown protects operators
+// inside the formula from ordinary Markdown parsing.
+const INLINE_OPEN: &str = "$\u{1c}";
+const INLINE_CLOSE: &str = "\u{1d}$";
+const DISPLAY_OPEN: &str = "$\u{1e}";
+const DISPLAY_CLOSE: &str = "\u{1f}$";
+const LITERAL_INLINE_OPEN: &str = "\u{80}";
+const LITERAL_INLINE_CLOSE: &str = "\u{81}";
+const LITERAL_DISPLAY_OPEN: &str = "\u{82}";
+const LITERAL_DISPLAY_CLOSE: &str = "\u{83}";
+const INLINE_OPEN_MARKER: &str = "\u{1c}";
+const INLINE_CLOSE_MARKER: &str = "\u{1d}";
+const DISPLAY_OPEN_MARKER: &str = "\u{1e}";
+const DISPLAY_CLOSE_MARKER: &str = "\u{1f}";
+const NESTED_BACKTICK: &str = "\u{16}";
+const NESTED_TILDE: &str = "\u{17}";
+
+/// Models sometimes wrap a copyable Markdown fixture in ` ```markdown ` and
+/// then include ordinary triple-backtick examples inside it. CommonMark
+/// cannot nest equal-length fences, so the first inner closing fence would
+/// terminate the wrapper and leak later `math`/`mermaid` blocks into rich
+/// rendering. Hide those inner closers behind same-byte control sentinels;
+/// code extraction restores them verbatim.
+fn normalize_nested_markdown_fences(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut normalized = bytes.to_vec();
+    let mut wrapper: Option<(u8, usize, usize)> = None;
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        let line_end = bytes[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |offset| line_start + offset);
+        let mut content_end = line_end;
+        if content_end > line_start && bytes[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+        let line = &bytes[line_start..content_end];
+        if let Some((marker, outer_count, depth)) = wrapper {
+            if let Some((found, count, rest)) = fence_marker(line)
+                && found == marker
+                && count >= outer_count
+            {
+                if rest.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    if depth == 0 {
+                        wrapper = None;
+                    } else {
+                        let indent = line.iter().take_while(|byte| **byte == b' ').count();
+                        let sentinel = if marker == b'`' { 0x16 } else { 0x17 };
+                        normalized[line_start + indent..line_start + indent + count].fill(sentinel);
+                        wrapper = Some((marker, outer_count, depth - 1));
+                    }
+                } else {
+                    wrapper = Some((marker, outer_count, depth + 1));
+                }
+            }
+        } else if let Some((marker, count, rest)) = fence_marker(line) {
+            let language = String::from_utf8_lossy(rest)
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(
+                language.as_str(),
+                "markdown" | "md" | "mdown" | "commonmark"
+            ) {
+                wrapper = Some((marker, count, 0));
+            }
+        }
+        line_start = (line_end + usize::from(line_end < bytes.len())).min(bytes.len());
+    }
+    String::from_utf8(normalized).expect("same-byte ASCII fence replacement")
+}
+
+fn normalize_tex_delimiters(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let protected = code_protected_bytes(source);
+    let mut matched = vec![false; bytes.len()];
+    let mut stack: Vec<(u8, usize)> = Vec::new();
+    let mut ix = 0;
+    while ix + 1 < bytes.len() {
+        if protected[ix] || bytes[ix] != b'\\' || is_escaped(bytes, ix) {
+            ix += 1;
+            continue;
+        }
+        match bytes[ix + 1] {
+            b'(' | b'[' => stack.push((bytes[ix + 1], ix)),
+            b')' | b']' => {
+                let expected = if bytes[ix + 1] == b')' { b'(' } else { b'[' };
+                if stack.last().is_some_and(|(kind, _)| *kind == expected) {
+                    let (_, open_ix) = stack.pop().expect("checked above");
+                    matched[open_ix] = true;
+                    matched[ix] = true;
+                }
+            }
+            _ => {}
+        }
+        ix += 2;
+    }
+
+    let mut out = String::with_capacity(source.len());
+    let mut last = 0;
+    let mut ix = 0;
+    while ix + 1 < bytes.len() {
+        if bytes[ix] == b'\\' && !is_escaped(bytes, ix) {
+            let replacement = match (bytes[ix + 1], matched[ix]) {
+                (b'(', true) => Some(INLINE_OPEN),
+                (b')', true) => Some(INLINE_CLOSE),
+                (b'[', true) => Some(DISPLAY_OPEN),
+                (b']', true) => Some(DISPLAY_CLOSE),
+                (b'(', false) => Some(LITERAL_INLINE_OPEN),
+                (b')', false) => Some(LITERAL_INLINE_CLOSE),
+                (b'[', false) => Some(LITERAL_DISPLAY_OPEN),
+                (b']', false) => Some(LITERAL_DISPLAY_CLOSE),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                out.push_str(&source[last..ix]);
+                out.push_str(replacement);
+                ix += 2;
+                last = ix;
+                continue;
+            }
+        }
+        ix += 1;
+    }
+    if last == 0 {
+        return source.to_string();
+    }
+    out.push_str(&source[last..]);
+    debug_assert_eq!(out.len(), source.len());
+    out
+}
+
+/// Bytes inside fenced, indented, or matched inline code must never pair with
+/// a TeX delimiter in surrounding prose.
+fn code_protected_bytes(source: &str) -> Vec<bool> {
+    let bytes = source.as_bytes();
+    let mut protected = vec![false; bytes.len()];
+    let mut fence: Option<(u8, usize)> = None;
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        let line_end = bytes[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |offset| line_start + offset);
+        let next_line = (line_end + usize::from(line_end < bytes.len())).min(bytes.len());
+        let mut content_end = line_end;
+        if content_end > line_start && bytes[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+        let line = &bytes[line_start..content_end];
+        if let Some((marker, count)) = fence {
+            protected[line_start..next_line].fill(true);
+            if fence_marker(line).is_some_and(|(found, found_count, rest)| {
+                found == marker
+                    && found_count >= count
+                    && rest.iter().all(|byte| byte.is_ascii_whitespace())
+            }) {
+                fence = None;
+            }
+        } else if let Some((marker, count, _)) = fence_marker(line) {
+            protected[line_start..next_line].fill(true);
+            fence = Some((marker, count));
+        } else if line.starts_with(b"\t") || line.starts_with(b"    ") {
+            protected[line_start..next_line].fill(true);
+        }
+        line_start = next_line;
+    }
+
+    // CommonMark code spans close on an equal-length backtick run and may
+    // cross a line boundary.
+    let mut ix = 0;
+    while ix < bytes.len() {
+        if protected[ix] || bytes[ix] != b'`' {
+            ix += 1;
+            continue;
+        }
+        let count = bytes[ix..].iter().take_while(|byte| **byte == b'`').count();
+        let mut at = ix + count;
+        let mut close = None;
+        while at < bytes.len() {
+            if !protected[at] && bytes[at] == b'`' {
+                let candidate = bytes[at..].iter().take_while(|byte| **byte == b'`').count();
+                if candidate == count {
+                    close = Some(at + candidate);
+                    break;
+                }
+                at += candidate;
+            } else {
+                at += 1;
+            }
+        }
+        if let Some(end) = close {
+            protected[ix..end].fill(true);
+            ix = end;
+        } else {
+            ix += count;
+        }
+    }
+    protected
+}
+
+fn fence_marker(line: &[u8]) -> Option<(u8, usize, &[u8])> {
+    let indent = line.iter().take_while(|byte| **byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let marker = *line.get(indent)?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let count = line[indent..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    (count >= 3).then_some((marker, count, &line[indent + count..]))
+}
+
+fn is_escaped(bytes: &[u8], ix: usize) -> bool {
+    let mut slashes = 0;
+    let mut at = ix;
+    while at > 0 && bytes[at - 1] == b'\\' {
+        slashes += 1;
+        at -= 1;
+    }
+    slashes % 2 == 1
+}
+
+fn restore_tex_delimiters(text: &str) -> String {
+    text.replace(INLINE_OPEN, "\\(")
+        .replace(INLINE_CLOSE, "\\)")
+        .replace(DISPLAY_OPEN, "\\[")
+        .replace(DISPLAY_CLOSE, "\\]")
+        .replace(INLINE_OPEN_MARKER, "\\(")
+        .replace(INLINE_CLOSE_MARKER, "\\)")
+        .replace(DISPLAY_OPEN_MARKER, "\\[")
+        .replace(DISPLAY_CLOSE_MARKER, "\\]")
+        .replace(LITERAL_INLINE_OPEN, "\\(")
+        .replace(LITERAL_INLINE_CLOSE, "\\)")
+        .replace(LITERAL_DISPLAY_OPEN, "\\[")
+        .replace(LITERAL_DISPLAY_CLOSE, "\\]")
+        .replace(NESTED_BACKTICK, "`")
+        .replace(NESTED_TILDE, "~")
+}
+
+fn decode_inline_math(text: &str) -> Result<(MathKind, String), String> {
+    let opening = if text.starts_with(INLINE_OPEN_MARKER) {
+        Some((MathKind::Inline, INLINE_OPEN_MARKER))
+    } else if text.starts_with(DISPLAY_OPEN_MARKER) {
+        Some((MathKind::Display, DISPLAY_OPEN_MARKER))
+    } else {
+        None
+    };
+    let closing = if text.ends_with(INLINE_CLOSE_MARKER) {
+        Some((MathKind::Inline, INLINE_CLOSE_MARKER))
+    } else if text.ends_with(DISPLAY_CLOSE_MARKER) {
+        Some((MathKind::Display, DISPLAY_CLOSE_MARKER))
+    } else {
+        None
+    };
+    match (opening, closing) {
+        (None, None) => Ok((MathKind::Inline, restore_tex_delimiters(text))),
+        (Some((open_kind, open)), Some((close_kind, close))) if open_kind == close_kind => {
+            let body = &text[open.len()..text.len() - close.len()];
+            Ok((open_kind, restore_tex_delimiters(body)))
+        }
+        (opening, closing) => {
+            let mut literal = restore_tex_delimiters(text);
+            // The event consumed a native `$` on whichever side did not carry
+            // a TeX marker. Put it back for mismatched/half-streamed input.
+            if opening.is_none() {
+                literal.insert(0, '$');
+            }
+            if closing.is_none() {
+                literal.push('$');
+            }
+            Err(literal)
+        }
+    }
 }
 
 /// Parse a whole source into a [`BlockTree`].
 pub fn parse_full(source: &str) -> BlockTree {
-    let events: Vec<(Event, Range<usize>)> = Parser::new_ext(source, options())
+    let fenced = normalize_nested_markdown_fences(source);
+    let normalized = normalize_tex_delimiters(&fenced);
+    let events: Vec<(Event, Range<usize>)> = Parser::new_ext(&normalized, options())
         .into_offset_iter()
         .collect();
     let mut cur = Cursor {
@@ -216,7 +515,7 @@ fn parse_started_block(cur: &mut Cursor) -> Vec<Block> {
             let mut code = String::new();
             loop {
                 match cur.next_event() {
-                    Some(Event::Text(t)) => code.push_str(&t),
+                    Some(Event::Text(t)) => code.push_str(&restore_tex_delimiters(&t)),
                     Some(Event::End(_)) | None => break,
                     Some(_) => {}
                 }
@@ -391,15 +690,32 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
         }
     };
     match event {
+        // Restore after adjacent plain events merge: pulldown may split an
+        // unmatched `$<marker>` pair at the dollar boundary while streaming.
         Event::Text(t) => push(runs, t.into_string(), style.clone()),
+        Event::InlineMath(t) => match decode_inline_math(&t) {
+            Ok((kind, body)) => {
+                let mut s = style.clone();
+                s.math = Some(kind);
+                push(runs, body, s);
+            }
+            Err(literal) => push(runs, literal, style.clone()),
+        },
+        Event::DisplayMath(t) => {
+            let mut s = style.clone();
+            s.math = Some(MathKind::Display);
+            push(runs, restore_tex_delimiters(&t), s);
+        }
         Event::Code(t) => {
             let mut s = style.clone();
             s.code = true;
-            push(runs, t.into_string(), s);
+            push(runs, restore_tex_delimiters(&t), s);
         }
         Event::SoftBreak => push(runs, " ".into(), style.clone()),
         Event::HardBreak => push(runs, "\n".into(), style.clone()),
-        Event::Html(t) | Event::InlineHtml(t) => push(runs, t.into_string(), style.clone()),
+        Event::Html(t) | Event::InlineHtml(t) => {
+            push(runs, restore_tex_delimiters(&t), style.clone())
+        }
         Event::TaskListMarker(done) => push(
             runs,
             if done { "[x] ".into() } else { "[ ] ".into() },
@@ -430,8 +746,15 @@ fn merge_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
     let mut out: Vec<InlineRun> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if last.style == run.style => last.text.push_str(&run.text),
+            Some(last) if last.style == run.style && run.style.math.is_none() => {
+                last.text.push_str(&run.text)
+            }
             _ => out.push(run),
+        }
+    }
+    for run in &mut out {
+        if run.style.math.is_none() {
+            run.text = restore_tex_delimiters(&run.text);
         }
     }
     out
@@ -893,6 +1216,45 @@ mod tests {
         p.set_text(corpus);
         assert_eq!(p.display_tree(), *p.tree());
         assert_eq!(p.tree(), &parse_full(corpus));
+    }
+
+    #[test]
+    fn parses_dollar_and_tex_math_delimiters() {
+        let tree =
+            parse_full("Euler: $e^{i\\pi}+1=0$ and \\(x^2\\).\n\n$$\\sum_i i$$\n\n\\[a=b\\]");
+        let math: Vec<_> = tree
+            .blocks
+            .iter()
+            .filter_map(|top| match &top.block {
+                Block::Paragraph { runs } => Some(runs),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|run| run.style.math.map(|kind| (kind, run.text.as_str())))
+            .collect();
+        assert_eq!(
+            math,
+            vec![
+                (MathKind::Inline, "e^{i\\pi}+1=0"),
+                (MathKind::Inline, "x^2"),
+                (MathKind::Display, "\\sum_i i"),
+                (MathKind::Display, "a=b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unclosed_math_and_code_delimiters_stay_literal() {
+        let tree = parse_full("open \\(x and `$y$ \\(z\\)`\n\n```txt\n\\[raw\\]\n```");
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected paragraph");
+        };
+        assert!(runs.iter().all(|run| run.style.math.is_none()));
+        assert_eq!(flat(&tree.blocks[0].block), "open \\(x and $y$ \\(z\\)");
+        let Block::CodeBlock { code, .. } = &tree.blocks[1].block else {
+            panic!("expected code block");
+        };
+        assert_eq!(code, "\\[raw\\]");
     }
 
     #[test]

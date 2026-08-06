@@ -26,7 +26,7 @@ use chrono::Utc;
 use tokio::sync::watch;
 
 use jolt_doc::{DeletedDevice, DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
-use jolt_proto::{Chat, ChatConfig, Device, Session, Space};
+use jolt_proto::{Chat, ChatConfig, Device, Session, Space, ThemeFileRecord};
 use jolt_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
@@ -43,6 +43,8 @@ pub const DEFAULT_ORG_ID: &str = "dev-org";
 pub const DEFAULT_USER_ID: &str = "dev-user";
 /// Presence beat cadence.
 const PRESENCE_INTERVAL_MS: u64 = 15_000;
+const MAX_THEME_FILES: usize = 256;
+const MAX_THEME_FILE_BYTES: usize = 256 * 1024;
 /// A presence heartbeat younger than this marks the device alive (3 missed
 /// beats = offline). Also the "peer is reachable" signal that clears the
 /// peer-dial cooldown.
@@ -128,6 +130,7 @@ struct WorkspaceHostInner {
     devices_tx: watch::Sender<Vec<Device>>,
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
+    themes_tx: watch::Sender<Vec<ThemeFileRecord>>,
     room: Mutex<Option<Arc<RegistryClient>>>,
     /// Bumped on every registry change (local mutation or applied server
     /// frame) — drives republish + the snapshot debounce in `workspace_task`.
@@ -241,6 +244,7 @@ impl WorkspaceHost {
         let (devices_tx, _) = watch::channel(state.devices);
         let (sessions_tx, _) = watch::channel(state.sessions);
         let (spaces_tx, _) = watch::channel(state.spaces);
+        let (themes_tx, _) = watch::channel(doc.read_themes()?);
         let (changed_tx, changed_rx) = watch::channel(0u64);
 
         let host = Self {
@@ -252,6 +256,7 @@ impl WorkspaceHost {
                 devices_tx,
                 sessions_tx,
                 spaces_tx,
+                themes_tx,
                 room: Mutex::new(None),
                 changed_tx,
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
@@ -451,6 +456,97 @@ impl WorkspaceHost {
         self.inner.spaces_tx.subscribe()
     }
 
+    pub fn watch_themes(&self) -> watch::Receiver<Vec<ThemeFileRecord>> {
+        self.inner.themes_tx.subscribe()
+    }
+
+    fn ensure_theme_sync_ready(&self) -> Result<(), EngineError> {
+        if self.inner.config.edge.is_some() && !self.connected() {
+            return Err(EngineError::Other(
+                "account registry is not connected".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn read_themes(&self) -> Result<Vec<ThemeFileRecord>, EngineError> {
+        self.ensure_theme_sync_ready()?;
+        Ok(self.read(|doc| doc.read_themes())?)
+    }
+
+    pub fn upsert_themes(&self, themes: &[ThemeFileRecord]) -> Result<(), EngineError> {
+        self.ensure_theme_sync_ready()?;
+        if themes.len() > MAX_THEME_FILES
+            || themes.iter().any(|theme| {
+                uuid::Uuid::parse_str(&theme.id).is_err()
+                    || theme.contents.len() > MAX_THEME_FILE_BYTES
+                    || (!theme.deleted && theme_revision(&theme.contents) != Some(theme.revision))
+                    || (theme.deleted && !theme.contents.is_empty())
+            })
+        {
+            return Err(EngineError::Other(
+                "invalid custom theme sync payload".into(),
+            ));
+        }
+        self.mutate(|doc| -> Result<(), EngineError> {
+            let existing = doc.read_themes()?;
+            let current: std::collections::HashMap<_, _> = existing
+                .iter()
+                .map(|theme| (theme.id.as_str(), theme.revision))
+                .collect();
+            let accepted: Vec<_> = themes
+                .iter()
+                .filter(|theme| {
+                    current
+                        .get(theme.id.as_str())
+                        .is_none_or(|revision| theme.revision > *revision)
+                })
+                .collect();
+            let mut live: std::collections::HashSet<_> = existing
+                .iter()
+                .filter(|theme| !theme.deleted)
+                .map(|theme| theme.id.as_str())
+                .collect();
+            for theme in &accepted {
+                if theme.deleted {
+                    live.remove(theme.id.as_str());
+                } else {
+                    live.insert(theme.id.as_str());
+                }
+            }
+            if live.len() > MAX_THEME_FILES {
+                return Err(EngineError::Other("too many custom themes".into()));
+            }
+            for theme in accepted {
+                doc.upsert_theme(theme);
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn delete_theme(&self, id: &str) -> Result<(), EngineError> {
+        self.ensure_theme_sync_ready()?;
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Err(EngineError::Other("invalid custom theme id".into()));
+        }
+        self.mutate(|doc| {
+            let revision = doc
+                .read_themes()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|theme| theme.id == id)
+                .map_or(1, |theme| theme.revision.saturating_add(1));
+            doc.upsert_theme(&ThemeFileRecord {
+                id: id.to_string(),
+                revision,
+                deleted: true,
+                contents: String::new(),
+            });
+        });
+        Ok(())
+    }
+
     /// WatchSessions source: remote devices' rows from the registry merged with
     /// this engine's live status watch (the local view is fresher for our own runs).
     pub fn merged_sessions_watch(
@@ -530,6 +626,7 @@ impl WorkspaceHost {
                 harness_session_cwd: None,
                 space_id,
                 last_seen_at: None,
+                goal: None,
             })
         })?;
         Ok(())
@@ -616,6 +713,44 @@ impl WorkspaceHost {
         }
     }
 
+    pub fn set_chat_goal(
+        &self,
+        chat_id: &str,
+        goal: Option<&jolt_proto::Goal>,
+    ) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_goal(chat_id, goal))?)
+    }
+
+    pub fn chat_goal(&self, chat_id: &str) -> Option<jolt_proto::Goal> {
+        self.read(|doc| doc.chat(chat_id))
+            .ok()
+            .flatten()
+            .and_then(|chat| chat.goal)
+    }
+
+    /// A process restart must never silently resume an expensive autonomous loop.
+    /// Only pause goals hosted by this device; another host may still be running.
+    pub fn pause_active_goals_after_restart(&self) -> Result<usize, EngineError> {
+        let goals: Vec<_> = self
+            .read_chats()?
+            .into_iter()
+            .filter(|chat| self.is_host(&chat.id))
+            .filter_map(|chat| {
+                let goal = chat.goal?;
+                (goal.status == jolt_proto::GoalStatus::Active).then_some((chat.id, goal))
+            })
+            .collect();
+        let count = goals.len();
+        for (chat_id, mut goal) in goals {
+            goal.revision = goal.revision.saturating_add(1);
+            goal.status = jolt_proto::GoalStatus::Paused;
+            goal.status_message = Some("Paused after Jolt restarted".into());
+            goal.updated_at_ms = now_ms();
+            self.set_chat_goal(&chat_id, Some(&goal))?;
+        }
+        Ok(count)
+    }
+
     /// Session-status row upsert (sessions engine transitions land here too, in
     /// addition to the local watch channel).
     pub fn record_session(&self, session: &Session) {
@@ -659,6 +794,7 @@ impl WorkspaceHost {
                 harness_session_cwd: None,
                 space_id: Some(space.id.clone()),
                 last_seen_at: None,
+                goal: None,
             })
         })?;
         Ok(())
@@ -854,7 +990,8 @@ impl WorkspaceHostInner {
     }
 
     fn publish(&self) {
-        match lock(&self.reg).read_all() {
+        let state = { lock(&self.reg).read_all() };
+        match state {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
                 // send_replace, NOT send: `watch::Sender::send` drops the value when
@@ -864,6 +1001,12 @@ impl WorkspaceHostInner {
                 self.devices_tx.send_replace(state.devices);
                 self.sessions_tx.send_replace(state.sessions);
                 self.spaces_tx.send_replace(state.spaces);
+                match lock(&self.reg).read_themes() {
+                    Ok(themes) => {
+                        self.themes_tx.send_replace(themes);
+                    }
+                    Err(err) => tracing::warn!(error = %err, "theme registry read failed"),
+                }
             }
             Err(err) => {
                 tracing::warn!(error = %err, "registry read failed");
@@ -994,6 +1137,13 @@ impl WorkspaceHostInner {
             room.set_presence(now_ms());
         }
     }
+}
+
+fn theme_revision(contents: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(contents)
+        .ok()?
+        .get("revision")?
+        .as_u64()
 }
 
 /// Local live statuses win for this device's chats; every other device's rows come

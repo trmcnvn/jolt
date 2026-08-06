@@ -75,9 +75,13 @@ The composer persists a concrete model, reasoning level, and harness-specific op
 
 A non-empty composer during a live steerable run sends a durable `steer` command. The host routes it into the active harness mailbox at the harness's supported boundary. If no live run can accept it, the engine can turn it into the next turn rather than discarding user intent.
 
+Cmd+Enter on macOS (Ctrl+Enter elsewhere) instead adds a distinct turn to Jolt's engine-owned queue. Queued turns stay outside the transcript until dispatched, drain together in FIFO order at the next clean turn boundary, and can be cancelled while pending. An interruption or error pauses the queue so it cannot restart work unexpectedly; the composer can resume it explicitly. Because dispatch happens between turns, this behavior is identical across Claude Code, Codex, and Pi.
+
 The harness-native session ID is updated after successful runs. Resume is scoped to the working directory where the CLI conversation was created.
 
 When compaction finishes, Jolt arms a hidden continuation. Any subsequent user or agent message cancels it; if the harness instead settles without resuming, Jolt sends the continuation into the same live session. This guard uses the normalized compaction lifecycle and therefore applies equally to Claude Code, Codex, and Pi.
+
+Jolt goals use the same harness-neutral layer. The engine prepends an active-goal contract without adding it to the visible user message, accounts normalized usage, removes the model's trailing goal-control envelope from the transcript, and schedules hidden continuation turns until the goal completes, blocks, pauses, errors, or reaches its budget. No harness-specific goal command or extension is required. Jolt pauses locally hosted active goals after an engine restart rather than silently restarting autonomous work.
 
 ## Harness secrets
 

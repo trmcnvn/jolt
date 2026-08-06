@@ -35,6 +35,7 @@ mod simd_base64;
 pub mod state;
 pub mod terminal;
 pub mod theme;
+pub mod themes;
 pub mod toast;
 pub mod transcript;
 
@@ -149,6 +150,8 @@ pub fn run_app(config: UiConfig) {
         toast::init(ui_settings.system_notifications_enabled, cx);
         appearance::init(
             ui_settings.appearance,
+            &ui_settings.light_theme,
+            &ui_settings.dark_theme,
             &ui_settings.ui_font,
             &ui_settings.prompt_font,
             &ui_settings.code_font,

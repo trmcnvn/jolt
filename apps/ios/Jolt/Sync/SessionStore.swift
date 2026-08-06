@@ -426,6 +426,65 @@ final class SessionStore {
         queueCommand(kind: "interrupt", payload: ["kind": "interrupt"])
     }
 
+    func createGoal(objective: String, tokenBudget: UInt64?) {
+        var operation: [String: Any] = [
+            "action": "create",
+            "objective": objective,
+        ]
+        if let tokenBudget {
+            operation["tokenBudget"] = tokenBudget
+        } else {
+            operation["tokenBudget"] = NSNull()
+        }
+        sendGoal(operation)
+    }
+
+    func editGoal(_ goal: Goal, objective: String, tokenBudget: UInt64?) {
+        var operation: [String: Any] = [
+            "action": "edit",
+            "goalId": goal.id,
+            "expectedRevision": goal.revision,
+            "objective": objective,
+        ]
+        if let tokenBudget {
+            operation["tokenBudget"] = tokenBudget
+        } else {
+            operation["tokenBudget"] = NSNull()
+        }
+        sendGoal(operation)
+    }
+
+    func pauseGoal(_ goal: Goal) {
+        sendGoal([
+            "action": "pause",
+            "goalId": goal.id,
+            "expectedRevision": goal.revision,
+        ])
+    }
+
+    func resumeGoal(_ goal: Goal) {
+        sendGoal([
+            "action": "resume",
+            "goalId": goal.id,
+            "expectedRevision": goal.revision,
+        ])
+    }
+
+    func clearGoal(_ goal: Goal) {
+        sendGoal([
+            "action": "clear",
+            "goalId": goal.id,
+            "expectedRevision": goal.revision,
+        ])
+    }
+
+    private func sendGoal(_ operation: [String: Any]) {
+        queueCommand(kind: "goal", payload: [
+            "kind": "goal",
+            "operation": operation,
+        ])
+    }
+
     func respondInput(requestId: String, answers: [UserInputAnswer]) {
         queueCommand(kind: "respondInput", payload: [
             "kind": "respondInput",

@@ -30,6 +30,7 @@ use crate::theme::{
     MAX_INTERFACE_FONT_SIZE, MAX_PROMPT_FONT_SIZE, MAX_TERMINAL_FONT_SIZE, MIN_CODE_FONT_SIZE,
     MIN_INTERFACE_FONT_SIZE, MIN_PROMPT_FONT_SIZE, MIN_TERMINAL_FONT_SIZE, Theme,
 };
+use crate::themes::{EditableTheme, JOLT_THEME_ID, ThemeCatalog, ThemeSummary};
 
 /// The user's appearance preference. Persisted in `ui-settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -63,6 +64,11 @@ impl AppearanceMode {
 pub struct AppearanceState {
     pub mode: AppearanceMode,
     pub system: Appearance,
+    pub light_theme: String,
+    pub dark_theme: String,
+    pub catalog: ThemeCatalog,
+    preview: Option<Theme>,
+    preview_revision: u64,
     pub ui_font: SharedString,
     pub prompt_font: SharedString,
     pub code_font: SharedString,
@@ -115,11 +121,23 @@ pub fn resolve(mode: AppearanceMode, system: Appearance) -> Appearance {
     }
 }
 
+fn selected_or_jolt(id: &str, catalog: &ThemeCatalog) -> String {
+    let resolved = catalog.resolve(id, Appearance::Light);
+    if resolved.palette_id.as_ref() == id {
+        id.to_string()
+    } else {
+        JOLT_THEME_ID.to_string()
+    }
+}
+
 /// Install the appearance globals and the matching theme. Call once at boot,
 /// before any window opens, so the first frame is already the right palette
 /// (installing later produces a visible dark-to-light flash).
+#[allow(clippy::too_many_arguments)] // one-time app bootstrap seam
 pub fn init(
     mode: AppearanceMode,
+    light_theme: impl AsRef<str>,
+    dark_theme: impl AsRef<str>,
     ui_font: impl AsRef<str>,
     prompt_font: impl AsRef<str>,
     code_font: impl AsRef<str>,
@@ -129,25 +147,40 @@ pub fn init(
     cx: &mut App,
 ) {
     let system = Appearance::from_window(cx.window_appearance());
+    let data_dir = data_dir.into();
+    let catalog = ThemeCatalog::load(&data_dir);
+    let light_theme = selected_or_jolt(light_theme.as_ref(), &catalog);
+    let dark_theme = selected_or_jolt(dark_theme.as_ref(), &catalog);
     let available = cx.text_system().all_font_names();
     let ui_font = resolve_font_family(ui_font.as_ref(), DEFAULT_UI_FONT, &available);
     let prompt_font = resolve_font_family(prompt_font.as_ref(), DEFAULT_UI_FONT, &available);
     let code_font = resolve_font_family(code_font.as_ref(), DEFAULT_CODE_FONT, &available);
     let terminal_font = resolve_font_family(terminal_font.as_ref(), DEFAULT_CODE_FONT, &available);
     tracing::debug!(?mode, ?system, "appearance: initial");
+    let appearance = resolve(mode, system);
+    let palette_id = match appearance {
+        Appearance::Light => &light_theme,
+        Appearance::Dark => &dark_theme,
+    };
+    let theme = catalog.resolve(palette_id, appearance);
     cx.set_global(AppearanceState {
         mode,
         system,
+        light_theme,
+        dark_theme,
+        catalog,
+        preview: None,
+        preview_revision: 0,
         ui_font: ui_font.clone().into(),
         prompt_font: prompt_font.clone().into(),
         code_font: code_font.clone().into(),
         terminal_font: terminal_font.clone().into(),
         font_sizes: font_sizes.clamped(),
-        data_dir: data_dir.into(),
+        data_dir,
     });
     sync_ns_appearance(mode);
-    Theme::install_with_fonts(
-        resolve(mode, system),
+    Theme::install_resolved_with_fonts(
+        theme,
         ui_font,
         prompt_font,
         code_font,
@@ -162,6 +195,174 @@ pub fn mode(cx: &App) -> AppearanceMode {
     cx.try_global::<AppearanceState>()
         .map(|s| s.mode)
         .unwrap_or_default()
+}
+
+/// Selected light and dark theme-family ids.
+pub fn theme_ids(cx: &App) -> (String, String) {
+    cx.try_global::<AppearanceState>()
+        .map(|state| (state.light_theme.clone(), state.dark_theme.clone()))
+        .unwrap_or_else(|| (JOLT_THEME_ID.into(), JOLT_THEME_ID.into()))
+}
+
+/// Reload installation-level theme files, including files delivered by an
+/// external/background sync process while Jolt was already running.
+pub fn reload_theme_files(cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let state = cx.global_mut::<AppearanceState>();
+    state.catalog = ThemeCatalog::load(&state.data_dir);
+    if state
+        .catalog
+        .resolve(&state.light_theme, Appearance::Light)
+        .palette_id
+        .as_ref()
+        != state.light_theme
+    {
+        state.light_theme = JOLT_THEME_ID.into();
+    }
+    if state
+        .catalog
+        .resolve(&state.dark_theme, Appearance::Dark)
+        .palette_id
+        .as_ref()
+        != state.dark_theme
+    {
+        state.dark_theme = JOLT_THEME_ID.into();
+    }
+    state.preview = None;
+    apply(cx);
+}
+
+/// Built-in and on-disk custom themes available to the settings UI.
+pub fn themes(cx: &App) -> Vec<ThemeSummary> {
+    cx.try_global::<AppearanceState>()
+        .map(|state| state.catalog.summaries())
+        .unwrap_or_else(|| ThemeCatalog::default().summaries())
+}
+
+/// Resolve a theme family without installing it, for cards and editor previews.
+pub fn theme_for(id: &str, appearance: Appearance, cx: &App) -> Theme {
+    cx.try_global::<AppearanceState>()
+        .map(|state| state.catalog.resolve(id, appearance))
+        .unwrap_or_else(|| Theme::for_appearance(appearance))
+}
+
+/// Select one family for one appearance.
+pub fn set_theme(appearance: Appearance, id: &str, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let state = cx.global_mut::<AppearanceState>();
+    let resolved = state.catalog.resolve(id, appearance);
+    if resolved.palette_id.as_ref() != id {
+        return;
+    }
+    let selected = match appearance {
+        Appearance::Light => &mut state.light_theme,
+        Appearance::Dark => &mut state.dark_theme,
+    };
+    if selected == id {
+        return;
+    }
+    *selected = id.to_string();
+    state.preview = None;
+    apply(cx);
+    persist_current(cx);
+}
+
+/// Select a paired family for both appearances.
+pub fn set_theme_pair(id: &str, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let state = cx.global_mut::<AppearanceState>();
+    if state
+        .catalog
+        .resolve(id, Appearance::Light)
+        .palette_id
+        .as_ref()
+        != id
+        || state
+            .catalog
+            .resolve(id, Appearance::Dark)
+            .palette_id
+            .as_ref()
+            != id
+    {
+        return;
+    }
+    if state.light_theme == id && state.dark_theme == id {
+        return;
+    }
+    state.light_theme = id.to_string();
+    state.dark_theme = id.to_string();
+    state.preview = None;
+    apply(cx);
+    persist_current(cx);
+}
+
+pub fn editable_theme(id: &str, cx: &App) -> EditableTheme {
+    cx.try_global::<AppearanceState>()
+        .map(|state| state.catalog.editable(id))
+        .unwrap_or_else(|| ThemeCatalog::default().editable(JOLT_THEME_ID))
+}
+
+/// Install an editor draft without changing persisted selections.
+pub fn preview_theme(mut theme: Theme, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let state = cx.global_mut::<AppearanceState>();
+    state.preview_revision = state.preview_revision.wrapping_add(1);
+    theme.palette_id = "theme-editor-preview".into();
+    theme.palette_revision = state.preview_revision;
+    state.preview = Some(theme);
+    apply(cx);
+}
+
+pub fn clear_theme_preview(cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let state = cx.global_mut::<AppearanceState>();
+    if state.preview.take().is_some() {
+        apply(cx);
+    }
+}
+
+/// Persist a paired custom theme and select it for both appearances.
+pub fn save_custom_theme(draft: &EditableTheme, cx: &mut App) -> std::io::Result<String> {
+    let state = cx.global_mut::<AppearanceState>();
+    let data_dir = state.data_dir.clone();
+    let is_new = draft.id.is_none();
+    let id = state.catalog.save(draft, &data_dir)?;
+    if is_new {
+        state.light_theme = id.clone();
+        state.dark_theme = id.clone();
+    }
+    state.preview = None;
+    apply(cx);
+    persist_current(cx);
+    Ok(id)
+}
+
+pub fn delete_custom_theme(id: &str, cx: &mut App) -> std::io::Result<bool> {
+    let state = cx.global_mut::<AppearanceState>();
+    let data_dir = state.data_dir.clone();
+    let deleted = state.catalog.delete(id, &data_dir)?;
+    if deleted {
+        if state.light_theme == id {
+            state.light_theme = JOLT_THEME_ID.into();
+        }
+        if state.dark_theme == id {
+            state.dark_theme = JOLT_THEME_ID.into();
+        }
+        state.preview = None;
+        apply(cx);
+        persist_current(cx);
+    }
+    Ok(deleted)
 }
 
 /// The effective UI, prompt, code, and terminal font families.
@@ -203,22 +404,8 @@ pub fn set_mode(mode: AppearanceMode, cx: &mut App) {
         return;
     }
     state.mode = mode;
-    let data_dir = state.data_dir.clone();
-    let ui_font = state.ui_font.clone();
-    let prompt_font = state.prompt_font.clone();
-    let code_font = state.code_font.clone();
-    let terminal_font = state.terminal_font.clone();
-    let font_sizes = state.font_sizes;
     apply(cx);
-    persist(
-        mode,
-        &ui_font,
-        &prompt_font,
-        &code_font,
-        &terminal_font,
-        font_sizes,
-        &data_dir,
-    );
+    persist_current(cx);
 }
 
 /// Change one font family, immediately re-lay out every window, and persist it.
@@ -243,23 +430,8 @@ pub fn set_font(role: FontRole, family: impl AsRef<str>, cx: &mut App) {
         return;
     }
     *target = family.into();
-    let mode = state.mode;
-    let ui_font = state.ui_font.clone();
-    let prompt_font = state.prompt_font.clone();
-    let code_font = state.code_font.clone();
-    let terminal_font = state.terminal_font.clone();
-    let font_sizes = state.font_sizes;
-    let data_dir = state.data_dir.clone();
     apply(cx);
-    persist(
-        mode,
-        &ui_font,
-        &prompt_font,
-        &code_font,
-        &terminal_font,
-        font_sizes,
-        &data_dir,
-    );
+    persist_current(cx);
 }
 
 /// Change one font size, immediately re-lay out every window, and persist it.
@@ -279,23 +451,8 @@ pub fn set_font_size(role: FontSizeRole, size: u8, cx: &mut App) {
         return;
     }
     *target = size;
-    let mode = state.mode;
-    let ui_font = state.ui_font.clone();
-    let prompt_font = state.prompt_font.clone();
-    let code_font = state.code_font.clone();
-    let terminal_font = state.terminal_font.clone();
-    let font_sizes = state.font_sizes;
-    let data_dir = state.data_dir.clone();
     apply(cx);
-    persist(
-        mode,
-        &ui_font,
-        &prompt_font,
-        &code_font,
-        &terminal_font,
-        font_sizes,
-        &data_dir,
-    );
+    persist_current(cx);
 }
 
 /// Resolve a persisted family against the current machine's catalogue. Family
@@ -320,8 +477,28 @@ pub fn resolve_font_family(requested: &str, fallback: &str, available: &[String]
 /// shell holds its own `UiSettings` and saves it debounced, so writing a stale
 /// snapshot from here would silently roll back a pane resize the user made
 /// seconds earlier. Reloading keeps this to the fields appearance owns.
+fn persist_current(cx: &App) {
+    let Some(state) = cx.try_global::<AppearanceState>() else {
+        return;
+    };
+    persist(
+        state.mode,
+        &state.light_theme,
+        &state.dark_theme,
+        &state.ui_font,
+        &state.prompt_font,
+        &state.code_font,
+        &state.terminal_font,
+        state.font_sizes,
+        &state.data_dir,
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors the appearance-owned settings snapshot
 fn persist(
     mode: AppearanceMode,
+    light_theme: &str,
+    dark_theme: &str,
     ui_font: &str,
     prompt_font: &str,
     code_font: &str,
@@ -331,6 +508,8 @@ fn persist(
 ) {
     let mut settings = UiSettings::load(data_dir);
     settings.appearance = mode;
+    settings.light_theme = light_theme.to_string();
+    settings.dark_theme = dark_theme.to_string();
     settings.ui_font = ui_font.to_string();
     settings.prompt_font = prompt_font.to_string();
     settings.code_font = code_font.to_string();
@@ -386,24 +565,42 @@ pub fn apply(cx: &mut App) {
     let Some(state) = cx.try_global::<AppearanceState>() else {
         return;
     };
-    sync_ns_appearance(state.mode);
-    let wanted = resolve(state.mode, state.system);
+    let appearance = resolve(state.mode, state.system);
+    let wanted = state.preview.clone().unwrap_or_else(|| {
+        let id = match appearance {
+            Appearance::Light => &state.light_theme,
+            Appearance::Dark => &state.dark_theme,
+        };
+        state.catalog.resolve(id, appearance)
+    });
+    let native_mode = if state.preview.is_some() {
+        if wanted.appearance.is_light() {
+            AppearanceMode::Light
+        } else {
+            AppearanceMode::Dark
+        }
+    } else {
+        state.mode
+    };
+    sync_ns_appearance(native_mode);
     let ui_font = state.ui_font.clone();
     let prompt_font = state.prompt_font.clone();
     let code_font = state.code_font.clone();
     let terminal_font = state.terminal_font.clone();
     let font_sizes = state.font_sizes;
-    let changed = !cx.try_global::<Theme>().is_some_and(|t| {
-        t.appearance == wanted
-            && t.font_sans == ui_font
-            && t.font_prompt == prompt_font
-            && t.font_mono == code_font
-            && t.font_terminal == terminal_font
-            && t.font_sizes == font_sizes
+    let changed = !cx.try_global::<Theme>().is_some_and(|theme| {
+        theme.palette_id == wanted.palette_id
+            && theme.palette_revision == wanted.palette_revision
+            && theme.appearance == wanted.appearance
+            && theme.font_sans == ui_font
+            && theme.font_prompt == prompt_font
+            && theme.font_mono == code_font
+            && theme.font_terminal == terminal_font
+            && theme.font_sizes == font_sizes
     });
     if changed {
-        tracing::debug!(?wanted, %ui_font, %prompt_font, %code_font, %terminal_font, "appearance: installing theme");
-        Theme::install_with_fonts(
+        tracing::debug!(appearance = ?wanted.appearance, palette = %wanted.palette_id, %ui_font, %prompt_font, %code_font, %terminal_font, "appearance: installing theme");
+        Theme::install_resolved_with_fonts(
             wanted,
             ui_font,
             prompt_font,

@@ -28,11 +28,14 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use jolt_doc::{
-    SessionMessageEntry, TranscriptDesync, TranscriptFrame, TranscriptManifest, TranscriptPage,
-    TranscriptWatchFrame,
+    QueuedPrompt, SessionMessageEntry, TranscriptDesync, TranscriptFrame, TranscriptManifest,
+    TranscriptPage, TranscriptWatchFrame,
 };
 use jolt_engine::{Engine, EngineConfig, EngineSupervisor, ScopeKind, ScopeStatus};
-use jolt_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space, UsageSummary};
+use jolt_proto::{
+    AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space, ThemeFileRecord,
+    UsageSummary,
+};
 use jolt_rpc::{RpcClient, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
@@ -300,6 +303,8 @@ pub struct AppState {
     /// Latest queued send per chat, overlaid as Working until the host writes
     /// the matching message into the transcript.
     pending_sends: HashMap<String, PendingSend>,
+    /// Engine-owned turns waiting behind the selected chat's current run.
+    pub queued_prompts: Vec<QueuedPrompt>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -314,7 +319,9 @@ pub struct AppState {
     /// Auth, update, and scope watches survive runtime switches.
     global_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
+    queue_task: Option<Task<()>>,
     usage_task: Option<Task<()>>,
+    theme_sync_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -344,6 +351,7 @@ impl AppState {
             transcript_sequence: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
+            queued_prompts: Vec::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
@@ -351,7 +359,9 @@ impl AppState {
             watch_tasks: Vec::new(),
             global_tasks: Vec::new(),
             transcript_task: None,
+            queue_task: None,
             usage_task: None,
+            theme_sync_task: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -371,6 +381,8 @@ impl AppState {
             self.selected_chat = None;
             self.clear_transcript_projection();
             self.transcript_task = None;
+            self.queued_prompts.clear();
+            self.queue_task = None;
             self.selected_usage = None;
             self.usage_task = None;
         }
@@ -892,6 +904,7 @@ impl AppState {
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
         self.engine = Some(handle.clone());
         self.restart_scope_watches(handle.clone(), cx);
+        self.restart_theme_sync(handle.clone(), cx);
         self.global_tasks = vec![
             spawn_auth_watch(cx, handle.clone()),
             spawn_scope_watch(cx, handle.clone()),
@@ -902,7 +915,7 @@ impl AppState {
                 AppState::apply_update,
             ),
         ];
-        // Re-subscribe the transcript if a chat was already selected (reconnect path).
+        // Re-subscribe selected-chat projections after reconnect.
         if let Some(chat_id) = self.selected_chat.clone() {
             let target_device_id = self
                 .chats
@@ -911,9 +924,17 @@ impl AppState {
                 .map(|chat| chat.device_id.clone());
             self.transcript_task =
                 Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.queue_task = Some(spawn_queue_watch(cx, handle.clone(), chat_id.clone()));
             self.usage_task = Some(spawn_usage_watch(cx, handle, chat_id, target_device_id));
         }
         cx.notify();
+    }
+
+    fn restart_theme_sync(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        let Some(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.theme_sync_task = Some(spawn_theme_file_sync(cx, handle, data_dir));
     }
 
     fn restart_scope_watches(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
@@ -926,6 +947,8 @@ impl AppState {
         self.selected_usage = None;
         self.clear_transcript_projection();
         self.transcript_task = None;
+        self.queued_prompts.clear();
+        self.queue_task = None;
         self.usage_task = None;
         self.local_device_id = None;
         self.chats_synced = false;
@@ -971,6 +994,8 @@ impl AppState {
         self.auto_selected = true;
         self.clear_transcript_projection();
         self.transcript_task = None;
+        self.queued_prompts.clear();
+        self.queue_task = None;
         self.selected_usage = None;
         self.usage_task = None;
         if let Some(id) = chat_id.as_deref() {
@@ -994,6 +1019,7 @@ impl AppState {
                 .map(|chat| chat.device_id.clone());
             self.transcript_task =
                 Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.queue_task = Some(spawn_queue_watch(cx, handle.clone(), chat_id.clone()));
             self.usage_task = Some(spawn_usage_watch(cx, handle, chat_id, target_device_id));
         }
         cx.notify();
@@ -1048,6 +1074,131 @@ impl AppState {
         })
         .detach();
     }
+}
+
+/// Reconcile installation-level theme files with the signed-in account
+/// registry. The task intentionally survives Local/Account viewport switches;
+/// the supervisor routes these methods to the account runtime directly.
+fn spawn_theme_file_sync(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    data_dir: PathBuf,
+) -> Task<()> {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    cx.spawn(async move |this, cx| {
+        let mut known = Vec::<ThemeFileRecord>::new();
+        loop {
+            let local = match crate::themes::local_theme_records(&data_dir) {
+                Ok(records) => records,
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not read local theme files for sync");
+                    cx.background_executor().timer(INTERVAL).await;
+                    continue;
+                }
+            };
+            let local_map: std::collections::BTreeMap<_, _> = local
+                .iter()
+                .map(|record| (record.id.clone(), record.contents.clone()))
+                .collect();
+            let initial_remote = match handle
+                .client()
+                .call(methods::LIST_THEMES, serde_json::json!({}))
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<ThemeFileRecord>>(value)
+                        .map_err(|err| jolt_rpc::RpcError::Failed(err.to_string()))
+                }) {
+                Ok(records) => records,
+                Err(err) => {
+                    tracing::debug!(error = %err, "theme sync unavailable; retrying");
+                    cx.background_executor().timer(INTERVAL).await;
+                    continue;
+                }
+            };
+
+            let plan = match crate::themes::plan_theme_file_sync(&local, &initial_remote, &known) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not reconcile conflicting theme files");
+                    cx.background_executor().timer(INTERVAL).await;
+                    continue;
+                }
+            };
+            let mut mutated = false;
+            if !plan.upserts.is_empty() {
+                if let Err(err) = handle
+                    .client()
+                    .call(
+                        methods::UPSERT_THEMES,
+                        serde_json::json!({ "themes": &plan.upserts }),
+                    )
+                    .await
+                {
+                    tracing::debug!(error = %err, "theme upload interrupted; retrying");
+                    cx.background_executor().timer(INTERVAL).await;
+                    continue;
+                }
+                known = plan.project_upserts_onto(&initial_remote);
+                mutated = true;
+            }
+            let mut deletion_failed = false;
+            for id in &plan.deletes {
+                if let Err(err) = handle
+                    .client()
+                    .call(methods::DELETE_THEME, serde_json::json!({ "id": id }))
+                    .await
+                {
+                    tracing::debug!(error = %err, "theme deletion interrupted; retrying");
+                    deletion_failed = true;
+                    break;
+                }
+                mutated = true;
+            }
+            if deletion_failed {
+                cx.background_executor().timer(INTERVAL).await;
+                continue;
+            }
+            if mutated {
+                known = plan.project_onto(&initial_remote);
+            }
+            let remote = if mutated {
+                let Ok(value) = handle
+                    .client()
+                    .call(methods::LIST_THEMES, serde_json::json!({}))
+                    .await
+                else {
+                    cx.background_executor().timer(INTERVAL).await;
+                    continue;
+                };
+                let Ok(records) = serde_json::from_value(value) else {
+                    tracing::warn!("dropping malformed theme list response");
+                    cx.background_executor().timer(INTERVAL).await;
+                    continue;
+                };
+                records
+            } else {
+                initial_remote
+            };
+            let remote_map: std::collections::BTreeMap<_, _> = remote
+                .iter()
+                .filter(|record| !record.deleted)
+                .map(|record| (record.id.clone(), record.contents.clone()))
+                .collect();
+            if remote_map != local_map {
+                match crate::themes::install_synced_theme_files(&remote, &data_dir) {
+                    Ok(()) => {
+                        this.update(cx, |_, cx| crate::appearance::reload_theme_files(cx))
+                            .ok();
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping invalid synced theme frame");
+                    }
+                }
+            }
+            known = remote;
+            cx.background_executor().timer(INTERVAL).await;
+        }
+    })
 }
 
 /// Chats watch. Boot selection belongs to the shell because restored tabs are
@@ -1264,6 +1415,55 @@ fn spawn_usage_watch(
                     .update(cx, |state, cx| {
                         if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
                             state.selected_usage = Some(usage);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
+fn spawn_queue_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    chat_id: String,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_QUEUED_PROMPTS, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(error) => {
+                    tracing::warn!(%chat_id, %error, "queue watch failed; retrying");
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let prompts: Vec<QueuedPrompt> = match serde_json::from_value(value) {
+                    Ok(prompts) => prompts,
+                    Err(error) => {
+                        tracing::warn!(%chat_id, %error, "malformed queue frame");
+                        break;
+                    }
+                };
+                if this
+                    .update(cx, |state, cx| {
+                        if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                            state.queued_prompts = prompts;
                             cx.notify();
                         }
                     })
@@ -1622,6 +1822,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            goal: None,
         }
     }
 

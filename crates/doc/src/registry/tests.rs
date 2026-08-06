@@ -4,7 +4,7 @@
 //! tested, not asserted.
 
 use super::*;
-use jolt_proto::{HarnessId, SandboxLevel, SessionStatus};
+use jolt_proto::{Goal, GoalStatus, HarnessId, SandboxLevel, SessionStatus};
 
 fn ts(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
@@ -271,6 +271,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         harness_session_cwd: None,
         space_id: None,
         last_seen_at: None,
+        goal: None,
     }
 }
 
@@ -382,12 +383,30 @@ fn field_mutators_round_trip() {
     assert!(!ws.rename_chat("nope", "x").unwrap());
     assert!(!ws.set_chat_archived("nope", true).unwrap());
     assert!(!ws.rename_device("nope", "x").unwrap());
+    let goal = Goal {
+        id: "goal-1".into(),
+        revision: 1,
+        control_nonce: "nonce-1".into(),
+        objective: "finish it".into(),
+        status: GoalStatus::Active,
+        status_message: None,
+        token_budget: Some(10_000),
+        tokens_used: 500,
+        elapsed_active_ms: 1_000,
+        turns: 2,
+        blocker_key: None,
+        blocker_streak: 0,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+    };
+    assert!(ws.set_chat_goal("chat-1", Some(&goal)).unwrap());
 
     let chat = ws.chat("chat-1").unwrap().unwrap();
     assert_eq!(chat.title.as_deref(), Some("Renamed"));
     assert!(chat.archived);
     assert_eq!(chat.last_message_preview.as_deref(), Some("preview text"));
     assert_eq!(chat.last_message_at, Some(ts(5_000)));
+    assert_eq!(chat.goal, Some(goal));
     let dev = &ws.read_devices().unwrap()[0];
     assert_eq!(dev.name, "workstation");
     assert_eq!(dev.last_seen_at, Some(ts(6_000)));
@@ -659,6 +678,33 @@ fn state_frames_delta_replace_and_reseed() {
     assert_eq!(outcome, StateOutcome::Reseeded);
     assert!(fresh.pending_len() > 0);
     assert_eq!(fresh.read_chats().unwrap().len(), 1);
+}
+
+#[test]
+fn theme_files_sync_and_delete_as_registry_rows() {
+    let mut a = RegistryDoc::new("dev-a");
+    let mut b = RegistryDoc::new("dev-b");
+    a.upsert_theme(&jolt_proto::ThemeFileRecord {
+        id: "theme-1".into(),
+        revision: 1,
+        deleted: false,
+        contents: r#"{"revision":1}"#.into(),
+    });
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(a.read_themes().unwrap(), b.read_themes().unwrap());
+    assert_eq!(b.read_themes().unwrap()[0].id, "theme-1");
+
+    b.upsert_theme(&jolt_proto::ThemeFileRecord {
+        id: "theme-1".into(),
+        revision: 2,
+        deleted: true,
+        contents: String::new(),
+    });
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert!(a.read_themes().unwrap()[0].deleted);
+    assert!(b.read_themes().unwrap()[0].deleted);
 }
 
 #[test]

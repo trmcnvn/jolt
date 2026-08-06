@@ -105,6 +105,9 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
         "WebSearch" => ToolCall::WebSearch {
             query: str_field(input, "query"),
         },
+        "Agent" | "Task" => ToolCall::SpawnAgent {
+            agent_type: opt_str_field(input, "subagent_type"),
+        },
         "TodoWrite" => ToolCall::Todo {
             items: input
                 .get("todos")
@@ -442,6 +445,16 @@ mod tests {
                 tool: "search".into(),
                 input: Some(json!({"q": "bug"}))
             }
+        );
+        assert_eq!(
+            decode_tool_use("Agent", &json!({"subagent_type": "Explore"})),
+            ToolCall::SpawnAgent {
+                agent_type: Some("Explore".into())
+            }
+        );
+        assert_eq!(
+            decode_tool_use("Task", &json!({"prompt": "investigate"})),
+            ToolCall::SpawnAgent { agent_type: None }
         );
         assert!(matches!(
             decode_tool_use("Mystery", &json!({})),

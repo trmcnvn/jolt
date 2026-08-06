@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use jolt_proto::{Chat, ChatConfig, Device, Session, Space};
+use jolt_proto::{Chat, ChatConfig, Device, Session, Space, ThemeFileRecord};
 
 use crate::schema::DocError;
 use crate::workspace::{DeletedDevice, DeletedSpace, WorkspaceState};
@@ -30,6 +30,7 @@ pub const KIND_DEVICES: &str = "devices";
 pub const KIND_SPACES: &str = "spaces";
 pub const KIND_CHATS: &str = "chats";
 pub const KIND_SESSIONS: &str = "sessions";
+pub const KIND_THEMES: &str = "themes";
 
 /// Snapshot row id in the local `DocsStore` for the persisted registry state.
 pub const REGISTRY_DOC_ID: &str = "registry1";
@@ -644,6 +645,26 @@ impl RegistryDoc {
 
     // ── typed API (the WorkspaceDoc surface) ────────────────────────────────
 
+    pub fn read_themes(&self) -> Result<Vec<ThemeFileRecord>, DocError> {
+        let mut themes = self.read_kind::<ThemeFileRecord>(KIND_THEMES);
+        themes.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(themes)
+    }
+
+    pub fn upsert_theme(&mut self, theme: &ThemeFileRecord) {
+        self.write(
+            KIND_THEMES,
+            &theme.id,
+            OpKind::Upsert,
+            fields([
+                ("id", Value::String(theme.id.clone())),
+                ("revision", json!(theme.revision)),
+                ("deleted", json!(theme.deleted)),
+                ("contents", Value::String(theme.contents.clone())),
+            ]),
+        );
+    }
+
     /// Upsert a full device row (writer discipline: callers pass their OWN device).
     pub fn upsert_device(&mut self, device: &Device) -> Result<(), DocError> {
         let set = fields([
@@ -844,6 +865,10 @@ impl RegistryDoc {
             Some(config) => serde_json::to_value(config)?,
             None => Value::Null,
         };
+        let goal = match &chat.goal {
+            Some(goal) => serde_json::to_value(goal)?,
+            None => Value::Null,
+        };
         let set = fields([
             ("id", json!(chat.id)),
             ("deviceId", json!(chat.device_id)),
@@ -869,9 +894,31 @@ impl RegistryDoc {
             ),
             ("spaceId", opt_str(chat.space_id.as_deref())),
             ("lastSeenAt", opt_ms(chat.last_seen_at)),
+            ("goal", goal),
         ]);
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
         Ok(())
+    }
+
+    pub fn set_chat_goal(
+        &mut self,
+        chat_id: &str,
+        goal: Option<&jolt_proto::Goal>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        let value = goal
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or(Value::Null);
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("goal", value)]),
+        );
+        Ok(true)
     }
 
     /// Synced seen marker (LWW) with a monotonic guard: no write when the
@@ -1155,6 +1202,10 @@ impl RegistryDoc {
                 Some(config) => serde_json::to_value(config)?,
                 None => Value::Null,
             };
+            let goal = match &chat.goal {
+                Some(goal) => serde_json::to_value(goal)?,
+                None => Value::Null,
+            };
             seed(
                 KIND_CHATS,
                 &chat.id,
@@ -1184,6 +1235,7 @@ impl RegistryDoc {
                     ),
                     ("spaceId", opt_str(chat.space_id.as_deref())),
                     ("lastSeenAt", opt_ms(chat.last_seen_at)),
+                    ("goal", goal),
                 ]),
             );
         }

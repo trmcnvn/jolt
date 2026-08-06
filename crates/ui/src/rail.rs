@@ -37,6 +37,19 @@ pub struct RailTick {
     pub reply: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct RailTarget {
+    tick: RailTick,
+    row: usize,
+    unloaded_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailDirection {
+    Previous,
+    Next,
+}
+
 fn user_text(entry: &SessionMessageEntry) -> String {
     let raw = entry
         .parts
@@ -107,6 +120,23 @@ pub fn active_tick(tick_rows: &[usize], top_row: usize) -> Option<usize> {
     match tick_rows.iter().rposition(|&row| row <= top_row) {
         Some(ix) => Some(ix),
         None => Some(0),
+    }
+}
+
+/// Nearest prompt marker in `direction` from the exact viewport-top position.
+/// A marker at the current row counts as previous only after the viewport has
+/// moved into that row; at its exact start, navigation advances past it.
+pub fn adjacent_tick(
+    tick_rows: &[usize],
+    top_row: usize,
+    offset_in_row: f32,
+    direction: RailDirection,
+) -> Option<usize> {
+    match direction {
+        RailDirection::Previous => tick_rows
+            .iter()
+            .rposition(|&row| row < top_row || (row == top_row && offset_in_row > 0.0)),
+        RailDirection::Next => tick_rows.iter().position(|&row| row > top_row),
     }
 }
 
@@ -438,11 +468,10 @@ impl Transcript {
         }));
     }
 
-    /// The rail element — an absolute overlay along the transcript's left edge.
-    pub fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if !self.rail_enabled() {
-            return gpui::Empty.into_any_element();
-        }
+    /// Ordered prompt targets shared by the visual rail and keyboard
+    /// navigation. Manifest turns retain unloaded history by mapping each turn
+    /// to its page placeholder until that page materializes.
+    fn rail_targets(&self, cx: &Context<Self>) -> Vec<RailTarget> {
         let (entries, echoes, manifest) = {
             let state = self.state_entity().read(cx);
             (
@@ -451,62 +480,106 @@ impl Transcript {
                 state.transcript_manifest.clone(),
             )
         };
-        let ticks = manifest.as_ref().map_or_else(
-            || rail_ticks(&entries, &echoes),
+        let mut candidates: Vec<(RailTick, Option<String>)> = manifest.as_ref().map_or_else(
+            || {
+                rail_ticks(&entries, &echoes)
+                    .into_iter()
+                    .map(|tick| (tick, None))
+                    .collect()
+            },
             |manifest| {
-                let mut ticks: Vec<RailTick> = manifest
+                manifest
                     .turns
                     .iter()
-                    .map(|turn| RailTick {
-                        message_id: turn.message_id.clone(),
-                        prompt: turn.prompt_preview.clone(),
-                        reply: turn.reply_preview.clone(),
+                    .map(|turn| {
+                        (
+                            RailTick {
+                                message_id: turn.message_id.clone(),
+                                prompt: turn.prompt_preview.clone(),
+                                reply: turn.reply_preview.clone(),
+                            },
+                            Some(turn.page_id.clone()),
+                        )
                     })
-                    .collect();
-                for echo in &echoes {
-                    if echo.role == MessageRole::User
-                        && !ticks.iter().any(|tick| tick.message_id == echo.id)
-                    {
-                        ticks.push(RailTick {
+                    .collect()
+            },
+        );
+        if manifest.is_some() {
+            for echo in &echoes {
+                if echo.role == MessageRole::User
+                    && !candidates
+                        .iter()
+                        .any(|(tick, _)| tick.message_id == echo.id)
+                {
+                    candidates.push((
+                        RailTick {
                             message_id: echo.id.clone(),
                             prompt: user_text(echo),
                             reply: None,
-                        });
-                    }
+                        },
+                        None,
+                    ));
                 }
-                ticks
-            },
-        );
-        // Map each tick to its transcript row (user rows share the entry id).
-        let pairs: Vec<(RailTick, usize, Option<String>)> = ticks
+            }
+        }
+        candidates
             .into_iter()
-            .filter_map(|tick| {
+            .filter_map(|(tick, page_id)| {
                 let loaded = self
                     .rows()
                     .iter()
                     .position(|row| row.id.as_ref() == tick.message_id.as_str());
-                let page_id = manifest.as_ref().and_then(|manifest| {
-                    manifest
-                        .turns
-                        .iter()
-                        .find(|turn| turn.message_id == tick.message_id)
-                        .map(|turn| turn.page_id.clone())
-                });
                 let row = loaded.or_else(|| {
                     let placeholder = format!("history-page:{}", page_id.as_deref()?);
                     self.rows()
                         .iter()
                         .position(|row| row.id.as_ref() == placeholder)
                 })?;
-                Some((tick, row, loaded.is_none().then_some(page_id).flatten()))
+                Some(RailTarget {
+                    tick,
+                    row,
+                    unloaded_page: loaded.is_none().then_some(page_id).flatten(),
+                })
             })
-            .collect();
+            .collect()
+    }
+
+    fn scroll_to_rail_target(&mut self, target: RailTarget, cx: &mut Context<Self>) {
+        if let Some(page_id) = target.unloaded_page {
+            self.load_and_scroll_to_message(target.tick.message_id, page_id, cx);
+        } else {
+            self.scroll_to_row(target.row, cx);
+        }
+    }
+
+    /// Navigate to the nearest prompt marker above or below the viewport. This
+    /// remains available when the compact visual rail is hidden by width.
+    pub fn navigate_rail(&mut self, direction: RailDirection, cx: &mut Context<Self>) {
+        let targets = self.rail_targets(cx);
+        let top = self.list_state().logical_scroll_top();
+        let rows: Vec<usize> = targets.iter().map(|target| target.row).collect();
+        let Some(index) =
+            adjacent_tick(&rows, top.item_ix, f32::from(top.offset_in_item), direction)
+        else {
+            return;
+        };
+        if let Some(target) = targets.into_iter().nth(index) {
+            self.scroll_to_rail_target(target, cx);
+        }
+    }
+
+    /// The rail element — an absolute overlay along the transcript's left edge.
+    pub fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.rail_enabled() {
+            return gpui::Empty.into_any_element();
+        }
+        let pairs = self.rail_targets(cx);
         // A minimap of one exchange is noise, not navigation, so hide below
         // two marks.
         if pairs.len() < 2 {
             return gpui::Empty.into_any_element();
         }
-        let tick_rows: Vec<usize> = pairs.iter().map(|(_, row, _)| *row).collect();
+        let tick_rows: Vec<usize> = pairs.iter().map(|target| target.row).collect();
         let top_row = self.list_state().logical_scroll_top().item_ix;
         let active = active_tick(&tick_rows, top_row);
         let hover = self.rail_hover();
@@ -538,8 +611,8 @@ impl Transcript {
                 // falls inside (hover then previews what you're reading),
                 // the first prompt of the range otherwise.
                 let rep = active.filter(|&a| a >= start && a < end).unwrap_or(start);
-                let (tick, row, unloaded_page) = &pairs[rep];
-                let (tick, row, unloaded_page) = (tick.clone(), *row, unloaded_page.clone());
+                let target = pairs[rep].clone();
+                let tick = target.tick.clone();
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
@@ -603,11 +676,7 @@ impl Transcript {
                         cx.notify();
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(page_id) = unloaded_page.clone() {
-                            this.load_and_scroll_to_message(tick.message_id.clone(), page_id, cx);
-                        } else {
-                            this.scroll_to_row(row, cx);
-                        }
+                        this.scroll_to_rail_target(target.clone(), cx);
                     }))
                     .child(
                         div()
@@ -758,6 +827,35 @@ mod tests {
         // Above the first tick row → first tick still active.
         assert_eq!(active_tick(&[3, 7], 1), Some(0));
         assert_eq!(active_tick(&[], 4), None);
+    }
+
+    #[test]
+    fn adjacent_ticks_follow_viewport_direction_without_wrapping() {
+        let rows = [2, 5, 9];
+        assert_eq!(
+            adjacent_tick(&rows, 5, 0.0, RailDirection::Previous),
+            Some(0)
+        );
+        assert_eq!(adjacent_tick(&rows, 5, 0.0, RailDirection::Next), Some(2));
+        // Once the viewport moves into a prompt row, Previous returns to that
+        // row's start before advancing farther back.
+        assert_eq!(
+            adjacent_tick(&rows, 5, 12.0, RailDirection::Previous),
+            Some(1)
+        );
+        assert_eq!(adjacent_tick(&rows, 0, 0.0, RailDirection::Previous), None);
+        assert_eq!(adjacent_tick(&rows, 9, 0.0, RailDirection::Next), None);
+    }
+
+    #[test]
+    fn adjacent_ticks_enter_unloaded_placeholder_from_nearest_edge() {
+        // Several manifest turns can share one unloaded page placeholder row.
+        let rows = [2, 5, 5, 5, 9];
+        assert_eq!(adjacent_tick(&rows, 2, 0.0, RailDirection::Next), Some(1));
+        assert_eq!(
+            adjacent_tick(&rows, 9, 0.0, RailDirection::Previous),
+            Some(3)
+        );
     }
 
     #[test]

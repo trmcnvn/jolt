@@ -23,9 +23,10 @@ use tokio::sync::{broadcast, watch};
 
 use jolt_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
-    SessionCommandStatus, SessionDoc, SessionMessageEntry, TranscriptBootstrap, TranscriptCatalog,
-    TranscriptPage, TranscriptWatchFrame, evaluate_command, join_continuation_entries,
+    GoalOperation, MessagePart, MessageRole, MessageStatus, QueuedPrompt, SessionCommandEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
+    TranscriptBootstrap, TranscriptCatalog, TranscriptPage, TranscriptWatchFrame,
+    can_composer_cancel, evaluate_command, join_continuation_entries, queued_prompts,
 };
 use jolt_harness::{BashRequest, BashResult};
 use jolt_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
@@ -188,6 +189,9 @@ pub struct ChatDocHandle {
     device_id: String,
     doc: Arc<SessionDoc>,
     messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
+    queue_tx: watch::Sender<Vec<QueuedPrompt>>,
+    /// Serializes change-driven drains with explicit session-transition kicks.
+    drain_lock: tokio::sync::Mutex<()>,
     /// V2 tail-first projection. Historical pages are decoded directly from
     /// Loro only when requested; this state retains compact metadata and the
     /// mutable live page.
@@ -240,6 +244,29 @@ impl ChatDocHandle {
             self.publish_messages();
         }
         rx
+    }
+
+    /// Pending queued turns, projected from the durable command ledger.
+    pub fn watch_queue(&self) -> watch::Receiver<Vec<QueuedPrompt>> {
+        self.touch();
+        if let Some(room) = lock(&self.room).as_ref() {
+            room.probe();
+        }
+        let rx = self.queue_tx.subscribe();
+        self.publish_queue();
+        rx
+    }
+
+    fn publish_queue(&self) {
+        let entries = self.doc.read_commands().unwrap_or_default();
+        self.queue_tx
+            .send_replace(queued_prompts(&entries, &self.device_id));
+    }
+
+    fn publish_queue_if_watched(&self) {
+        if self.queue_tx.receiver_count() > 0 {
+            self.publish_queue();
+        }
     }
 
     /// Tail-first transcript stream. The opening bootstrap and subscription
@@ -563,6 +590,7 @@ impl DocHost {
         // drains, nudges) never watch the transcript, and the first
         // watch_messages attach materializes it on demand.
         let (messages_tx, _) = watch::channel(Vec::new());
+        let (queue_tx, _) = watch::channel(Vec::new());
         let (transcript_tx, _) = broadcast::channel(128);
 
         let handle = Arc::new(ChatDocHandle {
@@ -570,6 +598,8 @@ impl DocHost {
             device_id: self.inner.config.device_id.clone(),
             doc: doc.clone(),
             messages_tx,
+            queue_tx,
+            drain_lock: tokio::sync::Mutex::new(()),
             transcript_projection: Mutex::new(None),
             transcript_tx,
             mirror_dirty: AtomicBool::new(true),
@@ -697,7 +727,10 @@ impl DocHost {
     }
 
     fn pinned(&self, handle: &Arc<ChatDocHandle>) -> bool {
-        if handle.messages_tx.receiver_count() > 0 || handle.transcript_tx.receiver_count() > 0 {
+        if handle.messages_tx.receiver_count() > 0
+            || handle.queue_tx.receiver_count() > 0
+            || handle.transcript_tx.receiver_count() > 0
+        {
             return true;
         }
         // The handle itself holds one doc ref; more means a live writer.
@@ -794,6 +827,45 @@ impl DocHost {
 
     /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's workspace row names
     /// another device as host. Best-effort: offline/edge-less engines skip silently.
+    /// Cancel a queue item while it is still pending and owned by this device.
+    pub fn cancel_queued_prompt(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+    ) -> Result<bool, EngineError> {
+        let handle = self.open(chat_id)?;
+        let Some(entry) = handle
+            .doc
+            .read_commands()?
+            .into_iter()
+            .find(|entry| entry.id == command_id)
+        else {
+            return Ok(false);
+        };
+        if !matches!(entry.payload, SessionCommandPayload::Queue { .. })
+            || !can_composer_cancel(&entry, &self.inner.config.device_id)
+        {
+            return Ok(false);
+        }
+        handle.doc.set_command_status(
+            command_id,
+            SessionCommandStatus::Cancelled,
+            Some("cancelled by composer"),
+        )?;
+        self.nudge_remote_host(chat_id);
+        Ok(true)
+    }
+
+    /// Re-run a chat's command drain after a session transition makes a queued
+    /// turn eligible without requiring another document mutation.
+    pub(crate) fn kick_commands(&self, chat_id: &str) {
+        let Ok(handle) = self.open(chat_id) else {
+            return;
+        };
+        let host = self.clone();
+        tokio::spawn(async move { host.drain_commands(&handle).await });
+    }
+
     fn nudge_remote_host(&self, chat_id: &str) {
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
@@ -865,6 +937,7 @@ impl DocHost {
     /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
     /// execute → write the outcome as the sole outcome writer.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
+        let _drain = handle.drain_lock.lock().await;
         let Some(sessions) = self.inner.sessions.get() else {
             return; // executor not wired yet; the set_sessions kick re-drains
         };
@@ -888,9 +961,15 @@ impl DocHost {
                     c.status == SessionCommandStatus::Pending
                         && !skipped.contains(&c.id)
                         && !is_processed(&c.id)
+                        && (!matches!(c.payload, SessionCommandPayload::Queue { .. })
+                            || sessions.queued_turn_ready(&handle.chat_id))
                 })
                 .cloned()
             else {
+                // A clean boundary drains the whole queue snapshot in this
+                // pass. Close the gate only after no eligible item remains;
+                // later arrivals wait for the next boundary.
+                sessions.finish_queued_turn_drain(&handle.chat_id);
                 return;
             };
             let messages = handle.doc.read_entries().unwrap_or_default();
@@ -1011,6 +1090,37 @@ impl DocHost {
                         context,
                     )
                     .await?;
+                Ok((SessionCommandStatus::Applied, None))
+            }
+            SessionCommandPayload::Queue {
+                request,
+                message_id,
+            } => {
+                if !sessions.queued_turn_ready(chat_id) {
+                    return Err(EngineError::Other("queued turn is paused".into()));
+                }
+                if let Some(ws) = self.workspace() {
+                    ws.claim_chat(chat_id, Some(&request.cwd))?;
+                }
+                let harness = self.harness_for(chat_id);
+                let context = if sessions.bash_context_is_native(harness)? {
+                    None
+                } else {
+                    bash_context_before(handle, &entry.id)?
+                };
+                sessions
+                    .dispatch_with_context(
+                        chat_id,
+                        harness,
+                        request.clone(),
+                        Some(message_id.clone()),
+                        context,
+                    )
+                    .await?;
+                Ok((SessionCommandStatus::Applied, None))
+            }
+            SessionCommandPayload::ResumeQueue {} => {
+                sessions.resume_queued_turns(chat_id);
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::HiddenPrompt { request } => {
@@ -1137,6 +1247,35 @@ impl DocHost {
             }
             SessionCommandPayload::Interrupt {} => {
                 sessions.interrupt(chat_id).await?;
+                Ok((SessionCommandStatus::Applied, None))
+            }
+            SessionCommandPayload::Goal { operation } => {
+                let workspace = self.workspace().ok_or_else(|| {
+                    EngineError::Other("workspace registry is unavailable".into())
+                })?;
+                let current = workspace.chat_goal(chat_id);
+                let next = crate::goals::apply_operation(current, operation)?;
+                workspace.set_chat_goal(chat_id, next.as_ref())?;
+
+                if matches!(
+                    operation,
+                    GoalOperation::Create { .. }
+                        | GoalOperation::Edit { .. }
+                        | GoalOperation::Resume { .. }
+                ) {
+                    next.as_ref()
+                        .expect("active goal operation produced a goal");
+                    let mut request = self.request_from_chat_row(chat_id, "").ok_or_else(|| {
+                        EngineError::Other("session has no run configuration".into())
+                    })?;
+                    request.prompt = "Begin or resume work toward the active Jolt goal now.".into();
+                    request.resume = None;
+                    request.attachments.clear();
+                    let harness = self.harness_for(chat_id);
+                    sessions
+                        .dispatch_hidden_with_context(chat_id, harness, request, None)
+                        .await?;
+                }
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::RespondInput {
@@ -1345,6 +1484,7 @@ fn bash_context_before(
         }
         match &entry.payload {
             SessionCommandPayload::Run { .. }
+            | SessionCommandPayload::Queue { .. }
             | SessionCommandPayload::HiddenPrompt { .. }
             | SessionCommandPayload::Steer { .. }
                 if entry.status == SessionCommandStatus::Applied =>
@@ -1461,6 +1601,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 let Some(handle) = weak.upgrade() else { break };
                 handle.publish_messages_if_watched();
                 handle.publish_transcript_if_watched();
+                handle.publish_queue_if_watched();
                 host.drain_commands(&handle).await;
                 if save_deadline.is_none() {
                     save_deadline = Some(

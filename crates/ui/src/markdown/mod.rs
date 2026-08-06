@@ -19,8 +19,11 @@ pub mod link_target;
 pub mod mend;
 pub mod parser;
 pub mod render;
+pub mod rich;
 pub mod selection;
 pub mod veil;
 
 pub use link_target::LinkTarget;
-pub use parser::{Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full};
+pub use parser::{
+    Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, MathKind, parse_full,
+};
