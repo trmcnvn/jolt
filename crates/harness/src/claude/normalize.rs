@@ -1,5 +1,5 @@
-//! Frame → [`AgentEvent`] normalization, ported from claude.ts's `normalize`
-//! (init dedupe, subagent filtering, tool decoding, error-code mapping).
+//! Frame → [`AgentEvent`] normalization: init dedupe, subagent filtering,
+//! tool decoding, and error-code mapping.
 
 use jolt_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
 use serde_json::Value;
@@ -143,16 +143,30 @@ pub(crate) struct Normalizer {
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
+    /// Last API prompt size; the result frame carries aggregate billing usage,
+    /// not current context size.
+    latest_context_tokens: Option<u64>,
+    context_window: u64,
     /// Last session id seen (init or result) — used for synthetic Dones.
     pub session_id: Option<String>,
+    /// Dedupes Claude's status-clear + compact-boundary completion signals.
+    compacting: bool,
 }
 
 impl Normalizer {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_context_window(200_000)
+    }
+
+    pub fn with_context_window(context_window: u64) -> Self {
         Self {
             saw_init: false,
             assistant_message_id: new_message_id(),
+            latest_context_tokens: None,
+            context_window,
             session_id: None,
+            compacting: false,
         }
     }
 
@@ -167,21 +181,32 @@ impl Normalizer {
     /// a post-interrupt `result` into `Done { status: Interrupted }`.
     pub fn normalize(&mut self, frame: Frame, interrupted: bool) -> Vec<AgentEvent> {
         match frame {
-            Frame::System(f) => {
-                if f.subtype != "init" || self.saw_init {
-                    return Vec::new();
+            Frame::System(f) => match f.subtype.as_str() {
+                "init" if !self.saw_init => {
+                    self.saw_init = true;
+                    self.session_id = Some(f.session_id.clone());
+                    vec![AgentEvent::SessionStarted {
+                        harness: HarnessId::ClaudeCode,
+                        model: f.model,
+                        tools: f.tools,
+                        cwd: f.cwd,
+                        session_id: f.session_id,
+                        assistant_message_id: self.assistant_message_id.clone(),
+                    }]
                 }
-                self.saw_init = true;
-                self.session_id = Some(f.session_id.clone());
-                vec![AgentEvent::SessionStarted {
-                    harness: HarnessId::ClaudeCode,
-                    model: f.model,
-                    tools: f.tools,
-                    cwd: f.cwd,
-                    session_id: f.session_id,
-                    assistant_message_id: self.assistant_message_id.clone(),
-                }]
-            }
+                "status" if f.status.as_deref() == Some("compacting") && !self.compacting => {
+                    self.compacting = true;
+                    vec![AgentEvent::CompactionStarted]
+                }
+                "status" | "compact_boundary"
+                    if self.compacting
+                        && (f.subtype == "compact_boundary" || f.status.is_none()) =>
+                {
+                    self.compacting = false;
+                    vec![AgentEvent::CompactionFinished]
+                }
+                _ => Vec::new(),
+            },
 
             // Frames with `parent_tool_use_id` set belong to a SUBAGENT's
             // nested transcript; a background Task runs concurrently with the
@@ -214,6 +239,10 @@ impl Normalizer {
             Frame::Assistant(f) => {
                 if f.parent_tool_use_id.is_some() {
                     return Vec::new();
+                }
+                let context_tokens = f.message.usage.context_tokens();
+                if context_tokens != 0 {
+                    self.latest_context_tokens = Some(context_tokens);
                 }
                 let mut out: Vec<AgentEvent> = f
                     .message
@@ -277,6 +306,11 @@ impl Normalizer {
                 let usage = AgentEvent::Usage {
                     input_tokens: f.usage.input_tokens,
                     output_tokens: f.usage.output_tokens,
+                    cache_read_input_tokens: f.usage.cache_read_input_tokens,
+                    cache_write_input_tokens: f.usage.cache_creation_input_tokens,
+                    cost_usd: f.total_cost_usd,
+                    context_tokens: self.latest_context_tokens,
+                    context_window: Some(self.context_window),
                 };
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {

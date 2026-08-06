@@ -23,6 +23,7 @@ use jolt_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
+use crate::environment::HarnessEnvironment;
 use crate::{BashMessage, BashRequest, BashResult, Harness, HarnessError, RunControls};
 use rpc::{Incoming, RpcClient};
 
@@ -40,6 +41,7 @@ const TOOL_ACCESS_OPTION: &str = "toolAccess";
 
 pub struct PiHarness {
     executable: Option<PathBuf>,
+    environment: HarnessEnvironment,
     interrupt_grace: Duration,
     kill_grace: Duration,
 }
@@ -48,6 +50,7 @@ impl Default for PiHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            environment: HarnessEnvironment::default(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
         }
@@ -61,6 +64,11 @@ impl PiHarness {
 
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+
+    pub fn with_environment(mut self, environment: HarnessEnvironment) -> Self {
+        self.environment = environment;
         self
     }
 
@@ -113,9 +121,11 @@ impl Harness for PiHarness {
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         let executable = self.resolve_executable()?;
+        let environment = self.environment.resolve(HarnessId::Pi).await?;
         let (mut child, client, mut incoming, _stderr) = spawn_rpc(
             &executable,
             None,
+            &environment,
             &[
                 "--no-session",
                 "--no-extensions",
@@ -133,6 +143,7 @@ impl Harness for PiHarness {
     }
     async fn commands(&self, context: CommandContext) -> Result<Vec<AgentCommand>, HarnessError> {
         let executable = self.resolve_executable()?;
+        let environment = self.environment.resolve(HarnessId::Pi).await?;
         let mut owned_args = vec!["--no-session".to_string()];
         match command_discovery_trust(&context) {
             Some(true) => owned_args.push("--approve".into()),
@@ -141,7 +152,7 @@ impl Harness for PiHarness {
         }
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         let (mut child, client, mut incoming, _stderr) =
-            spawn_rpc(&executable, Some(&context.cwd), &args)?;
+            spawn_rpc(&executable, Some(&context.cwd), &environment, &args)?;
         let incoming_drain = tokio::spawn(async move { while incoming.recv().await.is_some() {} });
         let result = discover_commands(&client).await;
         shutdown_child(&mut child, self.kill_grace).await;
@@ -151,7 +162,8 @@ impl Harness for PiHarness {
 
     async fn bash(&self, request: BashRequest) -> Result<BashResult, HarnessError> {
         let executable = self.resolve_executable()?;
-        run_bash_process(&executable, request, self.kill_grace).await
+        let environment = self.environment.resolve(HarnessId::Pi).await?;
+        run_bash_process(&executable, &environment, request, self.kill_grace).await
     }
 
     async fn run(
@@ -160,9 +172,11 @@ impl Harness for PiHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let executable = self.resolve_executable()?;
+        let environment = self.environment.resolve(HarnessId::Pi).await?;
         let (event_tx, event_rx) = mpsc::channel(256);
         tokio::spawn(run_session(Session {
             executable,
+            environment,
             request,
             controls,
             event_tx,
@@ -215,6 +229,7 @@ fn resolve_pi_executable() -> Option<PathBuf> {
 fn spawn_rpc(
     executable: &Path,
     cwd: Option<&str>,
+    environment: &[(String, String)],
     extra_args: &[&str],
 ) -> Result<
     (
@@ -229,6 +244,7 @@ fn spawn_rpc(
     command.args(["--mode", "rpc"]);
     command.args(extra_args);
     crate::compose_child_path(&mut command, executable);
+    crate::environment::apply(&mut command, environment);
     if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
         command.current_dir(cwd);
     }
@@ -468,6 +484,7 @@ fn tool_access_option() -> ModelOption {
 
 struct Session {
     executable: PathBuf,
+    environment: Vec<(String, String)>,
     request: RunRequest,
     controls: RunControls,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
@@ -478,6 +495,7 @@ struct Session {
 async fn run_session(session: Session) {
     let Session {
         executable,
+        environment,
         request,
         controls,
         event_tx,
@@ -557,7 +575,7 @@ async fn run_session(session: Session) {
         );
     }
     let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-    let spawned = spawn_rpc(&executable, Some(&request.cwd), &args);
+    let spawned = spawn_rpc(&executable, Some(&request.cwd), &environment, &args);
     let (mut child, client, mut incoming, stderr_tail) = match spawned {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -617,6 +635,14 @@ async fn run_session(session: Session) {
         })
         .or_else(|| request.model.clone())
         .unwrap_or_default();
+    let context_window = state
+        .get("model")
+        .and_then(|model| {
+            model
+                .get("contextWindow")
+                .or_else(|| model.get("context_window"))
+        })
+        .and_then(Value::as_u64);
     let mut assistant_message_id = new_id();
     if !send(
         &event_tx,
@@ -768,7 +794,7 @@ async fn run_session(session: Session) {
                             if let Some(error) = normalize::message_end_error(&event) {
                                 pending_error = Some(error);
                             }
-                            if let Some(usage) = normalize::usage(&event)
+                            if let Some(usage) = normalize::usage(&event, context_window)
                                 && !send(&event_tx, usage).await
                             {
                                 break 'main;
@@ -792,6 +818,16 @@ async fn run_session(session: Session) {
                         if let Some(agent_event) = normalize::tool_end(&event)
                             && !send(&event_tx, agent_event).await
                         {
+                            break 'main;
+                        }
+                    }
+                    Some("compaction_start") => {
+                        if !send(&event_tx, AgentEvent::CompactionStarted).await {
+                            break 'main;
+                        }
+                    }
+                    Some("compaction_end") => {
+                        if !send(&event_tx, AgentEvent::CompactionFinished).await {
                             break 'main;
                         }
                     }
@@ -980,6 +1016,7 @@ async fn run_session(session: Session) {
 
 async fn run_bash_process(
     executable: &Path,
+    environment: &[(String, String)],
     request: BashRequest,
     kill_grace: Duration,
 ) -> Result<BashResult, HarnessError> {
@@ -998,7 +1035,7 @@ async fn run_bash_process(
     }
     let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
     let (mut child, client, mut incoming, _stderr) =
-        spawn_rpc(executable, Some(&request.cwd), &args)?;
+        spawn_rpc(executable, Some(&request.cwd), environment, &args)?;
     let incoming_drain = tokio::spawn(async move { while incoming.recv().await.is_some() {} });
     let result = async {
         let state = client.request(json!({"type": "get_state"})).await?;

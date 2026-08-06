@@ -345,8 +345,8 @@ struct UserBubble: View {
     var deviceId = ""
 
     var body: some View {
-        // Attachment refs ride the message text (message-attachments.ts
-        // transport); split them out and render thumbnails above the bubble,
+        // Attachment refs ride the message text; split them out and render
+        // thumbnails above the bubble,
         // exactly like the desktop's user rows.
         let parsed = parseUserMessageImages(text)
         VStack(alignment: .trailing, spacing: 8) {

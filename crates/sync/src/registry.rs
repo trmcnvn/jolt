@@ -1,5 +1,5 @@
 //! RegistryClient — WebSocket transport for the workspace registry
-//! (docs/registry-sync.md): hello/cursor handshake, push/ack for pending op
+//! (docs/sync.md): hello/cursor handshake, push/ack for pending op
 //! batches, merged-row broadcasts, presence beats, probe/redial liveness, and
 //! reconnect with exponential backoff.
 //!
@@ -41,8 +41,7 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(15);
 /// A probe's `probe-ok` (or any other protocol frame) must arrive within this
 /// deadline, or the session is torn down for a fresh socket.
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
-/// Presence entries older than this are treated as expired (mirrors the
-/// EphemeralStore's 30s TTL the old workspace room used).
+/// Presence entries older than this are treated as expired.
 const PRESENCE_TTL: Duration = Duration::from_secs(30);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);

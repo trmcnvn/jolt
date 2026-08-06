@@ -248,6 +248,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac436601d6bdde674a0d7fb593e829ffe7b3387c351b356dd20e2d40f5bf3ee5"
 
 [[package]]
+name = "apple-native-keyring-store"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "797f94b6a53d7d10b56dc18290e0d40a2158352f108bb4ff32350825081a9f29"
+dependencies = [
+ "keyring-core",
+ "log",
+ "security-framework",
+]
+
+[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3561,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "jolt"
-version = "0.1.20"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3580,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-doc"
-version = "0.1.20"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "jolt-proto",
@@ -3593,7 +3604,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-engine"
-version = "0.1.20"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3607,6 +3618,8 @@ dependencies = [
  "jolt-rpc",
  "jolt-sync",
  "jolt-update",
+ "keyring",
+ "keyring-core",
  "libc",
  "loro",
  "notify",
@@ -3626,7 +3639,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-harness"
-version = "0.1.20"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3646,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-proto"
-version = "0.1.20"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
@@ -3656,7 +3669,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-rpc"
-version = "0.1.20"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3674,7 +3687,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-sync"
-version = "0.1.20"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "futures",
@@ -3696,7 +3709,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-ui"
-version = "0.1.20"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3727,7 +3740,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-update"
-version = "0.1.20"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -3749,6 +3762,27 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "keyring"
+version = "4.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72585bb6cc9bc370d1d545b7e23fcce71dfd4461c5e15275e3cf51bdfd9a980a"
+dependencies = [
+ "apple-native-keyring-store",
+ "keyring-core",
+ "windows-native-keyring-store",
+ "zbus-secret-service-keyring-store",
+]
+
+[[package]]
+name = "keyring-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb1e621458ca9c51aa110bd0339d4751a056b9576bf1253aee1aa560dda0fc9d"
+dependencies = [
+ "log",
 ]
 
 [[package]]
@@ -6330,6 +6364,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
+name = "secret-service"
+version = "5.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a62d7f86047af0077255a29494136b9aaaf697c76ff70b8e49cded4e2623c14"
+dependencies = [
+ "aes",
+ "cbc",
+ "futures-util",
+ "generic-array",
+ "getrandom 0.2.17",
+ "hkdf",
+ "num",
+ "once_cell",
+ "serde",
+ "sha2 0.10.9",
+ "zbus",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8498,6 +8551,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
+name = "windows-native-keyring-store"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "063426e76fdec7438d56bb777f67e318a84a25c707b07e575cb8b78e10c028f8"
+dependencies = [
+ "byteorder",
+ "keyring-core",
+ "regex",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "windows-numerics"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9048,6 +9114,17 @@ dependencies = [
  "zbus-lockstep",
  "zbus_xml",
  "zvariant",
+]
+
+[[package]]
+name = "zbus-secret-service-keyring-store"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ccede190ba363386a24e8021c7f3848393976609ec9f5d1f8c6c09ef37075b4"
+dependencies = [
+ "keyring-core",
+ "secret-service",
+ "zbus",
 ]
 
 [[package]]

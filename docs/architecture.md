@@ -1,0 +1,202 @@
+# Architecture
+
+Jolt is a multi-device controller for local coding-agent CLIs. The engine is the authority for machine-local capabilities; viewports render and control engines through one RPC contract. Cloudflare edge services synchronize durable shared state and relay device-to-device calls.
+
+## Topology
+
+```text
+                         Cloudflare edge
+                 ┌─────────────────────────────┐
+                 │ Worker: auth and routing    │
+                 │ RegistryRoom: workspace rows│
+                 │ SessionRoom: Loro per chat  │
+                 │ DeviceRoom: engine relay    │
+                 │ R2: attachments, backups,   │
+                 │     and release artifacts   │
+                 └───────────┬─────────────────┘
+                             │ TLS / WebSocket
+              ┌──────────────┴──────────────┐
+              │                             │
+     ┌────────▼────────┐           ┌────────▼────────┐
+     │ Engine: device A│           │ Engine: device B│
+     │ agents/files/PTY│           │ agents/files/PTY│
+     └────────┬────────┘           └────────┬────────┘
+              │ typed RPC                   │ typed RPC
+       ┌──────▼──────┐               ┌──────▼──────┐
+       │ desktop gpui│               │ desktop gpui│
+       └─────────────┘               └─────────────┘
+
+             iOS joins registry/session rooms directly and
+             dials engines through DeviceRoom for live RPC.
+```
+
+## Processes
+
+### Engine
+
+The Rust engine:
+
+- launches Claude Code, Codex, Pi, and test harness subprocesses;
+- owns local authentication, repositories, version-control commands, worktrees/workspaces, terminals, uploads, diffs, and usage;
+- hosts session documents and executes commands only for chats assigned to its device;
+- persists snapshots, command claims, run journals, settings, and identity-scoped telemetry;
+- exposes the RPC service on localhost and through its device relay room.
+
+A data directory has one engine owner, enforced by an OS-level lock.
+
+### Desktop viewport
+
+The gpui desktop app is a viewport over the RPC service. On startup it probes the configured localhost port:
+
+- a responding engine becomes a remote local backend over WebSocket;
+- otherwise the app creates an `EngineSupervisor`, uses the same JSON envelopes over an in-memory channel, and best-effort serves that engine on the localhost port.
+
+Authentication RPC remains available before identity-scoped stores are assembled. Once sign-in and hidden organization setup complete, the supervisor creates exactly one runtime for that identity.
+
+### iOS viewport
+
+The SwiftUI app maintains a local workspace-registry replica and Loro session replicas, appends durable commands, and uses relay RPC when an engine must touch a filesystem or CLI.
+
+### Edge
+
+`edge/` is a TypeScript Cloudflare Worker with three Durable Object classes:
+
+- **RegistryRoom:** current-state workspace rows and per-field last-write-wins merge.
+- **SessionRoom:** per-chat Loro synchronization, transcript tail and diff sidecars, compaction, and backups.
+- **DeviceRoom:** one host socket per engine, client byte relay, durable nudges, and small latest-value sidecars.
+
+The Worker verifies WorkOS JWTs or development bearers before stamping identity into Durable Object requests. It also performs WorkOS code exchange/refresh and serves content-addressed attachments and signed release metadata.
+
+## Data model
+
+### Workspace registry
+
+The sidebar and session index use a replicated table with four row kinds:
+
+- `devices`
+- `spaces`
+- `chats`
+- `sessions`
+
+A per-user RegistryRoom is authoritative for current rows. Clients retain an authoritative snapshot plus pending local operations, which are overlaid for optimistic reads and replayed after reconnect. Per-field hybrid logical clocks provide deterministic last-write-wins behavior.
+
+This data is small scalar index state. Transcript content never enters the registry.
+
+### Session documents
+
+Every chat has one Loro document with three roots:
+
+```text
+meta      { chatId, schemaVersion }
+messages  [ { id, role, parts, createdAt, deviceId, status?, continuationOf? } ]
+commands  [ { id, payload, issuedBy, issuedAt, status, ... } ]
+```
+
+Text bodies use `LoroText`, allowing streamed appends to merge efficiently. Large entries split into continuation records at part/code-point boundaries and join during projection.
+
+The host engine writes transcript entries and command outcomes. Any authorized client can append its own command entries. Synced tool projections deliberately omit sensitive or bulky inputs that are not needed for rendering.
+
+### Durable command plane
+
+Run, shell, steer, interrupt, and input-answer operations are session-document entries. The chat's host device:
+
+1. evaluates expiry and supersession rules;
+2. claims the command in its local processed-command ledger **before** execution;
+3. executes it at most once from that host store;
+4. writes the outcome and transcript changes back to the document.
+
+A device-room nudge tells a cold host to open the chat. Delivery does not depend on the nudge: the command itself is durable and remains pending while the host is offline.
+
+### Machine-local state
+
+The following stays on its owning device:
+
+- agent/provider credential values;
+- harness secret values;
+- repository path registry and VCS selection;
+- PTY processes and replay buffers;
+- full run journals and stripped tool inputs;
+- detailed token/cost usage;
+- viewport layout, fonts, notifications, and keybindings.
+
+Some local state is queried from a reachable device through RPC for display.
+
+## Main flows
+
+### Start a remote session
+
+```text
+viewport
+  → Mutate createChat in a synced space
+  → append Run command to the chat Loro document
+  → POST durable nudge to the host's DeviceRoom
+  → host opens/syncs the document
+  → host claims command and launches the selected harness
+  → normalized events fold into transcript parts every ~120 ms
+  → SessionRoom broadcasts Loro updates
+  → every viewport projects the same transcript
+```
+
+### Live remote RPC
+
+Filesystem browsing, model/ref discovery, terminals, account management, diffs, attachment reads, and updates can carry `targetDeviceId`. The local engine dials that device's DeviceRoom, wraps the normal RPC stream in a virtual socket, and forwards the unchanged method.
+
+Secret methods are rejected by the host relay. Local identity, auth, and workspace watch/mutation methods do not honor `targetDeviceId` forwarding and are normally called on the directly connected engine; an iOS client can dial a host directly for the limited workspace mutation it needs.
+
+## Storage layout
+
+Default root: `~/.jolt`.
+
+```text
+~/.jolt/
+  device-id
+  engine.lock
+  session.json
+  ui-settings.json
+  composer-defaults.json
+  vcs-settings.json
+  harness-secrets.json        # metadata only; values are in OS credentials
+  repos.json
+  repos/
+  uploads/
+  agent-accounts/
+  logs/
+  updates/
+  orgs/<org>/<user>/
+    docs.sqlite3              # doc/registry snapshots + processed commands
+    usage.sqlite
+    journals/*.jsonl
+```
+
+Git worktrees default to `~/.jolt/worktrees`; Jujutsu workspaces default to `~/.jolt/workspaces`.
+
+Identity-scoped stores prevent one WorkOS user or organization from reusing another identity's cached documents on a shared machine.
+
+## Rust workspace
+
+| Path | Responsibility |
+| --- | --- |
+| `crates/proto` | Shared entities, agent events, usage, secrets, and pure view derivations |
+| `crates/doc` | Session schema, command ledger, render parts, transcript deltas, workspace registry model |
+| `crates/sync` | Loro room client, registry client, local SQLite snapshots, liveness |
+| `crates/harness` | Claude Code, Codex, Pi, and mock adapters |
+| `crates/engine` | Runtime assembly, sessions, docs, registry host, repos, terminals, diffs, accounts, secrets, usage |
+| `crates/rpc` | Envelopes, clients/servers, in-memory transport, device relay |
+| `crates/update` | Release checks, downloads, verification, swaps, and restart support |
+| `crates/ui` | gpui desktop shell and views |
+| `apps/jolt` | Binary, CLI auth, daemon management, and environment resolution |
+| `apps/ios` | SwiftUI mobile viewport |
+| `edge` | Worker, Durable Objects, R2 routes, and WorkOS integration |
+
+## Design invariants
+
+- A session runs on exactly one host device at a time.
+- A space fixes its owning device and folder.
+- Transcript/session commands use Loro; workspace index rows use RegistryRoom current state.
+- Command outcomes are host-written and locally claimed before execution.
+- Viewports use the same RPC envelope in-process, over localhost, and through the relay.
+- Secret values never cross the device relay.
+- Usage telemetry remains device-local and outside synchronized documents.
+- Live status and presence are freshness-gated; durable state remains independent of heartbeats.
+
+See [Synchronization](sync.md), [RPC](rpc.md), and [Security and data](security.md) for protocol-level detail.

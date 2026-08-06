@@ -1,5 +1,4 @@
-//! Codex app-server notification/item → [`AgentEvent`] mapping, ported from
-//! codex.ts's `mapItem`/notification switch.
+//! Codex app-server notification and item mapping into [`AgentEvent`].
 //!
 //! Tolerant by construction: both field spellings the app server has shipped
 //! (`delta`/`textDelta`, `exitCode`/`exit_code`, camelCase/snake_case item
@@ -59,24 +58,36 @@ pub(crate) fn turn_error_message(params: &Value) -> Option<String> {
         })
 }
 
-/// `thread/tokenUsage/updated` → a [`AgentEvent::Usage`] snapshot of the LAST
-/// turn's tokens (held by the session loop, emitted before `Done`).
+/// `thread/tokenUsage/updated` → one API call's usage. Codex includes cached
+/// tokens inside `inputTokens`; normalize them into additive categories.
 pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
-    let last = field(params, &["tokenUsage", "token_usage"])?.get("last")?;
+    let usage = field(params, &["tokenUsage", "token_usage"])?;
+    let last = usage.get("last")?;
     let count = |keys: &[&str]| {
         field(last, keys)
             .and_then(Value::as_u64)
             .unwrap_or_default()
     };
+    let prompt_tokens = count(&["inputTokens", "input_tokens"]);
+    let cache_read_input_tokens = count(&["cachedInputTokens", "cached_input_tokens"]);
+    let cache_write_input_tokens = count(&["cacheWriteInputTokens", "cache_write_input_tokens"]);
     Some(AgentEvent::Usage {
-        input_tokens: count(&["inputTokens", "input_tokens"]),
+        input_tokens: prompt_tokens
+            .saturating_sub(cache_read_input_tokens)
+            .saturating_sub(cache_write_input_tokens),
         output_tokens: count(&["outputTokens", "output_tokens"]),
+        cache_read_input_tokens,
+        cache_write_input_tokens,
+        cost_usd: None,
+        context_tokens: Some(prompt_tokens),
+        context_window: field(usage, &["modelContextWindow", "model_context_window"])
+            .and_then(Value::as_u64),
     })
 }
 
 /// Tool-shaped Codex items must always close the lifecycle they open: started
-/// opens the ToolCall, completed refreshes its metadata and resolves the same
-/// stable id (port of codex.ts `toolLifecycle`).
+/// opens the ToolCall, and completed refreshes its metadata and resolves the
+/// same stable id.
 fn tool_lifecycle(phase: Phase, id: String, call: ToolCall, is_error: bool) -> Vec<AgentEvent> {
     match phase {
         Phase::Started => vec![AgentEvent::ToolCall { id, call }],
@@ -122,6 +133,10 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
     let id = str_field(item, &["id"]);
     let status = str_field(item, &["status"]);
     match item_type(item) {
+        "contextCompaction" | "context_compaction" => match phase {
+            Phase::Started => vec![AgentEvent::CompactionStarted],
+            Phase::Completed => vec![AgentEvent::CompactionFinished],
+        },
         "commandExecution" | "command_execution" => match phase {
             Phase::Started => vec![AgentEvent::ToolCall {
                 id,
@@ -147,7 +162,7 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 .unwrap_or_default()
                 .iter()
                 .map(|c| {
-                    // Unknown kinds degrade to "update", like codex.ts.
+                    // Unknown kinds degrade to "update".
                     let kind = c
                         .get("kind")
                         .and_then(Value::as_str)
@@ -221,6 +236,24 @@ mod tests {
         assert_eq!(delta_text(&json!({"textDelta": "b"})), Some("b".into()));
         assert_eq!(delta_text(&json!({"delta": ""})), None);
         assert_eq!(delta_text(&json!({})), None);
+    }
+
+    #[test]
+    fn context_compaction_maps_its_lifecycle() {
+        assert_eq!(
+            map_item(
+                Phase::Started,
+                &json!({"type": "contextCompaction", "id": "compact-1"}),
+            ),
+            vec![AgentEvent::CompactionStarted]
+        );
+        assert_eq!(
+            map_item(
+                Phase::Completed,
+                &json!({"type": "context_compaction", "id": "compact-1"}),
+            ),
+            vec![AgentEvent::CompactionFinished]
+        );
     }
 
     #[test]
@@ -306,17 +339,30 @@ mod tests {
     #[test]
     fn usage_reads_last_snapshot_under_both_spellings() {
         assert_eq!(
-            usage_event(&json!({"tokenUsage": {"last": {"inputTokens": 42, "outputTokens": 7}}})),
+            usage_event(&json!({"tokenUsage": {
+                "last": {"inputTokens": 42, "cachedInputTokens": 12, "outputTokens": 7},
+                "modelContextWindow": 200_000
+            }})),
             Some(AgentEvent::Usage {
-                input_tokens: 42,
-                output_tokens: 7
+                input_tokens: 30,
+                output_tokens: 7,
+                cache_read_input_tokens: 12,
+                cache_write_input_tokens: 0,
+                cost_usd: None,
+                context_tokens: Some(42),
+                context_window: Some(200_000),
             })
         );
         assert_eq!(
             usage_event(&json!({"token_usage": {"last": {"input_tokens": 1, "output_tokens": 2}}})),
             Some(AgentEvent::Usage {
                 input_tokens: 1,
-                output_tokens: 2
+                output_tokens: 2,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                cost_usd: None,
+                context_tokens: Some(1),
+                context_window: None,
             })
         );
         assert_eq!(usage_event(&json!({})), None);

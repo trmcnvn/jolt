@@ -292,6 +292,7 @@ fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
         chat_id: chat_id.into(),
         device_id: device_id.into(),
         status,
+        compacting: false,
         started_at: Some(ts(3_000)),
         updated_at: ts(3_500),
     }
@@ -344,16 +345,14 @@ fn rows_round_trip_and_upsert_refreshes() {
     let mut doc = RegistryDoc::new("dev-a");
     doc.upsert_device(&device("dev-a", "laptop")).unwrap();
     doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
-    doc.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
-        .unwrap();
+    let mut live = session("chat-1", "dev-a", SessionStatus::Working);
+    live.compacting = true;
+    doc.upsert_session(&live).unwrap();
 
     let state = doc.read_all().unwrap();
     assert_eq!(state.devices, vec![device("dev-a", "laptop")]);
     assert_eq!(state.chats, vec![chat("chat-1", "dev-a")]);
-    assert_eq!(
-        state.sessions,
-        vec![session("chat-1", "dev-a", SessionStatus::Working)]
-    );
+    assert_eq!(state.sessions, vec![live]);
 
     let mut updated = chat("chat-1", "dev-a");
     updated.title = None;

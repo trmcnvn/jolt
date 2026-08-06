@@ -1,8 +1,6 @@
 /**
- * Tail materialization — vendored verbatim from jolt's
- * packages/session-doc/src/schema.ts (`readMessageEntries` /
- * `materializeTail`), minus the loro-mirror schema those functions do not
- * depend on. The DO reads the doc's plain JSON shape directly; no Mirror.
+ * Tail materialization from the document's plain JSON shape. The Durable
+ * Object does not need a Loro Mirror.
  */
 import { LoroDoc } from "loro-crdt";
 import { SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT } from "./constants";

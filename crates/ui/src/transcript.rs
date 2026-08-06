@@ -1,7 +1,7 @@
 //! The conversation view: virtualized transcript with block-granularity rows,
 //! stick-to-bottom, tool-group folding, and streaming markdown.
 //!
-//! Row model (docs/research/mugen-pretext.md §3):
+//! Row model (docs/using-jolt.md):
 //! - one row per BLOCK: user message = one bubble row; assistant messages split
 //!   into one row per markdown top-level block, plus consecutive-tool groups and
 //!   input/error chips;
@@ -64,9 +64,8 @@ pub const GAP_BLOCK: f32 = 8.0;
 /// Transcript column max width (jolt 46rem).
 pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 /// Tool chip row height / gap — analytic, so fold heights need no measurement.
-/// A row is the guide rail + a 30px chip card centered in it (jolt
-/// tool-chip.tsx: `TOOL_CHIP_HEIGHT = 38`, card `h-[30px]`); rows stack with no
-/// gap so the rail reads continuous.
+/// A row is the guide rail plus a 30px chip card centered in a 38px row. Rows
+/// stack without gaps so the rail reads continuously.
 pub const CHIP_HEIGHT: f32 = 38.0;
 pub const CHIP_GAP: f32 = 0.0;
 pub const CHIP_CARD_HEIGHT: f32 = 30.0;
@@ -75,8 +74,8 @@ const CHIPS_TOP_PAD: f32 = 2.0;
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
 /// tween replays on remount, i.e. on every scroll-back-into-view.
 const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
-/// User-bubble attachment thumbnails (user-attachments.tsx): 112×80 thumbs in
-/// a FIXED-height strip (load-state flips never shift the virtualizer).
+/// User-bubble attachment thumbnails: 112×80 thumbnails in a fixed-height
+/// strip so load-state changes never shift the virtualizer.
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
@@ -207,8 +206,8 @@ pub enum RowKind {
         /// once per entry change in [`rows_for_entry`] (rows are cached by
         /// fingerprint), never per frame. Empty for ordinary prompts.
         mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
-        /// Image refs parsed out of the message text (message-attachments.ts):
-        /// thumbnails load from the owning device via ReadAttachmentChunk.
+        /// Image refs parsed out of the message text; thumbnails load from the
+        /// owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
@@ -231,8 +230,8 @@ pub enum RowKind {
         auto_open: bool,
     },
     InputChip {
-        /// First question's header (chat-view.tsx `InputChip`: the resolved
-        /// chip shows it; unresolved shows "Awaiting your answer…" — which
+        /// First question's header. The resolved chip shows it; unresolved
+        /// shows "Awaiting your answer…", which
         /// stays TRUE even across a run death: the composer keeps the panel
         /// up until the user answers, and the engine delivers a dead run's
         /// answer as a resumed turn).
@@ -252,18 +251,16 @@ pub struct Row {
     /// First row of its message entry (gets the turn gap).
     pub turn_start: bool,
     pub kind: RowKind,
-    /// The owning message entry — hover anywhere on the entry's rows reveals
-    /// its timestamp strip (jolt chat-view.tsx `group`/`group-hover`).
+    /// The owning message entry; hovering any row reveals its timestamp strip.
     pub entry_id: SharedString,
     /// Epoch-ms for the 16px hover-timestamp strip UNDER this row: set on the
-    /// LAST row of a completed entry (user rows always; assistant rows only
-    /// once streaming ends — "the turn isn't at a time yet", chat-view.tsx).
+    /// Last row of a completed entry: user rows always, assistant rows only
+    /// once streaming ends.
     pub timestamp: Option<i64>,
 }
 
-/// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
-/// `formatTimestamp` shape (utils.ts: short month, numeric day, hour,
-/// 2-digit minutes, no leading zero on the hour). Pure over an explicit
+/// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM": short month,
+/// numeric day, hour, two-digit minutes, and no leading zero. Pure over an explicit
 /// timezone so tests don't depend on the host's local time.
 pub fn format_timestamp<Tz: chrono::TimeZone>(ms: i64, tz: &Tz) -> String
 where
@@ -323,8 +320,8 @@ pub fn rows_for_entry(
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        // Attachment refs ride the plain text (the `withAttachments`
-        // transport); split them back out for the thumbnail strip.
+        // Attachment refs ride the plain text; split them back out for the
+        // thumbnail strip.
         let parsed = crate::attachments::parse_user_message_images(&raw);
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
@@ -344,8 +341,8 @@ pub fn rows_for_entry(
                 pending,
             },
             entry_id,
-            // User rows always carry the strip (chat-view.tsx: whenever
-            // `createdAt` exists — the optimistic echo included).
+            // User rows always carry the strip when `createdAt` exists,
+            // including the optimistic echo.
             timestamp: Some(entry.created_at),
         }];
     }
@@ -499,8 +496,8 @@ pub fn rows_for_entry(
     if let Some(first) = rows.first_mut() {
         first.turn_start = true;
     }
-    // Timestamp strip under the entry's LAST row once the turn has settled
-    // (chat-view.tsx: "No timestamp hover mid-stream"). The version bit keeps
+    // Timestamp strip under the entry's last row once the turn has settled;
+    // there is no timestamp hover mid-stream. The version bit keeps
     // the diff key honest for last-row kinds whose own version wouldn't
     // change when streaming flips off (chips).
     if !streaming && let Some(last) = rows.last_mut() {
@@ -697,9 +694,8 @@ pub fn chips_height(count: usize) -> f32 {
 // Working indicator flavour (pure; rendered by the shell strip)
 // ---------------------------------------------------------------------------
 
-/// Rotating working-message vocabulary sourced from the local Pi
-/// `whimsical.ts` extension (7s per item, seeded per chat). The extension's
-/// trailing ASCII ellipses are omitted because the shell adds one consistently.
+/// Rotating working-message vocabulary, changing every seven seconds and
+/// seeded per chat. Trailing ellipses are omitted because the shell adds one.
 pub const FLAVOUR_WORDS: [&str; 453] = [
     "Schlepping",
     "Combobulating",
@@ -1349,9 +1345,8 @@ pub struct Transcript {
     rail_enabled: bool,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
-    /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
-    /// strip (jolt chat-view.tsx `group-hover`; the rows report hover
-    /// themselves). Keyed by ROW so a row→row move within one entry can't
+    /// `(row id, entry id)` under the pointer, used to reveal the entry's
+    /// timestamp strip. Keyed by row so a row-to-row move within one entry cannot
     /// clear the reveal when the old row's leave event arrives after the new
     /// row's enter (enter/leave order across rows is not guaranteed).
     hovered_entry: Option<(SharedString, SharedString)>,
@@ -1778,11 +1773,10 @@ impl Transcript {
         entry.toggled_at = Some(Instant::now());
     }
 
-    // ---- attachment read-back (user-attachments.tsx + transcript cache) ----
+    // ---- attachment read-back and transcript cache ----
 
     /// Devices that may own a user message's attachment files: the chat's host
-    /// device (uploads targeted it) plus this device (jolt's
-    /// `uniqueIds([attachmentDeviceId, m.device_id])`).
+    /// device, which receives uploads, plus this device.
     fn attachment_device_ids(&self, cx: &Context<Self>) -> Vec<String> {
         let state = self.state.read(cx);
         let mut ids = Vec::new();
@@ -2000,9 +1994,8 @@ impl Transcript {
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
-                // Attachment thumbnails ride ABOVE the bubble, right-aligned
-                // (chat-view.tsx RowView: UserAttachmentStrip then the text
-                // HStack); image-only sends show no bubble at all.
+                // Attachment thumbnails sit above the right-aligned bubble;
+                // image-only sends show no bubble at all.
                 let mut column = div().w_full().flex().flex_col();
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
@@ -2027,11 +2020,7 @@ impl Transcript {
                                 .line_height(px(22.0))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
-                                .child(if mentions.is_empty() {
-                                    text.into_any_element()
-                                } else {
-                                    user_mention_text(text, mentions, &theme)
-                                }),
+                                .child(user_bubble_text(&row.id, text, mentions, &theme)),
                         ),
                     );
                 }
@@ -2132,8 +2121,8 @@ impl Transcript {
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
         };
 
-        // Hover-revealed timestamp strip (jolt chat-view.tsx `Timestamp`):
-        // a RESERVED 16px lane under the entry's last row — the label only
+        // Hover-revealed timestamp strip: a reserved 16px lane under the
+        // entry's last row; the label only
         // flips opacity, so revealing it never shifts the virtualizer's
         // layout. User entries align end (under the bubble), assistant start.
         let is_user_row = matches!(row.kind, RowKind::User { .. });
@@ -2141,14 +2130,13 @@ impl Transcript {
             .hovered_entry
             .as_ref()
             .is_some_and(|(_, entry)| entry == &row.entry_id);
-        // Vertical breathing room from the source: assistant text blocks sit
-        // in a `VStack padding={4}` (chat-view.tsx:183), so the strip starts
-        // 4px below the message text — the native markdown column has no such
+        // Assistant timestamp strips start 4px below the message text; the
+        // native markdown column has no such
         // bottom padding, so the strip carries it as top inset (grown into the
         // reserved height: reveal still never shifts layout). User rows are
         // flush: the Timestamp follows the bubble HStack directly (VStack gap
         // defaults to 0 in mugen), the label's centering inside the 16px lane
-        // is all the gap the original has.
+        // supplies the remaining gap.
         let strip = row.timestamp.map(|ms| {
             div()
                 .h(px(if is_user_row { 16.0 } else { 20.0 }))
@@ -2156,8 +2144,8 @@ impl Transcript {
                 .w_full()
                 .flex()
                 .items_center()
-                // No horizontal inset: the original's `px-1` netted out flush
-                // because its message text was inset by the same amount (group
+                // No horizontal inset because the message text and timestamp
+                // begin on the same edge (group
                 // padding 4 + inner VStack 4 = 8 = group 4 + px-1 4). Here the
                 // markdown text / user bubble sit AT the content column edges,
                 // so the label must too — assistant label's left edge on the
@@ -2315,8 +2303,8 @@ impl Transcript {
 
         let toggle_id = row_id.clone();
         let tool_count = tools.len();
-        // Header (jolt tool-group.tsx): a small chevron tile centered over the
-        // chips' guide rail, then the quiet 12px summary.
+        // Header: a small chevron tile centered over the chips' guide rail,
+        // then a quiet 12px summary.
         let header = div()
             .id(SharedString::from(format!("{row_id}-hdr")))
             .flex()
@@ -2330,8 +2318,8 @@ impl Transcript {
             // Quiet even when children failed: agents routinely have failed
             // probes mid-work, and a red HEADER read as "this whole step
             // broke" (user report). Failures still show on the individual
-            // chips (destructive tint, jolt tool-chip.tsx) and in the
-            // summary's "· N failed" count.
+            // chips with a destructive tint and in the summary's
+            // "· N failed" count.
             .text_color(theme.text_muted)
             .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2403,18 +2391,18 @@ impl Transcript {
     }
 }
 
-/// A sent message's text with its file-mention chips. The same recipe as the
-/// markdown renderer's inline code (`flat_text_element`): chip ranges shape in
-/// the mono font at `code_text` violet, [`StyledText`] supplies wrapped glyph
-/// geometry through its layout handle, and a canvas paints the rounded
-/// `code_wash` *beneath* the glyphs — so chips wrap, clip, and scroll exactly
-/// like the text they decorate.
+/// Selectable sent-message text with its file-mention chips. The same recipe
+/// as the markdown renderer's inline code (`flat_text_element`): chip ranges
+/// shape in the mono font at `code_text` violet, [`StyledText`] supplies wrapped
+/// glyph geometry through its layout handle, and a canvas paints the rounded
+/// `code_wash` and selection wash *beneath* the glyphs.
 ///
 /// Per-frame cost while an assistant message streams below: shaping hits
 /// gpui's line-layout cache (identical text + runs ⇒ reuse) and the underlay
 /// repaints O(chips) quads — no layout work, no re-projection (spans were
 /// computed once in [`rows_for_entry`]).
-fn user_mention_text(
+fn user_bubble_text(
+    row_id: &SharedString,
     text: SharedString,
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
     theme: &Theme,
@@ -2452,22 +2440,32 @@ fn user_mention_text(
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
-    let wash = theme.code_wash;
+    let mention_wash = theme.code_wash;
+    let selection_wash = render::selection_wash(theme);
+    let selection_key: Arc<str> = format!("{row_id}:user").into();
+    let selection_text = text.clone();
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
             for span in mentions.iter() {
-                for rect in render::range_rects(&layout, &span.range, 0.0, 2.0) {
+                for rect in render::range_rects(&layout, &selection_text, &span.range, 0.0, 2.0) {
                     window.paint_quad(quad(
                         rect,
                         px(5.0),
-                        wash,
+                        mention_wash,
                         px(0.0),
                         gpui::transparent_black(),
                         BorderStyle::default(),
                     ));
                 }
             }
+            render::paint_and_register_selection(
+                window,
+                &selection_key,
+                &selection_text,
+                &layout,
+                selection_wash,
+            );
         },
     )
     .absolute()
@@ -2479,8 +2477,8 @@ fn user_mention_text(
         .into_any_element()
 }
 
-/// The transcript ErrorChip — an exact port of jolt chat-view.tsx
-/// `ErrorChip`: a 34px row (`rounded-[10px] border border-red-400/[0.16]
+/// The transcript ErrorChip: a 34px row (`rounded-[10px] border
+/// border-red-400/[0.16]
 /// bg-red-400/[0.05] px-2 text-[12px]`) with a 20px red-washed tile holding a
 /// 12px DangerTriangle (`bg-red-400/[0.12] text-red-300/80`), a medium
 /// "Error" label, then the human message truncating at `text-foreground/80` —
@@ -2539,8 +2537,8 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A passive one-line chip marking a question the agent asked — the
-/// interactive controls live in the composer (chat-view.tsx `InputChip`):
+/// A passive one-line chip marking a question the agent asked; interactive
+/// controls live in the composer:
 /// 34px row, `rounded-[10px] border-white/[0.08] bg-white/[0.045] px-2
 /// text-[12px]`, a 20px `bg-white/[0.09]` icon tile with a 12px
 /// ChatRoundLine, the medium "Question" label, then the truncating value —
@@ -2605,7 +2603,7 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
 
 /// A small glyph standing in for the tool's icon (jolt uses an icon set; a
 /// quiet monochrome character keeps the tile without shipping SVGs).
-/// The glyph for a tool call (jolt tool-chip.tsx `toolIcon`, Solar set).
+/// The glyph for a tool call from the Solar icon set.
 fn tool_icon_path(call: &ToolCall) -> &'static str {
     match call {
         ToolCall::Exec { .. } => crate::icons::COMMAND,
@@ -2621,8 +2619,8 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 }
 
 /// One tool chip row: a guide rail on the left (continuous across stacked
-/// chips — the rail spans the row's full height) threading the chips to their
-/// group toggle, then the chip card (jolt tool-chip.tsx).
+/// chips; the rail spans the row's full height, threading the chips to their
+/// group toggle, then the chip card.
 fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
     let (label, detail) = tool_chip_content(&tool.call);
     let tint = if tool.is_error {
@@ -3385,12 +3383,12 @@ mod tests {
     fn multiline_command_flattens_to_one_chip_line() {
         // The user's breaker: a multi-line script in a Run chip. The detail
         // must come out as ONE sanitized line — the chip's fixed 30px card
-        // then truncates it with an ellipsis like the original's CSS.
+        // then truncates it with an ellipsis.
         let (label, detail) = tool_chip_content(&ToolCall::Exec {
-            command: "set -e\nfixture_in_original=0\n\tgrep -c  \"x\"".into(),
+            command: "set -e\nfixture_value=0\n\tgrep -c  \"x\"".into(),
         });
         assert_eq!(label, "Run");
-        assert_eq!(detail, "set -e fixture_in_original=0 grep -c \"x\"");
+        assert_eq!(detail, "set -e fixture_value=0 grep -c \"x\"");
         assert!(!detail.contains('\n'));
         // The chip row height is a constant, independent of content shape.
         assert_eq!(chips_height(1), CHIPS_TOP_PAD + CHIP_HEIGHT);
@@ -3437,7 +3435,7 @@ mod tests {
         assert_eq!(rows.last().unwrap().timestamp, Some(done.created_at));
         assert!(rows[..rows.len() - 1].iter().all(|r| r.timestamp.is_none()));
 
-        // …but never mid-stream (chat-view.tsx: no hover under a moving reply).
+        // …but never mid-stream while the reply is moving.
         let live = assistant(
             "a2",
             MessageStatus::Streaming,

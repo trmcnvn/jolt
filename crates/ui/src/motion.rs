@@ -1,7 +1,7 @@
 //! Animation kit — the jolt motion catalog as reusable helpers over gpui
 //! [`Animation`]/[`AnimationExt`].
 //!
-//! Catalog (docs/research/feature-inventory.md §1.12):
+//! Catalog (docs/using-jolt.md):
 //! - `fade-in`   0.5s  cubic-bezier(0.16,1,0.3,1), translateY 4→0 (entrances)
 //! - `fade-quick` 0.15s
 //! - `menu-in`   0.14s scale 0.96 + translateY −2 (popovers)
@@ -24,7 +24,7 @@
 //! relative insets after layout, so — like a CSS transform — siblings never move.
 //! gpui has no scale transform for `div`s at the pinned rev (only `svg`
 //! transformations), so `menu-in`/`dialog-in` approximate their scale component
-//! with fade + translate; see the module report in ARCHITECTURE §4 follow-ups.
+//! with fade + translate.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -42,11 +42,12 @@ pub use gpui::AnimationExt;
 // ---------------------------------------------------------------------------
 
 /// Repeat-tick interval for low-motion pulse and skeleton loaders (~30fps).
-///
-/// High-motion activity orbs use display-linked frames through
-/// [`display_link_delta`]; keeping the shared timer slower avoids making a
-/// mounted skeleton repaint the whole window at display refresh rate.
 const PULSE_TICK: Duration = Duration::from_millis(33);
+
+/// Tiny activity orbs do not need display-refresh animation. Limiting them to
+/// ~15fps preserves their motion without forcing a full GPUI window pass at
+/// 60–120fps while an agent is working.
+const ACTIVITY_TICK: Duration = Duration::from_millis(66);
 
 /// How long a view stays on the tick list after its last spinner paint. One
 /// lease outlives a few missed frames; an unmounted spinner stops renewing and
@@ -70,6 +71,11 @@ impl Default for PulseClock {
         }
     }
 }
+
+#[derive(Default)]
+struct ActivityClock(PulseClock);
+
+impl Global for ActivityClock {}
 
 /// Current phase `[0,1)` of a repeating spec, plus a lease that keeps the
 /// calling view re-rendering at [`PULSE_TICK`] while its spinner stays
@@ -113,20 +119,42 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
     phase
 }
 
-/// Current phase for paint-only motion that must follow the display cadence.
-///
-/// Unlike [`pulse_delta`], this requests the next window frame directly rather
-/// than waking an entity from a wall-clock timer. Calls happen during paint, so
-/// an unmounted element naturally stops requesting frames. Reduced motion
-/// returns a static phase and schedules nothing.
-pub fn display_link_delta(spec: &MotionSpec, window: &Window, cx: &mut App) -> f32 {
+/// Elapsed seconds for the compact activity orb, with a leased ~15fps refresh.
+/// An unmounted orb stops renewing its lease and the shared clock parks.
+pub fn activity_elapsed(view: EntityId, cx: &mut App) -> f32 {
     if cx.reduce_motion() {
         return 0.0;
     }
-    window.request_animation_frame();
-    let clock = cx.default_global::<PulseClock>();
-    let period = spec.total().as_secs_f32();
-    (clock.epoch.elapsed().as_secs_f32() / period).fract()
+    let clock = &mut cx.default_global::<ActivityClock>().0;
+    clock.leases.insert(view, Instant::now() + PULSE_LEASE);
+    let elapsed = clock.epoch.elapsed().as_secs_f32();
+    if !clock.running {
+        clock.running = true;
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(ACTIVITY_TICK).await;
+                let parked = cx.update(|cx| {
+                    let clock = &mut cx.default_global::<ActivityClock>().0;
+                    let now = Instant::now();
+                    clock.leases.retain(|_, until| *until > now);
+                    if clock.leases.is_empty() {
+                        clock.running = false;
+                        return true;
+                    }
+                    let views: Vec<EntityId> = clock.leases.keys().copied().collect();
+                    for view in views {
+                        cx.notify(view);
+                    }
+                    false
+                });
+                if parked {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    elapsed
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +247,7 @@ impl CubicBezier {
     }
 }
 
-/// jolt's signature entrance curve — CSS `cubic-bezier(0.16, 1, 0.3, 1)`.
+/// Jolt's entrance curve: CSS `cubic-bezier(0.16, 1, 0.3, 1)`.
 pub const EASE_OUT_EXPO: CubicBezier = CubicBezier::new(0.16, 1.0, 0.3, 1.0);
 /// CSS `ease-out` — width/height transitions.
 pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
@@ -310,22 +338,18 @@ pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_OUT);
 /// Diff-pane chevron rotate: 200ms (§1.11; approximated as a crossfade — gpui
 /// divs have no rotation transform at the pinned rev, same caveat as scale).
 pub const CHEVRON: MotionSpec = MotionSpec::new(200, EASE);
-/// Rail-tick / scroll-to-row glide: 500ms ease-in-out over the whole distance
-/// (Electron parity — the original rail rode the browser's native smooth
-/// scroll, a fixed-duration gentle ease, never percent-of-remaining).
+/// Rail-tick / scroll-to-row glide: 500ms ease-in-out over the whole distance.
 pub const SCROLL_GLIDE: MotionSpec = MotionSpec::new(500, EASE_IN_OUT);
 /// Tailwind's default transition curve — CSS `cubic-bezier(0.4, 0, 0.2, 1)`
-/// (`transition-colors` et al. carry it unless overridden; jolt never does).
+/// (`transition-colors` and related properties carry it unless overridden).
 pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
 /// CSS `transition-colors` default: 150ms over [`EASE_TAILWIND`] — the temporal
-/// blend every interactive hover wash rides in the original.
+/// blend used by interactive hover washes.
 pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
 /// Jolt loader pulse period: 2.4s.
 pub const JOLT_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
 /// Gradient matrix spinner wave period: 750ms.
 pub const GRADIENT_SPIN: MotionSpec = MotionSpec::new(750, EASE);
-/// Dotted activity-orb sweep period: 2.8s.
-pub const ACTIVITY_ORB: MotionSpec = MotionSpec::new(jolt_proto::motion::ACTIVITY_ORB_MS, EASE);
 
 // ---------------------------------------------------------------------------
 // Element helpers (paint-layer entrances/exits)
@@ -350,7 +374,6 @@ where
 }
 
 /// Popover entrance: fade + translateY −2→0 over [`MENU_IN`].
-/// (jolt also scales 0.96→1; divs have no scale transform in gpui — approximated.)
 pub fn menu_in<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
 where
     E: Styled + IntoElement + 'static,
@@ -412,9 +435,8 @@ pub fn lerp(from: f32, to: f32, t: f32) -> f32 {
 // ---------------------------------------------------------------------------
 //
 // gpui `.hover()` styles snap by construction — the style applies the frame
-// the pointer enters. The original jolt puts Tailwind `transition-colors`
-// (150ms, cubic-bezier(0.4, 0, 0.2, 1)) on every interactive wash, so hover
-// states FADE. This is the manual-drive tween for that (the shell `WidthTween`
+// the pointer enters. Interactive washes instead fade over 150ms using
+// cubic-bezier(0.4, 0, 0.2, 1). This is the manual-drive tween for that (the shell `WidthTween`
 // pattern — never `with_animation`, whose element-id-keyed clock replays on
 // remount): a per-element-key hover progress, advanced from wall time on each
 // evaluation, with the render tail requesting frames while any fade is

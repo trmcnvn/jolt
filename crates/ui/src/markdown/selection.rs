@@ -1,9 +1,9 @@
-//! Text selection for rendered markdown (round 18).
+//! Text selection for rendered transcript text (round 18).
 //!
 //! gpui has no built-in selection for plain text elements. Zed's markdown
 //! selects continuously because its whole document is ONE element over one
-//! text model; jolt renders a TREE of text elements inside a virtualized
-//! list, so this module rebuilds that continuity: every frame the renderer
+//! text model; jolt renders a TREE of assistant blocks and user bubbles inside
+//! a virtualized list, so this module rebuilds that continuity: every frame the renderer
 //! registers each painted text element in paint order (= document order),
 //! and a drag anchored in one element resolves against that registry into
 //! per-element SPANS — partial in the anchor/head elements, whole for every
@@ -46,7 +46,8 @@ fn state() -> &'static Mutex<Option<MdSelection>> {
 
 /// Resolve the spans for a selection between `a` and `b`, each an
 /// `(element index, byte offset)` into `elements` (document-ordered
-/// `(key, text)` pairs). Handles either direction; empty slices are skipped.
+/// `(key, text)` pairs). Handles either direction; cross-element empty slices
+/// are retained so their separating newlines remain copyable.
 pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, usize)) -> Vec<Span> {
     let (start, end) = if (a.0, a.1) <= (b.0, b.1) {
         (a, b)
@@ -58,7 +59,10 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
         let from = if ei == start.0 { start.1 } else { 0 };
         let to = if ei == end.0 { end.1 } else { text.len() };
         let (from, to) = (from.min(text.len()), to.min(text.len()));
-        if from < to {
+        // Keep empty endpoint/middle spans when selection crosses elements:
+        // the newline inserted between spans is selected content too. This is
+        // required for exact multi-line code copies, including blank lines.
+        if from < to || start.0 != end.0 {
             spans.push(Span {
                 key: (*key).to_string(),
                 range: from..to,
@@ -100,6 +104,14 @@ pub fn drag_anchor(key: &str) -> Option<usize> {
     (sel.dragging && sel.anchor_key == key).then_some(sel.anchor_ix)
 }
 
+/// The live drag's owner and anchor byte offset.
+pub fn active_drag_anchor() -> Option<(String, usize)> {
+    let guard = state().lock().unwrap();
+    let sel = guard.as_ref()?;
+    sel.dragging
+        .then(|| (sel.anchor_key.clone(), sel.anchor_ix))
+}
+
 /// Replace the resolved spans (drag update). Returns true if they changed.
 pub fn update_spans(spans: Vec<Span>) -> bool {
     let mut guard = state().lock().unwrap();
@@ -121,11 +133,18 @@ pub fn end_drag(key: &str) -> Option<String> {
         return None;
     }
     sel.dragging = false;
-    if sel.spans.iter().all(|s| s.range.is_empty()) {
+    let text = join_spans(&sel.spans);
+    if text.is_empty() {
         *guard = None;
         return None;
     }
-    Some(join_spans(&sel.spans))
+    Some(text)
+}
+
+/// End whichever text element owns the live drag.
+pub fn end_active_drag() -> Option<String> {
+    let key = active_drag_anchor()?.0;
+    end_drag(&key)
 }
 
 /// Clear if `key` owns a settled selection (a mouse-down landed outside the
@@ -161,16 +180,13 @@ pub fn wash_range(key: &str) -> Option<Range<usize>> {
 pub fn selected_text() -> Option<String> {
     let guard = state().lock().unwrap();
     let sel = guard.as_ref()?;
-    if sel.spans.iter().all(|s| s.range.is_empty()) {
-        return None;
-    }
-    Some(join_spans(&sel.spans))
+    let text = join_spans(&sel.spans);
+    (!text.is_empty()).then_some(text)
 }
 
 fn join_spans(spans: &[Span]) -> String {
     spans
         .iter()
-        .filter(|s| !s.range.is_empty())
         .map(|s| &s.text[s.range.clone()])
         .collect::<Vec<_>>()
         .join("\n")
@@ -244,6 +260,17 @@ mod tests {
         assert_eq!(resolve_spans(&elems(), (2, 5), (0, 6)), spans);
     }
 
+    #[test]
+    fn cross_element_selection_preserves_newlines_and_blank_lines() {
+        let elements = [("l1", "one"), ("l2", ""), ("l3", "three")];
+        let spans = resolve_spans(&elements, (0, 3), (2, 0));
+        assert_eq!(spans.len(), 3);
+        assert_eq!(join_spans(&spans), "\n\n");
+
+        let spans = resolve_spans(&elements, (0, 1), (2, 2));
+        assert_eq!(join_spans(&spans), "ne\n\nth");
+    }
+
     /// The drag tests below mutate the process-global selection state —
     /// serialize them, or the parallel test runner interleaves their
     /// begin/end_drag calls (long-standing flake).
@@ -259,13 +286,14 @@ mod tests {
         begin("p1", 6);
         assert_eq!(drag_anchor("p1"), Some(6));
         assert_eq!(drag_anchor("p2"), None);
+        assert_eq!(active_drag_anchor(), Some(("p1".to_string(), 6)));
         let spans = resolve_spans(&elems(), (0, 6), (1, 6));
         assert!(update_spans(spans.clone()));
         assert!(!update_spans(spans)); // unchanged ⇒ no repaint
         assert_eq!(wash_range("p1"), Some(6..15));
         assert_eq!(wash_range("p2"), Some(0..6));
         assert_eq!(wash_range("p3"), None);
-        assert_eq!(end_drag("p1").as_deref(), Some("paragraph\nsecond"));
+        assert_eq!(end_active_drag().as_deref(), Some("paragraph\nsecond"));
         assert_eq!(selected_text().as_deref(), Some("paragraph\nsecond"));
         // Settled: a down elsewhere clears via the owner's listener.
         assert!(!clear_if_owner("p2"));

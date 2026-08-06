@@ -1,8 +1,8 @@
 //! jolt-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
 //! transports, plus the device-room relay transport ({s,k,to,from} frames — [`device_room`]).
 //!
-//! Framing: ndjson envelopes, one JSON object per WebSocket text message (or per line on
-//! byte transports), matching the shape of jolt's Effect RPC without the Effect runtime:
+//! Framing: ndjson envelopes, one JSON object per WebSocket text message or per
+//! line on byte transports:
 //!
 //! - client → server: `{id, method, params}` to invoke, `{id, cancel: true}` to stop a stream;
 //! - server → client: `{id, ok}` / `{id, err}` for unary calls,
@@ -31,7 +31,7 @@ pub use device_room::{
 pub use server::{serve_connection, serve_ws_listener};
 
 /// RPC method names — single source of truth for both ends.
-/// Full surface: docs/research/feature-inventory.md §2.
+/// Full surface: docs/rpc.md.
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const LIST_MODELS: &str = "ListModels";
@@ -52,9 +52,13 @@ pub mod methods {
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
+    /// Selected-chat usage on its host device (relay-forwardable stream).
+    pub const WATCH_CHAT_USAGE: &str = "WatchChatUsage";
+    /// Ranged device-local usage analytics (relay-forwardable unary call).
+    pub const USAGE_BREAKDOWN: &str = "UsageBreakdown";
     /// Spaces registry (device+folder pairs) from the workspace doc.
     pub const WATCH_SPACES: &str = "WatchSpaces";
-    /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
+    /// Entity mutations against the workspace document.
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     pub const MUTATE: &str = "Mutate";
@@ -62,7 +66,7 @@ pub mod methods {
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
     pub const AUTH_STATUS: &str = "AuthStatus";
-    // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
+    // Auth RPC mutations (IPC-only).
     pub const SIGN_IN: &str = "SignIn";
     pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
     pub const COMPLETE_SIGN_IN: &str = "CompleteSignIn";
@@ -103,6 +107,11 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
+    // Device-local harness secrets. Values are accepted only by the local IPC
+    // engine and are never relay-forwarded or returned by any method.
+    pub const LIST_HARNESS_SECRETS: &str = "ListHarnessSecrets";
+    pub const UPSERT_HARNESS_SECRET: &str = "UpsertHarnessSecret";
+    pub const DELETE_HARNESS_SECRET: &str = "DeleteHarnessSecret";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
@@ -187,7 +196,7 @@ pub fn parse_params<T: serde::de::DeserializeOwned>(
 
 /// Spawn an in-memory server for `service` and return a connected client.
 /// Same envelopes, same dispatch loop as the WebSocket path — the in-process UI
-/// transport (ARCHITECTURE §1 "zero serialization shortcuts").
+/// transport deliberately keeps the serialization boundary (docs/rpc.md).
 pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
     let (client_out, server_in) = tokio::sync::mpsc::channel::<String>(256);
     let (server_out, client_in) = tokio::sync::mpsc::channel::<String>(256);

@@ -1,5 +1,5 @@
 /**
- * The /auth/* HTTP surface absorbed from jolt's apps/server:
+ * The /auth/* HTTP surface:
  *
  *  - POST /auth/exchange     — WorkOS code → tokens (see `workos.ts`).
  *  - POST /auth/refresh      — WorkOS refresh → fresh tokens (org-scopable).
@@ -10,8 +10,8 @@
  * Exchange/refresh/callback run BEFORE the bearer gate (the caller has no
  * access token yet); the org routes verify the bearer themselves — the user
  * id is ALWAYS the token's `sub`, never request input: users manage their own
- * memberships and no one else's. Error mapping matches the old server: bad
- * body 400, missing bearer 401, WorkOS-off 501, rejected exchange/refresh 401.
+ * memberships and no one else's. Error mapping: bad body 400, missing bearer
+ * 401, WorkOS-off 501, rejected exchange/refresh 401.
  */
 import { bearerFromRequest, verifyToken } from "./auth";
 import type { Env } from "./env";

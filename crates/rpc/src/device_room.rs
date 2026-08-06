@@ -1,4 +1,4 @@
-//! Device-room relay transport (ARCHITECTURE §1, feature-inventory §3.7): the byte-frame
+//! Device-room relay transport (docs/architecture.md, docs/sync.md): the byte-frame
 //! codec spoken by the edge `DeviceRoom` DO, the **host relay** (this device serving its
 //! full RPC surface through the relay), and the **client link** (dialing another device's
 //! relay and speaking ordinary [`RpcClient`] RPC over it).
@@ -13,7 +13,7 @@
 //!
 //! The RPC path multiplexes NOTHING new: each distinct client `connId` becomes a virtual
 //! string-frame connection feeding the existing [`serve_connection`] seam, so every RPC
-//! handler works through the relay untouched (the port of jolt's `device-room-host.ts`).
+//! handler works through the relay untouched.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -234,7 +234,7 @@ impl HostRelayConfig {
 /// `service` to every client conn through virtual string-frame connections. Immortal
 /// supervisor: quiet while signed out, reconnects with backoff when the socket drops
 /// (including the 4409 "superseded by new host connection" close — the newest host wins,
-/// so the superseded process backs off and retries, mirroring jolt's DeviceRoomHost).
+/// so the superseded process backs off and retries).
 pub struct HostRelay {
     task: tokio::task::JoinHandle<()>,
 }
@@ -603,7 +603,7 @@ pub struct LinkCacheConfig {
     pub edge_url: String,
     pub token: Arc<dyn TokenSource>,
     /// Exponential dial cooldown after failures (base, cap) — a dead peer must not be
-    /// redialed at full cadence; callers fail fast in between (jolt peers.ts behavior).
+    /// redialed at full cadence; callers fail fast in between.
     pub cooldown_base: Duration,
     pub cooldown_max: Duration,
     /// Readiness probe budget: the relay accepts client joins even when the host is
@@ -614,10 +614,9 @@ pub struct LinkCacheConfig {
 impl LinkCacheConfig {
     pub fn new(edge_url: impl Into<String>, token: Arc<dyn TokenSource>) -> Self {
         // Interactive remote control (remote folders, terminals, accounts) rides
-        // this cache: one blip must cost seconds, not minutes. The old jolt
-        // 15s→5min curve punished a single failed dial with a 5-minute refusal;
-        // here the first failure backs off 5s and even a dead peer is re-probed
-        // within a minute. A generous probe budget keeps a slow-waking laptop
+        // this cache: one blip must cost seconds, not minutes. The first failure
+        // backs off 5s and even a dead peer is re-probed within a minute. A
+        // generous probe budget keeps a slow-waking laptop
         // (radio up, engine still thawing) from counting as a failure.
         Self {
             edge_url: edge_url.into(),
@@ -640,8 +639,8 @@ struct DialState {
     cooldown_until: Option<Instant>,
 }
 
-/// Lazily-dialed, cached peer links keyed by device id — the Rust twin of jolt's
-/// `Peers`. Cache hits never wait behind an in-flight dial; dials to the same device are
+/// Lazily-dialed, cached peer links keyed by device id. Cache hits never wait
+/// behind an in-flight dial; dials to the same device are
 /// serialized per device (a global lock would head-of-line-block healthy peers); links
 /// self-evict when the transport drops; a failed RPC should call [`LinkCache::invalidate`]
 /// so the next call re-dials.
@@ -683,8 +682,7 @@ impl LinkCache {
     /// Transient dial failures retry in place a couple of times before
     /// surfacing: the host relay's DO periodically ends its session and
     /// rejoins within ~a second, and a user-facing call landing in that
-    /// window should ride over it, not error (user report: refs/folders
-    /// "unstable" vs the old app).
+    /// window should ride over it instead of erroring.
     pub async fn client(self: &Arc<Self>, device_id: &str) -> Result<Arc<RpcClient>, RpcError> {
         // Fast path outside any lock.
         if let Some(link) = self.cached(device_id) {
@@ -854,7 +852,7 @@ impl LinkCache {
 }
 
 // ---------------------------------------------------------------------------
-// Codec tests — vectors ported from edge/src/device-frame.test.ts
+// Codec tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -867,7 +865,7 @@ mod tests {
 
     #[test]
     fn round_trips_header_and_payload() {
-        // device-frame.test.ts: "round-trips header + payload"
+        // Round-trip header and payload.
         let payload = [1u8, 2, 3, 250, 255];
         let h = header("term-42", "term").with_to("conn-9");
         let frame = encode_device_frame(&h, &payload).expect("encode");
@@ -878,7 +876,7 @@ mod tests {
 
     #[test]
     fn handles_empty_payloads_and_long_headers() {
-        // device-frame.test.ts: "handles empty payloads and long headers" — the 200-char
+        // Handle empty payloads and long headers; the 200-character
         // stream id forces a multi-byte uleb128 length prefix.
         let mut h = header(&"x".repeat(200), "rpc");
         h.from = Some("conn-1".into());

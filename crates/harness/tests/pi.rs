@@ -1,11 +1,14 @@
 //! PiHarness integration tests against the fake RPC CLI.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use tokio::sync::{mpsc, oneshot};
 
+use jolt_harness::environment::{HarnessEnvironment, HarnessEnvironmentProvider};
 use jolt_harness::{
     BashMessage, BashRequest, CancellationToken, Harness, HarnessError, PiHarness, RunControls,
     SteerMessage,
@@ -27,6 +30,16 @@ fn fixture_path() -> PathBuf {
 
 fn harness() -> PiHarness {
     PiHarness::new().with_executable(fixture_path())
+}
+
+struct TestEnvironment;
+
+#[async_trait]
+impl HarnessEnvironmentProvider for TestEnvironment {
+    async fn environment(&self, harness: HarnessId) -> Result<Vec<(String, String)>, HarnessError> {
+        assert_eq!(harness, HarnessId::Pi);
+        Ok(vec![("JOLT_TEST_SECRET".into(), "available".into())])
+    }
 }
 
 fn request(prompt: &str) -> RunRequest {
@@ -238,6 +251,8 @@ async fn happy_path_maps_streaming_tools_usage_images_and_done() {
             ..
         } if model == "test-provider/alpha" && session_id == "pi-session-1"
     )));
+    assert!(events.contains(&AgentEvent::CompactionStarted));
+    assert!(events.contains(&AgentEvent::CompactionFinished));
     assert!(events.contains(&AgentEvent::ReasoningDelta {
         text: "considering".into()
     }));
@@ -255,8 +270,13 @@ async fn happy_path_maps_streaming_tools_usage_images_and_done() {
         is_error: true
     }));
     assert!(events.contains(&AgentEvent::Usage {
-        input_tokens: 14,
-        output_tokens: 4
+        input_tokens: 3,
+        output_tokens: 4,
+        cache_read_input_tokens: 5,
+        cache_write_input_tokens: 6,
+        cost_usd: None,
+        context_tokens: Some(14),
+        context_window: None,
     }));
     assert!(events.iter().any(|event| matches!(
         event,
@@ -421,6 +441,26 @@ async fn interrupt_sends_abort_and_settles_interrupted() {
         AgentEvent::Done {
             status: DoneStatus::Interrupted,
             error: None,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn scoped_environment_reaches_pi_child() {
+    let environment = HarnessEnvironment::default();
+    environment.set_provider(Arc::new(TestEnvironment));
+    let harness = harness().with_environment(environment);
+    let (controls, _steer, _interrupt) = controls("Yes");
+    let mut stream = harness
+        .run(request("scenario:environment"), controls)
+        .await
+        .unwrap();
+    let events = until_done(&mut stream).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
             ..
         }
     )));

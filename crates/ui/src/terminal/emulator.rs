@@ -256,9 +256,12 @@ impl Emulator {
     }
 
     /// Scroll the view: positive = up into history, negative = toward live.
-    pub fn scroll(&mut self, delta: i32) {
+    /// Returns whether the visible offset changed.
+    pub fn scroll(&mut self, delta: i32) -> bool {
+        let before = self.display_offset();
         self.term
             .scroll_viewport(ScrollViewport::Delta((delta as isize).saturating_neg()));
+        self.display_offset() != before
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -528,14 +531,15 @@ mod tests {
         assert_eq!(e.history_lines(), 6);
         assert_eq!(e.display_offset(), 0);
         // Scroll up into history.
-        e.scroll(2);
+        assert!(e.scroll(2));
         assert_eq!(e.display_offset(), 2);
         assert_eq!(e.row_text(0), "line5");
         // Cursor is below the viewport while scrolled back.
         assert_eq!(e.cursor(), None);
         // Over-scroll clamps to the top of history.
-        e.scroll(100);
+        assert!(e.scroll(100));
         assert_eq!(e.display_offset(), 6);
+        assert!(!e.scroll(1), "scrolling past the top is a no-op");
         assert_eq!(e.row_text(0), "line1");
         e.scroll_to_bottom();
         assert_eq!(e.display_offset(), 0);

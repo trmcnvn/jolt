@@ -35,9 +35,9 @@ pub enum Indicator {
     Errored,
 }
 
-/// A `Working`/`AwaitingInput` session older than this is treated as dead — a
-/// crashed backend must never show an eternal "Working" (feature-inventory
-/// §1.12). Engines heartbeat sessions well inside this window.
+/// A `Working`/`AwaitingInput` session older than this is treated as dead so a
+/// crashed backend never shows an eternal "Working". Engines heartbeat sessions
+/// well inside this window.
 pub const SESSION_STALE_MS: i64 = 45_000;
 
 /// Staleness-checked indicator for a session row. Pure.
@@ -91,8 +91,8 @@ pub fn attention_rank(status: ChatIndicator) -> u8 {
 /// attention-bucketed: status drives the DOT, never the position — bucketing
 /// meant that merely OPENING a completed session (completed → seen → idle)
 /// dropped its row under the pointer (user report: "their position in the
-/// scrollbar changes"). Matches the old sidebar, which rendered chats in
-/// recency order and let the dots carry urgency; [`attention_rank`] still
+/// scrollbar changes"). Recency determines order while dots carry urgency;
+/// [`attention_rank`] still
 /// aggregates the space rows' urgency dot.
 pub fn sort_active(rows: &mut Vec<(ChatIndicator, &Chat)>) {
     rows.sort_by(|(_, a), (_, b)| {
@@ -139,7 +139,7 @@ pub fn sort_chats(chats: &mut [Chat]) {
 // Boot gate
 // ---------------------------------------------------------------------------
 
-/// The app gate (jolt's App.tsx phases). Pure.
+/// The app boot gate. Pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatePhase {
     /// Booting / probing — splash covers this.
@@ -239,8 +239,8 @@ pub fn group_chats<'a>(chats: impl IntoIterator<Item = &'a Chat>) -> Vec<ChatGro
     groups
 }
 
-/// Compact relative time ("now", "5m", "3h", "2d", "1w", …) — no "ago" suffix;
-/// port of jolt's `formatTimeAgo`.
+/// Compact relative time ("now", "5m", "3h", "2d", "1w", …) without an
+/// "ago" suffix.
 pub fn format_time_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let s = now.signed_duration_since(then).num_seconds().max(0);
     // Under a minute reads as "now" — otherwise 45–59s floors to a bare "0m".
@@ -315,8 +315,8 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
-/// Per-kind chip label + one-line detail. Labels match jolt's `describeTool`
-/// (tool-chip.tsx) exactly, so the two viewports name a tool identically.
+/// Per-kind chip label and one-line detail, shared so both viewports name tools
+/// identically.
 pub fn tool_chip_content(call: &crate::ToolCall) -> (&'static str, String) {
     let (label, detail) = tool_chip_content_raw(call);
     (label, single_line(&detail))
@@ -420,7 +420,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
         segments.push(format!("{failed} failed"));
     }
     let mut summary = segments.join(" · ");
-    // Capitalize the first segment only (jolt's style).
+    // Capitalize the first segment only.
     if let Some(first) = summary.get(0..1) {
         let upper = first.to_uppercase();
         summary.replace_range(0..1, &upper);

@@ -1,6 +1,6 @@
 /**
  * Registry merge core — the pure row/op semantics behind RegistryRoom
- * (docs/registry-sync.md). No storage, no sockets: everything here is unit
+ * (docs/sync.md). No storage, no sockets: everything here is unit
  * tested in registry-core.test.ts and mirrored 1:1 by
  * crates/doc/src/registry.rs (shared test vectors — keep both in sync).
  *
@@ -96,7 +96,7 @@ export interface ApplyResult {
  * Apply one op to a row (absent = undefined). Pure; returns the (possibly new)
  * row and whether anything changed. Callers stamp `row.seq` on change.
  *
- * Rules (docs/registry-sync.md):
+ * Rules (docs/sync.md):
  * - field write applies iff clock > stored clock for that field;
  * - `update` never creates or revives a row ("never invent rows");
  * - `upsert` creates, and revives a tombstone iff newer than `delHlc`;

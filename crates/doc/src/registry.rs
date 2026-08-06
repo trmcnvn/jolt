@@ -1,5 +1,5 @@
 //! Workspace registry — the client side of the row-table sidebar sync that
-//! replaces the Loro workspace doc (docs/registry-sync.md).
+//! replaces the Loro workspace doc (docs/sync.md).
 //!
 //! [`RegistryDoc`] is a local replica of the per-user registry room:
 //! - `authoritative` rows — the server's truth, replaced wholesale by `state`/
@@ -1022,6 +1022,7 @@ impl RegistryDoc {
             ("chatId", json!(session.chat_id)),
             ("deviceId", json!(session.device_id)),
             ("status", serde_json::to_value(session.status)?),
+            ("compacting", json!(session.compacting)),
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
         ]);
@@ -1156,6 +1157,7 @@ impl RegistryDoc {
                     ("chatId", json!(session.chat_id)),
                     ("deviceId", json!(session.device_id)),
                     ("status", serde_json::to_value(session.status)?),
+                    ("compacting", json!(session.compacting)),
                     ("startedAt", opt_ms(session.started_at)),
                     ("updatedAt", json!(session.updated_at.timestamp_millis())),
                 ]),

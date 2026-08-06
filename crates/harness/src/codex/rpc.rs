@@ -1,5 +1,5 @@
-//! Minimal JSON-RPC 2.0 client over the app server's stdio (newline-delimited
-//! frames, id-multiplexed), ported from codex.ts's `startAppServer`.
+//! Minimal JSON-RPC 2.0 client over the app server's stdio with newline-delimited,
+//! id-multiplexed frames.
 //!
 //! - Responses are matched to callers by numeric id (a shared pending map the
 //!   reader task resolves directly, so requests can be awaited from anywhere —

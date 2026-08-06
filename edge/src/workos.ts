@@ -1,7 +1,6 @@
 /**
- * Minimal WorkOS User Management REST client — the fetch-based port of the
- * old apps/server `WorkOsAuth` service (which used @workos-inc/node; the
- * Worker keeps it SDK-free). This is the one place that holds the WorkOS
+ * Minimal SDK-free WorkOS User Management REST client. This is the one place
+ * that holds the WorkOS
  * **API key** (a Worker secret). Device backends build the public authorize
  * URL themselves and delegate the secret-bearing steps here, so the key never
  * lands on a device.
@@ -13,8 +12,7 @@ import type { Env } from "./env";
 
 const API = "https://api.workos.com";
 
-/** Thrown for rejected WorkOS calls; routes map it to 401 (same as the old
- * server's WorkOsAuthFailed). */
+/** Thrown for rejected WorkOS calls; routes map it to HTTP 401. */
 export class WorkOsAuthFailed extends Error {}
 
 export interface ExchangeResult {

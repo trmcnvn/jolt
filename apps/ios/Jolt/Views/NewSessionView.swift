@@ -1,7 +1,6 @@
-// New session — a real composer page, not a form. Mirrors the old mobile
-// app's canvas (faded mark + "What are we building?" + glass composer with
-// picker chips) and the desktop's new-session canvas (composer expanded with
-// in-pill pickers). The space already fixes device + folder; the composer
+// New session — a composer page rather than a form. Its canvas uses a faded
+// mark, prompt, and glass composer with in-pill picker chips. The space already
+// fixes device + folder; the composer
 // carries the agent/model chip, and sending mints the chat, queues the first
 // run, and swaps straight into the live session.
 
@@ -12,7 +11,7 @@ struct NewSessionView: View {
     let spaceId: String
     @Binding var path: [Route]
 
-    // Sticky run config (the old app persisted these to prefs.db).
+    // Sticky run configuration.
     @AppStorage("newSessionHarness") private var harness = "claude-code"
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
@@ -49,7 +48,7 @@ struct NewSessionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Canvas — tap dismisses the keyboard, like the old app.
+            // Tapping the canvas dismisses the keyboard.
             ZStack {
                 Theme.bg
                 VStack(spacing: 24) {
@@ -332,9 +331,8 @@ struct NewSessionView: View {
 
 // MARK: - Model / effort picker sheet
 
-/// Detent bottom sheet in the old app's ModelEffortMenu layout: harness tabs
-/// (hidden once a chat exists — harness is locked, like the old app), a
-/// grouped card of models, and the effort ladder in the same select-row style.
+/// Detent bottom sheet with harness tabs (hidden once a chat exists), a grouped
+/// card of models, and an effort ladder in the same select-row style.
 /// Mid-session checkout context: the read-only kind label plus the live ref
 /// list (the desktop keeps its branch selector interactive mid-session).
 struct SessionCheckoutContext {

@@ -1,4 +1,4 @@
-//! Settings → Devices (feature-inventory §1.5): the device registry — name,
+//! Settings → Devices: the device registry — name,
 //! platform, last-seen, presence dot, a "This device" badge, click-to-copy id,
 //! and a Rename dialog (Mutate renameDevice).
 
@@ -177,7 +177,7 @@ impl DevicesPage {
     }
 }
 
-/// Human platform label (jolt settings.devices.tsx `platformLabel`).
+/// Human-readable platform label.
 pub fn platform_label(platform: &str) -> &str {
     match platform {
         "macos" | "darwin" => "macOS",
@@ -231,8 +231,7 @@ impl Render for DevicesPage {
                 };
                 // Presence lives ON the identity tile: a corner dot (emerald
                 // online with a soft glow, faint offline), ringed by the card
-                // tone so it "cuts" the tile — jolt settings.devices.tsx
-                // `border-2 border-[var(--card)]` +
+                // tone so it cuts through the tile, plus
                 // `shadow-[0_0_6px_rgba(52,211,153,0.55)]`.
                 let tile = widgets::row_tile(&theme, platform_icon).relative().child(
                     div()
@@ -280,7 +279,7 @@ impl Render for DevicesPage {
                             .into_any_element(),
                     );
                 }
-                // "Added {time ago}" — always present (jolt settings.devices.tsx).
+                // "Added {time ago}" is always present.
                 if let Some(created) = device.created_at {
                     meta.push(
                         div()

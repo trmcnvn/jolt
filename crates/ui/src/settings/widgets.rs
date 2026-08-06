@@ -1,7 +1,5 @@
-//! Shared scaffolding for the settings pages — the original's page rhythm
-//! (`mx-auto max-w-3xl px-6 pb-16 pt-8`), section cards, row layout, badges
-//! and small buttons, so every page reads as the same product surface
-//! (jolt settings.devices.tsx / settings.agents.tsx / settings.archived.tsx).
+//! Shared scaffolding for settings pages: centered columns, section cards, row
+//! layouts, badges, and small buttons, so every page reads as one product.
 
 use gpui::{AnyElement, SharedString, div, prelude::*, px};
 
@@ -20,13 +18,13 @@ pub fn page_column() -> gpui::Div {
         .flex_col()
 }
 
-/// Page headline row: `flex items-baseline gap-2.5` — `text-base font-semibold`
-/// title + `text-[13px]` count sharing a baseline (jolt settings.devices.tsx).
+/// Page headline row: `flex items-center gap-2.5` — `text-base font-semibold`
+/// title + a vertically centered `text-[13px]` count.
 pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Div {
     div()
         .flex()
         .flex_row()
-        .items_baseline()
+        .items_center()
         .gap(px(10.0))
         .child(
             div()

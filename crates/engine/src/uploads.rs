@@ -1,10 +1,9 @@
-//! Uploads — attachment staging + the content-addressed edge mirror
-//! (feature-inventory §3.7 "Uploads"; port of jolt's `uploads.ts`).
+//! Uploads — attachment staging and the content-addressed edge mirror.
 //!
 //! The UI streams a file as base64 chunks (~60KB, sized for the relay when the
 //! target device is remote); chunks stage on disk under `{data_dir}/uploads/tmp/
-//! {uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike jolt's
-//! in-memory buffers), and `commit` assembles them into
+//! {uploadId}/{seq}.b64` so they survive an engine restart mid-upload, and
+//! `commit` assembles them into
 //! `{data_dir}/uploads/{id8}-{name}` and returns the absolute path, which the
 //! composer appends to the prompt so the agent can read the file from disk.
 //!
@@ -17,8 +16,7 @@
 //!
 //! `read_chunk` serves transcript images back in 45KB base64 chunks. Path jail:
 //! only files under the uploads dir or a workspace-known chat cwd are readable
-//! (the RPC layer supplies the cwd roots) — and only supported image types, as
-//! in jolt.
+//! (the RPC layer supplies the cwd roots), and only supported image types.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -1,6 +1,6 @@
 //! Streaming fade veil — per-appended-chunk opacity over already-committed text.
 //!
-//! The desktop app (docs/research/mugen-pretext.md §2e) commits streamed text to
+//! The desktop app (docs/using-jolt.md) commits streamed text to
 //! layout instantly and dissolves a purely cosmetic veil over the newly arrived
 //! characters. This module is the gpui port of that idea:
 //!
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn default_row_veil_fades_first_text() {
-        // Mid-stream new rows keep the old behavior: their first chunk fades.
+        // The first chunk of a new mid-stream row fades.
         let t0 = Instant::now();
         let mut row = RowVeil::default();
         let spans = row.advance(0, "fresh", t0);

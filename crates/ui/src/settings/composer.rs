@@ -1,5 +1,4 @@
-//! Sticky composer defaults — the new-chat "remember my last picks" store
-//! (jolt parity: localStorage `jolt.composer.defaults:v1`, defaults.ts).
+//! Sticky composer defaults — the new-chat "remember my last picks" store.
 //!
 //! A small JSON file beside `ui-settings.json` (that file is the shell's and
 //! is saved debounced from its own boot-time copy, so the composer keeps its
@@ -18,9 +17,8 @@ use jolt_proto::{HarnessId, ReasoningLevel};
 
 const FILE_NAME: &str = "composer-defaults.json";
 
-/// Remembered model per harness — id plus display label, mirroring jolt's
-/// `modelByHarness` storing the full `Model` object "so the pill never flashes
-/// a raw id or 'Default'".
+/// Remembered model per harness: id plus display label so the pill never flashes
+/// a raw id or "Default".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RememberedModel {
@@ -35,7 +33,7 @@ pub struct ComposerDefaults {
     pub harness: Option<HarnessId>,
     /// Last model picked, per harness (restored on harness switch).
     pub model_by_harness: HashMap<HarnessId, RememberedModel>,
-    /// Last reasoning level picked (global, like jolt's `reasoning` key).
+    /// Last reasoning level picked globally.
     pub reasoning: Option<ReasoningLevel>,
     /// Every model label ever seen (id → label), fed from catalog loads.
     /// The chip's fallback while a harness's list is still loading — a
@@ -79,7 +77,7 @@ impl ComposerDefaults {
         self.model_by_harness.get(&harness)
     }
 
-    /// Remember a pick (jolt `saveDefaults({ harness, modelByHarness })`).
+    /// Remember a model pick for one harness.
     pub fn remember_model(&mut self, harness: HarnessId, id: String, label: String) {
         self.harness = Some(harness);
         self.model_by_harness

@@ -79,7 +79,7 @@ final class AppConfig: @unchecked Sendable {
         return url
     }
 
-    /// The workspace registry room (docs/registry-sync.md) — the row-table
+    /// The workspace registry room (docs/sync.md) — the row-table
     /// replacement for the old ws Loro workspace doc.
     func registrySocketURL() async -> URL? {
         guard let token = await currentToken() else { return nil }

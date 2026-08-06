@@ -1,6 +1,6 @@
 //! The terminal panel: session-scoped tabs over engine PTYs.
 //!
-//! Feature-inventory §1.10: tabs are per selected chat and restored on return
+//! Tabs are per selected chat and restored on return
 //! (emulators — and their server-side PTYs — survive navigation; detach is not
 //! close). Tab bar supports pointer drag-reorder with 150 ms sliding
 //! transforms, middle-click close, and a "+" new-tab button; Cmd/Ctrl+`
@@ -183,6 +183,8 @@ struct TerminalTab {
     exited: Option<i32>,
     last_seq: u64,
     coalescer: InputCoalescer,
+    /// Fractional wheel lines retained between high-resolution trackpad events.
+    scroll_remainder: f32,
     flush_task: Option<Task<()>>,
     resize_task: Option<Task<()>>,
     /// Open + subscribe/reconnect lifecycle; dropping it cancels the stream.
@@ -309,8 +311,7 @@ impl TerminalPanel {
     }
 
     /// The chat's host device when it differs from the connected engine's own —
-    /// the PTY lives on the chat's device (feature-inventory §2.1 "terminals
-    /// live on the chat's host device"), so every terminal RPC for a remote
+    /// the PTY lives on the chat's host device, so every terminal RPC for a remote
     /// chat needs the `targetDeviceId` passthrough. Without it the local
     /// engine checks the chat's cwd against its OWN filesystem and fails with
     /// "Session working directory is unavailable" (user report).
@@ -370,6 +371,7 @@ impl TerminalPanel {
             exited: None,
             last_seq: 0,
             coalescer: InputCoalescer::default(),
+            scroll_remainder: 0.0,
             flush_task: None,
             resize_task: None,
             _run: None,
@@ -766,8 +768,8 @@ impl TerminalPanel {
         Some(GridSnapshot { lines, cursor })
     }
 
-    fn scroll_active(&mut self, delta_lines: i32, cx: &mut Context<Self>) {
-        if delta_lines == 0 {
+    fn scroll_active(&mut self, delta_lines: f32, cx: &mut Context<Self>) {
+        if delta_lines == 0.0 {
             return;
         }
         let Some(chat) = self.selected_chat(cx) else {
@@ -777,8 +779,17 @@ impl TerminalPanel {
             return;
         };
         let active = tabs.active;
-        if let Some(tab) = tabs.tabs.get_mut(active) {
-            tab.emulator.scroll(delta_lines);
+        let Some(tab) = tabs.tabs.get_mut(active) else {
+            return;
+        };
+
+        tab.scroll_remainder += delta_lines;
+        let step = tab.scroll_remainder.trunc() as i32;
+        if step == 0 {
+            return;
+        }
+        tab.scroll_remainder -= step as f32;
+        if tab.emulator.scroll(step) {
             cx.notify();
         }
     }
@@ -893,8 +904,8 @@ impl TerminalPanel {
 
         let bar_chat = chat_owned.clone();
         let drop_chat = chat_owned.clone();
-        // Jolt terminal-panel.tsx: `flex h-10 items-center border-b
-        // border-white/[0.07] pl-2 pr-1.5` on the #090909 panel — no separate
+        // 40px tab bar with a hairline, 8px left padding, and 6px right padding
+        // on the near-black panel; no separate
         // bar fill.
         div()
             .id("terminal-tab-bar")
@@ -982,7 +993,7 @@ impl TerminalPanel {
                             .pl(px(8.0))
                             .pr(px(4.0))
                             .rounded(px(8.0))
-                            // jolt terminal-panel.tsx tab: `transition-colors`.
+                            // Fade tab hover colors.
                             .bg(motion::hover_blend(
                                 &format!("term-tab-{key}"),
                                 bg,
@@ -1038,9 +1049,8 @@ impl TerminalPanel {
                                     ))
                                     .into_any_element()
                             }
-                            // Invisible spacer — the ghost carries the tab; a
-                            // dimmed original overlapped the sibling that
-                            // slides into the vacated slot.
+                            // Invisible spacer: the ghost carries the tab while
+                            // a sibling slides into the vacated slot.
                             Some((from, ..)) if ix == from => div()
                                 .w(px(TAB_WIDTH))
                                 .h(px(28.0))
@@ -1060,7 +1070,7 @@ impl TerminalPanel {
                     .justify_center()
                     .rounded(px(8.0))
                     .cursor_pointer()
-                    // jolt terminal-panel.tsx icon buttons: `transition-colors`.
+                    // Fade icon-button hover colors.
                     .bg(motion::hover_blend(
                         "term-new-tab",
                         gpui::transparent_black(),
@@ -1161,8 +1171,7 @@ impl Render for TerminalPanel {
                                 f32::from(delta.y) / super::view::TERM_LINE_HEIGHT
                             }
                         };
-                        let step = lines.round() as i32;
-                        this.scroll_active(step, cx);
+                        this.scroll_active(lines, cx);
                     }))
                     .child(TerminalElement::new(cx.entity(), focused)),
             )

@@ -38,7 +38,7 @@ export const bearerFromRequest = (request: Request): string | undefined => {
 
 export const verifyToken = async (env: Env, token: string): Promise<Verified | undefined> => {
   if (env.AUTH_MODE === "dev") {
-    // Dev mode mirrors the old apps/server: the bearer string IS the user id.
+    // In dev mode, the bearer string is the user id.
     // `userId@orgId` additionally carries a fake org claim so workspace-room
     // membership is exercisable locally (smoke tests).
     if (!token) return undefined;

@@ -1,4 +1,4 @@
-//! Settings → Agents / accounts (feature-inventory §1.9): provider cards
+//! Settings → Agents / accounts: provider cards
 //! (Claude Code, Codex) with account rows — email, plan badge, Active, usage
 //! meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
 //! the add-account dialogs (paste-code and browser-poll flows) and
@@ -85,9 +85,9 @@ pub enum LoadTrigger {
 /// engine only hits the provider when forced; non-forced lists serve the 60s
 /// usage cache or nothing (engine/src/agent_accounts.rs module docs — the
 /// design expects the UI to force "on page mount/refresh"). The visit's first
-/// list (mount, or retry after a failure) must force, or every first open
-/// renders "Usage unavailable" until a manual Refresh — the old app fetched
-/// usage on every list. Post-Switch/Forget lists ride the still-warm cache.
+/// list (mount, or retry after a failure) must force so the first open does not
+/// render "Usage unavailable" until a manual refresh. Post-Switch/Forget lists
+/// ride the still-warm cache.
 pub fn force_usage_for(trigger: LoadTrigger) -> bool {
     match trigger {
         LoadTrigger::Mount | LoadTrigger::Retry | LoadTrigger::Refresh | LoadTrigger::PostLogin => {
@@ -97,8 +97,8 @@ pub fn force_usage_for(trigger: LoadTrigger) -> bool {
     }
 }
 
-/// Compact absolute reset moment (jolt settings.agents.tsx `formatReset`):
-/// a local clock time ("3:45 PM") when it lands within ~22h, else a short
+/// Compact absolute reset moment: a local clock time ("3:45 PM") when it
+/// lands within about 22h, otherwise a short
 /// weekday ("Mon"); the caller prefixes "resets ". Pure given `now`.
 pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
     use chrono::Local;
@@ -111,8 +111,7 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     })
 }
 
-/// The provider cards, in display order: (harness, name, CLI command — named
-/// in the empty-state copy, jolt settings.agents.tsx `PROVIDERS`).
+/// Provider cards in display order: harness, name, and CLI command.
 pub const PROVIDERS: [(HarnessId, &str, &str); 2] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
@@ -172,9 +171,9 @@ impl LoginFlow {
 
 pub struct AccountsPage {
     state: Entity<AppState>,
-    /// Which device's logins are shown; `None` = this device (no passthrough).
-    /// Retargeted by the page-header device switcher (jolt parity: the
-    /// accounts RPCs are relay-forwardable, CLI logins are per-device).
+    /// Which device's logins are shown; `None` means this device. Retargeted by
+    /// the page-header device switcher because account RPCs are relay-forwardable
+    /// while CLI logins are per-device.
     target_device: Option<String>,
     device_switcher: Entity<DeviceSwitcher>,
     snapshot: Loadable<AgentAccountsSnapshot>,
@@ -517,8 +516,8 @@ impl AccountsPage {
 
     // ---- render pieces ----
 
-    /// One usage window (jolt settings.agents.tsx `UsageMeter`): label ·
-    /// 5px rounded-full bar (indigo → amber ≥80% → red ≥95%) · "NN% used" ·
+    /// One usage window: label, 5px rounded bar (indigo → amber ≥80% → red
+    /// ≥95%), "NN% used",
     /// quiet reset time.
     fn render_usage_meter(
         &self,
@@ -590,8 +589,8 @@ impl AccountsPage {
             .into_any_element()
     }
 
-    /// One account row (jolt settings.agents.tsx `AccountRow`): email + usage
-    /// meters left; badges over the Switch/Forget actions right-anchored.
+    /// One account row: email and usage meters on the left, with badges above
+    /// right-anchored Switch/Forget actions.
     fn render_account_row(
         &self,
         account: &AgentAccount,
@@ -913,8 +912,8 @@ impl AccountsPage {
         Some(popover::modal("add-account-dialog", viewport, card))
     }
 
-    /// A ghost account row (jolt settings.agents.tsx `SkeletonRow`): email
-    /// line, two usage-meter ghosts, and a badge — same geometry as the real
+    /// A ghost account row with an email line, two usage-meter ghosts, and a
+    /// badge using the same geometry as the real
     /// row so loaded data lands without a layout jump. `dim` fades row two.
     fn render_skeleton_row(
         &self,
@@ -1006,7 +1005,6 @@ impl Render for AccountsPage {
         let provider_icon = |harness: HarnessId| match harness {
             HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
             HarnessId::Pi => (crate::icons::TERMINAL, None),
-            HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -1029,8 +1027,8 @@ impl Render for AccountsPage {
                 )
         };
 
-        // One section per provider (jolt settings.agents.tsx `ProviderSection`):
-        // brand header + Add account, then the account rows card.
+        // One section per provider: brand header, Add account, then the account
+        // rows card.
         let sections: Vec<AnyElement> = match &self.snapshot {
             Loadable::Idle | Loadable::Loading => PROVIDERS
                 .into_iter()
@@ -1349,6 +1347,6 @@ mod tests {
         let ids: Vec<&str> = claude.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["c2", "c1"], "active account leads");
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
-        assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
+        assert!(provider_accounts(&snapshot, HarnessId::Pi).is_empty());
     }
 }

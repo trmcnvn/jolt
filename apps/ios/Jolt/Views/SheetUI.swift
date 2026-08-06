@@ -1,7 +1,6 @@
-// Sheet design language — the mobile app's grouped-card system (a port of the
-// old app's sheet-ui.tsx: panel cards, hairline-separated rows, centered
-// headers), restated in this app's monochrome theme. Every sheet composes
-// these pieces so they all feel like one product.
+// Sheet design language — grouped panel cards, hairline-separated rows, and
+// centered headers in Jolt's monochrome theme. Every sheet composes these
+// pieces so they feel like one product.
 
 import SwiftUI
 

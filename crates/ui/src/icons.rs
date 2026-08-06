@@ -1,16 +1,10 @@
 //! Embedded icon assets + the gpui [`AssetSource`] that serves them.
 //!
-//! The set mirrors the original jolt's icon usage exactly:
-//! - Most glyphs come from the **Solar Icons** set (Linear weight) by 480 Design,
-//!   the same set the Electron app used via `@solar-icons/react`. Solar Icons is
-//!   licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/);
-//!   attribution: "Solar Icons by 480 Design".
-//! - The terminal tab glyphs (`terminal`, `plus`, `close`) and the stop square
-//!   are ports of the hand-drawn inline SVGs in jolt's `terminal-panel.tsx` /
-//!   `composer-actions.tsx`.
-//! - The inherited harness brand marks (`claude-mark`, `openai-mark`,
-//!   `cursor-mark`) are ports of jolt's `icons.tsx`; `pi-mark` is Pi's official
-//!   mark from https://pi.dev/logo-auto.svg.
+//! Most glyphs come from the **Solar Icons** set (Linear weight) by 480 Design,
+//! licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/);
+//! attribution: "Solar Icons by 480 Design".
+//! The terminal controls and Jolt logo are hand-drawn SVGs. `pi-mark` is Pi's
+//! official mark from https://pi.dev/logo-auto.svg.
 //! - `jj-mark` is Jujutsu's official logo from docs.jj-vcs.dev, © 2025 J.
 //!   Jennings, adapted to SVG by Lucas Garron, licensed CC BY 4.0. Its opaque
 //!   app-icon background is removed because gpui renders SVGs as tinted alpha
@@ -67,8 +61,8 @@ icon_assets![
     // terminal/plus/return ports) — the set has no branch icon.
     (GIT_BRANCH, "git-branch"),
     (SIDEBAR_MINIMALISTIC, "sidebar-minimalistic"),
-    // Mirrored variant (jolt window-controls.tsx `-scale-x-100`): the LEFT
-    // sidebar toggle shows the panel line on the left; gpui divs have no
+    // Mirrored variant: the left sidebar toggle shows the panel line on the
+    // left; gpui divs have no
     // scale transform at the pinned rev, so the flip is baked into the asset.
     (SIDEBAR_MINIMALISTIC_LEFT, "sidebar-minimalistic-left"),
     (KEY_MINIMALISTIC, "key-minimalistic"),
@@ -91,6 +85,8 @@ icon_assets![
     (RESTART, "restart"),
     (ADD_CIRCLE, "add-circle"),
     (TUNING, "tuning"),
+    // Hand-drawn notification bell in the Solar Linear style.
+    (BELL, "bell"),
     (PAPERCLIP, "paperclip"),
     (PEN, "pen"),
     (ARCHIVE_MINIMALISTIC, "archive-minimalistic"),
@@ -111,8 +107,7 @@ icon_assets![
     (INFO_CIRCLE, "info-circle"),
     (DANGER_TRIANGLE, "danger-triangle"),
     (CHAT_ROUND_LINE, "chat-round-line"),
-    // Hand-drawn jolt glyphs (terminal-panel.tsx / composer-actions.tsx /
-    // menu-check.tsx / logo.tsx).
+    // Hand-drawn Jolt glyphs.
     (TERMINAL, "terminal"),
     (PLUS, "plus"),
     (CLOSE, "close"),
@@ -125,7 +120,6 @@ icon_assets![
     (OPENAI_MARK, "openai-mark"),
     (PI_MARK, "pi-mark"),
     (JJ_MARK, "jj-mark"),
-    (CURSOR_MARK, "cursor-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — jolt keeps it even on the

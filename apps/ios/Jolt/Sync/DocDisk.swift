@@ -1,6 +1,5 @@
-// On-device Loro doc persistence — the old mobile app's snapshot cache
-// (kv.ts/loro-room.ts) and the engine's DocsStore, in file form: one snapshot
-// per doc under Application Support. Docs load BEFORE the room join, so the
+// On-device Loro document persistence: one snapshot per document under
+// Application Support. Documents load before the room join, so the
 // UI renders instantly from local state (offline included) and the join's
 // version vector turns the backfill incremental instead of a full snapshot.
 

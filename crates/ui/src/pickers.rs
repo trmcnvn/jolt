@@ -1,4 +1,4 @@
-//! Composer pickers (feature-inventory §1.7): RepoPicker (recents + search +
+//! Composer pickers: RepoPicker (recents + search +
 //! in-app folder browser + clone/create), BranchPicker (search + isolated-
 //! worktree toggle), HarnessModelPicker (harness rail + model list, harness
 //! locked once the chat exists), TraitsPicker (reasoning ladder + advertised
@@ -16,13 +16,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
-    Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, Render,
+    SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
 use jolt_engine::registry::HarnessDescriptor;
 use jolt_proto::{
     ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    UsageSummary,
 };
 use jolt_rpc::methods;
 
@@ -118,16 +119,14 @@ impl ResolvedRunConfig {
 // Pure: default resolution (no "Default" placeholders — a concrete pick always)
 // ---------------------------------------------------------------------------
 
-/// The harness's default model: the first catalog row (both curated catalogs
-/// lead with the flagship — jolt's `pickDefaultModel` Opus preference maps to
-/// the same row here).
+/// The harness's default model is the first catalog row; both curated catalogs
+/// lead with the flagship.
 pub fn default_model(models: &[Model]) -> Option<&Model> {
     models.first()
 }
 
-/// A model's default reasoning: X-High when the ladder offers it (jolt
-/// `DEFAULT_REASONING = "xhigh"`), else High, else the ladder's first entry.
-/// `None` only for ladder-less models (e.g. Haiku's thinking toggle instead).
+/// A model's default reasoning: High when available, then Medium, then the
+/// ladder's first entry. `None` only for ladder-less models.
 pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
     // The recommended default is High (user-corrected — not X-High globally);
     // fall to Medium then the ladder's first entry for shorter ladders.
@@ -141,8 +140,8 @@ pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
 }
 
 /// Clamp a picked/remembered level to what the model actually offers: keep it
-/// when the ladder lists it, else fall to the model's default (never a stale
-/// or foreign level — jolt use-run-config.ts's derived-model discipline).
+/// when the ladder lists it; otherwise fall back to the model's default and
+/// never retain a stale or foreign level.
 pub fn clamp_reasoning(
     level: Option<ReasoningLevel>,
     ladder: &[ReasoningLevel],
@@ -259,6 +258,101 @@ pub enum PickerKind {
     Checkout,
     HarnessModel,
     Traits,
+    Usage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextPressure {
+    Normal,
+    Warning,
+    Danger,
+}
+
+fn context_pressure(usage: Option<&UsageSummary>) -> ContextPressure {
+    match usage.and_then(UsageSummary::context_fraction) {
+        Some(fraction) if fraction >= 0.9 => ContextPressure::Danger,
+        Some(fraction) if fraction >= 0.7 => ContextPressure::Warning,
+        _ => ContextPressure::Normal,
+    }
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+struct UsagePopover {
+    usage: Option<UsageSummary>,
+}
+
+impl Render for UsagePopover {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        let content = match &self.usage {
+            Some(usage) if usage.calls != 0 => {
+                let context = match (usage.context_tokens, usage.context_window) {
+                    (Some(tokens), Some(window)) if window != 0 => format!(
+                        "{} / {} ({:.0}%)",
+                        format_tokens(tokens),
+                        format_tokens(window),
+                        tokens as f64 / window as f64 * 100.0
+                    ),
+                    (Some(tokens), _) => format_tokens(tokens),
+                    _ => "Unavailable".into(),
+                };
+                let cost = usage
+                    .cost_usd
+                    .map(|cost| format!("${cost:.2} reported"))
+                    .unwrap_or_else(|| "Unavailable".into());
+                let model = usage.model.as_deref().unwrap_or("Unknown model");
+                vec![
+                    ("Context", context),
+                    ("Prompt", format_tokens(usage.prompt_tokens())),
+                    ("Output", format_tokens(usage.output_tokens)),
+                    ("Cache read", format_tokens(usage.cache_read_input_tokens)),
+                    ("Cache write", format_tokens(usage.cache_write_input_tokens)),
+                    ("Total", format_tokens(usage.total_tokens())),
+                    ("Cost", cost),
+                    ("Model", model.to_string()),
+                ]
+            }
+            _ => vec![("Usage", "Available after the first response".into())],
+        };
+        let mut card = div()
+            .w(px(270.0))
+            .p(px(10.0))
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .text_size(px(11.0));
+        for (label, value) in content {
+            card = card.child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap(px(16.0))
+                    .child(div().text_color(theme.text_muted).child(label))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.text)
+                            .child(value),
+                    ),
+            );
+        }
+        card
+    }
 }
 
 pub struct Pickers {
@@ -324,6 +418,7 @@ impl Pickers {
             | ComposerInputEvent::PastedPaths(_)
             | ComposerInputEvent::CursorMoved
             | ComposerInputEvent::ViewportChanged
+            | ComposerInputEvent::MessageHistoryNavigate(_)
             | ComposerInputEvent::MentionNavigate(_)
             | ComposerInputEvent::MentionAccept
             | ComposerInputEvent::MentionDismiss => {}
@@ -419,7 +514,7 @@ impl Pickers {
         &self.config
     }
 
-    /// Harness is locked once the chat exists (feature-inventory §1.7).
+    /// Harness is locked once the chat exists.
     fn harness_locked(&self, cx: &App) -> bool {
         self.state.read(cx).selected_chat.is_some()
     }
@@ -617,6 +712,7 @@ impl Pickers {
                 });
                 window.focus(&handle, cx);
             }
+            PickerKind::Usage => {}
             _ => window.focus(&self.focus, cx),
         }
         match kind {
@@ -630,6 +726,7 @@ impl Pickers {
                     self.ensure_models(harness, cx);
                 }
             }
+            PickerKind::Usage => {}
         }
         cx.notify();
     }
@@ -1356,7 +1453,7 @@ impl Pickers {
                     // chips below (reasoning ladder, model options) are
                     // mouse-only.
                     Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
-                    Some(PickerKind::Traits) => 0, // merged into HarnessModel
+                    Some(PickerKind::Traits | PickerKind::Usage) => 0,
                     None => 0,
                 };
                 self.active = popover::menu_step(Some(self.active), count, delta).unwrap_or(0);
@@ -1406,12 +1503,12 @@ impl Pickers {
             PickerKind::Checkout => "picker-checkout",
             PickerKind::HarnessModel => "picker-model",
             PickerKind::Traits => "picker-traits",
+            PickerKind::Usage => "composer-usage",
         };
         let open = self.open == Some(kind)
             || (kind == PickerKind::Traits && self.open == Some(PickerKind::HarnessModel));
-        // Ghost pill (jolt composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
-        // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
-        // hover/open wash — no border, no caret; the actions row stays quiet.
+        // Ghost pill: 32px high, rounded, compact padded content with 12px
+        // medium muted text, 16px icons, and hover/open wash; no border or caret.
         div()
             .id(id)
             .h(px(32.0))
@@ -1424,8 +1521,7 @@ impl Pickers {
             .rounded(px(8.0))
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            // jolt composer/styles.tsx `pill`: `transition-colors` — the wash
-            // and text brighten fade over 150ms.
+            // The wash and text brighten over 150ms.
             .text_color(motion::hover_blend(
                 id,
                 if set {
@@ -1536,6 +1632,51 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
+    fn usage_indicator(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let usage = self.state.read(cx).selected_usage.clone();
+        let color = match context_pressure(usage.as_ref()) {
+            ContextPressure::Normal => theme.text_muted.opacity(0.6),
+            ContextPressure::Warning => theme.warning,
+            ContextPressure::Danger => theme.danger,
+        };
+        let open = self.open == Some(PickerKind::Usage);
+        let popover = open.then(|| {
+            let content = div()
+                .id("usage-popover-content")
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(cx.new(|_| UsagePopover { usage }))
+                .into_any_element();
+            popover::anchored_menu_above("usage-popover", content)
+        });
+        div()
+            .id("composer-usage")
+            .relative()
+            .size(px(20.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(color)
+            .bg(if open {
+                theme.element_hover
+            } else {
+                motion::hover_blend(
+                    "composer-usage",
+                    gpui::transparent_black(),
+                    theme.element_hover,
+                )
+            })
+            .on_hover(motion::hover_listener("composer-usage"))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle(PickerKind::Usage, window, cx)))
+            .children(popover)
+            .child("$")
+    }
+
     /// The composer footer row (t3code BranchToolbar): checkout-kind on the
     /// left, the ref selector right-aligned. `None` for non-VCS spaces. On an
     /// existing session both sides are read-only labels ("Worktree" /
@@ -1637,7 +1778,16 @@ impl Pickers {
             } else {
                 (crate::icons::FOLDER, "Local checkout")
             };
-            let left = Self::footer_label(icon_path, SharedString::from(label), &theme);
+            let left = div()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .child(Self::footer_label(
+                    icon_path,
+                    SharedString::from(label),
+                    &theme,
+                ))
+                .child(self.usage_indicator(&theme, cx));
             return Some(row.child(left).child(ref_side).into_any_element());
         }
 
@@ -1653,16 +1803,18 @@ impl Pickers {
             &theme,
             cx,
         );
-        Some(
-            row.child(attach_overlay(
+        let kind_side = div()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .child(attach_overlay(
                 kind_chip,
                 &mut overlay,
                 PickerKind::Checkout,
                 "checkout-popover",
             ))
-            .child(ref_side)
-            .into_any_element(),
-        )
+            .child(self.usage_indicator(&theme, cx));
+        Some(row.child(kind_side).child(ref_side).into_any_element())
     }
 
     fn popover_frame(&self, width: f32, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
@@ -1682,9 +1834,8 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// [`Self::popover_frame`] without the p-1 inset — the harness/model
-    /// picker's rail + list panes bleed to the card edge (jolt
-    /// harness-model-picker.tsx `className="w-80 p-0"`).
+    /// [`Self::popover_frame`] without an inset so the harness/model picker's
+    /// rail and list panes bleed to the card edge.
     fn popover_frame_flush(
         &self,
         width: f32,
@@ -1737,6 +1888,7 @@ impl Pickers {
                             this.models.clear();
                             this.ensure_harnesses(cx);
                         }
+                        PickerKind::Usage => {}
                     }))
                     .child(SharedString::from("Retry")),
             )
@@ -1956,8 +2108,8 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// The combined harness + model switcher (jolt harness-model-picker.tsx):
-    /// a vertical harness rail of square brand-icon tabs on the left, the
+    /// The combined harness and model switcher: a vertical harness rail of
+    /// square brand-icon tabs on the left, the
     /// viewed harness's models on the right. On an existing chat the other
     /// tabs stay visible but disabled — the lock reads as a rule.
     fn render_harness_model_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -2095,8 +2247,7 @@ impl Pickers {
                             this.pick_model(id.clone(), cx);
                         }))
                         .child(
-                            // Name + 11px muted description subline, per
-                            // harness-model-picker.tsx (`min-w-0 flex-1` column).
+                            // Name with an 11px muted description subline.
                             div()
                                 .flex_1()
                                 .min_w_0()
@@ -2381,12 +2532,11 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         ),
         HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
         HarnessId::Pi => (crate::icons::PI_MARK, None),
-        HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
     }
 }
 
-/// Display-only toggle switch (jolt branch-picker.tsx `Toggle`): an 18×32
-/// pill whose knob slides right and track flips white when on. State is owned
+/// Display-only 18×32 toggle switch whose knob slides right and whose track
+/// flips white when on. State is owned
 /// by the parent row.
 #[allow(dead_code)]
 fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
@@ -2598,14 +2748,14 @@ impl Render for Pickers {
                     self.popover_frame_flush(460.0, content, cx),
                 ))
             }
-            // Traits merged into the HarnessModel popover.
-            Some(PickerKind::Traits) | None => None,
+            // Traits merged into the HarnessModel popover; usage renders in
+            // the composer footer beside its trigger.
+            Some(PickerKind::Traits | PickerKind::Usage) | None => None,
         };
 
         // Left cluster (the branch chip moved to the composer FOOTER row).
-        // Right cluster: agent+model and traits — the composer appends
-        // attach + send after this element (jolt composer-actions.tsx
-        // arrangement).
+        // Right cluster: agent/model and traits. The composer appends attach
+        // and send after this element.
         let left = div()
             .flex()
             .flex_row()
@@ -2670,6 +2820,20 @@ mod tests {
             current,
             worktree_path: worktree_path.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn context_pressure_changes_at_seventy_and_ninety_percent() {
+        let usage = |tokens| UsageSummary {
+            context_tokens: Some(tokens),
+            context_window: Some(100),
+            ..UsageSummary::default()
+        };
+        assert_eq!(context_pressure(Some(&usage(69))), ContextPressure::Normal);
+        assert_eq!(context_pressure(Some(&usage(70))), ContextPressure::Warning);
+        assert_eq!(context_pressure(Some(&usage(89))), ContextPressure::Warning);
+        assert_eq!(context_pressure(Some(&usage(90))), ContextPressure::Danger);
+        assert_eq!(context_pressure(None), ContextPressure::Normal);
     }
 
     #[test]

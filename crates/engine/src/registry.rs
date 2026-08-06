@@ -1,6 +1,6 @@
 //! HarnessRegistry — the engine's harness catalog: eager instances (mock) plus lazy
-//! slots resolved on first use (Claude Code, Codex, and Pi spawn subprocess discovery; Cursor
-//! later). Lazy slots carry a static descriptor so `ListHarnesses` never forces a spawn.
+//! slots resolved on first use (Claude Code, Codex, and Pi spawn subprocess discovery).
+//! Lazy slots carry a static descriptor so `ListHarnesses` never forces a spawn.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -44,6 +44,7 @@ enum Slot {
 pub struct HarnessRegistry {
     slots: Mutex<HashMap<HarnessId, Slot>>,
     order: Mutex<Vec<HarnessId>>,
+    environment: jolt_harness::environment::HarnessEnvironment,
 }
 
 impl Default for HarnessRegistry {
@@ -57,6 +58,7 @@ impl HarnessRegistry {
         Self {
             slots: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
+            environment: jolt_harness::environment::HarnessEnvironment::default(),
         }
     }
 
@@ -66,6 +68,13 @@ impl HarnessRegistry {
 
     fn order(&self) -> MutexGuard<'_, Vec<HarnessId>> {
         self.order.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn set_environment_provider(
+        &self,
+        provider: Arc<dyn jolt_harness::environment::HarnessEnvironmentProvider>,
+    ) {
+        self.environment.set_provider(provider);
     }
 
     pub fn register(&self, harness: Arc<dyn Harness>) {
@@ -168,6 +177,7 @@ pub fn default_registry() -> HarnessRegistry {
             },
         ],
     }));
+    let claude_environment = registry.environment.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::ClaudeCode,
@@ -184,14 +194,19 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
         },
-        Box::new(|| Ok(Arc::new(jolt_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            Ok(Arc::new(
+                jolt_harness::ClaudeHarness::new().with_environment(claude_environment.clone()),
+            ) as Arc<dyn Harness>)
+        }),
     );
-    // Codex, same lazy pattern: the static descriptor mirrors CodexHarness
-    // exactly (`describe()` after the first resolve must not change the
-    // catalog entry) — "Codex" per the original HARNESS_LABEL, StepBoundary
-    // steering via native `turn/steer`, and the unified reasoning ladder from
+    // Codex uses the same lazy pattern: the static descriptor mirrors
+    // CodexHarness exactly, so `describe()` after the first resolve must not
+    // change the catalog entry. It uses StepBoundary steering via native
+    // `turn/steer` and the unified reasoning ladder from
     // jolt_harness::codex::catalog. CLI discovery only happens when a
     // run/model call actually resolves the slot.
+    let codex_environment = registry.environment.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Codex,
@@ -208,8 +223,13 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Ultra,
             ],
         },
-        Box::new(|| Ok(Arc::new(jolt_harness::CodexHarness::new()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            Ok(Arc::new(
+                jolt_harness::CodexHarness::new().with_environment(codex_environment.clone()),
+            ) as Arc<dyn Harness>)
+        }),
     );
+    let pi_environment = registry.environment.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Pi,
@@ -225,7 +245,12 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
         },
-        Box::new(|| Ok(Arc::new(jolt_harness::PiHarness::new()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            Ok(
+                Arc::new(jolt_harness::PiHarness::new().with_environment(pi_environment.clone()))
+                    as Arc<dyn Harness>,
+            )
+        }),
     );
     registry
 }

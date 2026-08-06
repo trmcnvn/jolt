@@ -2,8 +2,6 @@
 
 Control your coding agents (Claude Code, Codex, Pi) from any of your devices.
 
-![Jolt running a Claude Code session](docs/screenshot.png)
-
 Every device runs a small engine that keeps your sessions in sync: start an
 agent on one machine, follow and drive it from another. Install the engine as
 a daemon on an always-on machine (a VPS, a spare box) and your agents keep
@@ -40,6 +38,11 @@ settings, extensions, skills, or prompts when Pi has no saved trust decision; th
 prompt can save the folder decision to Pi's trust store.
 `JOLT_PI_EXECUTABLE` can point Jolt at a non-standard Pi installation.
 
+Harness environment secrets can be added under **Settings → Secrets**. Values
+stay in the device's native credential store (macOS Keychain, Windows Credential
+Manager, or Secret Service on Linux) and are injected only into the selected
+harness processes. Secrets are device-local and are never synced.
+
 ## Building from source
 
 Building Jolt requires stable Rust and Zig 0.15.2:
@@ -56,8 +59,13 @@ device under **Settings → Version control**. `JOLT_JJ_EXECUTABLE` and
 `JOLT_GIT_EXECUTABLE` override executable discovery. Jolt-created JJ workspaces
 live under `~/.jolt/workspaces` (`JOLT_WORKSPACES_DIR` overrides the root).
 
+## Acknowledgements
+
+Jolt is a fork of [Comet](https://github.com/zeronsh/comet). A huge shoutout
+to the Comet project and its contributors for the foundation they created.
+
 ---
 
-Developing or curious how it works? See [ARCHITECTURE.md](ARCHITECTURE.md).
+Start with the [Jolt documentation](docs/README.md) for usage, harnesses, headless deployment, architecture, sync, RPC, and development.
 
 Licensed under the [MIT License](LICENSE).

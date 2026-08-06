@@ -160,16 +160,16 @@ enum BenchRunner {
         switch index % 4 {
         case 0:
             try call.insert(key: "kind", v: "exec")
-            try call.insert(key: "command", v: "rg -n 'refDropdown' src/components --glob '!*.test.ts'")
+            try call.insert(key: "command", v: "rg -n 'render_branch_popover' crates/ui/src")
         case 1:
             try call.insert(key: "kind", v: "readFile")
-            try call.insert(key: "path", v: "src/components/refs/RefDropdown.tsx")
+            try call.insert(key: "path", v: "crates/ui/src/pickers.rs")
         case 2:
             try call.insert(key: "kind", v: "editFile")
-            try call.insert(key: "path", v: "src/components/refs/useRefIndex.ts")
+            try call.insert(key: "path", v: "crates/ui/src/pickers.rs")
         default:
             try call.insert(key: "kind", v: "search")
-            try call.insert(key: "pattern", v: "loadRefs\\(")
+            try call.insert(key: "pattern", v: "render_branch_popover\\(")
         }
     }
 

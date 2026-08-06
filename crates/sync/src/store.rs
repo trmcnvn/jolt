@@ -1,6 +1,6 @@
 //! `DocsStore` — local SQLite persistence for doc snapshots and the
-//! processed-command ledger (ARCHITECTURE §2 command plane: entries are marked
-//! processed BEFORE execution so a crash can never double-execute a command).
+//! processed-command ledger (docs/architecture.md): entries are marked processed
+//! BEFORE execution so a crash can never double-execute a command.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};

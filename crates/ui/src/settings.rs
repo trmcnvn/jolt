@@ -16,6 +16,8 @@ pub mod archived;
 pub mod composer;
 mod device_switcher;
 pub mod devices;
+pub mod notifications;
+pub mod secrets;
 pub mod shortcuts;
 pub mod terminal;
 pub mod vcs;
@@ -63,18 +65,18 @@ pub struct UiSettings {
     /// are skipped; new spaces append in creation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
-    /// Session notification chimes (done / awaiting-input). `JOLT_DISABLE_SOUND`
-    /// overrides.
-    pub sound_enabled: bool,
+    /// Deliver app-wide alerts through the operating system instead of in-app
+    /// toasts.
+    pub system_notifications_enabled: bool,
     pub right_pane_width: f32,
-    /// Legacy: panel *open* flags are session-scoped in-memory state now
-    /// (`shell::SessionPanels`, jolt `sessionPanels` parity). Kept for file
-    /// compatibility; no longer read or written by the shell.
+    /// Legacy: panel open flags are session-scoped in-memory state now via
+    /// `shell::SessionPanels`. Kept for file compatibility; no longer read or
+    /// written by the shell.
     pub right_pane_open: bool,
     pub terminal_height: f32,
     /// Legacy — see [`Self::right_pane_open`].
     pub terminal_open: bool,
-    /// Customizable shortcut combos (feature-inventory §1.4).
+    /// Customizable shortcut combinations.
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
@@ -98,7 +100,7 @@ impl Default for UiSettings {
             last_space_id: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
-            sound_enabled: true,
+            system_notifications_enabled: false,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
@@ -142,7 +144,7 @@ impl ShortcutId {
         ShortcutId::ToggleTerminal,
     ];
 
-    /// Row label (jolt lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
+    /// Row label.
     pub fn label(self) -> &'static str {
         match self {
             ShortcutId::NewSession => "New session",
@@ -398,7 +400,7 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
-            sound_enabled: false,
+            system_notifications_enabled: true,
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,
@@ -425,7 +427,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             UiSettings::path(dir.path()),
-            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+            r#"{"sidebarWidth": 300, "systemNotificationsEnabled": true}"#,
         )
         .unwrap();
         let loaded = UiSettings::load(dir.path());
@@ -435,7 +437,10 @@ mod tests {
         assert_eq!(loaded.terminal_font, crate::theme::DEFAULT_CODE_FONT);
         assert!(loaded.terminal_command.is_empty());
         assert_eq!(loaded.sidebar_width, 300.0);
-        assert!(!loaded.sound_enabled, "other keys still parse");
+        assert!(
+            loaded.system_notifications_enabled,
+            "other keys still parse"
+        );
     }
 
     #[test]
@@ -480,6 +485,7 @@ mod tests {
         assert_eq!(d.code_font, crate::theme::DEFAULT_CODE_FONT);
         assert_eq!(d.terminal_font, crate::theme::DEFAULT_CODE_FONT);
         assert!(d.terminal_command.is_empty());
+        assert!(!d.system_notifications_enabled);
     }
 
     #[test]

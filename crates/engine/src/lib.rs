@@ -1,9 +1,8 @@
-//! jolt-engine — the headless backend: sessions engine, doc host + command executor,
-//! run journal + crash recovery, and the IPC RPC server.
+//! jolt-engine — the machine-local backend: harness sessions, document hosting,
+//! durable command execution, repositories, terminals, diffs, accounts, secrets,
+//! usage, updates, and the IPC/device-relay RPC surface.
 //!
-//! Spec: ARCHITECTURE.md §5 and docs/research/feature-inventory.md §3. M2 surface:
-//! sessions + docs + commands + minimal IPC. Terminals, repos/diffs, uploads, auth,
-//! agent accounts, and the device-room host land in later milestones.
+//! See docs/architecture.md for process and data ownership.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,16 +19,19 @@ pub mod auth;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
+mod model_selection;
 mod question_extraction;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
+pub mod secrets;
 pub mod sessions;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
+pub mod usage;
 pub mod vcs;
 pub mod workspace_host;
 
@@ -42,11 +44,13 @@ pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
+pub use secrets::{HarnessSecrets, SecretsError};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
+pub use usage::UsageStore;
 pub use vcs::Vcs;
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
@@ -109,6 +113,7 @@ pub struct EngineCore {
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
+    pub secrets: HarnessSecrets,
     pub device_id: String,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -150,6 +155,9 @@ impl EngineCore {
         // SQLite snapshots + journals. Taken before any store opens or the IPC
         // port binds; held (and kernel-released on crash) for the engine's life.
         let lock = InstanceLock::acquire(data_dir)?;
+        let secrets = HarnessSecrets::open(data_dir)
+            .map_err(|error| EngineError::Other(format!("secrets: {error}")))?;
+        registry.set_environment_provider(Arc::new(secrets.clone()));
         let device_id = load_or_create_device_id(data_dir)?;
         // Identity-scoped storage: snapshots, the command ledger, and run
         // journals live under `orgs/{orgId}/{userId}/` so switching accounts or
@@ -160,7 +168,9 @@ impl EngineCore {
             .join(sanitize_path_id(user_id));
         let store = Arc::new(DocsStore::open(&org_dir)?);
         let journal = Arc::new(RunJournal::open(org_dir.join("journals"))?);
-        let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        let usage = UsageStore::open(&org_dir.join("usage.sqlite"), device_id.clone())
+            .map_err(|error| EngineError::Other(format!("usage store: {error}")))?;
+        let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone(), usage);
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -210,6 +220,7 @@ impl EngineCore {
             spaces_sync,
             uploads,
             agent_accounts,
+            secrets,
             device_id,
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -308,7 +319,11 @@ impl EngineCore {
                 }
             }
         });
-        jolt_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+        jolt_rpc::HostRelay::spawn(
+            config,
+            crate::rpc::relay_service(self.rpc_service()),
+            on_nudge,
+        )
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
@@ -323,6 +338,7 @@ impl EngineCore {
             self.spaces_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
+            self.secrets.clone(),
         )
         .with_auth(self.auth());
         if let Some(links) = self.links() {

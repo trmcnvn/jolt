@@ -136,6 +136,22 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
     assert_eq!(tools, &vec!["Bash".to_string(), "Read".to_string()]);
     assert_eq!(session_id, "sess-1");
 
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::CompactionStarted))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::CompactionFinished))
+            .count(),
+        1,
+        "status clear and compact boundary must dedupe: {events:?}"
+    );
+
     assert!(events.contains(&AgentEvent::ReasoningDelta {
         text: "pondering".into()
     }));
@@ -193,7 +209,12 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
 
     assert!(events.contains(&AgentEvent::Usage {
         input_tokens: 10,
-        output_tokens: 20
+        output_tokens: 20,
+        cache_read_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        cost_usd: Some(0.01),
+        context_tokens: None,
+        context_window: Some(200_000),
     }));
     assert_eq!(
         events.last(),

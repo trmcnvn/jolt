@@ -133,6 +133,9 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     assert_eq!(cwd, "/tmp");
     assert_eq!(session_id, "th-1");
 
+    assert!(events.contains(&AgentEvent::CompactionStarted));
+    assert!(events.contains(&AgentEvent::CompactionFinished));
+
     // Deltas — both wire spellings accepted.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "Hello".into()
@@ -257,7 +260,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
                 e,
                 AgentEvent::Usage {
                     input_tokens: 42,
-                    output_tokens: 7
+                    output_tokens: 7,
+                    ..
                 }
             )
         })
@@ -599,8 +603,7 @@ async fn models_returns_curated_catalog() {
     // caller's path, so only the default resolution can report NotInstalled —
     // exercise the harness identity surface instead.
     assert_eq!(missing.id(), HarnessId::Codex);
-    // "Codex" — jolt composer/defaults.ts HARNESS_LABEL (and the registry's
-    // lazy descriptor must stay in lockstep).
+    // The registry's lazy descriptor must stay in lockstep.
     assert_eq!(missing.display_name(), "Codex");
     assert_eq!(missing.reasoning_levels().len(), 7);
 }

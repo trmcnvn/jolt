@@ -1,7 +1,7 @@
 //! The app theme — two concrete appearances, one token set.
 //!
-//! Colors are precomputed from an oklch-derived neutral scale (perceptually even
-//! lightness steps; the same scale jolt's Tailwind theme used) into gpui [`Hsla`].
+//! Colors are precomputed from an oklch-derived neutral scale with perceptually
+//! even lightness steps into gpui [`Hsla`].
 //! **Numbers drive layout, colors are paint**: layout constants live here as plain
 //! numbers and never depend on which color is painted.
 //!
@@ -254,8 +254,7 @@ pub struct Theme {
     pub selection: Hsla,
     /// Terminal block cursor.
     pub cursor: Hsla,
-    /// Composer text caret. A blue distinct from `accent` — sampled from the
-    /// original composer, not derived, so it keeps its own token.
+    /// Composer text caret. A blue distinct from `accent`, kept as its own token.
     pub caret: Hsla,
     /// Destructive-action button fill (danger plate, carries [`Self::on_accent`]).
     pub danger_strong: Hsla,
@@ -296,11 +295,8 @@ impl Theme {
     /// Frost translucency over the blurred window background (macOS vibrancy).
     /// Opaque elsewhere: Linux/Windows get no compositor-blur guarantee, and a
     /// merely transparent window would show raw desktop through the sidebar.
-    /// Darkness matched by eye to a reference Electron app's dark glass. That
-    /// scrim is 0.76 over `hsl(0 0% 3%)`, but it sits on Electron's
-    /// `under-window` vibrancy MATERIAL, which pre-darkens the blur; our bare
-    /// backdrop blur has no material layer, so the scrim runs heavier to land
-    /// on the same perceived tone (see [`Theme::glass`]).
+    /// The scrim runs heavier than the base surface because the bare backdrop
+    /// blur has no material layer to pre-darken it (see [`Theme::glass`]).
     pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
     /// Light-mode frost alpha — glass-forward, like dark mode.
     ///
@@ -379,9 +375,9 @@ impl Theme {
     /// lift the same way.
     ///
     /// Dark gives hover and selection the SAME fill (selection adds only the
-    /// ring) because the wash is a 14% translucent glow. Light cannot mirror
-    /// that literally — its selected fill is near-opaque white, and fill
-    /// parity would flash a solid card under every pointer pass — so hover
+    /// ring) because the wash is a 14% translucent glow. Light cannot use the
+    /// same fill: its selection is near-opaque white and would flash a solid
+    /// card under every pointer pass, so hover
     /// runs the same direction at roughly half the lift instead. 0.30 was
     /// invisible against the bright frost: rest→hover has to be as legible a
     /// step as dark's, or the sidebar feels dead under the pointer.
@@ -428,9 +424,7 @@ impl Theme {
         }
     }
 
-    /// Build the dark theme. The surface tones are sampled straight from the
-    /// reference screenshots of the original app (docs/reference): main panel
-    /// `#060606`, shell/sidebar `#0d0d0d`.
+    /// Build the dark theme: main panel `#060606`, shell/sidebar `#0d0d0d`.
     pub fn dark() -> Self {
         Self {
             appearance: Appearance::Dark,
@@ -1000,7 +994,7 @@ mod tests {
 
     #[test]
     fn neutral_950_is_0a0a0a() {
-        // oklch(0.145 0 0) is Tailwind neutral-950, jolt's app background.
+        // oklch(0.145 0 0) is Tailwind neutral-950.
         let rgb = srgb_u8(oklch_to_srgb(0.145, 0.0, 0.0));
         assert_eq!(rgb, [10, 10, 10]);
     }
@@ -1173,7 +1167,7 @@ mod tests {
     /// Solid (primary button) plates must carry their label at AA in both modes.
     ///
     /// The accent plate is held to 4.0 rather than 4.5: dark mode's indigo-500
-    /// fill — inherited unchanged from the original palette — measures 4.38:1
+    /// fill measures 4.38:1
     /// under white, which clears WCAG AA for the medium-weight 14px labels these
     /// buttons use (large-text AA is 3:1) but not body copy. Light mode's
     /// indigo-600 clears the stricter bar with room to spare.

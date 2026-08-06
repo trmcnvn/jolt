@@ -2,7 +2,7 @@
 //!
 //! Tolerant by construction: every field defaults, unknown frame types map to
 //! [`Frame::Other`], so a newer CLI never breaks parsing — we only read the
-//! fields the normalizer needs (spec: docs/research/harness.md).
+//! fields the normalizer needs (see docs/harnesses.md).
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -35,6 +35,9 @@ pub(crate) struct SystemFrame {
     pub session_id: String,
     #[serde(default)]
     pub slash_commands: Vec<String>,
+    /// `system/status` uses `"compacting"` to begin and `null` to clear.
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -80,6 +83,9 @@ pub(crate) struct MessageBody {
     /// Either a plain string or an array of content blocks.
     #[serde(default)]
     pub content: Value,
+    /// Per-call usage on assistant messages; used only for the latest context size.
+    #[serde(default)]
+    pub usage: UsageBody,
 }
 
 impl MessageBody {
@@ -134,6 +140,8 @@ pub(crate) struct ResultFrame {
     #[serde(default)]
     pub usage: UsageBody,
     #[serde(default)]
+    pub total_cost_usd: Option<f64>,
+    #[serde(default)]
     pub session_id: Option<String>,
 }
 
@@ -143,6 +151,18 @@ pub(crate) struct UsageBody {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+}
+
+impl UsageBody {
+    pub fn context_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+    }
 }
 
 /// A CLI→client control request (`can_use_tool` is the one we act on).

@@ -1,6 +1,5 @@
-//! Workspace doc schema over `loro` — the per-org entity index that replaces jolt's
-//! residual entity sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
-//! SessionRoom class, doc id `ws/{orgId}`).
+//! Legacy workspace-doc schema over `loro`, retained only to migrate old local
+//! snapshots into the current workspace registry described in docs/sync.md.
 //!
 //! Container layout — maps keyed by id, NOT lists: entity rows are LWW upserts, and a
 //! map-of-maps means concurrent writers to *different* rows never conflict while writes
@@ -11,15 +10,14 @@
 //! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
 //!   branch?, checkoutId?, config?(json), lastMessagePreview?, lastMessageAt?, createdAt,
 //!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
-//! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
-//!   updatedAt}
+//! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, compacting,
+//!   startedAt?, updatedAt}
 //! - `meta`: LoroMap {schemaVersion} — in-band detection for future destructive changes
 //!
-//! Writer discipline (ARCHITECTURE §2.2): each device writes its own device row, its
+//! Legacy writer discipline: each device writes its own device row, its
 //! own session rows, and rows for chats it hosts; title/archived renames are LWW map
-//! sets from any device — matching jolt's Mutate surface. Presence rides the room's
-//! `EphemeralStore` under keys `presence/{deviceId}` (an online timestamp), replacing
-//! jolt's 15s heartbeat writes so liveness never grows the oplog.
+//! sets from any device. Presence rides the room's `EphemeralStore` under keys
+//! `presence/{deviceId}` (an online timestamp), so liveness never grows the oplog.
 //!
 //! Timestamps are stored as epoch millis (the session-doc convention) and surface as
 //! `chrono::DateTime<Utc>` through the `jolt_proto` entity types.
@@ -436,6 +434,7 @@ impl WorkspaceDoc {
         row.insert("chatId", session.chat_id.as_str())?;
         row.insert("deviceId", session.device_id.as_str())?;
         row.insert("status", status_str(session.status))?;
+        row.insert("compacting", session.compacting)?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         self.doc.commit();
@@ -678,6 +677,8 @@ pub(crate) struct RawSession {
     device_id: String,
     status: SessionStatus,
     #[serde(default)]
+    compacting: bool,
+    #[serde(default)]
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: i64,
@@ -689,6 +690,7 @@ impl From<RawSession> for Session {
             chat_id: raw.chat_id,
             device_id: raw.device_id,
             status: raw.status,
+            compacting: raw.compacting,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
         }
@@ -759,6 +761,7 @@ mod tests {
             chat_id: chat_id.into(),
             device_id: device_id.into(),
             status,
+            compacting: false,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
         }
@@ -806,16 +809,14 @@ mod tests {
         let ws = WorkspaceDoc::new();
         ws.upsert_device(&device("dev-a", "laptop")).unwrap();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
-        ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
-            .unwrap();
+        let mut live = session("chat-1", "dev-a", SessionStatus::Working);
+        live.compacting = true;
+        ws.upsert_session(&live).unwrap();
 
         let state = ws.read_all().unwrap();
         assert_eq!(state.devices, vec![device("dev-a", "laptop")]);
         assert_eq!(state.chats, vec![chat("chat-1", "dev-a")]);
-        assert_eq!(
-            state.sessions,
-            vec![session("chat-1", "dev-a", SessionStatus::Working)]
-        );
+        assert_eq!(state.sessions, vec![live]);
 
         // Upsert refreshes in place — no duplicate rows, cleared options removed.
         let mut updated = chat("chat-1", "dev-a");

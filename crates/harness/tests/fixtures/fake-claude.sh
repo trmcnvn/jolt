@@ -18,6 +18,10 @@ case "$first" in
 
 *scenario:happy*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash","Read"],"cwd":"/tmp","session_id":"sess-1"}'
+  emit '{"type":"system","subtype":"status","status":"compacting","session_id":"sess-1"}'
+  emit '{"type":"system","subtype":"status","status":null,"session_id":"sess-1"}'
+  # The boundary follows the status clear and must not duplicate completion.
+  emit '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":180000},"session_id":"sess-1"}'
   # Re-emitted init mid-run (background-task wakeup): must be deduped.
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash","Read"],"cwd":"/tmp","session_id":"sess-1"}'
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"pondering"}}}'

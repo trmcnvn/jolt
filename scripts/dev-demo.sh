@@ -37,7 +37,7 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   DEV=$(probe LocalDevice '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["deviceId"])')
   # One space per demo folder, created up-front (chats join by space id).
   declare -A SPACES=()
-  for project in jolt-native soccertcg jolt aether; do
+  for project in jolt soccertcg aether; do
     sid=$(uuidgen | tr 'A-Z' 'a-z')
     probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$HOME/github/$project\"}" >/dev/null
     SPACES[$project]="$sid"
@@ -54,7 +54,7 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
     fi
     probe Mutate "{\"op\":\"setChatActivity\",\"chatId\":\"$id\",\"lastMessageAt\":$(( ($(date +%s) - $4*3600) * 1000 ))}" >/dev/null
   }
-  seed "Native Jolt Rust Rewrite"     jolt-native  jolt-native/main                  0  run
+  seed "Improve Jolt Streaming"       jolt         jolt/improve-streaming             0  run
   seed "Rebalance Player Stats Caps"  soccertcg    jolt/rebalance-player-stat-caps  2  run
   seed "Craft Premium TCG Experience" soccertcg    jolt/craft-premium-tcg-exp       26 skip
   seed "Initial Context Exploration"  jolt        jolt/initial-context-exploration 14 skip

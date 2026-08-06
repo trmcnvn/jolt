@@ -3,9 +3,9 @@
 //! is run twice over one data dir, asserting
 //! - chats + transcripts survive a graceful shutdown → relaunch;
 //! - the next run in an existing chat carries the chat's stored harness-native
-//!   session id as `RunRequest.resume` (engine-owned, jolt sessions.ts:736);
-//! - a kill -9 style crash recovers the session id from the run journal
-//!   (jolt recoverDraft, sessions.ts:538-552) and stamps streaming entries
+//!   session id as `RunRequest.resume`;
+//! - a kill -9 style crash recovers the session id from the run journal and
+//!   stamps streaming entries
 //!   `aborted`;
 //! - resume is cwd-scoped (harness session stores are keyed by cwd);
 //! - a harness-rejected resume retries once as a fresh session;

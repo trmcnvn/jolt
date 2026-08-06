@@ -1,15 +1,14 @@
 //! Chat auto-titling — after the first user+assistant exchange completes on an
-//! untitled chat, name it with the harness's cheapest model (port of jolt's
-//! `generateTitle` in `sessions.ts`).
+//! untitled chat, name it with the harness's cheapest model.
 //!
 //! Flow (fire-and-forget from the run task; every failure is a silent skip with
 //! tracing — a title must never fail or delay a run):
 //! 1. skip when the chat already has a title (or has no workspace row);
 //! 2. pick the run harness's cheapest model (small-tier name heuristic, else the
-//!    last listed model — jolt's `cheapestModel`);
+//!    last listed model);
 //! 3. run a one-shot, non-streaming-collected titling prompt through the
 //!    [`Harness`] trait (read-only sandbox, minimal reasoning, auto-approve),
-//!    retrying on jolt's short backoff ladder; fall back to the prompt's first
+//!    retrying with a short backoff ladder; fall back to the prompt's first
 //!    words when every attempt produces nothing;
 //! 4. re-check the title (a user rename during generation wins);
 //! 5. when the chat sits in a jolt worktree (`jolt/<name>` branch), rename the
@@ -22,17 +21,18 @@ use futures::StreamExt;
 
 use jolt_harness::{CancellationToken, RunControls, SteerMessage};
 use jolt_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, UserInputAnswer,
+    UserInputQuestion,
 };
 
 use crate::EngineError;
+use crate::model_selection::cheap_model_id;
 use crate::registry::HarnessRegistry;
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
 
 /// Throwaway title runs are cheap but still cross a process boundary — retry a
-/// couple of times with a short backoff before falling back (jolt's ladder).
+/// couple of times with a short backoff before falling back.
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
 struct Inner {
@@ -155,10 +155,11 @@ impl TitleGenerator {
                 return None;
             }
         };
-        let cheap = cheapest_model(&harness.models().await.unwrap_or_default());
+        let cheap = cheap_model_id(&harness.models().await.unwrap_or_default(), None);
         let title_prompt = format!(
-            "Reply with ONLY a concise 3-5 word title in Title Case (no quotes, no punctuation) \
-             for a coding session that begins with this request:\n\n{prompt}"
+            "Reply with ONLY a concise 3-5 word title in sentence case (capitalize only the first \
+             word and proper nouns; no quotes, no punctuation) for a coding session that begins \
+             with this request:\n\n{prompt}"
         );
         let mut model_options = serde_json::Map::new();
         // Titling never needs repository-provided Pi settings/extensions and
@@ -198,22 +199,6 @@ impl TitleGenerator {
         }
         None
     }
-}
-
-/// The cheapest model a harness offers (jolt's `cheapestModel` heuristic):
-/// prefer a small-tier name (haiku/mini/nano/flash/small/lite), else the last
-/// listed model; `None` when the catalog is empty (harness picks its default).
-fn cheapest_model(models: &[Model]) -> Option<String> {
-    if models.is_empty() {
-        return None;
-    }
-    let small = models.iter().find(|m| {
-        let haystack = format!("{} {}", m.id, m.label).to_lowercase();
-        ["haiku", "mini", "nano", "flash", "small", "lite"]
-            .iter()
-            .any(|tier| haystack.contains(tier))
-    });
-    small.or(models.last()).map(|m| m.id.clone())
 }
 
 /// First line, stripped of quote/heading dressing, capped at 60 chars.
@@ -271,31 +256,6 @@ pub(crate) async fn collect_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jolt_proto::Model;
-
-    fn model(id: &str, label: &str) -> Model {
-        Model {
-            id: id.into(),
-            label: label.into(),
-            description: None,
-            reasoning_levels: vec![],
-            options: vec![],
-        }
-    }
-
-    #[test]
-    fn cheapest_prefers_small_tier_then_last() {
-        let models = vec![
-            model("opus-4", "Opus"),
-            model("haiku-3", "Haiku"),
-            model("sonnet-4", "Sonnet"),
-        ];
-        assert_eq!(cheapest_model(&models).as_deref(), Some("haiku-3"));
-        let no_small = vec![model("opus-4", "Opus"), model("sonnet-4", "Sonnet")];
-        assert_eq!(cheapest_model(&no_small).as_deref(), Some("sonnet-4"));
-        assert_eq!(cheapest_model(&[]), None);
-    }
-
     #[test]
     fn titles_are_cleaned() {
         assert_eq!(clean_title("\"Fix Login Flow\"\nextra"), "Fix Login Flow");

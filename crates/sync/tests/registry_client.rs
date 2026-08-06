@@ -114,6 +114,7 @@ async fn two_clients_converge_and_stream_live_updates() {
             chat_id: "chat-1".into(),
             device_id: "dev-a".into(),
             status: SessionStatus::Working,
+            compacting: false,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
         })
@@ -425,6 +426,7 @@ async fn churn_stays_bounded_no_history_growth() {
                 } else {
                     SessionStatus::Idle
                 },
+                compacting: false,
                 started_at: Some(ts(i)),
                 updated_at: ts(i + 1),
             })

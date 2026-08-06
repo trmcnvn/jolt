@@ -75,7 +75,7 @@ const clientTag = (connId: string) => `client:${connId}`;
 const HOST_LIVENESS_MS = 75_000;
 
 /** Control frames the relay itself emits (kind " relay"). */
-// MUST byte-match packages/rpc device-frames.ts RELAY_KIND — clients compare
+// Must byte-match the native relay kind because clients compare
 // with ===; a mismatch makes host_offline/host_closed invisible to them.
 const RELAY_KIND = " relay";
 

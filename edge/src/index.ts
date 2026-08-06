@@ -1,8 +1,8 @@
 /**
- * Jolt edge Worker (design §2, ARCHITECTURE §6): JWT auth at the
+ * Jolt edge Worker (docs/architecture.md): JWT auth at the
  * edge, then forwarding into per-session, per-workspace, and per-device
- * Durable Objects. Also serves content-addressed R2 attachments (§1.2) and
- * the absorbed WorkOS auth routes (formerly apps/server).
+ * Durable Objects. It also serves content-addressed R2 attachments and WorkOS
+ * authentication routes.
  *
  * Routes:
  *   GET  /health
@@ -192,7 +192,7 @@ export default {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
     }
 
-    // ── workspace rooms (ARCHITECTURE §2.2/§6.1): same SessionRoom DO class;
+    // ── Legacy workspace rooms: same SessionRoom DO class;
     //    the caller's WorkOS org claim (`org_id`) must equal the URL's orgId,
     //    and the room itself is derived from the caller's OWN user id — the
     //    workspace doc (spaces, chats index, devices) is per-user; teammates
@@ -256,7 +256,7 @@ export default {
       }
     }
 
-    // ── registry rooms (docs/registry-sync.md): the row-table replacement for
+    // ── registry rooms (docs/sync.md): the row-table replacement for
     //    the Loro workspace doc. Same trust shape as /workspace: org claim
     //    must match the URL, room derived from the caller's OWN user id, DO
     //    trusts the stamped header. `reg1` = first registry generation. ─────

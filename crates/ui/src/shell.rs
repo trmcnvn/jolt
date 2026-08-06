@@ -1,7 +1,7 @@
-//! The app shell (jolt `__root.tsx`): sidebar column + main panel + optional
-//! right "Changes" pane, plus the boot splash and the connection gate.
+//! The app shell: sidebar column, main panel, optional right "Changes" pane,
+//! boot splash, and connection gate.
 //!
-//! Layout is jolt's: collapsible drag-resizable sidebar (208–400px, default
+//! Layout: collapsible drag-resizable sidebar (208–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
 //! content outlet, and a reserved h-6 status strip so later content never
 //! shifts; right pane scaffold (360–760px, default 520), hidden by default.
@@ -16,12 +16,13 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding, Keystroke,
-    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Subscription,
-    Task, Window, WindowControlArea, actions, div, prelude::*, px,
+    AnyElement, App, Context, Empty, Entity, FocusHandle, Focusable as _, IntoElement, KeyBinding,
+    Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString,
+    Subscription, Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
+use jolt_proto::{HarnessId, UsageBreakdown, UsageBreakdownRow, UsageDay};
 use jolt_rpc::methods;
 
 use crate::changes::Changes;
@@ -37,6 +38,8 @@ use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
+use crate::settings::secrets::SecretsPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::terminal::{TerminalPage, TerminalSettingsEvent};
 use crate::settings::vcs::VcsPage;
@@ -52,6 +55,7 @@ use crate::terminal::panel::{
     TerminalPanel, TerminalPanelEvent, ToggleTerminal, clamp_terminal_height,
 };
 use crate::theme::Theme;
+use crate::toast::{Toast, ToastAction, ToastKind};
 use crate::transcript::{self, Transcript};
 
 mod spaces;
@@ -79,11 +83,11 @@ const SESSION_SHORTCUT_COUNT: usize = 9;
 struct SelectSession(usize);
 
 // ---------------------------------------------------------------------------
-// Traffic-light-aware titlebar layout (feature-inventory §1.1)
+// Traffic-light-aware titlebar layout
 // ---------------------------------------------------------------------------
 
 /// Where the top-left window-control cluster starts, in px from the window's
-/// left edge (jolt window-controls.tsx: `left: fullscreen ? 12 : 88`). The
+/// left edge. The
 /// frameless hiddenInset chrome puts the macOS traffic lights at {14,15};
 /// fullscreen hides them and the cluster reclaims the inset.
 pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
@@ -121,8 +125,8 @@ pub fn cluster_clearance(is_macos: bool, fullscreen: bool, container_pad: f32) -
 }
 
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
-/// map, then binds the customizable shortcuts from `keymap` (feature-inventory
-/// §1.4). Invalid persisted combos fall back to that shortcut's default.
+/// map, then binds the customizable shortcuts from `keymap`. Invalid persisted
+/// combinations fall back to that shortcut's default.
 pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     fn valid_or_default(combo: &str, fallback: &str) -> String {
         let candidate = platform_combo(combo);
@@ -221,38 +225,43 @@ fn session_key_bindings() -> Vec<KeyBinding> {
         .collect()
 }
 
-/// The settings sections (feature-inventory §1.5 routes).
+/// The settings sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Devices,
     Agents,
+    Secrets,
     VersionControl,
     Terminal,
     Appearance,
+    Notifications,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 7] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
+        SettingsSection::Secrets,
         SettingsSection::VersionControl,
         SettingsSection::Terminal,
         SettingsSection::Appearance,
+        SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
     ];
 
-    /// Sidebar + header label (jolt settings-sidebar.tsx SECTIONS / __root.tsx
-    /// `settingsTitle` — the same strings in both places).
+    /// Label shared by the settings sidebar and header.
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
             SettingsSection::Agents => "Accounts",
+            SettingsSection::Secrets => "Secrets",
             SettingsSection::VersionControl => "Version control",
             SettingsSection::Terminal => "Terminal",
             SettingsSection::Appearance => "Appearance",
+            SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
         }
@@ -266,9 +275,9 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// Per-chat panel open flags (jolt parity: `sessionPanels` — the terminal and
-/// changes panels open *per session*, in memory only; heights and every other
-/// persisted setting stay global). New/unknown chats default to closed.
+/// Per-chat panel open flags. The terminal and changes panels open per session
+/// in memory only; heights and every other persisted setting stay global.
+/// New or unknown chats default to closed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ChatPanels {
     pub terminal_open: bool,
@@ -308,8 +317,7 @@ impl SessionPanels {
     }
 }
 
-/// One route-history entry (jolt parity: the renderer's TanStack memory
-/// history — every route the user visited, browser-style).
+/// One browser-style route-history entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
@@ -317,8 +325,8 @@ pub enum NavEntry {
     Settings(SettingsSection),
 }
 
-/// Browser-style navigation history for the titlebar back/forward buttons
-/// (jolt window-controls.tsx semantics): every route change pushes an entry;
+/// Browser-style navigation history for the titlebar back/forward buttons:
+/// every route change pushes an entry;
 /// Back/Forward walk the stack without changing it; pushing while behind the
 /// tip truncates the entries ahead (a new branch, exactly like a browser).
 #[derive(Debug)]
@@ -351,9 +359,8 @@ impl NavHistory {
         self.index += 1;
     }
 
-    /// Swap the current entry in place without growing the stack — the native
-    /// equivalent of a `replace: true` navigation (jolt's boot redirect from
-    /// `/` into the last-used chat leaves no dead Back target behind).
+    /// Swap the current entry in place without growing the stack so a boot
+    /// redirect into the last-used chat leaves no dead Back target behind.
     pub fn replace(&mut self, entry: NavEntry) {
         self.entries[self.index] = entry;
     }
@@ -362,8 +369,8 @@ impl NavHistory {
         self.index > 0
     }
 
-    /// Memory history keeps every entry, so "behind the last entry" is exactly
-    /// "can go forward" (jolt window-controls.tsx).
+    /// Memory history keeps every entry, so "behind the last entry" means
+    /// forward navigation is available.
     pub fn can_forward(&self) -> bool {
         self.index + 1 < self.entries.len()
     }
@@ -389,7 +396,7 @@ impl NavHistory {
     }
 }
 
-/// Sidebar resort glide (feature-inventory §1.6): 260ms
+/// Sidebar resort glide: 260ms
 /// `cubic-bezier(0.22,1,0.36,1)` per-row translate, the View Transitions
 /// equivalent.
 pub const RESORT: MotionSpec = MotionSpec::new(260, motion::EASE_RESORT);
@@ -492,13 +499,28 @@ struct RenameChatDialog {
     _events: Subscription,
 }
 
-/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
+/// In-app update lifecycle for macOS bundle installs.
 enum UpdateFlow {
     Idle,
     Downloading,
-    /// Staged bundle ready to swap in — one click restarts into it.
+    /// Staged bundle ready to swap in.
     Ready(PathBuf),
-    Failed(SharedString),
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum UsageWarningLevel {
+    Normal,
+    Warning,
+    Danger,
+}
+
+fn usage_warning_level(fraction: f32) -> UsageWarningLevel {
+    match crate::settings::accounts::usage_level(fraction) {
+        crate::settings::accounts::UsageLevel::Normal => UsageWarningLevel::Normal,
+        crate::settings::accounts::UsageLevel::Warn => UsageWarningLevel::Warning,
+        crate::settings::accounts::UsageLevel::Critical => UsageWarningLevel::Danger,
+    }
 }
 
 /// Transient automatic setup for the user's hidden Personal organization.
@@ -506,6 +528,104 @@ struct OrgGateUi {
     submitting: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
+}
+
+struct BreakdownDialog {
+    days: u16,
+    data: Loadable<UsageBreakdown>,
+    unavailable_devices: usize,
+    task: Option<Task<()>>,
+}
+
+fn add_reported_cost(total: &mut Option<f64>, value: Option<f64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or_default() + value);
+    }
+}
+
+fn merge_breakdowns(days: u16, breakdowns: Vec<UsageBreakdown>) -> UsageBreakdown {
+    let mut merged = UsageBreakdown {
+        days,
+        device_id: "all".into(),
+        ..UsageBreakdown::default()
+    };
+    let mut activity: std::collections::BTreeMap<String, UsageDay> =
+        std::collections::BTreeMap::new();
+    let mut rows: std::collections::HashMap<(HarnessId, String, String), UsageBreakdownRow> =
+        std::collections::HashMap::new();
+    for breakdown in breakdowns {
+        merged.sessions = merged.sessions.saturating_add(breakdown.sessions);
+        merged.calls = merged.calls.saturating_add(breakdown.calls);
+        merged.input_tokens = merged.input_tokens.saturating_add(breakdown.input_tokens);
+        merged.output_tokens = merged.output_tokens.saturating_add(breakdown.output_tokens);
+        merged.cache_read_input_tokens = merged
+            .cache_read_input_tokens
+            .saturating_add(breakdown.cache_read_input_tokens);
+        merged.cache_write_input_tokens = merged
+            .cache_write_input_tokens
+            .saturating_add(breakdown.cache_write_input_tokens);
+        add_reported_cost(&mut merged.cost_usd, breakdown.cost_usd);
+        for day in breakdown.activity {
+            let entry = activity.entry(day.day.clone()).or_insert_with(|| UsageDay {
+                day: day.day,
+                ..UsageDay::default()
+            });
+            entry.tokens = entry.tokens.saturating_add(day.tokens);
+            entry.calls = entry.calls.saturating_add(day.calls);
+            add_reported_cost(&mut entry.cost_usd, day.cost_usd);
+        }
+        for row in breakdown.rows {
+            let key = (row.harness, row.model.clone(), row.cwd.clone());
+            let entry = rows.entry(key).or_insert_with(|| UsageBreakdownRow {
+                harness: row.harness,
+                model: row.model.clone(),
+                cwd: row.cwd.clone(),
+                sessions: 0,
+                calls: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                cost_usd: None,
+            });
+            entry.sessions = entry.sessions.saturating_add(row.sessions);
+            entry.calls = entry.calls.saturating_add(row.calls);
+            entry.input_tokens = entry.input_tokens.saturating_add(row.input_tokens);
+            entry.output_tokens = entry.output_tokens.saturating_add(row.output_tokens);
+            entry.cache_read_input_tokens = entry
+                .cache_read_input_tokens
+                .saturating_add(row.cache_read_input_tokens);
+            entry.cache_write_input_tokens = entry
+                .cache_write_input_tokens
+                .saturating_add(row.cache_write_input_tokens);
+            add_reported_cost(&mut entry.cost_usd, row.cost_usd);
+        }
+    }
+    merged.activity = activity.into_values().collect();
+    merged.rows = rows.into_values().collect();
+    merged
+        .rows
+        .sort_by_key(|row| std::cmp::Reverse(row.total_tokens()));
+    merged
+}
+
+fn compact_number(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn harness_label(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "Claude Code",
+        HarnessId::Codex => "Codex",
+        HarnessId::Pi => "Pi",
+        HarnessId::Mock => "Mock",
+    }
 }
 
 pub struct Shell {
@@ -528,16 +648,20 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
+    notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
+    secrets_page: Option<Entity<SecretsPage>>,
     vcs_page: Option<Entity<VcsPage>>,
     terminal_page: Option<Entity<TerminalPage>>,
+    notifications_sub: Option<Subscription>,
     shortcuts_sub: Option<Subscription>,
     terminal_settings_sub: Option<Subscription>,
     terminal_panel_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: Option<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
+    breakdown_dialog: Option<BreakdownDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
     /// Space-row context menu: (space id, window position).
@@ -567,23 +691,20 @@ pub struct Shell {
     sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
-    /// Last seen session status per chat — the chime trigger compares against
-    /// it (a row's FIRST appearance never chimes, so boot stays silent).
-    sound_prev: std::collections::HashMap<String, jolt_proto::SessionStatus>,
+    /// Highest provider rate-limit warning delivered per account/window. A
+    /// reset below the warning threshold allows that window to notify again.
+    usage_warning_levels: std::collections::HashMap<String, UsageWarningLevel>,
     user_menu_open: bool,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
     user_menu_dismissed_at: Option<std::time::Instant>,
-    /// Inline sidebar error strip (mutation failures); click dismisses.
-    sidebar_notice: Option<SharedString>,
-    /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
-    /// UpdateStatus stream says WHETHER one exists; this says how far the
-    /// download/stage of it has come in this process.
+    /// Local lifecycle of a macOS bundle update.
     update_flow: UpdateFlow,
     update_task: Option<Task<()>>,
-    /// Version whose update strip the user dismissed (advisory installs only —
-    /// a newer release shows the strip again).
-    update_dismissed: Option<String>,
+    update_checking: bool,
+    update_check_task: Option<Task<()>>,
+    /// Latest release already announced during this process.
+    notified_update_version: Option<String>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: jolt_update::InstallKind,
@@ -594,8 +715,8 @@ pub struct Shell {
     boot: EngineBootConfig,
     data_dir: PathBuf,
     settings: UiSettings,
-    /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
-    /// parity — heights stay in [`UiSettings`]).
+    /// Session-scoped panel open flags for terminal and changes panes. Heights
+    /// stay in [`UiSettings`].
     panels: SessionPanels,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
@@ -640,13 +761,18 @@ pub struct Shell {
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
+    /// Focus target for settings pages, which otherwise have no consistently
+    /// focusable child to receive route-level keyboard events.
+    settings_focus: FocusHandle,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
     /// window): keyboard shortcuts dispatch through the window focus chain, so
     /// with nothing focused they go dead. Initial focus lands on the composer
-    /// and focus lost with no successor routes back there.
+    /// and focus lost with no successor routes back to the active screen.
     focus_sub: Option<Subscription>,
     /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
     _ticker: Task<()>,
+    /// Refreshes Claude and ChatGPT/Codex rate-limit windows in the background.
+    _account_usage_task: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
 }
@@ -662,7 +788,7 @@ impl Shell {
         // Own-send re-engages the stick-to-bottom pin with a smooth scroll.
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+            move |_: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::Sent { .. } => {
                     transcript.update(cx, |t, cx| t.on_own_send(cx));
                 }
@@ -689,6 +815,42 @@ impl Shell {
                 }
             }
         });
+        let account_usage_task = cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(engine) = this.update(cx, |shell: &mut Shell, cx| {
+                    shell.state.read(cx).engine().cloned()
+                }) else {
+                    break;
+                };
+                let retry_soon = engine.is_none();
+                if let Some(engine) = engine {
+                    let result = engine
+                        .client()
+                        .call(
+                            methods::LIST_AGENT_ACCOUNTS,
+                            serde_json::json!({
+                                "forceUsage": true,
+                                "usageOnly": true,
+                            }),
+                        )
+                        .await;
+                    if let Ok(value) = result
+                        && let Ok(snapshot) =
+                            serde_json::from_value::<jolt_proto::AgentAccountsSnapshot>(value)
+                        && this
+                            .update(cx, |shell, cx| {
+                                shell.notify_account_usage(&snapshot, cx);
+                            })
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(if retry_soon { 5 } else { 5 * 60 }))
+                    .await;
+            }
+        });
         let data_dir = boot.data_dir.clone();
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable shortcuts from the persisted keymap.
@@ -701,9 +863,11 @@ impl Shell {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/secrets") => Route::Settings(SettingsSection::Secrets),
             Some("settings/vcs") => Route::Settings(SettingsSection::VersionControl),
             Some("settings/terminal") => Route::Settings(SettingsSection::Terminal),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
+            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
@@ -748,15 +912,19 @@ impl Shell {
             devices_page: None,
             archived_page: None,
             appearance_page: None,
+            notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
+            secrets_page: None,
             vcs_page: None,
             terminal_page: None,
+            notifications_sub: None,
             shortcuts_sub: None,
             terminal_settings_sub: None,
             terminal_panel_sub: None,
             chat_menu: None,
             rename_dialog: None,
+            breakdown_dialog: None,
             delete_confirm: None,
             space_menu: None,
             rename_space_dialog: None,
@@ -770,13 +938,14 @@ impl Shell {
             tabs_scrolled_to: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
-            sound_prev: std::collections::HashMap::new(),
+            usage_warning_levels: std::collections::HashMap::new(),
             user_menu_open: false,
             user_menu_dismissed_at: None,
-            sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
-            update_dismissed: None,
+            update_checking: false,
+            update_check_task: None,
+            notified_update_version: None,
             install: jolt_update::detect_install(),
             org: None,
             mutate_task: None,
@@ -806,8 +975,10 @@ impl Shell {
             splash: SplashPhase::Visible,
             splash_task: None,
             save_task: None,
+            settings_focus: cx.focus_handle(),
             focus_sub: None,
             _ticker: ticker,
+            _account_usage_task: account_usage_task,
             _state_observation: observation,
             _composer_events: composer_events,
         }
@@ -840,47 +1011,7 @@ impl Shell {
                 _ => {}
             }
         }
-        // Session chimes (herdr semantics, `sound::sound_for_transition`): a
-        // question rings whenever a session flips to AwaitingInput, a
-        // completion rings on the Working→Idle edge — for ANY session on any
-        // device. A row's first appearance only seeds the baseline, so boot
-        // (restored rows) and fresh sends stay silent.
-        //
-        // STALENESS-GATED like the dot (`effective_indicator`), for the same
-        // reason: raw row statuses include the past. A dead turn's Working row
-        // (host killed mid-run, Idle write lost to a wedged room) seeded
-        // prev=Working here, and the moment the old Idle finally synced in —
-        // typically piggybacked on the round-trip of a fresh send — the chime
-        // heard a phantom Working→Idle and rang "done" on send (user report
-        // 2026-07-31). The dot never showed that ghost; the chime must judge
-        // by the identical clock.
-        {
-            let now = Utc::now();
-            let sessions: Vec<(String, jolt_proto::SessionStatus)> = state
-                .read(cx)
-                .sessions
-                .iter()
-                .map(|s| {
-                    use jolt_proto::view::Indicator;
-                    let status = match jolt_proto::view::effective_indicator(Some(s), now) {
-                        Indicator::Working => jolt_proto::SessionStatus::Working,
-                        Indicator::AwaitingInput => jolt_proto::SessionStatus::AwaitingInput,
-                        Indicator::Errored => jolt_proto::SessionStatus::Errored,
-                        Indicator::None => jolt_proto::SessionStatus::Idle,
-                    };
-                    (s.chat_id.clone(), status)
-                })
-                .collect();
-            for (chat_id, status) in sessions {
-                let prev = self.sound_prev.insert(chat_id, status);
-                if let Some(prev) = prev
-                    && self.settings.sound_enabled
-                    && let Some(sound) = crate::sound::sound_for_transition(prev, status)
-                {
-                    crate::sound::play(sound);
-                }
-            }
-        }
+        self.notify_jolt_update(state, cx);
         // Boot: restore the last selected space once the first spaces frame
         // lands (a still-existing row wins over the auto-selected first one;
         // the boot-auto-selected chat's own space wins over both — selecting a
@@ -920,7 +1051,7 @@ impl Shell {
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
-            // jolt's `/` route redirected into the last-used chat, leaving no
+            // The boot route redirects into the last-used chat, leaving no
             // dead Back target. Walking history lands here too, but the
             // destination already equals `current()`, so the push dedups.
             if matches!(self.route, Route::Chat) {
@@ -962,6 +1093,103 @@ impl Shell {
             ConnectionStatus::Failed(_) => self.splash = SplashPhase::Gone,
             ConnectionStatus::Connecting => {}
         }
+    }
+
+    fn notify_account_usage(
+        &mut self,
+        snapshot: &jolt_proto::AgentAccountsSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        for account in snapshot.accounts.iter().filter(|account| {
+            account.active && matches!(account.harness, HarnessId::ClaudeCode | HarnessId::Codex)
+        }) {
+            let (provider, product) = match account.harness {
+                HarnessId::ClaudeCode => ("Claude Code", "Claude"),
+                HarnessId::Codex => ("Codex", "ChatGPT"),
+                _ => continue,
+            };
+            let account_label = account
+                .email
+                .as_deref()
+                .or(account.display_name.as_deref())
+                .unwrap_or("account");
+            for (index, window) in account.usage_windows.iter().enumerate() {
+                let key = format!("{provider}:{}:{index}:{}", account.id, window.label);
+                let level = usage_warning_level(window.used_fraction);
+                let previous = self
+                    .usage_warning_levels
+                    .insert(key.clone(), level)
+                    .unwrap_or(UsageWarningLevel::Normal);
+                if level <= previous || level == UsageWarningLevel::Normal {
+                    continue;
+                }
+                let (threshold, title, kind) = match level {
+                    UsageWarningLevel::Warning => {
+                        (80, format!("{provider} usage is high"), ToastKind::Warning)
+                    }
+                    UsageWarningLevel::Danger => (
+                        95,
+                        format!("{provider} usage is nearly exhausted"),
+                        ToastKind::Error,
+                    ),
+                    UsageWarningLevel::Normal => continue,
+                };
+                let percent = (window.used_fraction * 100.0).round() as u32;
+                let reset = crate::settings::accounts::format_reset(window.resets_at, Utc::now())
+                    .map(|reset| format!("; {reset}"))
+                    .unwrap_or_default();
+                crate::toast::show(
+                    Toast::new(format!("account-usage-{key}-{threshold}"), title, kind).body(
+                        format!(
+                            "{product} {} limit for {account_label} is {percent}% used{reset}.",
+                            window.label.to_lowercase()
+                        ),
+                    ),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn notify_jolt_update(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let Some(latest) = state
+            .read(cx)
+            .update
+            .as_ref()
+            .filter(|status| status.update_available)
+            .and_then(|status| status.latest_version.clone())
+        else {
+            return;
+        };
+        if self.notified_update_version.as_deref() == Some(latest.as_str()) {
+            return;
+        }
+        self.notified_update_version = Some(latest.clone());
+        self.show_jolt_update_available(latest, cx);
+    }
+
+    fn show_jolt_update_available(&mut self, latest: String, cx: &mut Context<Self>) {
+        let mut toast = Toast::new(
+            format!("jolt-update-{latest}"),
+            "Jolt update available",
+            ToastKind::Info,
+        )
+        .persistent();
+        if matches!(self.install, jolt_update::InstallKind::MacApp { .. }) {
+            let shell = cx.entity().downgrade();
+            toast = toast
+                .body(format!("Version {latest} is ready to download."))
+                .action(ToastAction::new("Download", move |cx| {
+                    shell
+                        .update(cx, |shell, cx| shell.begin_update_download(cx))
+                        .ok();
+                }));
+        } else {
+            toast = toast.body(format!(
+                "Version {latest} is available. Run `jolt update` to install it."
+            ));
+        }
+        crate::toast::show(toast, cx);
     }
 
     // ---- layout state ----
@@ -1118,9 +1346,8 @@ impl Shell {
         }));
     }
 
-    /// Cmd/Ctrl+` and the header button (feature-inventory §1.10). Height
-    /// animates 200 ms; closing detaches (PTYs stay alive), opening restores.
-    /// The flag is per chat (jolt `sessionPanels`).
+    /// Cmd/Ctrl+` and the header button. Height animates 200 ms; closing detaches
+    /// (PTYs stay alive), opening restores. The flag is per chat.
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.terminal_target(cx);
         let key = self.panel_key(cx);
@@ -1129,18 +1356,16 @@ impl Shell {
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
-            // Opening lands keyboard focus IN the shell — typing goes straight
-            // to the prompt, no click needed (jolt terminal-panel.tsx: the
-            // visible+active effect calls `terminal.focus()` on every open).
+            // Opening lands keyboard focus in the shell so typing goes straight
+            // to the prompt with no click needed.
             // The handle is focusable before the panel's first paint; once the
             // terminal body mounts with `track_focus` it receives the keys.
             window.focus(&panel.read(cx).focus_handle(), cx);
         } else {
             // Hiding the panel removes the (likely focused) terminal view;
             // with nothing focused, window key bindings stop dispatching, so
-            // hand focus to the composer. (Cmd+` is a pure toggle — a second
-            // press closes even while the terminal is focused, as in jolt's
-            // `useHotkey(toggleShortcut, ... setOpenScoped(!open))`.)
+            // hand focus to the composer. Cmd+` is a pure toggle, so a second
+            // press closes even while the terminal is focused.
             window.focus(&self.composer.focus_handle(cx), cx);
         }
         self.schedule_terminal_tween_cleanup(cx);
@@ -1255,6 +1480,28 @@ impl Shell {
         cx.notify();
     }
 
+    /// Leave the new-session canvas for the last session selected in its space.
+    fn restore_last_session(&mut self, cx: &mut Context<Self>) -> bool {
+        let target = {
+            let state = self.state.read(cx);
+            let Some(space_id) = state.selected_space.as_deref() else {
+                return false;
+            };
+            self.space_last_chat.get(space_id).filter(|chat_id| {
+                state
+                    .visible_chats()
+                    .any(|chat| chat.id == **chat_id && chat.space_id.as_deref() == Some(space_id))
+            })
+        }
+        .cloned();
+        let Some(chat_id) = target else {
+            return false;
+        };
+        self.state
+            .update(cx, |state, cx| state.select_chat(Some(chat_id), cx));
+        true
+    }
+
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
@@ -1321,6 +1568,16 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Secrets => {
+                if self.secrets_page.is_none() {
+                    let state = self.state.clone();
+                    self.secrets_page = Some(cx.new(|cx| SecretsPage::new(state, cx)));
+                }
+                match &self.secrets_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::VersionControl => {
                 if self.vcs_page.is_none() {
                     let state = self.state.clone();
@@ -1364,6 +1621,27 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Notifications => {
+                if self.notifications_page.is_none() {
+                    let system_notifications_enabled = self.settings.system_notifications_enabled;
+                    let page = cx.new(|_| NotificationsPage::new(system_notifications_enabled));
+                    self.notifications_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &NotificationsEvent, cx| {
+                            let NotificationsEvent::SystemNotificationsEnabledChanged(enabled) =
+                                event;
+                            this.settings.system_notifications_enabled = *enabled;
+                            crate::toast::configure(this.settings.system_notifications_enabled, cx);
+                            this.schedule_save(cx);
+                        },
+                    ));
+                    self.notifications_page = Some(page);
+                }
+                match &self.notifications_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Shortcuts => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -1402,18 +1680,24 @@ impl Shell {
 
     // ---- sidebar mutations ----
 
-    /// Fire a Mutate op; failures surface in the sidebar notice strip.
+    /// Fire a Mutate op; failures surface through the app-wide toast center.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some("Engine not connected".into());
-            cx.notify();
+            crate::toast::show(
+                Toast::new("mutation-error", "Action failed", ToastKind::Error)
+                    .body("The Jolt engine is not connected."),
+                cx,
+            );
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
-                this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
-                    cx.notify();
+                this.update(cx, |_, cx| {
+                    crate::toast::show(
+                        Toast::new("mutation-error", "Action failed", ToastKind::Error)
+                            .body(err.to_string()),
+                        cx,
+                    );
                 })
                 .ok();
             }
@@ -1494,9 +1778,12 @@ impl Shell {
                 .call(methods::SIGN_OUT, serde_json::json!({}))
                 .await
             {
-                this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("Sign out failed: {err}").into());
-                    cx.notify();
+                this.update(cx, |_, cx| {
+                    crate::toast::show(
+                        Toast::new("sign-out-error", "Sign out failed", ToastKind::Error)
+                            .body(err.to_string()),
+                        cx,
+                    );
                 })
                 .ok();
             }
@@ -1513,15 +1800,18 @@ impl Shell {
                 .client()
                 .call(methods::SIGN_IN, serde_json::json!({}))
                 .await;
-            this.update(cx, |shell, cx| match result {
+            this.update(cx, |_, cx| match result {
                 Ok(value) => {
                     if let Some(url) = value.get("url").and_then(|u| u.as_str()) {
                         cx.open_url(url);
                     }
                 }
                 Err(err) => {
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
-                    cx.notify();
+                    crate::toast::show(
+                        Toast::new("sign-in-error", "Sign in failed", ToastKind::Error)
+                            .body(err.to_string()),
+                        cx,
+                    );
                 }
             })
             .ok();
@@ -1626,13 +1916,9 @@ impl Shell {
         Some(div().flex_none().h_full().w(px(width)).into_any_element())
     }
 
-    /// The header's content row with the animated left inset — the native port
-    /// of jolt __root.tsx `transition-[padding-left] duration-200 ease-out` +
-    /// `style={{ paddingLeft: headerInset }}`: on sidebar toggles (and macOS
-    /// fullscreen flips) the SAME element's padding tweens, so the title
-    /// glides to its new x-position. Route changes SNAP: the tween is killed
-    /// by every route transition (jolt remounts the keyed header variants —
-    /// instant swap, zero horizontal motion).
+    /// The header's content row with an animated left inset. On sidebar toggles
+    /// and macOS fullscreen flips, the same element's padding tweens so the title
+    /// glides to its new x-position. Route changes snap by killing the tween.
     /// Where unified-titlebar content (tabs / the settings label) starts: past
     /// the traffic lights + control cluster, riding the fullscreen inset tween.
     pub(super) fn title_bar_content_start(&self) -> f32 {
@@ -1669,8 +1955,8 @@ impl Shell {
         }
     }
 
-    /// Make a titlebar strip drag the window — zed's platform-titlebar
-    /// pattern (jolt's `.drag` region): mark it a [`WindowControlArea::Drag`]
+    /// Make a titlebar strip drag the window using the platform-titlebar pattern:
+    /// mark it as a [`WindowControlArea::Drag`]
     /// (macOS app-owned titlebar), hand the drag to the compositor once the
     /// pointer moves with the button down, and double-click zooms.
     fn titlebar_drag_region(
@@ -1721,8 +2007,8 @@ impl Shell {
             })
     }
 
-    /// The ONE top-left window-control cluster (sidebar toggle + back/forward —
-    /// jolt window-controls.tsx): rendered once, in a paint-only overlay layer
+    /// The one top-left window-control cluster (sidebar toggle + back/forward),
+    /// rendered once in a paint-only overlay layer
     /// pinned at the window's top-left, ABOVE the sidebar and headers. The
     /// sidebar width animates *beneath* it, so the buttons keep their element
     /// identity and never move or remount on collapse/expand; only the
@@ -1834,8 +2120,8 @@ impl Shell {
         )
     }
 
-    /// Settings-mode sidebar (jolt settings-sidebar.tsx): window-control
-    /// strip, "Settings" heading, icon section rows styled like session rows,
+    /// Settings-mode sidebar: window-control strip, "Settings" heading, icon
+    /// section rows styled like session rows,
     /// and a Back row pinned to the bottom.
     fn render_settings_nav(
         &mut self,
@@ -1845,10 +2131,12 @@ impl Shell {
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
-            SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Agents => icons::USER,
+            SettingsSection::Secrets => icons::KEY_MINIMALISTIC,
             SettingsSection::VersionControl => icons::GIT_BRANCH,
             SettingsSection::Terminal => icons::TERMINAL,
             SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
@@ -1913,7 +2201,7 @@ impl Shell {
                         }),
                     )),
             )
-            // Back pinned to the bottom (jolt settings-sidebar.tsx).
+            // Back is pinned to the bottom.
             .child(
                 div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
                     div()
@@ -1931,8 +2219,8 @@ impl Shell {
                         .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
-                            // AltArrowLeft chevron (jolt settings-sidebar.tsx),
-                            // not the straight history arrow.
+                            // Use the AltArrowLeft chevron, not the straight
+                            // history arrow.
                             icon(icons::ALT_ARROW_LEFT)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
@@ -1943,7 +2231,7 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session row (jolt session-row.tsx): status rail on the left
+    /// One session row: status rail on the left
     /// (a live dotted orb while working, a dot otherwise), title +
     /// relative time on the first line, "folder · device" underneath aligned
     /// to the title. Click selects; right-click opens the context menu.
@@ -1961,7 +2249,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Status is a rail, not a word (jolt session-row.tsx): always present
+        // Status is a rail, not a word, and is always present
         // so rows align and state changes read in place. Working animates as a
         // compact dotted orb; every other status is a dot.
         let dot_color = spaces::status_dot_color(status, theme);
@@ -1993,8 +2281,7 @@ impl Shell {
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
         let menu_id = id.clone();
-        // Hover fades over transition-colors (jolt session-row.tsx) — both
-        // the wash and the title brighten ride the same 150ms blend.
+        // Both the hover wash and title brighten over the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
         let rest_bg = if selected {
             selected_wash
@@ -2132,13 +2419,12 @@ impl Shell {
         // promotions glide; cleared rows just go).
         let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
 
-        // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
-        // list changes (new activity resort, grouping flip), surviving rows
-        // glide from their old y to the new one — layout is already at the new
+        // When the order of a live list changes due to activity or grouping,
+        // surviving rows glide from their old y to the new one. Layout is at the new
         // position; the offset is a paint-only relative inset animated to 0
         // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
-        // just go (matching the original). First fill and chat switches (which
-        // don't reorder) never animate.
+        // disappear immediately. First fill and chat switches that do not
+        // reorder never animate.
         let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
         if self.sidebar_prev_order != order {
             if !self.sidebar_prev_order.is_empty() {
@@ -2284,137 +2570,98 @@ impl Shell {
                         )
                     }),
             ))
-            // Update strip (above the user menu; below the lists).
-            .when_some(self.render_update_strip(theme, cx), |el, strip| {
-                el.child(strip)
-            })
-            // Inline mutation-failure notice.
-            .when_some(self.sidebar_notice.clone(), |el, notice| {
-                el.child(
-                    div()
-                        .id("sidebar-notice")
-                        .mx(px(Theme::SPACE_SM))
-                        .mb(px(Theme::SPACE_SM))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(4.0))
-                        .rounded(px(Theme::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(theme.danger)
-                        .text_size(px(11.0))
-                        .text_color(theme.danger)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_notice = None;
-                            cx.notify();
-                        }))
-                        .child(notice),
-                )
-            })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
     }
 
-    /// Update strip: shown above the user menu whenever the engine's
-    /// UpdateStatus stream reports a newer release. On a macOS bundle install
-    /// it drives the whole flow — click to download, then click to restart into
-    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`jolt update`); click dismisses it for that version.
-    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = self.state.read(cx).update.clone()?;
-        if !status.update_available {
-            return None;
-        }
-        let latest = status.latest_version.clone()?;
-        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
-            return None;
-        }
-        let mac_app = matches!(self.install, jolt_update::InstallKind::MacApp { .. });
-
-        let (label, clickable): (SharedString, bool) = if mac_app {
-            match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
-                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
-            }
-        } else {
-            (
-                format!("Update available — v{latest} · run `jolt update`").into(),
-                true,
-            )
-        };
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
-        let tone = if failed { theme.danger } else { theme.accent };
-        // The chip fill is the sidebar's WHITE wash language, not an accent
-        // tint: an indigo fill over the glass composited into a dark slab that
-        // blocked the blur (user report) — the accent lives in the icon/text.
-        let (chip_bg, chip_bg_hover) = if failed {
-            (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
-        } else {
-            (crate::theme::wash(0.11), crate::theme::wash(0.16))
-        };
-
-        let mut strip = div()
-            .id("update-strip")
-            .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
-            // SPACE_SM padding — doubling it read as a hole (user report).
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(chip_bg)
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .text_size(px(11.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(tone)
-            .child(
-                icon(if failed {
-                    icons::DANGER_TRIANGLE
-                } else {
-                    icons::RESTART
-                })
-                .size(px(14.0))
-                .text_color(tone),
-            )
-            .child(div().flex_1().min_w_0().child(label));
-        if clickable {
-            strip = strip
-                .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
-        }
-        Some(strip.into_any_element())
-    }
-
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs → dismiss for this version.
-    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.install, jolt_update::InstallKind::MacApp { .. }) {
-            self.update_dismissed = self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.clone());
+    fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        self.user_menu_open = false;
+        if self.update_checking {
             cx.notify();
             return;
         }
-        match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
-            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
-            UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
-            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
-        }
+        self.update_checking = true;
+        let edge_url = self.boot.edge_url.clone();
+        let check = Tokio::spawn(
+            cx,
+            async move { jolt_update::fetch_latest(&edge_url).await },
+        );
+        self.update_check_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = match check.await {
+                Ok(Ok(manifest)) => Ok(manifest),
+                Ok(Err(error)) => Err(format!("{error:#}")),
+                Err(error) => Err(error.to_string()),
+            };
+            this.update(cx, |shell, cx| {
+                shell.update_checking = false;
+                match outcome {
+                    Ok(manifest)
+                        if jolt_update::version_newer(
+                            &manifest.version,
+                            jolt_update::current_version(),
+                        ) =>
+                    {
+                        shell.notified_update_version = Some(manifest.version.clone());
+                        shell.show_jolt_update_available(manifest.version, cx);
+                    }
+                    Ok(_) => crate::toast::show(
+                        Toast::new(
+                            "jolt-update-check",
+                            "Jolt is up to date",
+                            ToastKind::Success,
+                        )
+                        .body(format!(
+                            "Version {} is the latest available release.",
+                            jolt_update::current_version()
+                        )),
+                        cx,
+                    ),
+                    Err(message) => {
+                        let shell_handle = cx.entity().downgrade();
+                        crate::toast::show(
+                            Toast::new(
+                                "jolt-update-check",
+                                "Update check failed",
+                                ToastKind::Error,
+                            )
+                            .body(message)
+                            .action(ToastAction::new(
+                                "Retry",
+                                move |cx| {
+                                    shell_handle
+                                        .update(cx, |shell, cx| shell.check_for_update(cx))
+                                        .ok();
+                                },
+                            )),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
-    /// Fetch the manifest and stage the new `Jolt.app` under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
+    /// Fetch and stage a new macOS bundle. Progress and outcomes are app-wide
+    /// notifications so delivery follows the user's notification preference.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.update_flow, UpdateFlow::Downloading) {
+            return;
+        }
         let edge_url = self.boot.edge_url.clone();
         let data_dir = self.data_dir.clone();
         self.update_flow = UpdateFlow::Downloading;
+        crate::toast::show(
+            Toast::new(
+                "jolt-update-download",
+                "Downloading Jolt update",
+                ToastKind::Info,
+            )
+            .body("The update will be ready to restart shortly."),
+            cx,
+        );
         let download = Tokio::spawn(cx, async move {
             let manifest = jolt_update::fetch_latest(&edge_url).await?;
             jolt_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
@@ -2425,19 +2672,54 @@ impl Shell {
                 Ok(Err(err)) => Err(format!("{err:#}")),
                 Err(join_err) => Err(join_err.to_string()),
             };
-            this.update(cx, |shell, cx| {
-                shell.update_flow = match outcome {
-                    Ok(staged) => UpdateFlow::Ready(staged),
-                    Err(message) => {
-                        tracing::warn!(%message, "update download failed");
-                        UpdateFlow::Failed(message.into())
-                    }
-                };
-                cx.notify();
+            this.update(cx, |shell, cx| match outcome {
+                Ok(staged) => {
+                    shell.update_flow = UpdateFlow::Ready(staged);
+                    let shell_handle = cx.entity().downgrade();
+                    crate::toast::show(
+                        Toast::new("jolt-update-ready", "Jolt update ready", ToastKind::Success)
+                            .persistent()
+                            .body("Restart Jolt to apply the update.")
+                            .action(ToastAction::new("Restart", move |cx| {
+                                shell_handle
+                                    .update(cx, |shell, cx| shell.apply_ready_update(cx))
+                                    .ok();
+                            })),
+                        cx,
+                    );
+                }
+                Err(message) => {
+                    tracing::warn!(%message, "update download failed");
+                    shell.update_flow = UpdateFlow::Failed;
+                    shell.show_update_error(message, cx);
+                }
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    fn apply_ready_update(&mut self, cx: &mut Context<Self>) {
+        let flow = std::mem::replace(&mut self.update_flow, UpdateFlow::Idle);
+        match flow {
+            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
+            other => self.update_flow = other,
+        }
+    }
+
+    fn show_update_error(&mut self, message: String, cx: &mut Context<Self>) {
+        let shell = cx.entity().downgrade();
+        crate::toast::show(
+            Toast::new("jolt-update-error", "Jolt update failed", ToastKind::Error)
+                .persistent()
+                .body(message)
+                .action(ToastAction::new("Retry", move |cx| {
+                    shell
+                        .update(cx, |shell, cx| shell.begin_update_download(cx))
+                        .ok();
+                })),
+            cx,
+        );
     }
 
     /// Swap the staged bundle over the installed one, arm the detached
@@ -2453,9 +2735,10 @@ impl Shell {
                 cx.quit();
             }
             Err(err) => {
+                let message = format!("{err:#}");
                 tracing::error!(error = %err, "update apply failed");
-                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
-                cx.notify();
+                self.update_flow = UpdateFlow::Failed;
+                self.show_update_error(message, cx);
             }
         }
     }
@@ -2480,9 +2763,8 @@ impl Shell {
             .items_center()
             .gap(px(Theme::SPACE_SM))
             .cursor_pointer()
-            // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
-            // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
-            // the hover wash fades over `transition-colors`.
+            // The open state uses a slightly stronger wash than hover, and
+            // the hover wash fades over the standard color transition.
             .bg(if open {
                 theme.glass_hover()
             } else {
@@ -2530,13 +2812,11 @@ impl Shell {
                     .child(user_line.clone()),
             );
         if open {
-            // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
-            // (exactly as wide as the trigger row — sidebar minus its p-2
-            // gutters), `flex-col gap-0.5`, then: one small muted email line
-            // (`px-2 pb-1 pt-1.5 text-[11px] text-muted-foreground/70`),
-            // "Settings", separator, "Sign out". Both rows are plain
-            // `menuItem`s with muted 16px icons — sign-out carries NO
-            // destructive tone in the original.
+            // The menu is exactly as wide as the trigger row: sidebar minus
+            // its gutters. It contains a small muted email line, Settings,
+            // Usage breakdown, Check for update, a separator, and Sign out. Rows
+            // are plain `menuItem`s with muted 16px icons — sign-out carries
+            // no destructive tone.
             let menu = popover::popover_card(theme)
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2570,6 +2850,32 @@ impl Shell {
                         )
                         .child(SharedString::from("Settings")),
                 )
+                .child(
+                    popover::menu_row(theme, false, "user-menu-usage-breakdown")
+                        .id("user-menu-usage-breakdown")
+                        .on_click(cx.listener(|this, _, _, cx| this.open_breakdown(cx)))
+                        .child(
+                            icon(icons::LIST)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Usage breakdown")),
+                )
+                .child(
+                    popover::menu_row(theme, self.update_checking, "user-menu-check-update")
+                        .id("user-menu-check-update")
+                        .on_click(cx.listener(|this, _, _, cx| this.check_for_update(cx)))
+                        .child(
+                            icon(icons::REFRESH)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from(if self.update_checking {
+                            "Checking for updates…"
+                        } else {
+                            "Check for update"
+                        })),
+                )
                 .child(popover::menu_separator())
                 .child(
                     popover::menu_row(theme, false, "user-menu-signout")
@@ -2588,6 +2894,393 @@ impl Shell {
         trigger.into_any_element()
     }
 
+    fn open_breakdown(&mut self, cx: &mut Context<Self>) {
+        self.user_menu_open = false;
+        self.breakdown_dialog = Some(BreakdownDialog {
+            days: 30,
+            data: Loadable::Loading,
+            unavailable_devices: 0,
+            task: None,
+        });
+        self.load_breakdown(30, cx);
+    }
+
+    fn load_breakdown(&mut self, days: u16, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            if let Some(dialog) = &mut self.breakdown_dialog {
+                dialog.data = Loadable::Error("Engine not connected".into());
+            }
+            cx.notify();
+            return;
+        };
+        let (remote_devices, offline_devices) = {
+            let state = self.state.read(cx);
+            state
+                .local_device_id
+                .as_ref()
+                .map(|local_id| {
+                    let remotes: Vec<_> = state
+                        .devices
+                        .iter()
+                        .filter(|device| device.id != *local_id)
+                        .collect();
+                    let online = remotes
+                        .iter()
+                        .filter(|device| state.device_online(&device.id, Utc::now()))
+                        .map(|device| device.id.clone())
+                        .collect::<Vec<_>>();
+                    let offline = remotes.len().saturating_sub(online.len());
+                    (online, offline)
+                })
+                .unwrap_or_default()
+        };
+        if let Some(dialog) = &mut self.breakdown_dialog {
+            dialog.days = days;
+            // Keep the previous report visible while switching ranges. Replacing
+            // it with the shorter loading state made the modal collapse and
+            // expand around every request.
+            if !matches!(&dialog.data, Loadable::Ready(_)) {
+                dialog.data = Loadable::Loading;
+                dialog.unavailable_devices = 0;
+            }
+            dialog.task = Some(cx.spawn(async move |this, cx| {
+                let mut targets = vec![None];
+                targets.extend(remote_devices.into_iter().map(Some));
+                let mut replies = Vec::new();
+                let mut unavailable = offline_devices;
+                for target in targets {
+                    let mut params = serde_json::json!({ "days": days });
+                    if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
+                        object.insert("targetDeviceId".into(), serde_json::Value::String(target));
+                    }
+                    match engine.client().call(methods::USAGE_BREAKDOWN, params).await {
+                        Ok(value) => match serde_json::from_value::<UsageBreakdown>(value) {
+                            Ok(reply) => replies.push(reply),
+                            Err(error) => {
+                                tracing::warn!(%error, "malformed usage breakdown");
+                                unavailable += 1;
+                            }
+                        },
+                        Err(error) => {
+                            tracing::warn!(%error, "usage breakdown device unavailable");
+                            unavailable += 1;
+                        }
+                    }
+                }
+                this.update(cx, |shell, cx| {
+                    let Some(dialog) = &mut shell.breakdown_dialog else {
+                        return;
+                    };
+                    if dialog.days != days {
+                        return;
+                    }
+                    dialog.task = None;
+                    dialog.unavailable_devices = unavailable;
+                    dialog.data = if replies.is_empty() {
+                        Loadable::Error("Usage data is unavailable".into())
+                    } else {
+                        Loadable::Ready(merge_breakdowns(days, replies))
+                    };
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+        cx.notify();
+    }
+
+    fn render_breakdown_dialog(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let dialog = self.breakdown_dialog.as_ref()?;
+        let days = dialog.days;
+        let data = dialog.data.clone();
+        let unavailable = dialog.unavailable_devices;
+        let refreshing = dialog.task.is_some() && matches!(&data, Loadable::Ready(_));
+        let theme = Theme::of(cx).clone();
+
+        let ranges =
+            div()
+                .flex()
+                .items_center()
+                .gap(px(3.0))
+                .children([7_u16, 30, 90].into_iter().map(|range| {
+                    div()
+                        .id(("breakdown-range", range as usize))
+                        .px(px(9.0))
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(if days == range {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .bg(if days == range {
+                            theme.element_hover
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.load_breakdown(range, cx);
+                        }))
+                        .child(format!("{range}d"))
+                }));
+
+        let mut body = div()
+            .id("breakdown-body")
+            .h(px(440.0))
+            .max_h(viewport.height - px(120.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .opacity(if refreshing { 0.72 } else { 1.0 });
+        match data {
+            Loadable::Idle | Loadable::Loading => {
+                body = body.child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child("Loading usage…"),
+                );
+            }
+            Loadable::Error(error) => {
+                body = body.child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.0))
+                        .text_color(theme.danger_muted)
+                        .child(error),
+                );
+            }
+            Loadable::Ready(breakdown) => {
+                let cost = breakdown
+                    .cost_usd
+                    .map(|value| format!("${value:.2}"))
+                    .unwrap_or_else(|| "—".into());
+                let summaries = [
+                    ("Sessions", compact_number(breakdown.sessions)),
+                    ("Output", compact_number(breakdown.output_tokens)),
+                    ("Tokens", compact_number(breakdown.total_tokens())),
+                    ("Reported cost", cost),
+                ];
+                body = body.child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .children(summaries.into_iter().map(|(label, value)| {
+                            div()
+                                .flex_1()
+                                .p(px(10.0))
+                                .rounded(px(8.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.element_hover.opacity(0.45))
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_muted)
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(4.0))
+                                        .text_size(px(17.0))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.text)
+                                        .child(value),
+                                )
+                        })),
+                );
+
+                let by_day: std::collections::HashMap<_, _> = breakdown
+                    .activity
+                    .iter()
+                    .map(|day| (day.day.as_str(), day.tokens))
+                    .collect();
+                let max_tokens = breakdown
+                    .activity
+                    .iter()
+                    .map(|day| day.tokens)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let cells = (0..breakdown.days).rev().map(|offset| {
+                    let day = (chrono::Local::now().date_naive()
+                        - chrono::Duration::days(i64::from(offset)))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                    let tokens = by_day.get(day.as_str()).copied().unwrap_or_default();
+                    let intensity = tokens as f32 / max_tokens as f32;
+                    div().size(px(11.0)).rounded(px(2.0)).bg(if tokens == 0 {
+                        theme.element_hover.opacity(0.45)
+                    } else {
+                        theme.accent.opacity(0.22 + intensity * 0.78)
+                    })
+                });
+                body = body.child(
+                    div()
+                        .child(
+                            div()
+                                .mb(px(7.0))
+                                .text_size(px(11.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text_muted)
+                                .child("Activity"),
+                        )
+                        .child(div().flex().flex_wrap().gap(px(4.0)).children(cells)),
+                );
+
+                let mut rows = div().flex().flex_col();
+                for row in breakdown.rows.iter().take(8) {
+                    let location = std::path::Path::new(&row.cwd)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&row.cwd);
+                    rows = rows.child(
+                        div()
+                            .h(px(34.0))
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .text_size(px(11.0))
+                            .child(
+                                div()
+                                    .w(px(90.0))
+                                    .text_color(theme.text_muted)
+                                    .child(harness_label(row.harness)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_color(theme.text)
+                                    .child(row.model.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(90.0))
+                                    .truncate()
+                                    .text_color(theme.text_muted)
+                                    .child(location.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(64.0))
+                                    .text_right()
+                                    .text_color(theme.text)
+                                    .child(compact_number(row.total_tokens())),
+                            ),
+                    );
+                }
+                body = body.child(
+                    div()
+                        .child(
+                            div()
+                                .mb(px(4.0))
+                                .text_size(px(11.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text_muted)
+                                .child("Harness · model · space"),
+                        )
+                        .child(rows),
+                );
+                if unavailable != 0 {
+                    body = body.child(div().text_size(px(10.0)).text_color(theme.warning).child(
+                        format!(
+                            "{unavailable} device(s) unavailable or did not return usage data."
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let card = div()
+            .w(px(680.0))
+            .max_w(viewport.width - px(32.0))
+            .p(px(18.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_lg()
+            .child(
+                div()
+                    .mb(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .child(
+                                div()
+                                    .text_size(px(16.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child("Usage breakdown"),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.0))
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted)
+                                    .child("Tracked Jolt sessions across reachable devices"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(ranges)
+                            .child(
+                                div()
+                                    .id("close-breakdown")
+                                    .size(px(24.0))
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(theme.text_muted)
+                                    .bg(motion::hover_blend(
+                                        "close-breakdown",
+                                        gpui::transparent_black(),
+                                        theme.element_hover,
+                                    ))
+                                    .on_hover(motion::hover_listener("close-breakdown"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.breakdown_dialog = None;
+                                        cx.notify();
+                                    }))
+                                    .child("×"),
+                            ),
+                    ),
+            )
+            .child(body);
+        Some(popover::modal(
+            "usage-breakdown",
+            viewport,
+            card.into_any_element(),
+        ))
+    }
+
     /// Floating layers owned by the shell: the session context menu and the
     /// rename / delete-confirm dialogs.
     fn render_overlays(
@@ -2598,6 +3291,10 @@ impl Shell {
     ) -> Vec<AnyElement> {
         let theme = Theme::of(cx).clone();
         let mut overlays: Vec<AnyElement> = Vec::new();
+
+        if let Some(overlay) = self.render_breakdown_dialog(viewport, cx) {
+            overlays.push(overlay);
+        }
 
         if let Some((chat_id, position)) = self.chat_menu.clone() {
             let rename_id = chat_id.clone();
@@ -2788,6 +3485,7 @@ impl Shell {
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
+        let view = cx.entity_id();
         let theme_bg = theme.bg;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
 
@@ -2838,15 +3536,16 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .child(
-                            icon(icons::JOLT_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
-                                .text_color(theme.text.opacity(0.09)),
-                        )
+                        .child(crate::ascii_mark::ascii_jolt_mark(
+                            theme,
+                            132.0,
+                            crate::ascii_mark::AsciiMarkMotion::Idle,
+                            view,
+                            cx,
+                        ))
                         .child(
                             div()
-                                .mt(px(24.0))
+                                .mt(px(18.0))
                                 .text_size(px(16.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
@@ -2870,9 +3569,8 @@ impl Shell {
                 ))
                 .into_any_element()
         } else {
-            // New-chat canvas (jolt index.tsx): the dim jolt mark watermark
-            // (`h-12 text-foreground/[0.09]`) over the centered helper line —
-            // now naming the space the session will start in.
+            // New-chat canvas: the dim violet Jolt mark over the centered
+            // helper line, naming the space the session will start in.
             let helper: SharedString = if space_name.is_empty() {
                 "Send a message to start a new session.".into()
             } else {
@@ -2890,15 +3588,16 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .child(
-                            icon(icons::JOLT_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
-                                .text_color(theme.text.opacity(0.09)),
-                        )
+                        .child(crate::ascii_mark::ascii_jolt_mark(
+                            theme,
+                            132.0,
+                            crate::ascii_mark::AsciiMarkMotion::Idle,
+                            view,
+                            cx,
+                        ))
                         .child(
                             div()
-                                .mt(px(24.0))
+                                .mt(px(18.0))
                                 .text_size(px(14.0))
                                 .text_color(theme.text_muted.opacity(0.6))
                                 .child(helper),
@@ -2964,8 +3663,7 @@ impl Shell {
             )
             // Reserved status strip (h-6) — the WorkingIndicator lives here so
             // the composer below never shifts. Both live INSIDE the
-            // conversation region, ABOVE the terminal dock (jolt __root.tsx:
-            // the terminal panel sits below the whole conversation column).
+            // conversation region, above the terminal dock.
             .child(status)
             .when(has_spaces, |el| el.child(self.composer.clone()))
             .child(self.render_terminal_container(cx))
@@ -3132,7 +3830,7 @@ impl Shell {
         let state = self.state.read(cx);
 
         // Aligned with the composer column: centered, same max width, small
-        // inner gutter (jolt's `mx-auto h-6 max-w-3xl px-2`).
+        // inner gutter.
         let strip = div()
             .h(px(Theme::STATUS_STRIP_HEIGHT))
             .flex_none()
@@ -3149,14 +3847,38 @@ impl Shell {
             return strip.into_any_element();
         };
         let indicator = state.indicator_for(&chat_id, now);
+        let compacting = state
+            .session_for(&chat_id)
+            .is_some_and(|session| session.compacting);
         let elapsed_secs = state
             .session_for(&chat_id)
             .and_then(|s| s.started_at)
             .map(|t| now.signed_duration_since(t).num_seconds())
             .unwrap_or(0);
-        let sending = self.composer.read(cx).is_sending();
+        let composer = self.composer.read(cx);
+        let sending = composer.is_sending();
+        // Keep the reserved strip empty when the composer already owns the
+        // active workflow's progress feedback.
+        if composer.has_inline_progress() {
+            return strip.into_any_element();
+        }
 
         match indicator {
+            Indicator::Working if compacting => strip
+                .child(loaders::activity_orb(
+                    "compacting-indicator",
+                    &theme,
+                    14.0,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Compacting context…")),
+                )
+                .into_any_element(),
             Indicator::Working => {
                 let word =
                     transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
@@ -3296,8 +4018,8 @@ impl Shell {
                         .child(SharedString::from("Retry")),
                 )
                 .into_any_element(),
-            // Login card (jolt App.tsx Gate): centered card on the grid —
-            // logo, "Log in to Jolt", copy, full-width white Log in button.
+            // Login card centered on the grid: logo, copy, and a full-width
+            // white Log in button.
             _ => div()
                 .w(px(360.0))
                 .px(px(32.0))
@@ -3313,9 +4035,8 @@ impl Shell {
                 .text_center()
                 .child(
                     icon(icons::JOLT_LOGO)
-                        .w(px(31.4))
-                        .h(px(36.0))
-                        .text_color(theme.text),
+                        .size(px(36.0))
+                        .text_color(theme.code_text),
                 )
                 .child(
                     div()
@@ -3368,9 +4089,8 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    // Keyed per phase (jolt App.tsx `<div key={phase}
-                    // className="animate-in">`): every gate swap replays the
-                    // 0.5s entrance instead of mutating one animated element.
+                    // Keyed per phase so every gate swap replays the 0.5s
+                    // entrance instead of mutating one animated element.
                     .child(motion::fade_in(
                         match phase {
                             GatePhase::SignIn => "gate-card-signin",
@@ -3404,9 +4124,8 @@ impl Shell {
             .flex_col()
             .child(
                 icon(icons::JOLT_LOGO)
-                    .w(px(24.4))
-                    .h(px(28.0))
-                    .text_color(theme.text),
+                    .size(px(28.0))
+                    .text_color(theme.code_text),
             )
             .child(
                 div()
@@ -3526,8 +4245,7 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
         .overflow_hidden()
         .children(verticals)
         .children(horizontals)
-        // Mask approximation: fade the grid back into the background toward
-        // the window edges (the original masks to an ellipse at 50% / 40%).
+        // Fade the grid back into the background toward the window edges.
         .child(
             div()
                 .absolute()
@@ -3583,8 +4301,7 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A size-6 icon button for the titlebar strip (jolt window-controls.tsx:
-/// `grid size-6 place-items-center rounded-md text-muted-foreground`).
+/// A 24px icon button for the titlebar strip.
 fn window_control_button(
     id: &'static str,
     icon_path: &'static str,
@@ -3602,7 +4319,7 @@ fn window_control_button(
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
-        // jolt window-controls.tsx: `transition-colors` — the wash fades.
+        // Fade the hover wash.
         .bg(motion::hover_blend(
             &fade_key,
             theme.glass_hover().opacity(0.0),
@@ -3683,8 +4400,8 @@ fn windows_caption_button(
         .child(glyph)
 }
 
-/// A titlebar history button (jolt window-controls.tsx): enabled it is a
-/// normal window-control button; disabled it dims to 35% opacity and ignores
+/// A titlebar history button. Enabled, it is a normal window-control button;
+/// disabled, it dims to 35% opacity and ignores
 /// the pointer (`disabled:pointer-events-none disabled:opacity-35`).
 fn nav_history_button(
     id: &'static str,
@@ -3713,8 +4430,7 @@ fn nav_history_button(
     window_control_button(id, icon_path, theme, on_click).into_any_element()
 }
 
-/// A size-7 icon button for the main-panel header (jolt __root.tsx:
-/// `grid size-7 place-items-center rounded-md text-muted-foreground`).
+/// A 28px icon button for the main-panel header.
 fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
@@ -3732,7 +4448,7 @@ fn header_icon_button(
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
-        // jolt __root.tsx header buttons: `transition-colors`.
+        // Fade the hover wash.
         .bg(motion::hover_blend(
             &fade_key,
             crate::theme::wash(0.0),
@@ -3787,26 +4503,26 @@ impl Render for Shell {
         // composer, and whenever focus is lost with no successor (e.g. the
         // focused element unmounted), route it back there.
         if self.focus_sub.is_none() {
-            self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
-                match this.route {
-                    Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
-                    // No composer here — clear the stale handle so `focused()`
-                    // reads None (the render hook below re-lands focus when the
-                    // route returns to Chat; a lingering unmounted handle would
-                    // otherwise dead-end keyboard dispatch for good).
-                    Route::Settings(_) => window.blur(),
-                }
-            }));
+            self.focus_sub =
+                Some(
+                    cx.on_focus_lost(window, |this: &mut Shell, window, cx| match this.route {
+                        Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
+                        Route::Settings(_) => window.focus(&this.settings_focus, cx),
+                    }),
+                );
         }
-        if matches!(gate, GatePhase::Ready)
-            && matches!(self.route, Route::Chat)
-            && window.focused(cx).is_none()
-        {
-            window.focus(&self.composer.focus_handle(cx), cx);
+        if matches!(gate, GatePhase::Ready) && window.focused(cx).is_none() {
+            match self.route {
+                Route::Chat => window.focus(&self.composer.focus_handle(cx), cx),
+                Route::Settings(_) => window.focus(&self.settings_focus, cx),
+            }
         }
 
         let root = div()
             .id("shell-root")
+            .when(matches!(self.route, Route::Settings(_)), |root| {
+                root.track_focus(&self.settings_focus)
+            })
             .relative()
             .flex()
             .flex_row()
@@ -3818,10 +4534,33 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
-            // The panel shortcuts are chat-scoped chrome: in Settings they are
-            // no-ops (jolt __root.tsx gates the hotkey on `!isSettings`, and
-            // the terminal panel is only mounted on session routes). The
-            // sidebar toggle stays live everywhere, as in the original.
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                let shell_overlay_open = this.user_menu_open
+                    || this.chat_menu.is_some()
+                    || this.rename_dialog.is_some()
+                    || this.breakdown_dialog.is_some()
+                    || this.delete_confirm.is_some()
+                    || this.space_menu.is_some()
+                    || this.rename_space_dialog.is_some()
+                    || this.delete_space_confirm.is_some()
+                    || this.add_space.is_some();
+                if event.keystroke.key == "escape"
+                    && matches!(this.route, Route::Chat)
+                    && this.state.read(cx).selected_chat.is_none()
+                    && !shell_overlay_open
+                    && this.restore_last_session(cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && matches!(this.route, Route::Settings(_)) {
+                    this.close_settings(cx);
+                }
+            }))
+            // Panel shortcuts are chat-scoped chrome and no-op in Settings;
+            // the terminal panel only mounts on session routes. The sidebar
+            // toggle stays live everywhere.
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_terminal(window, cx)
@@ -3837,7 +4576,7 @@ impl Render for Shell {
                 if matches!(this.route, Route::Chat)
                     && let Some(chat_id) = this.state.read(cx).selected_chat.clone()
                 {
-                    this.close_session_tab(chat_id, cx);
+                    this.archive_current_session(chat_id, cx);
                 } else {
                     // Preserve the fixed Cmd+W Close Window binding when there
                     // is no current session to archive.
@@ -3926,9 +4665,8 @@ impl Render for Shell {
                     cx,
                 );
                 let main = self.render_main(cx);
-                // The Changes pane is chat-scoped chrome: the Settings route
-                // never renders it (jolt __root.tsx `!isSettings && activeChat`
-                // around the diff column) — the per-session open flags stay
+                // The Changes pane is chat-scoped chrome, so the Settings route
+                // never renders it. The per-session open flags stay
                 // intact for the return trip.
                 let on_chat = matches!(self.route, Route::Chat);
                 let right: AnyElement = if on_chat {
@@ -3942,12 +4680,10 @@ impl Render for Shell {
                 // rounded hairline-bordered floats on the frost shell (the
                 // changes card is built inside `render_right_pane`).
                 let theme = Theme::of(cx);
-                // Margins, radius, and border-color MELT over the same 200ms
-                // ease-out as the sidebar width (jolt __root.tsx `<main>`
-                // `transition-[margin,border-radius,border-color]`; collapsed
-                // is `m-0 rounded-none border-transparent` — the border WIDTH
-                // stays, only its color fades, so layout never jumps by the
-                // hairline).
+                // Margins, radius, and border color melt over the same 200ms
+                // ease-out as the sidebar width. Collapsed removes margins and
+                // radius and makes the border transparent; its width remains so
+                // layout never jumps by a hairline.
                 let border_color = theme.border;
                 let card = div()
                     .flex_1()
@@ -3989,9 +4725,8 @@ impl Render for Shell {
                     .rounded(px(12.0))
                     .border_color(border_color)
                     .into_any_element();
-                // The whole app page is one keyed `animate-in` entrance (jolt
-                // App.tsx `<div key={phase} className="animate-in h-full">`):
-                // arriving from the splash or any gate fades the page in; the
+                // The whole app page is one keyed entrance: arriving from the
+                // splash or any gate fades the page in; the
                 // splash-out crossfades over it on boot.
                 // The sidebar resize handle FLOATS over the sidebar/card seam
                 // (zero layout width, same idiom as the changes-pane grabber)
@@ -4094,6 +4829,7 @@ impl Render for Shell {
             )
         };
         let root = root.children(self.render_windows_caption_controls(window, cx));
+        let root = root.child(crate::toast::layer(cx));
         #[cfg(any(debug_assertions, feature = "debug-ui"))]
         let root = if let Some(hud) = self.performance_hud.clone() {
             root.child(hud)
@@ -4109,9 +4845,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn titlebar_cluster_matches_jolt_window_controls() {
-        // jolt window-controls.tsx: `left: fullscreen ? 12 : 88` — the
-        // cluster clears the {14,15} traffic lights, and reclaims the inset
+    fn account_usage_warnings_match_account_meter_thresholds() {
+        assert_eq!(usage_warning_level(0.79), UsageWarningLevel::Normal);
+        assert_eq!(usage_warning_level(0.80), UsageWarningLevel::Warning);
+        assert_eq!(usage_warning_level(0.94), UsageWarningLevel::Warning);
+        assert_eq!(usage_warning_level(0.95), UsageWarningLevel::Danger);
+    }
+
+    #[test]
+    fn usage_breakdowns_merge_devices_by_day_and_model() {
+        let row = |tokens| UsageBreakdownRow {
+            harness: HarnessId::Pi,
+            model: "anthropic/sonnet".into(),
+            cwd: "/repo".into(),
+            sessions: 1,
+            calls: 1,
+            input_tokens: tokens,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            cost_usd: Some(0.25),
+        };
+        let report = |device: &str, tokens| UsageBreakdown {
+            device_id: device.into(),
+            days: 30,
+            sessions: 1,
+            calls: 1,
+            input_tokens: tokens,
+            cost_usd: Some(0.25),
+            activity: vec![UsageDay {
+                day: "2026-08-06".into(),
+                tokens,
+                calls: 1,
+                cost_usd: Some(0.25),
+            }],
+            rows: vec![row(tokens)],
+            ..UsageBreakdown::default()
+        };
+        let merged = merge_breakdowns(30, vec![report("a", 10), report("b", 20)]);
+        assert_eq!(merged.sessions, 2);
+        assert_eq!(merged.total_tokens(), 30);
+        assert_eq!(merged.cost_usd, Some(0.5));
+        assert_eq!(merged.activity[0].tokens, 30);
+        assert_eq!(merged.rows[0].sessions, 2);
+        assert_eq!(merged.rows[0].total_tokens(), 30);
+    }
+
+    #[test]
+    fn titlebar_cluster_clears_traffic_lights() {
+        // The cluster clears the traffic lights and reclaims the inset
         // when fullscreen hides them.
         assert_eq!(titlebar_cluster_start(false), 88.0);
         assert_eq!(titlebar_cluster_start(true), 12.0);
@@ -4183,7 +4965,7 @@ mod tests {
         );
     }
 
-    // ---- per-session panel flags (§1.10/1.11 parity: jolt sessionPanels) ----
+    // ---- per-session panel flags ----
 
     #[test]
     fn session_panels_default_closed_per_chat() {
@@ -4356,8 +5138,8 @@ mod tests {
 
     #[test]
     fn nav_push_truncates_the_forward_branch() {
-        // a → b → c, back to a, then push d: the b/c branch is gone (browser
-        // semantics — jolt's memory history PUSH truncates entries ahead).
+        // a → b → c, back to a, then push d: browser semantics remove the b/c
+        // branch.
         let mut nav = NavHistory::new(chat("a"));
         nav.push(chat("b"));
         nav.push(chat("c"));

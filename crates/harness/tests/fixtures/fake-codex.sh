@@ -73,6 +73,8 @@ case "$turnline" in
   emit '{"method":"item/reasoning/textDelta","params":{"itemId":"r1","textDelta":"thinking hard"}}'
   emit '{"method":"item/reasoning/summaryTextDelta","params":{"itemId":"r1","delta":"summary"}}'
   # Item lifecycles.
+  emit '{"method":"item/started","params":{"item":{"id":"compact-1","type":"contextCompaction"}}}'
+  emit '{"method":"item/completed","params":{"item":{"id":"compact-1","type":"contextCompaction"}}}'
   emit '{"method":"item/started","params":{"item":{"id":"c1","type":"commandExecution","command":"ls -la"}}}'
   emit '{"method":"item/completed","params":{"item":{"id":"c1","type":"commandExecution","command":"ls -la","status":"completed","exitCode":1}}}'
   emit '{"method":"item/started","params":{"item":{"id":"f1","type":"fileChange","changes":[{"path":"/tmp/new.rs","kind":"add"}]}}}'

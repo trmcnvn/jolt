@@ -1,15 +1,12 @@
-//! Attachments (feature-inventory §1.7/§1.8): the composer's staged images,
+//! Attachments: the composer's staged images,
 //! the chunked upload to the chat's host device, the plain-text attachment-ref
 //! transport that rides the prompt, the transcript read-back cache, and the
 //! full-size preview lightbox.
 //!
-//! Ports of jolt's `composer/use-attachments.ts` (staging/upload),
-//! `control/message-attachments.ts` (the `withAttachments` /
-//! `parseUserMessageImages` text transport — attachment refs are embedded in
-//! the user message's plain text, which is exactly what persists in the doc),
-//! and `lib/transcript-attachment-cache.ts` (decoded-image cache keyed by
-//! `(deviceId, path)`, seeded locally after a send so own bubbles never
-//! round-trip).
+//! Attachment refs are embedded in the user message's plain text, which is
+//! what persists in the document. The decoded-image cache is keyed by
+//! `(deviceId, path)` and seeded locally after a send so local bubbles never
+//! round-trip.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,23 +24,22 @@ use crate::state::EngineHandle;
 use crate::theme::ink;
 use jolt_rpc::methods;
 
-/// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
+/// Maximum staged attachment size.
 pub const MAX_ATTACHMENT_BYTES: u64 = 24 * 1024 * 1024;
-/// Base64 chars per `UploadChunk` (jolt state.ts `UPLOAD_CHUNK` — sized for
-/// the relay when the target device is remote).
+/// Base64 characters per `UploadChunk`, sized for remote-device relay.
 pub const UPLOAD_CHUNK_B64_CHARS: usize = 60_000;
-/// state.ts `MAX_ATTACHMENT_READ_CHUNKS` — bounds the read-back loop.
+/// Maximum chunks accepted by the read-back loop.
 const MAX_READ_CHUNKS: usize = 1_000;
 
 // ---------------------------------------------------------------------------
-// Text transport (message-attachments.ts)
+// Text transport
 // ---------------------------------------------------------------------------
 
-/// The body used for image-only sends (`use-attachments.ts`).
+/// The body used for image-only sends.
 pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
 
-/// How attachments ride the prompt (use-attachments.ts `withAttachments`):
-/// plain local paths appended to the text — the files are staged on the device
+/// How attachments ride the prompt: plain local paths appended to the text.
+/// The files are staged on the device
 /// that runs the agent, so the agent can open them with its own tools; the
 /// same text is what persists as the user doc entry.
 pub fn with_attachments(text: &str, paths: &[String]) -> String {
@@ -92,8 +88,7 @@ fn name_from_path(path: &str) -> String {
 
 /// Find the refs trailer: a blank line, then a line starting (case-insensitive)
 /// with `Attached images (local files` and ending `):`. Returns
-/// `(body_end, refs_start)` byte offsets — the tolerant equivalent of jolt's
-/// `ATTACHED_IMAGES_RE`.
+/// `(body_end, refs_start)` byte offsets.
 fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
     let lower = content.to_ascii_lowercase();
     let needle = "\n\nattached images (local files";
@@ -115,8 +110,7 @@ fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// message-attachments.ts `parseUserMessageImages`: split the visible prompt
-/// from its attachment-ref trailer.
+/// Split the visible prompt from its attachment-ref trailer.
 pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
     let Some((body_end, refs_start)) = find_refs_marker(content) else {
         return ParsedUserMessage {
@@ -154,8 +148,8 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
     }
 }
 
-/// message-attachments.ts `userMessageRailText`: what the rail/sidebar shows
-/// for a user message ("Attached image" / "N attached images" when image-only).
+/// Text shown by the rail/sidebar for a user message, using attachment counts
+/// when the message contains only images.
 pub fn user_message_rail_text(content: &str) -> String {
     let parsed = parse_user_message_images(content);
     if !parsed.text.trim().is_empty() {
@@ -169,7 +163,7 @@ pub fn user_message_rail_text(content: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Staging (use-attachments.ts intake)
+// Staging
 // ---------------------------------------------------------------------------
 
 /// An image staged in the composer, before upload. The raw bytes live inside
@@ -178,8 +172,7 @@ pub fn user_message_rail_text(content: &str) -> String {
 #[derive(Clone)]
 pub struct StagedAttachment {
     pub id: String,
-    /// File name with a type-matching extension (use-attachments.ts
-    /// `ensureExtension` — agents sniff images by extension).
+    /// File name with a type-matching extension so agents can identify images.
     pub name: String,
     pub image: Arc<Image>,
 }
@@ -205,8 +198,8 @@ pub fn format_by_extension(path: &Path) -> Option<ImageFormat> {
     }
 }
 
-/// use-attachments.ts `ensureExtension`: pasted screenshots often arrive as a
-/// bare "image" — make sure the staged name carries a type-matching extension.
+/// Ensure pasted screenshots with a bare "image" name receive a type-matching
+/// extension.
 pub fn ensure_extension(name: &str, format: ImageFormat) -> String {
     let has_ext = name
         .rsplit_once('.')
@@ -224,7 +217,7 @@ pub fn ensure_extension(name: &str, format: ImageFormat) -> String {
 }
 
 /// Stage a file from disk (picker / drop / pasted path). `Err` carries the
-/// user-facing message (mirrors the old `onError` copy).
+/// user-facing message.
 pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
     let display_name = path
         .file_name()
@@ -256,7 +249,7 @@ pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
 }
 
 // ---------------------------------------------------------------------------
-// Upload (state.ts uploadAttachment) + read-back (state.ts readAttachmentImage)
+// Upload and read-back
 // ---------------------------------------------------------------------------
 
 fn with_target(mut params: serde_json::Value, target_device_id: Option<&str>) -> serde_json::Value {
@@ -266,7 +259,7 @@ fn with_target(mut params: serde_json::Value, target_device_id: Option<&str>) ->
     params
 }
 
-/// Per-call deadlines (desktop state.ts): a stalled-but-open relay link never
+/// Per-call deadlines: a stalled-but-open relay link never
 /// fails an RPC on its own, so every attachment call races a timer. The first
 /// chunk gets 90s (a cold dial to a remote device), later chunks 30s; commit
 /// 150s (it must outlast the engine's cross-device assemble); reads 20s.
@@ -320,7 +313,7 @@ pub async fn upload_attachment(
         };
         // One transient blip must not abort a ~400-chunk upload; `seq` slots
         // are idempotent engine-side, so a blind re-send is safe (timeouts
-        // retry too, like the original's per-chunk `withTimeout` + retry ×2).
+        // retry too, with up to two retries per chunk).
         let mut attempt = 0u32;
         loop {
             match call_with_timeout(
@@ -371,8 +364,8 @@ pub struct LoadedAttachmentImage {
     pub image: Arc<Image>,
 }
 
-/// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded, with
-/// the same stuck-offset guard as jolt's `readAttachmentImage`).
+/// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done`, bounded and
+/// protected against a stuck offset.
 pub async fn read_attachment_image(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
@@ -427,7 +420,7 @@ pub async fn read_attachment_image(
 }
 
 // ---------------------------------------------------------------------------
-// Transcript image cache (transcript-attachment-cache.ts)
+// Transcript image cache
 // ---------------------------------------------------------------------------
 
 /// A decoded transcript image, ready for `img(...)`.
@@ -443,7 +436,7 @@ pub enum AttachmentSnapshot {
     Loading,
     Loaded(CachedAttachmentImage),
     /// Load failed; `retry_in` is how long until [`begin_load`] would hand out
-    /// another attempt (the exponential 2s→15s ladder from user-attachments.tsx).
+    /// another attempt using an exponential 2s→15s ladder.
     Error {
         retry_in: Duration,
     },
@@ -614,7 +607,7 @@ pub fn seed_attachment(device_id: &str, path: &str, name: &str, image: Arc<Image
 }
 
 // ---------------------------------------------------------------------------
-// Preview lightbox (attachment-ui.tsx AttachmentPreviewDialog)
+// Preview lightbox
 // ---------------------------------------------------------------------------
 
 /// A full-size preview target (staged strip or transcript thumbnail).
@@ -625,8 +618,7 @@ pub struct PreviewImage {
 }
 
 /// The bare lightbox: dim scrim, the image at ≤85vh/90vw, the file name under
-/// it. Any click closes (the whole dialog is the close button, as in the
-/// original's `cursor-zoom-out` figure).
+/// it. Any click closes the dialog.
 pub fn lightbox(
     viewport: Size<gpui::Pixels>,
     preview: &PreviewImage,

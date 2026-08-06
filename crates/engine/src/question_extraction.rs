@@ -3,10 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use jolt_proto::{ExtractedQuestion, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel};
+use jolt_proto::{ExtractedQuestion, HarnessId, ReasoningLevel, RunRequest, SandboxLevel};
 use serde::Deserialize;
 
 use crate::EngineError;
+use crate::model_selection::cheap_model_id;
 use crate::registry::HarnessRegistry;
 use crate::titles::collect_text;
 
@@ -53,7 +54,7 @@ pub(crate) async fn extract_questions(
 ) -> Result<Vec<ExtractedQuestion>, EngineError> {
     let harness = registry.resolve(harness_id)?;
     let models = harness.models().await.unwrap_or_default();
-    let model = extraction_model(&models, configured_model);
+    let model = cheap_model_id(&models, configured_model);
     let mut model_options = serde_json::Map::new();
     if harness_id == HarnessId::Pi {
         model_options.insert("projectTrust".into(), serde_json::json!("ignore"));
@@ -76,22 +77,6 @@ pub(crate) async fn extract_questions(
         .map_err(|_| EngineError::Other("question extraction timed out".into()))??;
     parse_extraction(&raw)
         .ok_or_else(|| EngineError::Other("question extraction returned invalid JSON".into()))
-}
-
-fn extraction_model(models: &[Model], configured: Option<&str>) -> Option<String> {
-    let small = models.iter().find(|model| {
-        let name = format!("{} {}", model.id, model.label).to_lowercase();
-        ["mini", "haiku", "nano", "flash", "small", "lite"]
-            .iter()
-            .any(|tier| name.contains(tier))
-    });
-    small
-        .or_else(|| {
-            configured.and_then(|configured| models.iter().find(|model| model.id == configured))
-        })
-        .or_else(|| models.last())
-        .map(|model| model.id.clone())
-        .or_else(|| configured.map(str::to_owned))
 }
 
 fn parse_extraction(raw: &str) -> Option<Vec<ExtractedQuestion>> {
@@ -212,27 +197,6 @@ mod tests {
         assert_eq!(
             parse_extraction(r#"{"questions":[{"question":"  "}]}"#),
             Some(Vec::new())
-        );
-    }
-
-    #[test]
-    fn model_selection_prefers_small_then_configured() {
-        let model = |id: &str, label: &str| Model {
-            id: id.into(),
-            label: label.into(),
-            description: None,
-            reasoning_levels: vec![],
-            options: vec![],
-        };
-        let models = vec![model("large", "Large"), model("quick", "Mini")];
-        assert_eq!(
-            extraction_model(&models, Some("large")).as_deref(),
-            Some("quick")
-        );
-        let models = vec![model("large", "Large"), model("other", "Other")];
-        assert_eq!(
-            extraction_model(&models, Some("large")).as_deref(),
-            Some("large")
         );
     }
 }

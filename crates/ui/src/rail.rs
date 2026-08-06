@@ -1,4 +1,4 @@
-//! MessageRail (feature-inventory §1.8): a left vertical minimap of the user's
+//! MessageRail: a left vertical minimap of the user's
 //! prompts. The active tick brightens, hover grows the tick and shows a preview
 //! card (prompt + reply opening), click smooth-scrolls the transcript to that
 //! row. Hidden below a 48rem container width.
@@ -48,8 +48,7 @@ fn user_text(entry: &SessionMessageEntry) -> String {
         .collect::<Vec<_>>()
         .join("\n\n");
     // Attachment refs ride the message text — the rail shows the visible
-    // prompt, or "Attached image(s)" for image-only sends
-    // (message-attachments.ts `userMessageRailText`).
+    // prompt, or "Attached image(s)" for image-only sends.
     crate::attachments::user_message_rail_text(&raw)
 }
 
@@ -115,7 +114,7 @@ pub fn active_tick(tick_rows: &[usize], top_row: usize) -> Option<usize> {
 // Fixed-footprint outline (shadcn MessageScroller "Transcript Outline")
 // ---------------------------------------------------------------------------
 
-/// One tick's hit-row height and the gap between ticks (message-rail.tsx).
+/// One tick's hit-row height and the gap between ticks.
 pub const TICK_SLOT: f32 = 10.0;
 pub const TICK_GAP: f32 = 3.0;
 /// Vertical breathing room kept clear above/below the tick stack.
@@ -144,8 +143,7 @@ pub fn rail_slots(height: f32) -> usize {
 /// outnumber the slots that fit the viewport, ticks become evenly-sized
 /// BUCKETS over the conversation (a downsampled minimap) instead of
 /// overflowing. Returns each bucket's `[start, end)` tick range; with
-/// `n <= capacity` every bucket is a single tick — the identity, i.e. the
-/// old per-prompt rail.
+/// `n <= capacity` every bucket is a single per-prompt tick.
 pub fn tick_buckets(n: usize, capacity: usize) -> Vec<(usize, usize)> {
     if n == 0 {
         return Vec::new();
@@ -160,8 +158,8 @@ pub fn bucket_of(buckets: &[(usize, usize)], ix: usize) -> Option<usize> {
 }
 
 /// Char-cap a preview with an ellipsis. Whitespace runs (including newlines —
-/// prompts and replies are free text) collapse to single spaces first: the
-/// preview card's title is a one-line surface (message-rail.tsx line-clamp-1).
+/// prompts and replies are free text) collapse to single spaces first because
+/// the preview card's title is a one-line surface.
 pub fn truncate_preview(text: &str, max_chars: usize) -> String {
     let flat = crate::transcript::single_line(text);
     if flat.chars().count() <= max_chars {
@@ -175,9 +173,8 @@ pub fn truncate_preview(text: &str, max_chars: usize) -> String {
 // Duration-based glide timeline (pure)
 // ---------------------------------------------------------------------------
 
-/// Duration-based scroll glide (browser smooth-scroll parity: the Electron
-/// rail used `scrollToItem({behavior:"smooth"})` — a fixed-duration gentle
-/// ease over the WHOLE distance, never percent-of-remaining).
+/// Duration-based scroll glide with a fixed-duration gentle ease over the
+/// whole distance, never percent-of-remaining.
 ///
 /// Rows above the viewport are unmeasured, so the total pixel distance can
 /// only be ESTIMATED per frame. The timeline therefore hands out each frame's
@@ -426,8 +423,8 @@ impl Transcript {
                 Some((tick, row))
             })
             .collect();
-        // A minimap of one exchange is noise, not navigation — the original
-        // rail hides below two marks (message-rail.tsx `marks.length < 2`).
+        // A minimap of one exchange is noise, not navigation, so hide below
+        // two marks.
         if pairs.len() < 2 {
             return gpui::Empty.into_any_element();
         }
@@ -468,8 +465,7 @@ impl Transcript {
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
-                // Only hover grows the tick; the active one just reads brighter
-                // (message-rail.tsx: w-3 rest, w-5 hovered).
+                // Only hover grows the tick; the active one just reads brighter.
                 let bar_width = if is_hovered { 20.0 } else { 12.0 };
                 let bar_color = if is_active || is_hovered {
                     theme.text.opacity(0.8)
@@ -587,7 +583,7 @@ mod tests {
 
     #[test]
     fn buckets_are_identity_under_capacity() {
-        // n <= capacity: one tick per prompt — the old per-prompt rail.
+        // n <= capacity: one tick per prompt.
         let b = tick_buckets(5, 64);
         assert_eq!(b.len(), 5);
         assert!(

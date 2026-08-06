@@ -1,7 +1,7 @@
-//! Synced entity rows (workspace doc) and local projections.
+//! Synced workspace-registry rows and local projections.
 //!
-//! In jolt these were synced Postgres rows; in jolt-native they live in the per-org
-//! workspace Loro doc (see ARCHITECTURE.md §2.2) with the same field surface.
+//! Devices, spaces, chats, and live session rows converge through the per-user
+//! RegistryRoom current-state table; see docs/sync.md.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -99,8 +99,8 @@ pub struct Chat {
     pub last_message_preview: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
-    /// Harness-native session id of the chat's latest run — engine-owned resume
-    /// continuity across engine restarts (jolt's `chats.harness_session_id`).
+    /// Harness-native session id of the chat's latest run, used for engine-owned
+    /// resume continuity across engine restarts.
     /// Empty string = explicit
     /// "do not resume" tombstone after a rejected resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +176,10 @@ pub struct Session {
     pub chat_id: String,
     pub device_id: String,
     pub status: SessionStatus,
+    /// The active harness is compacting its context. Additive/defaulted so
+    /// mixed-version devices continue to read each other's session rows.
+    #[serde(default)]
+    pub compacting: bool,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }

@@ -8,7 +8,6 @@ pub enum HarnessId {
     ClaudeCode,
     Codex,
     Pi,
-    Cursor,
     /// Test harness; never shown in production pickers.
     Mock,
 }
@@ -80,8 +79,7 @@ pub enum SteeringMode {
 pub struct Model {
     pub id: String,
     pub label: String,
-    /// Short tagline rendered under the name in the model picker (11px muted),
-    /// mirroring the Electron app's `ModelInfo.description`.
+    /// Short tagline rendered under the name in the model picker (11px muted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]
@@ -124,8 +122,8 @@ pub struct RunRequest {
     /// Absolute paths of image attachments already staged on the run device
     /// (composer uploads: UploadChunk/UploadCommit → durable path). The same
     /// paths also ride the prompt text as `Attached images (local files …)`
-    /// refs (jolt's `withAttachments` transport — that's what persists in the
-    /// doc); this field additionally lets a harness inline the bytes as image
+    /// refs, which persist in the document; this field additionally lets a
+    /// harness inline the bytes as image
     /// content blocks. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
@@ -242,8 +240,6 @@ pub enum DoneStatus {
 }
 
 /// The normalized streaming event every harness emits.
-///
-/// Mirrors jolt's `AgentEvent` tagged enum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AgentEvent {
@@ -278,11 +274,23 @@ pub enum AgentEvent {
         id: String,
         is_error: bool,
     },
-    /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
+    /// One provider call's usage. Input excludes cache reads/writes so the
+    /// categories remain additive across harnesses. Never folded into docs.
     #[serde(rename_all = "camelCase")]
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        #[serde(default)]
+        cache_read_input_tokens: u64,
+        #[serde(default)]
+        cache_write_input_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        /// Current prompt/context size for this call, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
     },
     Error {
         message: String,
@@ -301,6 +309,11 @@ pub enum AgentEvent {
         assistant_message_id: Option<String>,
         next_assistant_message_id: Option<String>,
     },
+    /// Harness context compaction has started. Ephemeral UI state; never folded
+    /// into the conversation document.
+    CompactionStarted,
+    /// Harness context compaction has finished or been cancelled.
+    CompactionFinished,
     #[serde(rename_all = "camelCase")]
     Done {
         status: DoneStatus,
@@ -343,6 +356,17 @@ mod tests {
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+    }
+
+    #[test]
+    fn compaction_events_round_trip() {
+        for event in [
+            AgentEvent::CompactionStarted,
+            AgentEvent::CompactionFinished,
+        ] {
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
+        }
     }
 
     #[test]

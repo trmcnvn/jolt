@@ -1,8 +1,8 @@
 //! jolt-ui — the gpui viewport. Shell, sidebar, conversation, composer, terminal,
 //! diff pane.
 //!
-//! Design: ARCHITECTURE.md §4; animation catalog docs/research/feature-inventory.md
-//! §1.12; virtualization/markdown techniques docs/research/mugen-pretext.md.
+//! See docs/architecture.md for its runtime boundary and docs/using-jolt.md for
+//! the user-facing shell, transcript, composer, terminal, and changes behavior.
 //!
 //! M3a foundation:
 //! - [`theme`] — always-dark monochrome theme (oklch-derived neutrals), a gpui Global;
@@ -14,6 +14,7 @@
 
 pub mod app_menus;
 pub mod appearance;
+pub mod ascii_mark;
 pub mod attachments;
 pub mod changes;
 pub mod composer;
@@ -30,10 +31,10 @@ pub mod popover;
 pub mod rail;
 pub mod settings;
 pub mod shell;
-pub mod sound;
 pub mod state;
 pub mod terminal;
 pub mod theme;
+pub mod toast;
 pub mod transcript;
 
 use std::borrow::Cow;
@@ -137,12 +138,14 @@ pub fn run_app(config: UiConfig) {
     app.run(move |cx: &mut App| {
         // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
         gpui_tokio::init(cx);
+        cx.set_app_identity("dev.trmcnvn.jolt", "Jolt");
         register_fonts(cx);
         // Appearance before anything paints: the theme global has to be the
         // final one on the very first frame, or the window flashes the wrong
         // palette while settings load.
         let data_dir = config.boot().data_dir.clone();
         let ui_settings = settings::UiSettings::load(&data_dir);
+        toast::init(ui_settings.system_notifications_enabled, cx);
         appearance::init(
             ui_settings.appearance,
             &ui_settings.ui_font,
@@ -195,7 +198,7 @@ pub fn run_app(config: UiConfig) {
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
 /// clicked after ⌘W closed the window.
 fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
-    // jolt window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
+    // Main window geometry: 1320×880, min 900×600.
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
     cx.open_window(
         WindowOptions {
@@ -209,10 +212,8 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // from the missing `set_menus` call (nil `NSApp.mainMenu`), not
             // from window kind/level, and `appears_transparent` only affects
             // the titlebar, not the menu bar.
-            // macOS: frameless-inset chrome like the original Electron app
-            // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
-            // feature-inventory §1.1). No title text — the strip is
-            // custom-drawn (zed sets `title: None` the same way). On
+            // macOS uses frameless-inset chrome with traffic lights at 14,14.
+            // No title text — the strip is custom-drawn. On
             // Linux/Windows `appears_transparent` hides the system titlebar
             // for our custom-drawn chrome; harmless where unsupported.
             titlebar: Some(TitlebarOptions {

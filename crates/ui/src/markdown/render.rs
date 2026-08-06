@@ -37,13 +37,13 @@ pub const CODE_LINE_HEIGHT: f32 = 18.0;
 pub const CODE_PADDING_X: f32 = 12.0;
 pub const CODE_PADDING_Y: f32 = 10.0;
 
-// Table metrics — a port of mugen-markdown 0.6.2's `TableBlock` under jolt's
-// resolved md theme. The design is frameless ("flat hairline"): 1px horizontal
+// Table metrics based on mugen-markdown 0.6.2's `TableBlock` and Jolt's
+// resolved Markdown theme. The design is frameless ("flat hairline"): 1px horizontal
 // rules under the header and between rows are the only chrome — no outer box,
 // no header fill, no corner radius (theme: headerBackground transparent,
 // radius 0). Cells use the body scale (14/22) with a uniform 12px padding;
 // the header row is weight-700 per `table.headerWeight`.
-/// Uniform cell padding in px (jolt `table.cellPadding`).
+/// Uniform cell padding in pixels.
 pub const TABLE_CELL_PADDING: f32 = 12.0;
 /// Hairline between rows in px (jolt `table.gap`).
 pub const TABLE_DIVIDER: f32 = 1.0;
@@ -365,10 +365,10 @@ fn table_cell_ix(ix: usize, r: usize, c: usize) -> usize {
     ix * 100_000 + r * 100 + c
 }
 
-/// A GFM table — a port of mugen-markdown's `TableBlock` under jolt's md
+/// A GFM table based on mugen-markdown's `TableBlock` and Jolt's Markdown
 /// theme (see the `TABLE_*` constants).
 ///
-/// Column widths resolve exactly the way the source's CSS does: each cell is
+/// Column widths use max-content flex sizing: each cell is
 /// `flex: <max-content> <max-content> 0; min-width: min(max-content, 96px)`,
 /// so widths are content-proportional with a readable per-column floor.
 /// Naturals come from shaping each cell's runs unwrapped (gpui's line-layout
@@ -503,9 +503,8 @@ pub struct FlatText {
     pub code_ranges: Vec<Range<usize>>,
 }
 
-/// Inline-code tint (round 9): the original is neutral (chat-view.tsx mdTheme
-/// `inlineCode: #f0f0f0 on white/8%`), but the user asked for "a nice purple"
-/// — violet-300 text over a violet-400 wash, readable on the #060606 panel.
+/// Inline-code tint: violet-300 text over a violet-400 wash, readable on the
+/// #060606 panel.
 pub fn inline_code_text(theme: &Theme) -> Hsla {
     theme.code_text // violet-300
 }
@@ -531,8 +530,8 @@ pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> Fl
     )
 }
 
-/// [`flatten_runs`] with an explicit base weight (table headers are 700 per
-/// jolt's `table.headerWeight`; strong runs never drop below semibold).
+/// [`flatten_runs`] with an explicit base weight; table headers are 700 and
+/// strong runs never drop below semibold.
 fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWeight) -> FlatText {
     let mut text = String::new();
     let mut out: Vec<TextRun> = Vec::with_capacity(runs.len());
@@ -559,9 +558,8 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             FontStyle::Normal
         };
-        // Links stay monochrome — foreground with an underline (jolt's md
-        // theme underlines in the text color; indigo is reserved for primary
-        // actions).
+        // Links stay monochrome with a foreground-colored underline; indigo
+        // is reserved for primary actions.
         let is_link = run.style.link.is_some();
         // Inline code reads violet (see `inline_code_text`); everything else
         // stays the monochrome foreground.
@@ -694,7 +692,13 @@ fn flat_text_element(
         |_, _, _| (),
         move |_, _, window, _| {
             for range in &code_ranges {
-                for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
+                for rect in range_rects(
+                    &layout,
+                    &flat_text,
+                    range,
+                    INLINE_CODE_PAD_X,
+                    INLINE_CODE_INSET_Y,
+                ) {
                     window.paint_quad(quad(
                         rect,
                         px(INLINE_CODE_RADIUS),
@@ -705,29 +709,7 @@ fn flat_text_element(
                     ));
                 }
             }
-            if let Some(range) = super::selection::wash_range(&sel_key) {
-                for rect in range_rects(&layout, &range, 0.0, 0.0) {
-                    window.paint_quad(quad(
-                        rect,
-                        px(0.0),
-                        sel_wash,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        BorderStyle::default(),
-                    ));
-                }
-            }
-            // Register this element into the frame's document-ordered
-            // registry (paint order IS document order), then the frame's
-            // mouse listeners.
-            REGISTRY.with(|r| {
-                r.borrow_mut().push(RegEntry {
-                    key: sel_key.clone(),
-                    text: flat_text.clone(),
-                    layout: layout.clone(),
-                })
-            });
-            register_selection_listeners(window, &sel_key, &flat_text, &layout);
+            paint_and_register_selection(window, &sel_key, &flat_text, &layout, sel_wash);
         },
     )
     .absolute()
@@ -739,14 +721,38 @@ fn flat_text_element(
         .into_any_element()
 }
 
+/// Add selection paint and listeners to an already styled text element.
+fn selectable_styled_text(
+    key: std::sync::Arc<str>,
+    text: SharedString,
+    styled: StyledText,
+    wash: Hsla,
+) -> AnyElement {
+    let layout = styled.layout().clone();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            paint_and_register_selection(window, &key, &text, &layout, wash);
+        },
+    )
+    .absolute()
+    .size_full();
+    div()
+        .relative()
+        .child(underlay)
+        .child(styled)
+        .into_any_element()
+}
+
 /// Selection tint: the accent hue under the glyphs, dark-panel strength.
-fn selection_wash(theme: &Theme) -> Hsla {
+pub(crate) fn selection_wash(theme: &Theme) -> Hsla {
     theme.accent.opacity(0.35) // indigo-400
 }
 
 /// One painted text element, registered per frame in document order — the
-/// continuity model that lets a drag span paragraphs/list items (Zed gets
-/// this for free from its single-element markdown; our tree rebuilds it).
+/// continuity model that lets a drag span bubbles/paragraphs/list items (Zed
+/// gets this for free from its single-element markdown; our tree rebuilds it).
+#[derive(Clone)]
 struct RegEntry {
     key: std::sync::Arc<str>,
     text: SharedString,
@@ -757,17 +763,72 @@ thread_local! {
     static REGISTRY: RefCell<Vec<RegEntry>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Paint this element's selection wash and register it in document order.
+/// User bubbles use this same path so selection can cross user and assistant
+/// text. The frame installs one shared listener set in
+/// [`selection_frame_reset`] rather than three listeners per text element.
+pub(crate) fn paint_and_register_selection(
+    window: &mut Window,
+    key: &std::sync::Arc<str>,
+    text: &SharedString,
+    layout: &gpui::TextLayout,
+    wash: Hsla,
+) {
+    if let Some(range) = super::selection::wash_range(key) {
+        for rect in range_rects(layout, text, &range, 0.0, 0.0) {
+            window.paint_quad(quad(
+                rect,
+                px(0.0),
+                wash,
+                px(0.0),
+                gpui::transparent_black(),
+                BorderStyle::default(),
+            ));
+        }
+    }
+    // Paint order is document order, including across virtualized rows.
+    REGISTRY.with(|registry| {
+        registry.borrow_mut().push(RegEntry {
+            key: key.clone(),
+            text: text.clone(),
+            layout: layout.clone(),
+        })
+    });
+}
+
 /// A zero-size canvas that clears the selection registry — paint it FIRST in
-/// the transcript root (before any markdown), so each frame's registry holds
-/// exactly that frame's visible text elements in paint order.
+/// the transcript root (before any text), so each frame's registry holds
+/// exactly that frame's visible text elements in paint order. It also installs
+/// the frame's single shared set of selection listeners.
 pub fn selection_frame_reset() -> impl IntoElement {
     canvas(
         |_, _, _| (),
-        |_, _, _, _| REGISTRY.with(|r| r.borrow_mut().clear()),
+        |_, _, window, _| {
+            REGISTRY.with(|registry| registry.borrow_mut().clear());
+            register_selection_listeners(window);
+        },
     )
     .absolute()
     .w(px(0.0))
     .h(px(0.0))
+}
+
+/// The registered text element directly under `position`, including its byte
+/// offset. Cloning one hit is cheaper than installing and dispatching three
+/// window listeners for every visible paragraph and code line.
+fn registry_hit(position: gpui::Point<gpui::Pixels>) -> Option<(RegEntry, usize)> {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let entry = registry
+            .iter()
+            .rev()
+            .find(|entry| entry.layout.bounds().contains(&position))?
+            .clone();
+        let ix = match entry.layout.index_for_position(position) {
+            Ok(ix) | Err(ix) => ix,
+        };
+        Some((entry, ix))
+    })
 }
 
 /// `(element index, byte offset)` for a window position: the registered
@@ -818,76 +879,64 @@ fn resolve_drag(anchor_key: &str, anchor_ix: usize, head: (usize, usize)) -> boo
     })
 }
 
-/// Register this frame's window-level mouse listeners for one text element's
-/// selection (Zed-markdown mechanics: window-level so a drag keeps tracking
-/// outside the element's bounds; frame-scoped, so paint re-registers).
-fn register_selection_listeners(
-    window: &mut Window,
-    key: &std::sync::Arc<str>,
-    text: &SharedString,
-    layout: &gpui::TextLayout,
-) {
+/// Register one frame-scoped set of window-level selection listeners. Keeping
+/// these window-level lets a drag track outside its anchor, while sharing them
+/// avoids O(visible text elements) event dispatch on every wheel/mouse event.
+fn register_selection_listeners(window: &mut Window) {
     use gpui::{DispatchPhase, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
-    {
-        let (key, text, layout) = (key.clone(), text.clone(), layout.clone());
-        window.on_mouse_event(move |e: &MouseDownEvent, phase, window, _cx| {
-            if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
-                return;
-            }
-            if layout.bounds().contains(&e.position) {
-                // The composer retains focus while the transcript is read.
-                // Claiming transcript text must still collapse its selection.
-                window.dispatch_action(Box::new(crate::composer::ClearSelection), _cx);
-                let ix = match layout.index_for_position(e.position) {
-                    Ok(ix) | Err(ix) => ix,
-                };
-                match e.click_count {
-                    2 => {
-                        let range = super::selection::word_range(&text, ix);
-                        super::selection::begin_with_span(&key, &text, range);
-                    }
-                    n if n >= 3 => {
-                        super::selection::begin_with_span(&key, &text, 0..text.len());
-                    }
-                    _ => super::selection::begin(&key, ix),
-                }
-                window.refresh();
-            } else if super::selection::clear_if_owner(&key) {
+
+    window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+        if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
+            return;
+        }
+        let Some((entry, ix)) = registry_hit(e.position) else {
+            if super::selection::clear() {
                 window.refresh();
             }
-        });
-    }
-    {
-        let key = key.clone();
-        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _cx| {
-            if phase != DispatchPhase::Bubble || !e.dragging() {
-                return;
+            return;
+        };
+
+        // The composer retains focus while the transcript is read. Claiming
+        // transcript text must still collapse its selection.
+        window.dispatch_action(Box::new(crate::composer::ClearSelection), cx);
+        match e.click_count {
+            2 => {
+                let range = super::selection::word_range(&entry.text, ix);
+                super::selection::begin_with_span(&entry.key, &entry.text, range);
             }
-            // Only the anchor element's listener drives the drag.
-            let Some(anchor_ix) = super::selection::drag_anchor(&key) else {
-                return;
-            };
-            let Some(head) = registry_point(e.position) else {
-                return;
-            };
-            if resolve_drag(&key, anchor_ix, head) {
-                window.refresh();
+            n if n >= 3 => {
+                super::selection::begin_with_span(&entry.key, &entry.text, 0..entry.text.len());
             }
-        });
-    }
-    {
-        let key = key.clone();
-        window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, _cx| {
-            if phase != DispatchPhase::Bubble {
-                return;
-            }
-            if let Some(_text) = super::selection::end_drag(&key) {
-                // X11 middle-click paste parity (Zed does the same).
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                _cx.write_to_primary(gpui::ClipboardItem::new_string(_text));
-            }
-        });
-    }
+            _ => super::selection::begin(&entry.key, ix),
+        }
+        window.refresh();
+    });
+
+    window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _cx| {
+        if phase != DispatchPhase::Bubble || !e.dragging() {
+            return;
+        }
+        let Some((anchor_key, anchor_ix)) = super::selection::active_drag_anchor() else {
+            return;
+        };
+        let Some(head) = registry_point(e.position) else {
+            return;
+        };
+        if resolve_drag(&anchor_key, anchor_ix, head) {
+            window.refresh();
+        }
+    });
+
+    window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, _cx| {
+        if phase != DispatchPhase::Bubble {
+            return;
+        }
+        if let Some(_text) = super::selection::end_active_drag() {
+            // X11 middle-click paste parity (Zed does the same).
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            _cx.write_to_primary(gpui::ClipboardItem::new_string(_text));
+        }
+    });
 }
 
 /// The wash boxes for one byte range: one box per visual line the range
@@ -897,6 +946,7 @@ fn register_selection_listeners(
 /// full-line-height boxes that tile seamlessly across wrapped rows.
 pub(crate) fn range_rects(
     layout: &gpui::TextLayout,
+    text: &str,
     range: &Range<usize>,
     pad_x: f32,
     inset_y: f32,
@@ -904,31 +954,34 @@ pub(crate) fn range_rects(
     let mut rects = Vec::new();
     let line_height = layout.line_height();
     let mut cur = range.start;
-    // Walk the range one visual row at a time: find the furthest index that
-    // still sits on the current row (binary search over glyph positions).
+    // Walk the range one visual row at a time: find the furthest character
+    // boundary that still sits on the current row.
     let mut guard = 0;
     while cur < range.end && guard < 256 {
         guard += 1;
-        let Some(p1) = layout.position_for_index(cur) else {
+        let Some(mut p1) = layout.position_for_index(cur) else {
             break;
         };
-        // `seg_end` closes the wash on this row; `next` is the first index on
-        // the following row (strict progress even though a row-end index's
-        // position still reports the earlier row).
-        let (seg_end, next) = match layout.position_for_index(range.end) {
-            Some(pe) if pe.y == p1.y => (range.end, range.end),
+        // GPUI gives a soft-wrap boundary upstream affinity: the shared index
+        // resolves to the preceding row's end. If the next character lands on
+        // a lower row, this segment starts at that row's leading edge instead.
+        if let Some(next) = next_char_boundary(text, cur, range.end)
+            && let Some(after) = layout.position_for_index(next)
+            && after.y > p1.y
+        {
+            p1 = point(layout.bounds().left(), after.y);
+        }
+        let seg_end = match layout.position_for_index(range.end) {
+            Some(pe) if pe.y == p1.y => range.end,
             _ => {
-                // Largest ix on this row (probes stay on char boundaries only
-                // at the ends; intermediate probes just need a y).
                 let (mut lo, mut hi) = (cur, range.end);
-                while hi - lo > 1 {
-                    let mid = lo + (hi - lo) / 2;
+                while let Some(mid) = midpoint_char_boundary(text, lo, hi) {
                     match layout.position_for_index(mid) {
                         Some(pm) if pm.y == p1.y => lo = mid,
                         _ => hi = mid,
                     }
                 }
-                (lo, hi)
+                lo
             }
         };
         if let Some(p2) = layout.position_for_index(seg_end)
@@ -942,12 +995,39 @@ pub(crate) fn range_rects(
                 ),
             ));
         }
-        if next <= cur {
+        if seg_end <= cur {
             break;
         }
-        cur = next;
+        // Keep the shared wrap-boundary index. The next iteration applies
+        // downstream affinity and includes the first character on that row.
+        cur = seg_end;
     }
     rects
+}
+
+fn next_char_boundary(text: &str, from: usize, limit: usize) -> Option<usize> {
+    text.get(from..limit)?
+        .chars()
+        .next()
+        .map(|ch| from + ch.len_utf8())
+}
+
+/// A UTF-8 boundary strictly between `lo` and `hi`, near their midpoint.
+fn midpoint_char_boundary(text: &str, lo: usize, hi: usize) -> Option<usize> {
+    if lo >= hi {
+        return None;
+    }
+    let mut mid = lo + (hi - lo) / 2;
+    while mid < hi && !text.is_char_boundary(mid) {
+        mid += 1;
+    }
+    if mid == hi {
+        mid = lo + (hi - lo) / 2;
+        while mid > lo && !text.is_char_boundary(mid) {
+            mid -= 1;
+        }
+    }
+    (lo < mid && mid < hi).then_some(mid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1032,8 +1112,9 @@ fn render_code_block(
         None => Vec::new(),
     };
     let scroll_id: SharedString = format!("{}-code{ix}", opts.row_key).into();
-    // Copy affordance (round 9; no source counterpart — the original block is
-    // header + body only): a small ghost button in the block's top-right,
+    let selection_row_key = opts.row_key.clone();
+    let selection_wash = selection_wash(theme);
+    // Copy affordance: a small ghost button in the block's top-right,
     // absolutely overlaid so clicking / the "Copied" flash never shifts
     // layout. Sits centered in the header when there is one, floats over the
     // first code line otherwise.
@@ -1079,8 +1160,8 @@ fn render_code_block(
     });
     div()
         .rounded(px(10.0))
-        // Faint white wash over the near-black panel ≈ #101010 (jolt's code
-        // surface), with the hairline border.
+        // Faint white wash over the near-black code surface, with a hairline
+        // border.
         .bg(crate::theme::ink(0.035))
         .border_1()
         .border_color(theme.border)
@@ -1118,11 +1199,18 @@ fn render_code_block(
                     *off = start + line.len() + 1; // +1 for the '\n'
                     let local = slice_spans(&veil_spans, start, start + line.len());
                     let runs = apply_veil(runs.clone(), &local);
+                    let styled = StyledText::new(line.clone()).with_runs(runs);
+                    let selection_key = format!("{selection_row_key}:code{ix}:{li}").into();
                     Some(
                         div()
                             .h(px(CODE_LINE_HEIGHT))
                             .flex_none()
-                            .child(StyledText::new(line.clone()).with_runs(runs)),
+                            .child(selectable_styled_text(
+                                selection_key,
+                                line.clone(),
+                                styled,
+                                selection_wash,
+                            )),
                     )
                 })),
         )
@@ -1131,9 +1219,7 @@ fn render_code_block(
         .into_any_element()
 }
 
-/// Paint color for a token class — the soft syntax palette (round 9: the
-/// original's mdTheme code blocks are monochrome `#e7e7e7`, but the user
-/// asked for color; these are the diff pane's hues, now shared by both).
+/// Paint color for a token class, sharing the diff pane's soft syntax hues.
 pub fn token_color(class: TokenClass, theme: &Theme) -> Hsla {
     match class {
         TokenClass::Keyword => theme.syntax_keyword, // soft rose
@@ -1196,6 +1282,16 @@ mod tests {
     use super::*;
     use crate::markdown::highlight::{Lang, tokenize_line};
     use crate::markdown::parser::InlineStyle;
+
+    #[test]
+    fn range_search_uses_utf8_boundaries() {
+        let text = "aé中z";
+        assert_eq!(next_char_boundary(text, 1, text.len()), Some(3));
+        let mid = midpoint_char_boundary(text, 1, text.len()).unwrap();
+        assert!(text.is_char_boundary(mid));
+        assert!(1 < mid && mid < text.len());
+        assert_eq!(midpoint_char_boundary(text, 1, 3), None);
+    }
 
     #[test]
     fn code_line_runs_cover_exactly() {

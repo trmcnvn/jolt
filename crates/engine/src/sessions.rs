@@ -1,7 +1,7 @@
 //! SessionsEngine — per-chat agent runs: dispatch, steering, interrupts, input bridging,
 //! journal + broadcast fan-out, and 120ms coalesced doc streaming.
 //!
-//! Pragmatic port of jolt's `sessions.ts` (spec: feature-inventory §3.2):
+//! Run processing guarantees:
 //! - every `AgentEvent` is (a) appended to the on-disk run journal, (b) broadcast to
 //!   in-process subscribers, (c) folded via `fold_event_into_parts` and diffed into the
 //!   chat's `SessionDoc` through `SegmentWriter` on a coalesced `STREAM_COMMIT_MS` timer;
@@ -10,10 +10,10 @@
 //! - a `Steered` event splits the assistant entry at the exact boundary;
 //! - recovery (interrupt or a stale journal at boot) stamps the streaming entry `aborted`.
 //!
-//! Scope notes: sessions are keyed by chat id (one live run per chat). Jolt's pulse
-//! loop is ported as the 15s liveness heartbeat in `drive_run`; its stall watchdog is
-//! deliberately NOT ported (rejected in review — agents may legitimately wait on
-//! something for far longer than any timeout, and a live child IS the working signal).
+//! Scope notes: sessions are keyed by chat id (one live run per chat). A 15s liveness
+//! heartbeat runs in `drive_run`; there is deliberately no stall watchdog because agents
+//! may legitimately wait far longer than any fixed timeout, and a live child is the
+//! working signal.
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
@@ -43,6 +43,7 @@ use jolt_proto::{
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
+use crate::usage::{UsageContext, UsageStore};
 use crate::{EngineError, new_id, now_ms};
 
 /// One journaled event: the durable seq plus the event, as broadcast to subscribers.
@@ -64,9 +65,8 @@ pub enum SteerOutcome {
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 
 /// A harness-native session id plus the cwd it was created under. Harness
-/// session stores are cwd-scoped (claude keys conversations by project
-/// directory — jolt sessions.ts:563 "harness session stores are keyed by
-/// cwd"), so resume is only injected for runs launched from the same cwd.
+/// session stores are cwd-scoped, so resume is only injected for runs launched
+/// from the same cwd.
 #[derive(Debug, Clone)]
 struct HarnessSessionRef {
     session_id: String,
@@ -91,6 +91,8 @@ struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
+    usage: UsageStore,
+    usage_contexts: Mutex<HashMap<String, UsageContext>>,
     doc_host: OnceLock<DocHost>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
@@ -124,6 +126,7 @@ impl SessionsEngine {
         device_id: String,
         journal: Arc<RunJournal>,
         registry: Arc<HarnessRegistry>,
+        usage: UsageStore,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
         Self {
@@ -131,6 +134,8 @@ impl SessionsEngine {
                 device_id,
                 journal,
                 registry,
+                usage,
+                usage_contexts: Mutex::new(HashMap::new()),
                 doc_host: OnceLock::new(),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
@@ -170,6 +175,17 @@ impl SessionsEngine {
 
     pub fn session_status(&self, chat_id: &str) -> Option<Session> {
         lock(&self.inner.statuses).get(chat_id).cloned()
+    }
+
+    pub fn watch_usage(
+        &self,
+        chat_id: &str,
+    ) -> rusqlite::Result<watch::Receiver<jolt_proto::UsageSummary>> {
+        self.inner.usage.watch_chat(chat_id)
+    }
+
+    pub fn usage_breakdown(&self, days: u16) -> rusqlite::Result<jolt_proto::UsageBreakdown> {
+        self.inner.usage.breakdown(days)
     }
 
     /// Any run currently working or blocked on input — the auto-updater's
@@ -215,9 +231,9 @@ impl SessionsEngine {
     /// Start (or route) a run for `chat_id`.
     ///
     /// - The user message entry is written to the doc immediately (id = `message_id`).
-    /// - A live steerable run receives the prompt as its next turn via the mailbox
-    ///   (jolt's persistent-session routing); otherwise any live run is interrupted
-    ///   first — never two runtimes driving one chat.
+    /// - A live steerable run receives the prompt as its next turn via the mailbox;
+    ///   otherwise any live run is interrupted first — never two runtimes driving
+    ///   one chat.
     pub async fn dispatch(
         &self,
         chat_id: &str,
@@ -333,9 +349,9 @@ impl SessionsEngine {
             handle.write_user_message(&user_id, &turn_prompt, now_ms())?;
         }
 
-        // Engine-owned resume (jolt sessions.ts:736 — every dispatch read the
-        // chat's stored harness session): callers always send `resume: None`;
-        // the engine threads the chat's prior harness session back in so a new
+        // Engine-owned resume: callers always send `resume: None`; every
+        // dispatch reads the chat's stored harness session and threads it back
+        // in so a new
         // process (app restart) continues the same harness conversation.
         let mut resume_injected = false;
         if request.resume.is_none() && inject_resume {
@@ -605,7 +621,7 @@ impl SessionsEngine {
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
-            // same harness conversation (jolt recoverDraft, sessions.ts:538).
+            // same harness conversation.
             if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
                 self.inner
                     .remember_harness_session(&chat_id, &session_id, &cwd);
@@ -673,8 +689,8 @@ impl SessionsEngine {
                 let request = sessions
                     .last_request(&chat_id)
                     .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
-                    // Last resort: the journal's own cwd (jolt's draft config)
-                    // — a crash can predate the debounced workspace-row write.
+                    // Last resort: use the journal's own cwd because a crash can
+                    // predate the debounced workspace-row write.
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         Some(RunRequest {
@@ -744,6 +760,32 @@ impl Inner {
                 0
             }
         };
+        match event {
+            AgentEvent::SessionStarted {
+                harness,
+                model,
+                cwd,
+                ..
+            } => {
+                lock(&self.usage_contexts).insert(
+                    chat_id.to_string(),
+                    UsageContext {
+                        harness: *harness,
+                        model: model.clone(),
+                        cwd: cwd.clone(),
+                    },
+                );
+            }
+            AgentEvent::Usage { .. } if seq != 0 => {
+                let context = lock(&self.usage_contexts).get(chat_id).cloned();
+                if let Some(context) = context
+                    && let Err(error) = self.usage.record(chat_id, seq, &context, event)
+                {
+                    tracing::error!(chat = %chat_id, %error, "usage ledger write failed");
+                }
+            }
+            _ => {}
+        }
         if let Some(hub) = lock(&self.hubs).get(chat_id) {
             let _ = hub.send(JournaledEvent {
                 seq,
@@ -784,6 +826,29 @@ impl Inner {
         }
     }
 
+    fn set_compacting(&self, chat_id: &str, compacting: bool) {
+        let now = Utc::now();
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            if entry.compacting == compacting {
+                return;
+            }
+            entry.compacting = compacting;
+            entry.updated_at = now;
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
+    }
+
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
         let now = Utc::now();
         let session = {
@@ -794,6 +859,7 @@ impl Inner {
                     chat_id: chat_id.to_string(),
                     device_id: self.device_id.clone(),
                     status,
+                    compacting: false,
                     started_at: None,
                     updated_at: now,
                 });
@@ -801,6 +867,9 @@ impl Inner {
             entry.updated_at = now;
             if fresh_start {
                 entry.started_at = Some(now);
+            }
+            if status != SessionStatus::Working || fresh_start {
+                entry.compacting = false;
             }
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
@@ -832,8 +901,8 @@ impl Inner {
     }
 
     /// Record the chat's harness-native session id (and its cwd): live-process
-    /// cache plus the durable workspace chat row — the row is what survives an
-    /// engine restart (jolt sessions.ts:1039).
+    /// cache plus the durable workspace chat row, which survives an engine
+    /// restart.
     fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
         if session_id.is_empty() {
             return;
@@ -866,8 +935,7 @@ impl Inner {
         }
     }
 
-    /// The session id to resume for a run in `chat_id` launching from `cwd`
-    /// (jolt sessions.ts:736, looked up on every dispatch):
+    /// The session id to resume for a run in `chat_id` launching from `cwd`:
     /// live-process cache → workspace chat row → journal scan (the crash path
     /// where the debounced row write never landed — SessionStarted/Done events
     /// are journaled per event, flushed immediately). Cwd-gated throughout:
@@ -1394,13 +1462,19 @@ async fn drive_run(
             AgentEvent::InputResolved { .. } => {
                 inner.set_status(&chat_id, SessionStatus::Working, false);
             }
+            AgentEvent::CompactionStarted => {
+                inner.set_compacting(&chat_id, true);
+            }
+            AgentEvent::CompactionFinished => {
+                inner.set_compacting(&chat_id, false);
+            }
             _ => {}
         }
 
         inner.publish(&chat_id, &event);
 
-        // Defensive rule from jolt: a mid-run SessionStarted re-emission (Claude SDK
-        // background re-invocations) must not wipe the segment being written.
+        // A mid-run SessionStarted re-emission from a Claude SDK background
+        // invocation must not wipe the segment being written.
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);

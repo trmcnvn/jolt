@@ -29,7 +29,7 @@ jobs:
           - runner: ubuntu-24.04-arm # aarch64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: gpui system deps
         run: |
           sudo apt-get update -qq
@@ -40,13 +40,13 @@ jobs:
             libvulkan-dev pkg-config cmake
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.15.2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: package
         run: scripts/package-linux.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-${{ runner.arch }}
           path: target/package/*.tar.gz
@@ -59,16 +59,67 @@ jobs:
     runs-on: macos-latest # Apple silicon
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.15.2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: build
+        run: cargo build --release -p jolt
+      - name: import signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$certificate"
+          chmod 600 "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          rm -f "$certificate"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+
+          identity="$(
+            security find-identity -v -p codesigning "$keychain" \
+              | awk -F '"' '/Developer ID Application/ { print $2; exit }'
+          )"
+          test -n "$identity"
+          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: prepare notarization credentials
+        env:
+          NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+        run: |
+          key="$RUNNER_TEMP/notary-key.p8"
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$key"
+          chmod 600 "$key"
       - name: package dmg
+        env:
+          SKIP_BUILD: "1"
+          NOTARYTOOL_KEY_PATH: ${{ runner.temp }}/notary-key.p8
+          NOTARYTOOL_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARYTOOL_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: scripts/package-macos.sh
-      - uses: actions/upload-artifact@v4
+      - name: remove signing credentials
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-key.p8"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-${{ runner.arch }}
           path: |
@@ -86,7 +137,7 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: 2cd5db709b9369660ed7f1d52527c933
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -97,7 +148,7 @@ jobs:
           ls dist/ | grep -q "jolt-$ver-" \
             || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
           echo "VERSION=$ver" >> "$GITHUB_ENV"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           generate_release_notes: true

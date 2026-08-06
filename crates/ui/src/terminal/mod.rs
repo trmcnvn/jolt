@@ -1,4 +1,4 @@
-//! Terminal panel (feature-inventory §1.10): a `libghostty-vt`-backed
+//! Terminal panel: a `libghostty-vt`-backed
 //! emulator fed by the engine's PTY stream over the generic RPC client.
 //!
 //! - [`emulator`] — pure Ghostty VT state machine (bytes in, grid out);
@@ -9,7 +9,7 @@
 //!
 //! Method names come from `jolt_rpc::methods` and wire types from
 //! `jolt_proto` (`TerminalSession`, `TerminalEvent`) — the same contract the
-//! engine serves (feature-inventory §2.1).
+//! engine serves.
 
 pub mod emulator;
 pub mod panel;

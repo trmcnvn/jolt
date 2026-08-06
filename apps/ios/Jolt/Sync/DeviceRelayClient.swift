@@ -115,7 +115,7 @@ actor DeviceRelayClient {
     /// One unary ControlRpc call to the host engine. The default 10s deadline
     /// suits interactive calls (the engine itself caps folder listing at 6s);
     /// attachment uploads pass longer ones (first chunk 90s for a cold dial,
-    /// commit 150s to outlast the cross-device assemble — desktop state.ts).
+    /// commit 150s to outlast cross-device assembly.
     func call<Response: Decodable>(method: String, params: [String: Any],
                                    timeoutSeconds: UInt64 = 10) async throws -> Response {
         for attempt in 0..<3 {

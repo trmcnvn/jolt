@@ -1,4 +1,4 @@
-//! Settings → Archived (feature-inventory §1.5): archived chats across
+//! Settings → Archived: archived chats across
 //! devices, with Unarchive (Mutate setChatArchived false).
 
 use gpui::{
@@ -21,8 +21,7 @@ pub struct ArchivedPage {
     error: Option<SharedString>,
     /// Chat with an in-flight unarchive (button shows working state).
     busy: Option<String>,
-    /// Row index under the pointer — drives the original's `group-hover`
-    /// Unarchive reveal (`opacity-0 group-hover:opacity-100`).
+    /// Row index under the pointer, used to reveal the Unarchive action.
     hovered: Option<usize>,
     task: Option<Task<()>>,
     _observe: Subscription,
@@ -108,8 +107,8 @@ impl Render for ArchivedPage {
                 let is_busy = busy.as_deref() == Some(chat.id.as_str());
                 let row_hovered = self.hovered == Some(ix);
                 let chat_id = chat.id.clone();
-                // jolt settings.archived.tsx row: archive tile, medium title
-                // + tabular time, quiet device · location meta, Unarchive.
+                // Archive row: tile, medium title with tabular time, quiet
+                // device/location metadata, and Unarchive action.
                 div()
                     .id(("archived-row", ix))
                     .flex()
@@ -239,7 +238,7 @@ impl Render for ArchivedPage {
             .collect();
 
         let body: AnyElement = if items.is_empty() {
-            // Centered empty state (jolt settings.archived.tsx).
+            // Centered empty state.
             div()
                 .mt(px(96.0))
                 .flex()
@@ -248,8 +247,8 @@ impl Render for ArchivedPage {
                 .text_center()
                 .text_color(theme.text_muted.opacity(0.5))
                 .child(
-                    // `opacity-40` on top of the inherited muted/50 — an
-                    // effectively ~20% glyph (jolt settings.archived.tsx).
+                    // Muted color plus 40% opacity yields an effectively 20%
+                    // glyph.
                     crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
                         .size(px(28.0))
                         .text_color(theme.text_muted.opacity(0.2)),

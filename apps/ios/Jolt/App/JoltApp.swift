@@ -1,4 +1,4 @@
-// Jolt for iOS — a viewport onto the jolt-native mesh. The phone is a peer
+// Jolt for iOS — a viewport onto the Jolt mesh. The phone is a peer
 // device: it joins the workspace and session doc rooms and drives remote
 // engines through the durable command queue.
 

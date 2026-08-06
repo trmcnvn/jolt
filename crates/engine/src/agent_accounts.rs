@@ -1,5 +1,4 @@
-//! AgentAccounts — the Claude Code / Codex CLI logins on this device
-//! (feature-inventory §3.7 "Agent accounts"; port of jolt's `agent-accounts.ts`).
+//! AgentAccounts — the Claude Code and Codex CLI logins on this device.
 //!
 //! Each CLI stores exactly one live login:
 //!
@@ -132,7 +131,7 @@ struct SlotProfile {
     auth_kind: AgentAuthKind,
 }
 
-/// One saved login (`{slotId}.json`), same field surface as jolt's slot files.
+/// One saved login (`{slotId}.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Slot {
@@ -319,6 +318,68 @@ impl AgentAccounts {
                     saved_at: None,
                 });
             }
+        }
+        Ok(AgentAccountsSnapshot { accounts, warnings })
+    }
+
+    /// Probe the live Claude Code and Codex logins without touching inactive
+    /// saved accounts or re-snapshotting credentials on each background poll.
+    pub(crate) async fn usage_snapshot(
+        &self,
+        force_usage: bool,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
+        if force_usage {
+            lock(&self.inner.usage_cache).clear();
+        }
+        let mut warnings = Vec::new();
+        let mut detected = Vec::new();
+        let (claude, claude_warning) = self.detect_claude().await;
+        if let Some(message) = claude_warning {
+            warnings.push(AgentAccountWarning {
+                harness: HarnessId::ClaudeCode,
+                message,
+            });
+        }
+        if let Some(claude) = claude {
+            detected.push((HarnessId::ClaudeCode, claude));
+        }
+        if let Some(codex) = self.detect_codex() {
+            detected.push((HarnessId::Codex, codex));
+        }
+
+        let mut accounts = Vec::new();
+        for (harness, live) in detected {
+            let Some(credentials) = live.credentials.clone() else {
+                continue;
+            };
+            let id = slot_id_for(harness, &live.account_key);
+            let slot = Slot {
+                id: id.clone(),
+                harness,
+                account_key: live.account_key,
+                profile: live.profile.clone(),
+                credentials,
+                claude_config: live.claude_config,
+                saved_at: now_ms(),
+                created_at: None,
+            };
+            let usage_windows = self
+                .usage_for(harness, &slot, true, force_usage)
+                .await
+                .unwrap_or_default();
+            accounts.push(AgentAccount {
+                id,
+                harness,
+                email: Some(live.profile.email),
+                plan_label: live.profile.plan,
+                active: true,
+                usage_windows,
+                display_name: live.profile.display_name,
+                organization: live.profile.organization,
+                auth_kind: Some(live.profile.auth_kind),
+                switchable: true,
+                saved_at: None,
+            });
         }
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
@@ -1295,7 +1356,6 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Pi => "pi",
-        HarnessId::Cursor => "cursor",
         HarnessId::Mock => "mock",
     }
 }

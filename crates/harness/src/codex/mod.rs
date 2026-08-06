@@ -1,7 +1,6 @@
 //! Codex harness: spawns the installed `codex` CLI as `codex app-server` and
 //! speaks JSON-RPC 2.0 over stdio — the same interface the Codex IDE extension
-//! uses (spec: docs/research/harness.md; behavior ported from jolt's
-//! `packages/harness/src/codex.ts`).
+//! uses (see docs/harnesses.md).
 //!
 //! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`) then
 //!   the `initialized` notification; unknown notification methods tolerated.
@@ -47,6 +46,7 @@ use jolt_proto::{
     ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
+use crate::environment::HarnessEnvironment;
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
@@ -128,6 +128,7 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
 /// fake app server with [`CodexHarness::with_executable`].
 pub struct CodexHarness {
     executable: Option<PathBuf>,
+    environment: HarnessEnvironment,
     /// Grace between `turn/interrupt` and SIGTERM.
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
@@ -138,6 +139,7 @@ impl Default for CodexHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            environment: HarnessEnvironment::default(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
         }
@@ -152,6 +154,12 @@ impl CodexHarness {
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+
+    /// Inject environment variables resolved by the host engine.
+    pub fn with_environment(mut self, environment: HarnessEnvironment) -> Self {
+        self.environment = environment;
         self
     }
 
@@ -184,9 +192,8 @@ impl Harness for CodexHarness {
         HarnessId::Codex
     }
     fn display_name(&self) -> &str {
-        // "Codex" (not "Codex CLI") — jolt composer/defaults.ts
-        // HARNESS_LABEL; must also match the registry's lazy descriptor so
-        // the catalog entry doesn't change after the first resolve.
+        // Use the concise product name shown in the composer. This must match
+        // the registry's lazy descriptor so the catalog entry stays stable.
         "Codex"
     }
     fn supports_steering(&self) -> bool {
@@ -203,17 +210,19 @@ impl Harness for CodexHarness {
 
     /// The curated static catalog (see [`catalog`]); requires an installed CLI
     /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here.
-    /// This is the seam for live discovery: a short-lived `codex app-server`
-    /// paging `model/list` (experimentalApi) exactly as codex.ts does.
+    /// This is the seam for live discovery through a short-lived
+    /// `codex app-server` paging `model/list`.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
         Ok(static_models())
     }
     async fn commands(&self, context: CommandContext) -> Result<Vec<AgentCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
+        let environment = self.environment.resolve(HarnessId::Codex).await?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
+        crate::environment::apply(&mut cmd, &environment);
         if !context.cwd.is_empty() {
             cmd.current_dir(&context.cwd);
         }
@@ -273,9 +282,11 @@ impl Harness for CodexHarness {
             );
             request.sandbox = jolt_proto::SandboxLevel::DangerFullAccess;
         }
+        let environment = self.environment.resolve(HarnessId::Codex).await?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
+        crate::environment::apply(&mut cmd, &environment);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -349,8 +360,8 @@ struct Session {
     stderr_tail: crate::StderrTail,
 }
 
-/// Turn-routing state (port of codex.ts's activeTurnId/completedTurnIds): the
-/// `turn/start` response and the turn lifecycle notifications are separate
+/// Turn-routing state: the `turn/start` response and turn lifecycle
+/// notifications are separate
 /// app-server messages that may arrive in either order — never revive a turn
 /// that `turn/completed` already declared finished.
 #[derive(Default)]
@@ -492,6 +503,54 @@ fn codex_input(text: &str, skills: &[CodexSkill]) -> Value {
 fn rotate(id: &mut String) -> (String, String) {
     let prev = std::mem::replace(id, new_message_id());
     (prev, id.clone())
+}
+
+fn accumulate_usage(total: &mut Option<AgentEvent>, next: AgentEvent) {
+    let AgentEvent::Usage {
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_write_input_tokens,
+        cost_usd,
+        context_tokens,
+        context_window,
+    } = next
+    else {
+        return;
+    };
+    match total {
+        Some(AgentEvent::Usage {
+            input_tokens: total_input,
+            output_tokens: total_output,
+            cache_read_input_tokens: total_cache_read,
+            cache_write_input_tokens: total_cache_write,
+            cost_usd: total_cost,
+            context_tokens: total_context,
+            context_window: total_window,
+        }) => {
+            *total_input = total_input.saturating_add(input_tokens);
+            *total_output = total_output.saturating_add(output_tokens);
+            *total_cache_read = total_cache_read.saturating_add(cache_read_input_tokens);
+            *total_cache_write = total_cache_write.saturating_add(cache_write_input_tokens);
+            *total_cost = match (*total_cost, cost_usd) {
+                (Some(left), Some(right)) => Some(left + right),
+                (left, right) => left.or(right),
+            };
+            *total_context = context_tokens.or(*total_context);
+            *total_window = context_window.or(*total_window);
+        }
+        _ => {
+            *total = Some(AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
+                cost_usd,
+                context_tokens,
+                context_window,
+            });
+        }
+    }
 }
 
 async fn send(tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>, ev: AgentEvent) -> bool {
@@ -689,7 +748,8 @@ async fn run_session(session: Session) {
     // Deltas seen per agent-message item, so a model that never streams
     // (item/completed only) still emits its text exactly once.
     let mut streamed_text: HashSet<String> = HashSet::new();
-    // Token usage is held until the turn ends, emitted just before Done.
+    // Token usage is held until the turn ends, emitted just before Done. A
+    // tool-heavy turn has several API calls and therefore several updates.
     let mut pending_usage: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
@@ -769,7 +829,7 @@ async fn run_session(session: Session) {
 
                     "thread/tokenUsage/updated" => {
                         if let Some(usage) = usage_event(&params) {
-                            pending_usage = Some(usage);
+                            accumulate_usage(&mut pending_usage, usage);
                         }
                     }
 
@@ -979,9 +1039,8 @@ async fn run_session(session: Session) {
                     }
                 }
                 None => {
-                    // Mailbox closed (the caller's graceful idle-reap): finish
-                    // once nothing is in flight — mirrors codex.ts's steer loop
-                    // `finish()` on a null take.
+                    // Mailbox closed during graceful idle reap: finish once
+                    // nothing is in flight.
                     steering_open = false;
                     if router.active.is_none() && queued_steers.is_empty() {
                         break 'main;
@@ -1040,9 +1099,8 @@ async fn run_session(session: Session) {
                 }))
                 .await;
         } else if !interrupted && !done_current {
-            // A child KILLED mid-turn (OS memory pressure, `killall codex`)
-            // must not read as a silent success — codex.ts's signal-death
-            // handling, reduced to the turn-in-flight case.
+            // A child killed mid-turn by OS memory pressure or `killall codex`
+            // must not read as a silent success.
             let status = child.try_wait().ok().flatten();
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
@@ -1104,7 +1162,7 @@ async fn steer_as_new_turn(
 }
 
 // ---------------------------------------------------------------------------
-// Approvals (approval-as-input parity with jolt's UX)
+// Approvals bridged as interactive input
 // ---------------------------------------------------------------------------
 
 type RequestInputFn = Box<

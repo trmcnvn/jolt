@@ -14,8 +14,8 @@ enum Motion {
     static let resort = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.26)
     static let hoverFade = Animation.timingCurve(0.4, 0, 0.2, 1, duration: 0.15)
 
-    // Dotted activity-orb sweep, matching jolt_proto::motion::ACTIVITY_ORB_MS.
-    static let activityOrbPeriod: Double = 2.8
+    // Connecting-web clock, matching jolt_proto::motion::ACTIVITY_WEB_SPEED.
+    static let activityWebSpeed: Double = 6.63
 
     /// WorkingIndicator flavour words (transcript.rs:795), rotated every 7s,
     /// seeded per chat.

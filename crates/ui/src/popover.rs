@@ -1,6 +1,6 @@
 //! Popover / menu primitives: an anchored floating layer with the `menu-in`
 //! animation, outside-click dismissal, and pure keyboard-navigation + search
-//! reducers shared by every picker and menu (feature-inventory §1.12 popovers).
+//! reducers shared by every picker and menu.
 //!
 //! gpui pattern (examples/popover.rs at the pinned rev): the trigger element
 //! conditionally children a `deferred(anchored().child(content))` — deferred
@@ -357,8 +357,8 @@ pub fn modal(
 
 /// One menu row (jolt `menuItem`): `gap-2.5 rounded-lg px-2 py-1.5
 /// text-[13px]`, active = `bg-white/10 text-foreground`, hover wash
-/// `white/[0.08]` fading over `transition-colors` (floating-styles.ts) via the
-/// per-`fade_key` [`motion::hover_blend`]. The caller adds the id/click
+/// a subtle wash fading via the per-`fade_key` [`motion::hover_blend`]. The
+/// caller adds the id and click
 /// listener — `fade_key` must be unique app-wide and stable across frames
 /// (the id string is a good choice).
 pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) -> gpui::Div {
@@ -397,9 +397,8 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
 }
 
 /// [`menu_row`] with a distinct keyboard-navigation highlight: a selected row
-/// carries the full `bg-white/10` wash, the keyboard cursor the lighter
-/// `bg-white/[0.08]` (jolt's `data-[highlighted]` styling) — two selected-
-/// looking rows never appear at once.
+/// carries the stronger wash and the keyboard cursor a lighter one, so two
+/// selected-looking rows never appear at once.
 pub fn menu_row_nav(
     theme: &Theme,
     selected: bool,
@@ -595,7 +594,7 @@ pub fn menu_section() -> gpui::Div {
 }
 
 // ---------------------------------------------------------------------------
-// Dialog primitives (jolt dialog.tsx / sidebar dialogs.tsx)
+// Dialog primitives
 // ---------------------------------------------------------------------------
 
 /// The centered dialog card (`dialog-pop`): `w-[360px] rounded-2xl border
@@ -647,9 +646,8 @@ pub fn dialog_field(input: AnyElement) -> gpui::Div {
         .child(input)
 }
 
-/// Ghost button (`btnGhost`): quiet text, hover wash fading over
-/// `transition-colors` (jolt dialogs.tsx). Caller adds id + click; `fade_key`
-/// as in [`menu_row`].
+/// Ghost button (`btnGhost`): quiet text with a fading hover wash. Caller adds
+/// id and click; `fade_key` behaves as in [`menu_row`].
 pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) -> gpui::Div {
     let fade_key = fade_key.into();
     let mut btn = div()

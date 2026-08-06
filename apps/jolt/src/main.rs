@@ -89,7 +89,7 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
 
 /// mimalloc: system malloc (macOS libmalloc especially) never returns the
 /// streaming churn's high-water pages, so transient allocation became
-/// permanent RSS (docs/memory-plan.md §1).
+/// permanent RSS (see docs/architecture.md#storage-layout).
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -192,7 +192,7 @@ fn main() -> anyhow::Result<()> {
         None => {
             let edge_token = std::env::var("JOLT_EDGE_TOKEN").ok();
             // Headed: the UI probes JOLT_IPC_PORT and connects to a running
-            // daemon, or embeds the engine in-process (ARCHITECTURE §1).
+            // daemon, or embeds the engine in-process (docs/architecture.md).
             jolt_ui::run_app(jolt_ui::UiConfig {
                 data_dir: std::env::var_os("JOLT_DATA_DIR")
                     .map(std::path::PathBuf::from)
@@ -245,7 +245,6 @@ fn harness_from_env() -> jolt_engine::HarnessId {
         Ok("mock") => jolt_engine::HarnessId::Mock,
         Ok("codex") => jolt_engine::HarnessId::Codex,
         Ok("pi") => jolt_engine::HarnessId::Pi,
-        Ok("cursor") => jolt_engine::HarnessId::Cursor,
         _ => jolt_engine::HarnessId::ClaudeCode,
     }
 }

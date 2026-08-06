@@ -1,5 +1,4 @@
-//! CheckoutDiffSync — checkout-scoped working-tree diff production (feature-inventory
-//! §3.5; port of jolt's `checkout-diff-sync.ts` + `git-metadata-sync.ts`).
+//! CheckoutDiffSync — checkout-scoped working-tree diff production.
 //!
 //! Chats do not own working-copy state: a concrete VCS checkout does. This service
 //! groups this device's chats by their canonical checkout identity (`chat.cwd` →

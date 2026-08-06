@@ -1,5 +1,4 @@
-//! Repos — this device's repositories, refs, working copies, and the folder
-//! browser (feature-inventory §3.5; port of jolt's `repos.ts` + `folder-lister.ts`).
+//! Repos — this device's repositories, refs, working copies, and folder browser.
 //!
 //! Repos are device-local (paths differ per machine), so the known set is a plain
 //! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
@@ -892,8 +891,8 @@ impl Repos {
         .is_ok()
     }
 
-    /// Rename a jolt-created worktree branch after its chat's generated title
-    /// (port of jolt's `renameWorktreeBranch`). Guards:
+    /// Rename a Jolt-created worktree branch after its chat's generated title.
+    /// Guards:
     /// - respect an external checkout/rename: only act while the worktree is still
     ///   on `expected_branch` AND that branch is the original `jolt/<folderName>`;
     /// - a title-slug collision gets a stable 6-hex suffix (hash of the worktree
@@ -1325,10 +1324,9 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
         .collect())
 }
 
-/// Turn a generated chat title into the semantic portion of a Jolt branch
-/// (port of jolt's `worktreeBranchFromTitle`). Jolt NFKD-normalizes accented
-/// letters first; native keeps it ASCII-only (generated titles are Title Case
-/// English), so non-ASCII characters collapse into the `-` separator.
+/// Turn a generated chat title into the semantic portion of a Jolt branch.
+/// Generated titles are English, so non-ASCII characters collapse into the
+/// `-` separator.
 pub fn worktree_branch_from_title(title: &str) -> String {
     let mut slug = String::new();
     for c in title.trim().chars() {

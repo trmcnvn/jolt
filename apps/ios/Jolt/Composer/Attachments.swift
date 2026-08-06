@@ -1,6 +1,5 @@
-// Attachments — the iOS port of crates/ui/src/attachments.rs (itself a port
-// of jolt's use-attachments.ts / message-attachments.ts): composer staging,
-// the chunked upload to the chat's host device, the plain-text attachment-ref
+// Attachments — composer staging, chunked upload to the chat's host device,
+// the plain-text attachment-ref
 // transport that rides the prompt, the transcript read-back cache, and the
 // full-size preview lightbox.
 //
@@ -14,13 +13,13 @@ import Photos
 import PhotosUI
 import SwiftUI
 
-// MARK: - Text transport (message-attachments.ts)
+// MARK: - Text transport
 
 /// The body used for image-only sends.
 let attachmentOnlyText = "See the attached image(s)."
 
-/// use-attachments.ts `withAttachments`: plain local paths appended to the
-/// text — the files are staged on the device that runs the agent.
+/// Append plain local paths to the text; files are staged on the device that
+/// runs the agent.
 func withAttachments(text: String, paths: [String]) -> String {
     guard !paths.isEmpty else { return text }
     let body = text.isEmpty ? attachmentOnlyText : text
@@ -45,8 +44,8 @@ private func nameFromPath(_ path: String) -> String {
     return name.isEmpty ? "image" : name
 }
 
-/// message-attachments.ts `parseUserMessageImages`: split the visible prompt
-/// from its attachment-ref trailer (case-insensitive marker, `- path` lines).
+/// Split the visible prompt from its attachment-ref trailer using a
+/// case-insensitive marker and `- path` lines.
 func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
     let lines = content.components(separatedBy: "\n")
     var markerIx: Int?
@@ -79,9 +78,9 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
                              attachments: attachments)
 }
 
-// MARK: - Staging (use-attachments.ts intake)
+// MARK: - Staging
 
-/// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
+/// Maximum staged attachment size.
 let maxAttachmentBytes = 24 * 1024 * 1024
 /// Base64 chars per `UploadChunk` — sized for the relay link.
 let uploadChunkB64Chars = 60_000

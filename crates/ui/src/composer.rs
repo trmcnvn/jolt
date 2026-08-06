@@ -120,18 +120,15 @@ fn shell_mode_chip(scope: ShellScope, theme: &Theme) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// Expanded-mode textarea vertical padding: `pt-4 pb-1` (jolt composer.tsx
-/// line 578) = 16 + 4.
+/// Expanded-mode textarea vertical padding: 16px top + 4px bottom.
 pub const TEXTAREA_PAD_V: f32 = 20.0;
-/// The expanded textarea BOX (content + padding) is clamped by the original's
-/// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, 76),
-/// 260)` (jolt composer.tsx line 235). The 76px floor applies even when
+/// The expanded textarea box, including padding, is clamped to 76–260px.
+/// The 76px floor applies even when
 /// empty — it's what makes the always-expanded new-chat composer tall.
 pub const TEXTAREA_MIN: f32 = 76.0;
 pub const TEXTAREA_MAX: f32 = 260.0;
-/// Expanded actions row: `pt-1` (4) + h-8 picker chips (32 — the tallest
-/// children; composer/styles.tsx pickerChip) + `pb-2.5` (10) — jolt
-/// composer-actions.tsx line 60.
+/// Expanded actions row: 4px top padding + 32px picker chips + 10px bottom
+/// padding.
 pub const ACTIONS_ROW_HEIGHT: f32 = 46.0;
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
 pub const PILL_BORDER_V: f32 = 2.0;
@@ -140,7 +137,7 @@ pub const PILL_BORDER_V: f32 = 2.0;
 pub const COMPOSER_MIN_HEIGHT: f32 = TEXTAREA_MIN + ACTIONS_ROW_HEIGHT + PILL_BORDER_V;
 pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BORDER_V;
 /// Compact pill, border-box: one-line textarea `py-3` (24) + one 22.75px line
-/// (scrollHeight rounds to 47 in the original) + the 2px hairline = 49. The
+/// plus the 2px hairline = 49. The
 /// compact cluster (`py-1.5` + h-8 = 44) is shorter, so the textarea wins.
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
 /// Below this pill input width the composer always expands.
@@ -225,8 +222,8 @@ pub fn input_content_height(wrapped_lines: usize) -> f32 {
 }
 
 /// Total expanded composer height (border-box) for a content height: the
-/// textarea BOX (content + `pt-4 pb-1`) clamps to 76–260 exactly like the
-/// original's auto-grow effect, then the 46px actions row and the hairline
+/// textarea box (content + vertical padding) clamps to 76–260, then the 46px
+/// actions row and the hairline
 /// ride on top. Range 124–308.
 pub fn composer_total_height(content_height: f32) -> f32 {
     (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN, TEXTAREA_MAX)
@@ -284,8 +281,8 @@ fn input_drag_scroll_delta(
     distance.signum() * (distance.abs() * 0.2).clamp(1.0, line_height)
 }
 
-/// Staged-attachment strip metrics (jolt attachment-ui.tsx AttachmentStrip:
-/// `flex flex-wrap gap-2 px-4 pt-3`, `size-14` thumbs).
+/// Staged-attachment strip metrics: wrapping 56px thumbnails with 8px gaps,
+/// 16px horizontal padding, and 12px top padding.
 pub const STRIP_THUMB: f32 = 56.0;
 pub const STRIP_GAP: f32 = 8.0;
 pub const STRIP_PAD_TOP: f32 = 12.0;
@@ -304,10 +301,8 @@ pub fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
     STRIP_PAD_TOP + rows as f32 * STRIP_THUMB + (rows - 1) as f32 * STRIP_GAP
 }
 
-/// Compact↔expanded flip morph (round 9): the flip used to snap between the
-/// two pill layouts. The original has no height transition (its shell carries
-/// only `transition-colors`), so this is a native nicety: ONE committed flip
-/// starts exactly one 180ms ease-out morph ([`motion::COLLAPSE`], the same
+/// Compact↔expanded flip morph. One committed flip starts exactly one 180ms
+/// ease-out morph ([`motion::COLLAPSE`], the same
 /// manual-drive pattern as shell.rs `WidthTween` — never `with_animation`,
 /// whose element-id keying replays tweens on remount, round-6 §1–3).
 ///
@@ -412,8 +407,8 @@ pub fn morph_cluster_dy(progress: f32) -> f32 {
     CLUSTER_Y_DELTA * (1.0 - progress)
 }
 
-/// Session/route changes SNAP the composer (same rule as the header inset
-/// tween, round 6: route swaps remount in the original — zero motion). The
+/// Session and route changes snap the composer, matching the header inset
+/// tween's zero-motion route behavior. The
 /// nav-driven flip doesn't commit on the first render after a switch (the
 /// draft swap has to be laid out and re-measured first), so a plain reset at
 /// the nav instant leaks: `last_rendered_height` is repopulated before the
@@ -481,9 +476,8 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
 /// assistant entry supersedes an unanswered question. Assistant-entry-scoped,
 /// not last-entry: a steer prompt sent while the agent waits appends a USER
 /// entry after the streaming assistant entry, and a last-entry-only read made
-/// the QuestionPanel vanish exactly when the user typed (earlier forensics;
-/// matches the original composer.tsx, which reads the live-assistant fold —
-/// rebuilt from replay even after the run died).
+/// the question panel vanish exactly when the user typed. Read the live
+/// assistant fold, rebuilt from replay even after the run died.
 pub fn pending_input_request(
     transcript: &[SessionMessageEntry],
 ) -> Option<(String, Vec<UserInputQuestion>)> {
@@ -1442,11 +1436,13 @@ pub enum ComposerInputEvent {
     Edited,
     CursorMoved,
     ViewportChanged,
+    /// Recall an older/newer user prompt in the chat composer.
+    MessageHistoryNavigate(MessageHistoryDirection),
     MentionNavigate(isize),
     MentionAccept,
     MentionDismiss,
     /// Images pasted from the clipboard (screenshots / copied image data) —
-    /// the wrapper stages them as attachments (use-attachments.ts onPaste).
+    /// the wrapper stages them as attachments.
     PastedImages(Vec<gpui::Image>),
     /// File paths pasted from the clipboard (a file manager "Copy").
     PastedPaths(Vec<PathBuf>),
@@ -1486,6 +1482,11 @@ pub struct ComposerInput {
     /// File mentions are a composer feature, not a behavior of generic inputs
     /// (picker searches and rename fields also use this type).
     mentions_enabled: bool,
+    /// Bare vertical arrows recall sent prompts only in the chat composer.
+    message_history_enabled: bool,
+    /// Paint content as fixed-width masking characters while retaining the
+    /// real value for editing and submission.
+    masked: bool,
     /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
@@ -1554,6 +1555,8 @@ impl ComposerInput {
             last_width: 0.0,
             projection: TextProjection::default(),
             mentions_enabled: false,
+            message_history_enabled: false,
+            masked: false,
             layout_epoch: 0,
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
@@ -1625,8 +1628,28 @@ impl ComposerInput {
         self.refresh_projection();
     }
 
+    fn enable_message_history(&mut self) {
+        self.message_history_enabled = true;
+    }
+
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        if self.masked == masked {
+            return;
+        }
+        self.masked = masked;
+        self.refresh_projection();
+        cx.notify();
+    }
+
     fn refresh_projection(&mut self) {
-        self.projection = if self.mentions_enabled {
+        self.projection = if self.masked {
+            // One ASCII glyph per source byte preserves every byte-indexed
+            // selection/caret mapping, including for non-ASCII secret values.
+            TextProjection {
+                display: "*".repeat(self.content.len()),
+                mentions: Vec::new(),
+            }
+        } else if self.mentions_enabled {
             TextProjection::new(&self.content)
         } else {
             TextProjection {
@@ -2084,9 +2107,13 @@ impl ComposerInput {
             cx.emit(ComposerInputEvent::MentionNavigate(-1));
             return;
         }
-        if let Some(ix) = self.vertical_target(-1.0) {
-            self.move_to(ix, cx);
+        if self.message_history_enabled && !self.mention_open {
+            cx.emit(ComposerInputEvent::MessageHistoryNavigate(
+                MessageHistoryDirection::Older,
+            ));
+            return;
         }
+        self.move_vertically(-1.0, cx);
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
@@ -2094,7 +2121,17 @@ impl ComposerInput {
             cx.emit(ComposerInputEvent::MentionNavigate(1));
             return;
         }
-        if let Some(ix) = self.vertical_target(1.0) {
+        if self.message_history_enabled && !self.mention_open {
+            cx.emit(ComposerInputEvent::MessageHistoryNavigate(
+                MessageHistoryDirection::Newer,
+            ));
+            return;
+        }
+        self.move_vertically(1.0, cx);
+    }
+
+    fn move_vertically(&mut self, direction: f32, cx: &mut Context<Self>) {
+        if let Some(ix) = self.vertical_target(direction) {
             self.move_to(ix, cx);
         }
     }
@@ -2282,9 +2319,8 @@ impl ComposerInput {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        // Image data (or copied files) beats text — the original composer's
-        // onPaste prevents the default text insert when `clipboardData.files`
-        // is non-empty and stages the images instead.
+        // Image data or copied files take precedence over text and are staged
+        // as attachments instead of inserted.
         let mut images: Vec<gpui::Image> = Vec::new();
         let mut paths: Vec<PathBuf> = Vec::new();
         for entry in &item.entries {
@@ -3222,8 +3258,8 @@ impl gpui::Element for ComposerTextElement {
                 y += height;
             }
             // Caret only when this input is actually focused in an active
-            // window (Electron hides it on window deactivation too), and only
-            // in the "on" blink phase — solid while typing, ~500ms blink idle.
+            // window and in the "on" blink phase — solid while typing,
+            // ~500ms blink idle.
             if self
                 .input
                 .update(cx, |input, cx| input.caret_shown(window, cx))
@@ -3486,6 +3522,61 @@ fn is_bro_command(text: &str) -> bool {
     text.trim().strip_prefix('/') == Some(BRO_COMMAND)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageHistoryDirection {
+    /// Move toward the start of the transcript.
+    Older,
+    /// Move toward the empty prompt after the newest user message.
+    Newer,
+}
+
+fn message_history_position(
+    current: Option<usize>,
+    message_count: usize,
+    direction: MessageHistoryDirection,
+) -> Option<usize> {
+    if message_count == 0 {
+        return None;
+    }
+    let current = current.map(|position| position.min(message_count - 1));
+    match direction {
+        MessageHistoryDirection::Older => Some(
+            current
+                .map_or(0, |position| position.saturating_add(1))
+                .min(message_count - 1),
+        ),
+        MessageHistoryDirection::Newer => current.and_then(|position| position.checked_sub(1)),
+    }
+}
+
+fn user_message_text(entry: &SessionMessageEntry) -> Option<String> {
+    if entry.role != MessageRole::User {
+        return None;
+    }
+    let raw = entry
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let text = attachments::parse_user_message_images(&raw).text;
+    (!text.is_empty()).then_some(text)
+}
+
+fn user_message_history(
+    transcript: &[SessionMessageEntry],
+    pending_echoes: &[SessionMessageEntry],
+) -> Vec<String> {
+    transcript
+        .iter()
+        .chain(pending_echoes)
+        .filter_map(user_message_text)
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct BroRun {
     source_message_id: String,
@@ -3534,8 +3625,14 @@ pub struct Composer {
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
-    /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
-    /// navigating away and back restores them; memory-only, like the original.
+    /// Offset from the newest sent user message; `None` is the empty prompt
+    /// below the newest message.
+    message_history_position: Option<usize>,
+    /// Text expected while a recalled message is untouched. Any edit leaves
+    /// history navigation and turns the recalled prompt into a fresh draft.
+    message_history_text: Option<String>,
+    /// Staged-but-unsent attachments per chat key. Navigating away and back
+    /// restores them; they remain memory-only.
     attachments: HashMap<String, Vec<StagedAttachment>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
@@ -3607,6 +3704,7 @@ impl Composer {
         let input = cx.new(|cx| {
             let mut input = ComposerInput::new(DEFAULT_PLACEHOLDER, cx);
             input.enable_mentions();
+            input.enable_message_history();
             input
         });
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
@@ -3617,10 +3715,15 @@ impl Composer {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
-            ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
-                this.on_input_edited(cx)
+            ComposerInputEvent::Edited => {
+                this.leave_message_history_after_edit(cx);
+                this.on_input_edited(cx);
             }
+            ComposerInputEvent::CursorMoved => this.on_input_edited(cx),
             ComposerInputEvent::ViewportChanged => cx.notify(),
+            ComposerInputEvent::MessageHistoryNavigate(direction) => {
+                this.navigate_message_history(*direction, cx)
+            }
             ComposerInputEvent::MentionNavigate(delta) => this.move_mention(*delta, cx),
             ComposerInputEvent::MentionAccept => this.accept_mention(cx),
             ComposerInputEvent::MentionDismiss => this.dismiss_mention(cx),
@@ -3639,6 +3742,8 @@ impl Composer {
             input,
             pickers,
             drafts: HashMap::new(),
+            message_history_position: None,
+            message_history_text: None,
             attachments: HashMap::new(),
             preview: None,
             picker_task: None,
@@ -3725,7 +3830,18 @@ impl Composer {
         self.sending
     }
 
-    // ---- attachment staging (use-attachments.ts) ----
+    /// Whether the composer already renders progress for its active workflow.
+    /// Shell chrome uses this to avoid duplicating status feedback; future
+    /// composer-owned workflows opt in here without coupling the shell to them.
+    pub fn has_inline_progress(&self) -> bool {
+        self.bro_active()
+            || matches!(
+                self.extracted_answers.as_ref().map(|flow| &flow.state),
+                Some(ExtractedAnswerState::Extracting { .. })
+            )
+    }
+
+    // ---- attachment staging ----
 
     /// Staged attachments for the chat the composer is showing.
     fn staged(&self) -> &[StagedAttachment] {
@@ -3747,8 +3863,8 @@ impl Composer {
     }
 
     /// Stage image files (picker / drop / pasted paths). Non-images are
-    /// skipped silently (matching the original's `image/*` filter); read
-    /// failures and oversize files surface in the failure notice.
+    /// skipped silently; read failures and oversize files surface in the
+    /// failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let mut staged = Vec::new();
         for path in &paths {
@@ -3791,8 +3907,8 @@ impl Composer {
         }
     }
 
-    /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
-    /// `flex flex-wrap gap-2 px-4 pt-3`, 56px rounded thumbs, a remove button
+    /// The staged-thumbnail strip: wrapping 56px rounded thumbnails, a remove
+    /// button
     /// revealed on hover, click opens the full-size preview.
     fn render_attachment_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let staged = self.staged();
@@ -3866,8 +3982,7 @@ impl Composer {
         Some(strip)
     }
 
-    /// Paperclip: the native image picker (the original's hidden
-    /// `<input type=file accept=image/* multiple>`).
+    /// Paperclip action: open the native multi-image picker.
     fn open_file_picker(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -4153,6 +4268,49 @@ impl Composer {
             ..FileMentionState::default()
         };
         self.sync_mention_controls(cx);
+    }
+
+    fn leave_message_history_after_edit(&mut self, cx: &App) {
+        let Some(expected) = self.message_history_text.as_deref() else {
+            return;
+        };
+        if self.input.read(cx).text() != expected {
+            self.message_history_position = None;
+            self.message_history_text = None;
+        }
+    }
+
+    fn navigate_message_history(
+        &mut self,
+        direction: MessageHistoryDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.wizard.is_some() || self.extracted_answers.is_some() {
+            let direction = match direction {
+                MessageHistoryDirection::Older => -1.0,
+                MessageHistoryDirection::Newer => 1.0,
+            };
+            self.input
+                .update(cx, |input, cx| input.move_vertically(direction, cx));
+            return;
+        }
+
+        let history = {
+            let state = self.state.read(cx);
+            user_message_history(&state.transcript, state.pending_echoes())
+        };
+        let next =
+            message_history_position(self.message_history_position, history.len(), direction);
+        if next == self.message_history_position {
+            return;
+        }
+        let text = next
+            .and_then(|position| history.get(history.len() - 1 - position))
+            .cloned()
+            .unwrap_or_default();
+        self.message_history_position = next;
+        self.message_history_text = next.map(|_| text.clone());
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
     }
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
@@ -4910,6 +5068,8 @@ impl Composer {
             }
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
+            self.message_history_position = None;
+            self.message_history_text = None;
             self.failure = None;
             self.extraction_notice = None;
             self.wizard = None;
@@ -5002,8 +5162,8 @@ impl Composer {
             }
             _ => {
                 if let Some(wizard) = self.wizard.as_ref() {
-                    // LATCH (original composer.tsx `inputLatch`): a transient
-                    // fold/sync blip — or a steer appended behind the
+                    // Keep the panel latched through a transient fold/sync blip
+                    // or a steer appended behind the
                     // streaming entry — must not unmount the panel and lose
                     // the user's picks. Release only on explicit resolution
                     // (here or on another device) or when a NON-EMPTY
@@ -5185,8 +5345,8 @@ impl Composer {
         let space_remote = space
             .as_ref()
             .is_some_and(|s| local_device_id.as_deref() != Some(s.device_id.as_str()));
-        // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
-        // strip empties the instant you hit send; a failure hands the files
+        // Snapshot and clear now: the strip empties the instant you hit send;
+        // a failure hands the files
         // back into the chat's stash.
         let staged = if is_shell {
             Vec::new()
@@ -5381,8 +5541,7 @@ impl Composer {
                         }
                     }
                     // Seed the transcript cache from local bytes so the sent
-                    // bubble's thumbnails never round-trip (seedTranscript-
-                    // Attachment in the original send path).
+                    // bubble's thumbnails never round-trip.
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
                         attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
@@ -5923,9 +6082,8 @@ impl Composer {
             .into_any_element()
     }
 
-    /// The agent-asked-a-question panel (jolt question-panel.tsx), rendered in
-    /// The agent-asked-a-question panel (jolt question-panel.tsx), rendered in
-    /// place of the composer: the same floating-pill chrome (`rounded-[26px]
+    /// The agent-asked-a-question panel, rendered in place of the composer with
+    /// the same floating-pill chrome (`rounded-[26px]
     /// border-white/[0.08] bg-white/[0.03] shadow-xl`), uppercase header +
     /// "1/3" counter chip, option rows with number kbd chips, a free-text
     /// override over a hairline, and Back / Next-Submit footer.
@@ -5944,8 +6102,8 @@ impl Composer {
         let can_advance = wizard.page_has_pick() || !typed_empty;
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
-            // Selection reads on the row only while no typed override exists
-            // (typed answers win — jolt question-panel.tsx `isSel`).
+            // Selection reads on the row only while no typed override exists;
+            // typed answers win.
             let picked = wizard.is_picked(ix) && typed_empty;
             div()
                 .id(("wizard-option", ix))
@@ -5962,7 +6120,7 @@ impl Composer {
                 } else {
                     gpui::transparent_black()
                 })
-                // jolt question-panel.tsx option rows: `transition-colors`.
+                // Option rows use the standard color transition.
                 .bg(if picked {
                     crate::theme::ink(0.09)
                 } else {
@@ -6154,8 +6312,8 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
-        // Jolt composer-actions.tsx: a size-7 filled circle — up-arrow to
-        // send/steer, a dark rounded square on the same light circle to stop.
+        // A 28px filled circle: up-arrow to send/steer, or a dark rounded
+        // square on the same light circle to stop.
         match mode {
             SendButtonMode::Stop => div()
                 .id("composer-stop")
@@ -6315,7 +6473,7 @@ impl Render for Composer {
 
         let failure = self.failure.clone();
         let extraction_notice = self.extraction_notice.clone();
-        // Centered composer column (jolt `mx-auto w-full max-w-3xl`).
+        // Centered full-width composer column capped at 768px.
         let container = div()
             .w_full()
             .max_w(px(768.0))
@@ -6326,10 +6484,9 @@ impl Render for Composer {
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
             .when_some(failure, |el, message| {
-                // jolt composer.tsx `Notice` (matches the transcript
-                // ErrorChip palette): `flex items-start gap-2 rounded-xl
-                // border px-3 py-2 text-[12px] leading-snug` with a 14px
-                // DangerTriangle — a subtle tinted wash, not a bare red
+                // Failure notice matching the transcript ErrorChip palette:
+                // compact type, rounded border, 14px DangerTriangle, and a
+                // subtle tinted wash instead of a bare red
                 // stroke. Amber for the offline-ish case (engine not
                 // connected), red for send/run failures. Click dismisses.
                 let offline = message.as_ref() == "Engine not connected";
@@ -6457,16 +6614,15 @@ impl Render for Composer {
                 ));
         }
 
-        // New chats always use the expanded layout: the repo/branch pickers
-        // need the full-width actions row (jolt composer-actions.tsx
-        // `mustExpand = isNew || …`).
+        // New chats always use the expanded layout because the repo and branch
+        // pickers need the full-width actions row.
         let expanded = expanded || new_chat;
 
         // Committed-height morph: the layout below is already the NEW mode's;
         // only the pill's height (and the entrance fade/text glide driven by
         // `morph_t`) animates. Steady state renders exactly the target.
         // Staged attachments add the wrap strip's height to the pill in BOTH
-        // modes (attachment-ui.tsx AttachmentStrip sits above the input row).
+        // modes because the attachment strip sits above the input row.
         let staged_count = self.staged().len();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
@@ -6491,9 +6647,8 @@ impl Render for Composer {
         self.last_rendered_height = pill_height;
 
         let send_button = self.render_send_button(mode, cx);
-        // Attach button — opens the native image picker (the original's hidden
-        // `<input type=file accept="image/*" multiple>`); paste/drop also feed
-        // the same strip. `ml-1` per the source cluster — chips→attach reads
+        // Attach button opens the native multi-image picker; paste and drop
+        // feed the same strip. The left margin makes chips→attach read
         // 8px (4 gap + 4 margin) in BOTH modes.
         let attach = div()
             .id("composer-attach")
@@ -6505,7 +6660,7 @@ impl Render for Composer {
             .justify_center()
             .rounded_full()
             .cursor_pointer()
-            // jolt composer-actions.tsx attach: `transition-colors`.
+            // Use the standard hover color transition.
             .bg(motion::hover_blend(
                 "composer-attach",
                 gpui::transparent_black(),
@@ -6518,13 +6673,11 @@ impl Render for Composer {
                     .size(px(16.0))
                     .text_color(theme.text_muted),
             );
-        // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
-        // the input inside the pill in both modes.
+        // The staged-thumbnail strip sits above the input in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
 
-        // The pill chrome (jolt composer.tsx): `rounded-[26px] border
-        // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
-        // a hairline over a faint wash, never a solid grey box. Picker chips,
+        // The pill chrome uses a 26px radius, hairline, faint wash, and large
+        // shadow, never a solid grey box. Picker chips,
         // attach, and the send circle all live INSIDE the pill.
         let pill_bg = theme.input_bg;
         let pill = div()
@@ -6637,9 +6790,8 @@ impl Render for Composer {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                // Shared cluster metrics (`gap-1 pl-1 pr-2`,
-                                // jolt composer-actions.tsx): identical
-                                // internals to expanded; the right inset
+                                // Shared cluster metrics with internals
+                                // identical to expanded; the right inset
                                 // glides 12→8 on collapse.
                                 .gap(px(4.0))
                                 .pl(px(4.0))
@@ -6710,6 +6862,74 @@ mod tests {
             range,
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn message_history_walks_to_an_empty_new_prompt() {
+        let mut position = None;
+        position = message_history_position(position, 3, MessageHistoryDirection::Older);
+        assert_eq!(position, Some(0));
+        position = message_history_position(position, 3, MessageHistoryDirection::Older);
+        assert_eq!(position, Some(1));
+        position = message_history_position(position, 3, MessageHistoryDirection::Older);
+        assert_eq!(position, Some(2));
+        assert_eq!(
+            message_history_position(position, 3, MessageHistoryDirection::Older),
+            Some(2),
+            "the oldest prompt is the top boundary"
+        );
+        position = message_history_position(position, 3, MessageHistoryDirection::Newer);
+        assert_eq!(position, Some(1));
+        position = message_history_position(position, 3, MessageHistoryDirection::Newer);
+        assert_eq!(position, Some(0));
+        position = message_history_position(position, 3, MessageHistoryDirection::Newer);
+        assert_eq!(position, None, "the bottom slot is a fresh empty prompt");
+        assert_eq!(
+            message_history_position(None, 3, MessageHistoryDirection::Newer),
+            None
+        );
+        assert_eq!(
+            message_history_position(None, 0, MessageHistoryDirection::Older),
+            None
+        );
+        assert_eq!(
+            message_history_position(Some(9), 3, MessageHistoryDirection::Newer),
+            Some(1),
+            "a transcript shrink clamps a stale position"
+        );
+    }
+
+    #[test]
+    fn history_contains_only_recallable_user_text() {
+        let entry = |id: &str, role: MessageRole, text: &str| SessionMessageEntry {
+            id: id.into(),
+            role,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.into(),
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+        };
+        let with_attachment =
+            attachments::with_attachments("second prompt", &["/tmp/image.png".into()]);
+        let transcript = vec![
+            entry("u1", MessageRole::User, "first prompt"),
+            entry("a1", MessageRole::Assistant, "response"),
+            entry("u2", MessageRole::User, &with_attachment),
+            entry(
+                "u3",
+                MessageRole::User,
+                &attachments::with_attachments("", &["/tmp/only.png".into()]),
+            ),
+        ];
+        let echoes = vec![entry("u4", MessageRole::User, "latest prompt")];
+        assert_eq!(
+            user_message_history(&transcript, &echoes),
+            ["first prompt", "second prompt", "latest prompt"]
+        );
     }
 
     #[test]
@@ -7230,8 +7450,8 @@ mod tests {
 
     #[test]
     fn auto_grow_math() {
-        // The source heights (jolt composer.tsx line 235 clamp, composer-
-        // actions.tsx row, 1px hairlines): 76+46+2 empty … 260+46+2 capped.
+        // Textarea clamp + actions row + hairlines: 76+46+2 empty through
+        // 260+46+2 capped.
         assert_eq!(COMPOSER_MIN_HEIGHT, 124.0);
         assert_eq!(COMPOSER_MAX_HEIGHT, 308.0);
         // One line sits at the floor: the textarea BOX (content + `pt-4 pb-1`)

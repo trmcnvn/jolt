@@ -1,7 +1,5 @@
-//! Message parts: the event fold, the render-only privacy policy, and continuation splitting.
-//!
-//! Ports of `packages/control/src/parts.ts` (fold) and
-//! `packages/session-doc/src/{render-parts,messages}.ts`.
+//! Message parts: event folding, render-only privacy policy, and continuation
+//! splitting.
 
 use serde::{Deserialize, Serialize};
 
@@ -76,7 +74,7 @@ impl MessagePart {
 /// In place because the fold runs once per streamed event: rebuilding the
 /// accumulator each time made long turns O(n²) in allocations.
 ///
-/// Semantics from jolt `foldEventIntoParts`:
+/// Fold semantics:
 /// - `SessionStarted` / `Steered` reset the accumulator (turn boundary — makes replay safe).
 /// - `TextDelta` appends to the trailing text part, or starts a new one if the trail is not text
 ///   (a tool call in between breaks the text block).
@@ -101,7 +99,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             }
         }
         AgentEvent::ReasoningDelta { .. } => {
-            // Reasoning is not rendered as a transcript part (matches jolt).
+            // Reasoning is not rendered as a transcript part.
         }
         AgentEvent::ToolCall { id, call } => {
             if let Some(existing) = out.iter_mut().find_map(|p| match p {
@@ -178,7 +176,10 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::Usage { .. } => {}
+        AgentEvent::AssistantMessageCompleted { .. }
+        | AgentEvent::Usage { .. }
+        | AgentEvent::CompactionStarted
+        | AgentEvent::CompactionFinished => {}
     }
 }
 

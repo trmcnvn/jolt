@@ -1,10 +1,8 @@
 /**
- * Vendored subset of jolt's `@jolt/session-doc` — exactly what the edge
- * needs: the tunable constants, message-entry shapes + continuation stitching,
- * sidecar payload types, and the DO tail materializer. Byte-faithful to the
- * originals except: control-plane types are vendored (control-types.ts) and
- * the loro-mirror schema/commands modules are not carried (the DO never opens
- * a Mirror — `tail.ts` holds the two schema.ts functions it does use).
+ * Edge-facing session document types and helpers: tunable constants,
+ * message-entry shapes, continuation stitching, sidecar payload types, and the
+ * Durable Object tail materializer. The DO reads plain document JSON and does
+ * not open a Loro Mirror.
  */
 export * from "./constants";
 export * from "./control-types";

@@ -102,8 +102,8 @@ fn registry() -> Arc<HarnessRegistry> {
         step_delay: Duration::from_millis(60),
     }));
     registry.register(Arc::new(ScriptedHarness {
-        id: HarnessId::Cursor,
-        text: "From cursor",
+        id: HarnessId::Pi,
+        text: "From Pi",
         step_delay: Duration::from_millis(10),
     }));
     Arc::new(registry)
@@ -402,7 +402,7 @@ async fn chat_config_selects_the_run_harness() {
             "chat-cfg",
             "space-cfg",
             Some(ChatConfig {
-                harness: HarnessId::Cursor,
+                harness: HarnessId::Pi,
                 model: None,
                 reasoning: None,
                 model_options: Default::default(),
@@ -413,15 +413,20 @@ async fn chat_config_selects_the_run_harness() {
         .expect("create configured chat");
     queue_run(&a, "chat-cfg", "cmd-cfg-1", "m-1");
 
-    // The configured harness (Cursor, "From cursor") ran — not the default Mock.
+    // The configured harness (Pi, "From Pi") ran — not the default Mock.
     let handle = a.doc_host.open("chat-cfg").expect("open chat");
     wait_for(
         || {
-            handle.doc().read_entries().unwrap_or_default().iter().any(|e| {
-                e.parts.iter().any(
-                    |p| matches!(p, jolt_doc::MessagePart::Text { text, .. } if text == "From cursor"),
+            handle
+                .doc()
+                .read_entries()
+                .unwrap_or_default()
+                .iter()
+                .any(|e| {
+                    e.parts.iter().any(
+                    |p| matches!(p, jolt_doc::MessagePart::Text { text, .. } if text == "From Pi"),
                 )
-            })
+                })
         },
         "configured-harness output",
     )
@@ -560,6 +565,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 chat_id: "chat-legacy".into(),
                 device_id: "dev-a".into(),
                 status: SessionStatus::Idle,
+                compacting: false,
                 started_at: Some(now),
                 updated_at: now,
             })

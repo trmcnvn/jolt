@@ -15,7 +15,7 @@ export type SessionMessageRole = "user" | "assistant" | "system";
  * The doc-resident part shape — one flat map per part inside a message's
  * `parts` LoroList. Text parts store their text in a LoroText container so
  * streaming is an RLE-mergeable append (measured 1.03x oplog overhead vs 125x
- * for whole-value rewrites — see oplog-shape.test.ts; this is the schema
+ * for whole-value rewrites; this is the schema
  * correction anticipated by design open item §10.4). All other fields are
  * written once, so plain values are fine.
  */

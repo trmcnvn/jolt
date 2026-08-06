@@ -49,8 +49,8 @@ struct SessionView: View {
         .toolbar {
             if let chat {
                 ToolbarItem(placement: .principal) {
-                    // Tapping the header reconfigures model/effort mid-chat
-                    // (the old app's header model pill); harness stays locked.
+                    // Tapping the header reconfigures model and effort
+                    // mid-chat; the harness stays locked.
                     Button {
                         showConfig = true
                     } label: {

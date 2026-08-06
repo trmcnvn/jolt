@@ -1,4 +1,4 @@
-//! Session doc schema over `loro` — Rust port of `packages/session-doc/src/schema.ts`.
+//! Session document schema over `loro`.
 //!
 //! Container layout (MUST stay shape-compatible with the TS edge/tail materializer):
 //! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }         (host-only writer)
@@ -622,15 +622,15 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
 
 /// Incremental streaming writer for one assistant entry.
 ///
-/// Port of jolt's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
-/// live segment (from `fold_event_into_parts`) at each commit tick, it diffs against what's in
+/// Called with the *folded* parts of the live segment (from
+/// `fold_event_into_parts`) at each commit tick, it diffs against what's in
 /// the doc and writes only the delta:
 /// - trailing text growth → `LoroText` append (RLE-merged),
 /// - new parts → pushed,
 /// - tool call refresh / resolution / input resolution → in-place map updates.
 ///
-/// Invariant relied upon: the fold only ever APPENDS parts or grows the trailing text; earlier
-/// text never mutates. Tool/input parts may update fields in place.
+/// Invariant relied upon: the fold only ever appends parts or grows trailing
+/// text; earlier text never mutates. Tool/input parts may update fields in place.
 pub struct SegmentWriter<'a> {
     doc: &'a SessionDoc,
     /// Index of this entry in the `messages` list.

@@ -1,11 +1,7 @@
-//! Model catalog + effort/sandbox mapping for Codex, ported from jolt's
-//! `packages/harness/src/codex.ts`.
+//! Model catalog and effort/sandbox mapping for Codex.
 //!
-//! The TS harness discovers models live via the app server's `model/list`
-//! (experimentalApi) and falls back to a curated snapshot; here the snapshot IS
-//! the catalog, and `CodexHarness::models` is the single seam where a
-//! short-lived `codex app-server` + `model/list` pagination can later be
-//! spliced in (same call t3code's Codex provider makes).
+//! The curated snapshot is the current catalog. `CodexHarness::models` is the
+//! seam where short-lived `codex app-server` model discovery can be added.
 
 use jolt_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel};
 
@@ -21,11 +17,10 @@ pub(crate) const REASONING_LEVELS: &[ReasoningLevel] = &[
     ReasoningLevel::Ultra,
 ];
 
-/// Codex's API rejects `minimal` when default tools (web_search, image_gen)
-/// are enabled, and doesn't know Claude's ultracode/ultrathink modes. It DOES
-/// accept `max` and `ultra` natively (gpt-5.6+), so those pass straight
-/// through — only the levels Codex can't take are clamped to the nearest
-/// effort (port of codex.ts `toEffort`).
+/// Codex's API rejects `minimal` when default tools are enabled and does not
+/// know Claude's ultracode/ultrathink modes. It accepts `max` and `ultra`
+/// natively on GPT-5.6+, so only unsupported levels are clamped to the nearest
+/// effort.
 pub(crate) fn to_effort(reasoning: Option<ReasoningLevel>) -> Option<&'static str> {
     Some(match reasoning? {
         ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
@@ -124,8 +119,7 @@ fn model(id: &str, label: &str, description: &str, ladder: &[ReasoningLevel]) ->
 }
 
 /// The curated catalog: a snapshot of codex-cli 0.144's `model/list`, newest
-/// family first — efforts as the server reports them (gpt-5.6 goes up to
-/// `ultra`). Mirrors codex.ts's `CODEX_MODELS` fallback.
+/// family first, with efforts as the server reports them.
 pub(crate) fn static_models() -> Vec<Model> {
     vec![
         model(

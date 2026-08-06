@@ -5,8 +5,8 @@
 #   B queues a Run into the chat doc -> nudge -> A (host) executes via the mock
 #   harness -> transcript + session status sync A -> edge -> B.
 #
-# Both engines run as the SAME user (alice@org1) on different devices — jolt's
-# one-user-many-devices model; chat/device rooms are claim-on-first-join per user.
+# Both engines run as the same user (alice@org1) on different devices. This
+# exercises the one-user-many-devices model; rooms are claimed on first join.
 #
 # Usage: scripts/e2e-smoke.sh
 # Env:   JOLT_E2E_EDGE_PORT (default 27640), JOLT_E2E_KEEP_LOGS=1 to keep logs.

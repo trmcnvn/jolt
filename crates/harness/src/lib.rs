@@ -1,6 +1,6 @@
 //! jolt-harness — one interface over Claude Code, Codex, and Pi (plus a mock for tests).
 //!
-//! Integration decisions (docs/research/harness.md):
+//! Integration details (docs/harnesses.md):
 //! - Claude Code: spawn the installed `claude` CLI with
 //!   `--input-format stream-json --output-format stream-json --verbose
 //!    --include-partial-messages`, implement the control channel (can_use_tool →
@@ -28,6 +28,8 @@ pub enum HarnessError {
     Protocol(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("harness environment: {0}")]
+    Environment(String),
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.
@@ -114,6 +116,7 @@ pub trait Harness: Send + Sync {
 
 pub mod claude;
 pub mod codex;
+pub mod environment;
 pub mod mock;
 pub mod pi;
 pub mod shell_env;
@@ -185,7 +188,7 @@ pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::p
 /// Rolling tail of a child's stderr, shared between the reader task and the
 /// crash-message composer: an unexpected exit surfaces "<name> exited
 /// unexpectedly (<status>): <last stderr lines>" instead of a bare shrug —
-/// the proper background-crash message old jolt showed (user requirement).
+/// a useful background-crash message.
 #[derive(Clone, Default)]
 pub(crate) struct StderrTail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
 

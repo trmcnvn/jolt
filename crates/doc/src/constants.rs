@@ -1,5 +1,5 @@
-//! Constants carried over from jolt `packages/session-doc/src/constants.ts`.
-//! Per the original design these are starting points — re-measure with real heavy sessions.
+//! Session-document limits and timing constants.
+//! These are starting points; re-measure with real heavy sessions.
 
 /// Max bytes for a single message entry before continuation splitting.
 pub const MSG_INLINE_MAX: usize = 256 * 1024;

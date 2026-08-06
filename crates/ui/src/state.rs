@@ -3,8 +3,8 @@
 //!
 //! ## EngineHandle
 //! The UI talks the same typed RPC whether the engine is in-process or a separate
-//! daemon (ARCHITECTURE §1). [`EngineHandle::bootstrap`] probes the localhost IPC
-//! port, mirroring jolt: if an engine is listening it connects over WebSocket
+//! daemon (docs/architecture.md). [`EngineHandle::bootstrap`] probes the localhost IPC
+//! port: if an engine is listening it connects over WebSocket
 //! ([`RemoteEngine`]); otherwise it embeds one via [`EngineCore::assemble`] and an
 //! in-memory RPC transport ([`InProcessEngine`]) — same envelopes, same dispatch.
 //!
@@ -29,7 +29,7 @@ use serde::de::DeserializeOwned;
 
 use jolt_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use jolt_engine::{Engine, EngineConfig, EngineSupervisor};
-use jolt_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
+use jolt_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space, UsageSummary};
 use jolt_rpc::{RpcClient, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
@@ -250,6 +250,8 @@ pub struct AppState {
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
+    /// Live cumulative usage for the selected chat, streamed from its host.
+    pub selected_usage: Option<UsageSummary>,
     /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
     /// when the row vanishes; selecting a chat implies its space.
     pub selected_space: Option<String>,
@@ -272,6 +274,7 @@ pub struct AppState {
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
+    usage_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -289,6 +292,7 @@ impl AppState {
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
+            selected_usage: None,
             selected_space: None,
             selected_chat: None,
             transcript: Vec::new(),
@@ -299,6 +303,7 @@ impl AppState {
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
+            usage_task: None,
             auto_selected: false,
         }
     }
@@ -315,6 +320,8 @@ impl AppState {
             self.selected_chat = None;
             self.transcript.clear();
             self.transcript_task = None;
+            self.selected_usage = None;
+            self.usage_task = None;
         }
     }
 
@@ -599,7 +606,14 @@ impl AppState {
         ];
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            let target_device_id = self
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .map(|chat| chat.device_id.clone());
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.usage_task = Some(spawn_usage_watch(cx, handle, chat_id, target_device_id));
         }
         cx.notify();
     }
@@ -620,6 +634,8 @@ impl AppState {
         self.auto_selected = true;
         self.transcript.clear();
         self.transcript_task = None;
+        self.selected_usage = None;
+        self.usage_task = None;
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its space; `select_chat(None)` (the new-session
             // canvas) stays within the current space.
@@ -634,7 +650,14 @@ impl AppState {
             self.mark_chat_seen(id, cx);
         }
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            let target_device_id = self
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .map(|chat| chat.device_id.clone());
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.usage_task = Some(spawn_usage_watch(cx, handle, chat_id, target_device_id));
         }
         cx.notify();
     }
@@ -692,7 +715,7 @@ impl AppState {
 
 /// Subscribe to a watch method and pump each frame through `apply`. Runs on the
 /// gpui executor; ends when the stream closes or the entity is released.
-/// Chats watch with boot auto-select: jolt's `/` route redirected to the
+/// Chats watch with boot auto-select: the initial route redirects to the
 /// last-used chat; we approximate by selecting the most recent unarchived chat
 /// on the first frame when nothing is selected yet (manual selection wins).
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
@@ -830,6 +853,62 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
                 cx.notify();
             })
             .ok();
+        }
+    })
+}
+
+fn spawn_usage_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    chat_id: String,
+    target_device_id: Option<String>,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let mut params = serde_json::json!({ "chatId": chat_id });
+            if let (Some(target), Some(object)) = (&target_device_id, params.as_object_mut()) {
+                object.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
+            }
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_CHAT_USAGE, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(error) => {
+                    tracing::debug!(%chat_id, %error, "usage watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let Ok(usage) = serde_json::from_value::<UsageSummary>(value) else {
+                    tracing::warn!(%chat_id, "dropping malformed usage summary");
+                    continue;
+                };
+                if this
+                    .update(cx, |state, cx| {
+                        if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                            state.selected_usage = Some(usage);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }
@@ -1156,6 +1235,7 @@ mod tests {
             chat_id: chat_id.into(),
             device_id: "dev".into(),
             status,
+            compacting: false,
             started_at: None,
             updated_at: now - TimeDelta::seconds(updated_secs_ago),
         }

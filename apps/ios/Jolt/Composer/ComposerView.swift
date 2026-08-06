@@ -1,6 +1,6 @@
-// Composer — the floating glass shell, a port of the old mobile app's
-// composer (compact↔expanded morph, 36pt controls, focus-widen) carrying the
-// desktop's Send→Steer→Stop semantics: live run + text = steer (same
+// Composer — a floating glass shell with a compact↔expanded morph, 36pt
+// controls, and focus widening. It carries the desktop's Send→Steer→Stop
+// semantics: live run + text = steer (same
 // up-arrow), live run + empty = stop.
 //
 // The compact→expanded flip is deterministic (newline or >26 chars), NOT
@@ -20,8 +20,8 @@ struct ComposerShell<Chips: View>: View {
     var busy = false
     var onSend: () -> Void
     var onStop: () -> Void = {}
-    /// Staged image attachments (attachment-ui.tsx AttachmentStrip inside the
-    /// pill). Non-empty forces the expanded layout, like chips.
+    /// Staged image attachments shown inside the pill. Non-empty forces the
+    /// expanded layout, like chips.
     var attachments: [StagedAttachment] = []
     /// Present the photo picker; nil hides the attach button.
     var onAttach: (() -> Void)? = nil
@@ -86,7 +86,7 @@ struct ComposerShell<Chips: View>: View {
         .background(whiteAlpha(0.04), in: RoundedRectangle(cornerRadius: 28))
         .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 28))
         .overlay(RoundedRectangle(cornerRadius: 28).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
-        // Focus-widen: margins pull in slightly while typing (chat-session.tsx).
+        // Focus widening pulls margins in slightly while typing.
         .padding(.horizontal, focused ? 10 : 16)
         .motionAnimation(Motion.resize, value: focused)
         .motionAnimation(Motion.collapse, value: expanded)

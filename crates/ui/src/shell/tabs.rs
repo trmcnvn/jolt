@@ -2,8 +2,8 @@
 //! overhaul). Every non-archived session of the selected space is a tab:
 //! agent brand icon + title + a trailing slot that shows the status dot at
 //! rest and swaps to a close button on hover. `+` at the end opens the
-//! new-session canvas (the tab materializes on first send). The strip inherits
-//! the old header's titlebar duties: 44px tall, drag region, animated
+//! new-session canvas (the tab materializes on first send). The strip owns the
+//! titlebar duties: 44px tall, drag region, animated
 //! window-controls inset, and the toggle-changes button (git spaces only).
 //!
 //! Styling and drag-reorder mirror the terminal tab bar
@@ -93,8 +93,8 @@ pub(super) fn resolve_tab_order(created_order: &[String], manual: &[String]) -> 
     out
 }
 
-/// The neighbor to select after closing `closed`: the next tab, else the
-/// previous, else `None` (last tab → new-session canvas). Pure.
+/// The neighbor to select after removing `closed` from the supplied order:
+/// the following item, else the previous one, else `None`. Pure.
 pub(super) fn next_after_close(order: &[String], closed: &str) -> Option<String> {
     let ix = order.iter().position(|id| id == closed)?;
     if order.len() <= 1 {
@@ -143,6 +143,25 @@ impl Shell {
         self.state
             .update(cx, |state, cx| state.select_chat(Some(chat_id), cx));
         cx.notify();
+    }
+
+    /// Archive the current session, then select its neighbor in the global
+    /// sidebar list rather than its space's tab strip.
+    pub(super) fn archive_current_session(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let (selected, order) = {
+            let state = self.state.read(cx);
+            let order = state
+                .overview_chats(Utc::now())
+                .into_iter()
+                .map(|(_, chat)| chat.id.clone())
+                .collect::<Vec<_>>();
+            (state.selected_chat.clone(), order)
+        };
+        if selected.as_deref() == Some(chat_id.as_str()) {
+            let next = next_after_close(&order, &chat_id);
+            self.state.update(cx, |s, cx| s.select_chat(next, cx));
+        }
+        self.archive_chat(chat_id, cx);
     }
 
     /// Close a tab = archive the session. Selection moves to a neighbor; the

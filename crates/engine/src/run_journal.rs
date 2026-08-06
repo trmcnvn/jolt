@@ -1,4 +1,4 @@
-//! Per-session on-disk event journal (port of jolt's `run-journal.ts`, JSONL-shaped).
+//! Per-session on-disk event journal, stored as JSONL.
 //!
 //! One append-only JSONL file per chat under `{data_dir}/journals/{chat_id}.jsonl`; each
 //! line is `{"seq": n, "event": AgentEvent}` with a monotonically increasing `seq`. The

@@ -1,5 +1,4 @@
-//! Mends half-streamed inline markdown for display (after streamdown's
-//! `remend`, ported to jolt's incremental parser).
+//! Mends half-streamed inline markdown for incremental display.
 //!
 //! While a block is streaming, an unclosed `**bold`, `*em`, `` `code ``,
 //! `~~strike` or `[link](partial-url` parses as literal text; the closing
@@ -38,8 +37,8 @@
 //! (zero further work) whenever nothing hangs. Callers feed it only the last
 //! top-level block of the stream, so per-append work stays O(tail) — the same
 //! bound as the incremental reparse itself. remend re-scans the entire
-//! accumulated message every delta; feeding just the tail is what makes the
-//! port fit jolt's parser.
+//! accumulated message every delta; feeding just the tail keeps the parser
+//! efficient.
 
 /// Sentinel destination for a link whose URL is still streaming. The renderer
 /// styles it like any link but must not register it as clickable.

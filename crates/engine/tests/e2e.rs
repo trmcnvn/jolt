@@ -727,6 +727,68 @@ async fn session_status_transitions_idle_working_idle() {
 }
 
 #[tokio::test]
+async fn compaction_events_toggle_live_session_feedback() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: "a-1".into(),
+                },
+                AgentEvent::CompactionStarted,
+                AgentEvent::CompactionFinished,
+                done(DoneStatus::Completed),
+            ],
+            step_delay: Duration::from_millis(40),
+            hang_until_interrupt: false,
+        }),
+    );
+    let mut watch = core.sessions.watch_sessions();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-compaction",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::timeout_at(deadline, watch.changed())
+            .await
+            .expect("session change before timeout")
+            .expect("watch alive");
+        if let Some(session) = watch.borrow().first() {
+            let state = (session.status, session.compacting);
+            if seen.last() != Some(&state) {
+                seen.push(state);
+            }
+            if session.status == SessionStatus::Idle {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (SessionStatus::Working, false),
+            (SessionStatus::Working, true),
+            (SessionStatus::Working, false),
+            (SessionStatus::Idle, false),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn interrupt_stamps_streaming_entry_aborted() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
@@ -834,8 +896,8 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
     )
     .await;
 
-    // No live run anymore (mock finishes instantly): a steer command must fall back to
-    // dispatch-as-next-turn, per jolt's executor.
+    // No live run anymore (mock finishes instantly): a steer command must fall
+    // back to dispatch-as-next-turn.
     queue_as_viewer(
         handle.doc(),
         "cmd-steer-1",
@@ -1902,8 +1964,8 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
         "committed file holds the exact reassembled bytes"
     );
 
-    // Run with the jolt `withAttachments` transport: refs embedded in the
-    // prompt text (this is what persists), paths on the additive field.
+    // Run with attachment refs embedded in the persistent prompt text and
+    // paths on the additive field.
     let prompt = format!(
         "what color is this?\n\nAttached images (local files — open them to view):\n- {path}"
     );

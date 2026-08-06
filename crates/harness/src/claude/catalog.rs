@@ -1,13 +1,8 @@
-//! Model catalog + effort mapping for Claude Code, ported from jolt's
-//! `packages/harness/src/claude.ts` (which itself mirrors Claude Code's own
-//! picker via t3code's catalog).
+//! Model catalog and effort mapping for Claude Code.
 //!
-//! The TS harness discovers models at runtime through the SDK's
-//! `supportedModels()` control request and then OVERLAYS these static effort
-//! ladders / option sets (the SDK under-reports both). Until we grow a
-//! short-lived control-channel discovery session, [`static_models`] returns the
-//! curated list directly; `ClaudeHarness::models` is the single seam where
-//! dynamic discovery can later be spliced in.
+//! [`static_models`] returns a curated list because the SDK's
+//! `supportedModels()` control request under-reports effort ladders and option
+//! sets. `ClaudeHarness::models` is the seam for future dynamic discovery.
 
 use jolt_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
 
@@ -28,9 +23,7 @@ fn contains_any(hay: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| hay.contains(n))
 }
 
-/// Models whose CLI accepts `xhigh` natively; elsewhere it clamps to `max`
-/// (mirroring Claude Code's own normalization). Substring port of claude.ts's
-/// `/fable-5|opus-4-[7-9]|opus-[5-9]|sonnet-[5-9]/`.
+/// Models whose CLI accepts `xhigh` natively; elsewhere it clamps to `max`.
 pub(crate) fn supports_xhigh(model: &str) -> bool {
     contains_any(
         model,
@@ -114,7 +107,7 @@ const FULL_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Ultrathink,
 ];
 
-/// opus-4-7 / sonnet-5+ tier (claude.ts `claudeEffortsFor`): xhigh native,
+/// Opus 4.7 and Sonnet 5+ tier: xhigh native,
 /// no ultracode.
 const XHIGH_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Low,
@@ -141,8 +134,7 @@ fn model(
     }
 }
 
-/// The curated model list, mirroring claude.ts's `claudeEffortsFor` /
-/// `claudeOptionsFor` ladders: full ladder (through ultracode/ultrathink) on
+/// The curated model list: full ladder (through ultracode/ultrathink) on
 /// Fable 5, `max`-topped ladders on Opus/Sonnet, no efforts but a thinking
 /// toggle on Haiku; context-window select on the long-context families and
 /// fast mode on Opus 4.5+.

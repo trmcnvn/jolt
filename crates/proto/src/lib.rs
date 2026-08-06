@@ -1,13 +1,16 @@
 //! jolt-proto — wire types shared by engine, UI, and RPC.
 //!
-//! Ported from jolt's `packages/control/src/wire.ts` + `packages/harness/src/types.ts`.
-//! Token-usage *display* types are excluded by design; the `Usage` agent event is kept as a
-//! harness-level passthrough (rate-limit meters), never persisted into docs.
+//! Token usage stays out of synced conversation documents; host engines expose
+//! device-local summaries over RPC instead.
 
 pub mod agent;
 pub mod entities;
 pub mod motion;
+pub mod secrets;
+pub mod usage;
 pub mod view;
 
 pub use agent::*;
 pub use entities::*;
+pub use secrets::*;
+pub use usage::*;

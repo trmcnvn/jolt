@@ -2,38 +2,76 @@
 
 import SwiftUI
 
-/// Violet dotted globe whose fixed lattice carries a smooth brightness sweep.
+/// Dotted connecting web: drifting nodes wire themselves into a constellation.
 struct ActivityOrb: View {
     var size: CGFloat = 16
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+
+    private struct Node {
+        let x: Double
+        let y: Double
+        let z: Double
+    }
 
     private struct Dot {
         let x: CGFloat
         let y: CGFloat
-        let depth: CGFloat
+        let depth: Double
         let radius: CGFloat
+        let ink: Double
         let opacity: Double
+    }
+
+    private struct Line {
+        let start: CGPoint
+        let end: CGPoint
+        let width: CGFloat
+        let ink: Double
+        let opacity: Double
+    }
+
+    private struct Frame {
+        let lines: [Line]
+        let dots: [Dot]
     }
 
     var body: some View {
         TimelineView(.animation(paused: reduceMotion)) { timeline in
-            let phase = reduceMotion
-                ? 0
-                : (timeline.date.timeIntervalSinceReferenceDate / Motion.activityOrbPeriod)
-                    .truncatingRemainder(dividingBy: 1)
+            let time = reduceMotion
+                ? 0.6
+                : timeline.date.timeIntervalSinceReferenceDate * Motion.activityWebSpeed
             Canvas { context, dimensions in
-                let minimumRadius: CGFloat = size <= 10 ? 0.45 : 0.4
-                for dot in Self.dots(phase: phase, size: size) {
-                    let radius = max(size * dot.radius, minimumRadius)
+                let frame = Self.frame(time: time, size: size)
+                for line in frame.lines {
+                    var path = Path()
+                    path.move(to: CGPoint(
+                        x: dimensions.width * line.start.x,
+                        y: dimensions.height * line.start.y
+                    ))
+                    path.addLine(to: CGPoint(
+                        x: dimensions.width * line.end.x,
+                        y: dimensions.height * line.end.y
+                    ))
+                    let white = colorScheme == .dark ? 1 - line.ink : line.ink
+                    context.stroke(
+                        path,
+                        with: .color(Color(.sRGB, white: white, opacity: line.opacity)),
+                        lineWidth: line.width
+                    )
+                }
+                for dot in frame.dots {
+                    let radius = max(dot.radius, 0.3)
                     let rect = CGRect(
                         x: dimensions.width * dot.x - radius,
                         y: dimensions.height * dot.y - radius,
                         width: radius * 2,
                         height: radius * 2
                     )
+                    let white = colorScheme == .dark ? 1 - dot.ink : dot.ink
                     context.fill(
                         Path(ellipseIn: rect),
-                        with: .color(Theme.inlineCodeText.opacity(dot.opacity))
+                        with: .color(Color(.sRGB, white: white, opacity: dot.opacity))
                     )
                 }
             }
@@ -42,67 +80,127 @@ struct ActivityOrb: View {
         .accessibilityLabel("Working")
     }
 
-    private static func dots(phase: Double, size: CGFloat) -> [Dot] {
-        let latitudeCount: Int
-        let longitudeDensity: Int
-        if size >= 24 {
-            (latitudeCount, longitudeDensity) = (9, 20)
-        } else if size <= 10 {
-            (latitudeCount, longitudeDensity) = (4, 8)
-        } else {
-            (latitudeCount, longitudeDensity) = (6, 12)
+    private static func frame(time: Double, size: CGFloat) -> Frame {
+        let compact = size <= 10
+        let nodeCount = compact ? 8 : 12
+        let threshold = compact ? 1.05 : 0.9
+        let minimumLineWidth = compact ? 0.75 : 0.9
+        let nodeRadius = 1.4 * 1.52
+        let nodeRadiusDepth = 1.8 * 1.52
+        let radiusScale = pow(Double(size) / 300, 0.6)
+        let goldenAngle = Double.pi * (3 - sqrt(5))
+        var nodes: [Node] = []
+        nodes.reserveCapacity(nodeCount)
+
+        for index in 0..<nodeCount {
+            let baseY = 1 - 2 * (Double(index) + 0.5) / Double(nodeCount)
+            let radial = sqrt(1 - baseY * baseY)
+            let angle = Double(index) * goldenAngle
+            let base = Node(x: radial * cos(angle), y: baseY, z: radial * sin(angle))
+            let x = base.x + 0.6 * (noise(Double(index) * 0.31 + 9, time * 0.24) - 0.5)
+            let y = base.y + 0.6 * (noise(Double(index) * 0.53 + 27, time * 0.21) - 0.5)
+            let z = base.z + 0.6 * (noise(Double(index) * 0.77 + 55, time * 0.27) - 0.5)
+            let length = sqrt(x * x + y * y + z * z)
+            nodes.append(Node(x: x / length, y: y / length, z: z / length))
         }
-        var dots: [Dot] = []
-        dots.reserveCapacity(latitudeCount * longitudeDensity)
-        for latitude in 0..<latitudeCount {
-            let lat = -Double.pi / 2
-                + Double(latitude) / Double(latitudeCount - 1) * Double.pi
-            let longitudeCount = max(1, Int((abs(cos(lat)) * Double(longitudeDensity)).rounded()))
-            for longitude in 0..<longitudeCount {
-                dots.append(dot(
-                    phase: phase,
-                    latitude: latitude,
-                    latitudeCount: latitudeCount,
-                    longitude: longitude,
-                    longitudeCount: longitudeCount
+
+        var lines: [Line] = []
+        for first in 0..<nodeCount {
+            for second in (first + 1)..<nodeCount {
+                let dx = nodes[first].x - nodes[second].x
+                let dy = nodes[first].y - nodes[second].y
+                let dz = nodes[first].z - nodes[second].z
+                let distance = sqrt(dx * dx + dy * dy + dz * dz)
+                guard distance < threshold else { continue }
+                let start = project(nodes[first], time: time)
+                let end = project(nodes[second], time: time)
+                let depth = ((start.depth + end.depth) * 0.5 + 1) * 0.5
+                lines.append(Line(
+                    start: CGPoint(x: start.x, y: start.y),
+                    end: CGPoint(x: end.x, y: end.y),
+                    width: CGFloat(max(minimumLineWidth, 0.8 * radiusScale)),
+                    ink: 0.42,
+                    opacity: min(
+                        0.6,
+                        (1 - distance / threshold) * (0.3 + 0.55 * depth) * 1.8
+                    )
                 ))
             }
         }
-        return dots.sorted { $0.depth < $1.depth }
+
+        var dots: [Dot] = []
+        dots.reserveCapacity(nodeCount + 1)
+        for (index, node) in nodes.enumerated() {
+            let projected = project(node, time: time)
+            let depth = (projected.depth + 1) * 0.5
+            let pulse = 1 + 0.25 * sin(time * 1.4 + Double(index) * 2.7)
+            dots.append(Dot(
+                x: projected.x,
+                y: projected.y,
+                depth: projected.depth,
+                radius: CGFloat((nodeRadius + nodeRadiusDepth * depth) * pulse * radiusScale),
+                ink: 0.55 - 0.45 * depth,
+                opacity: 1
+            ))
+        }
+
+        let segment = floor(time * 0.55)
+        let first = Int(floor(hash(segment, 1.7) * Double(nodeCount)))
+        let second = Int(floor(hash(segment, 4.2) * Double(nodeCount)))
+        if first != second {
+            let progress = time * 0.55 - segment
+            let x = nodes[first].x + (nodes[second].x - nodes[first].x) * progress
+            let y = nodes[first].y + (nodes[second].y - nodes[first].y) * progress
+            let z = nodes[first].z + (nodes[second].z - nodes[first].z) * progress
+            let length = max(1e-6, sqrt(x * x + y * y + z * z))
+            let projected = project(
+                Node(x: x / length, y: y / length, z: z / length),
+                time: time
+            )
+            let depth = (projected.depth + 1) * 0.5
+            dots.append(Dot(
+                x: projected.x,
+                y: projected.y,
+                depth: projected.depth,
+                radius: CGFloat((nodeRadius * 1.5 + nodeRadiusDepth * depth) * radiusScale),
+                ink: 0.05,
+                opacity: 0.5 + 0.5 * depth
+            ))
+        }
+
+        return Frame(lines: lines, dots: dots.sorted { $0.depth < $1.depth })
     }
 
-    private static func dot(
-        phase: Double,
-        latitude: Int,
-        latitudeCount: Int,
-        longitude: Int,
-        longitudeCount: Int
-    ) -> Dot {
-        let lat = -Double.pi / 2
-            + Double(latitude) / Double(latitudeCount - 1) * Double.pi
-        let lon = Double(longitude) / Double(max(1, longitudeCount)) * Double.pi * 2
-        let cosLat = cos(lat)
-        let x = cosLat * cos(lon)
-        let y = sin(lat)
-        let z = cosLat * sin(lon)
-        let yaw = 0.55
-        let tilt = 0.38
-        let x1 = x * cos(yaw) + z * sin(yaw)
-        let z1 = -x * sin(yaw) + z * cos(yaw)
-        let y1 = y * cos(tilt) - z1 * sin(tilt)
-        let z2 = y * sin(tilt) + z1 * cos(tilt)
-        let depth = (z2 + 1) * 0.5
-        let angle = lon + yaw - phase * Double.pi * 2
-        let distance = atan2(sin(angle), cos(angle))
-        let boost = exp(-(distance * distance) / 0.16) * max(z2, 0)
+    private static func project(
+        _ node: Node,
+        time: Double
+    ) -> (x: CGFloat, y: CGFloat, depth: Double) {
+        let yaw = time * 0.12
+        let cameraTilt = 0.32
+        let x = node.x * cos(yaw) + node.z * sin(yaw)
+        let z = -node.x * sin(yaw) + node.z * cos(yaw)
+        let y = node.y * cos(cameraTilt) - z * sin(cameraTilt)
+        let depth = node.y * sin(cameraTilt) + z * cos(cameraTilt)
+        return (0.5 + CGFloat(x * 0.4), 0.5 - CGFloat(y * 0.4), depth)
+    }
 
-        return Dot(
-            x: 0.5 + CGFloat(x1) * 0.4,
-            y: 0.5 - CGFloat(y1) * 0.4,
-            depth: CGFloat(depth),
-            radius: 0.024 + CGFloat(depth) * 0.025 + CGFloat(boost) * 0.026,
-            opacity: min(1, 0.32 + depth * 0.42 + boost * 0.26)
-        )
+    private static func noise(_ x: Double, _ y: Double) -> Double {
+        let xi = floor(x)
+        let yi = floor(y)
+        var fx = x - xi
+        var fy = y - yi
+        fx = fx * fx * (3 - 2 * fx)
+        fy = fy * fy * (3 - 2 * fy)
+        let a = hash(xi, yi)
+        let b = hash(xi + 1, yi)
+        let c = hash(xi, yi + 1)
+        let d = hash(xi + 1, yi + 1)
+        return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy
+    }
+
+    private static func hash(_ a: Double, _ b: Double) -> Double {
+        let value = sin(a * 12.9898 + b * 78.233) * 43_758.5453
+        return value - floor(value)
     }
 }
 
@@ -151,7 +249,7 @@ struct HarnessBadge: View {
     let harness: String
     var size: CGFloat = 14
     var dimmed = false
-    /// Color for marks that carry no brand color of their own (codex, cursor).
+    /// Color for marks that carry no brand color of their own (Codex).
     /// Claude keeps its orange regardless.
     var neutral: Color = Theme.text
 

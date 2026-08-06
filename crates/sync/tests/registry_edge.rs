@@ -79,6 +79,7 @@ async fn two_rust_clients_converge_through_a_real_registry_do() {
             chat_id: "chat-live".into(),
             device_id: "dev-live-a".into(),
             status: SessionStatus::Working,
+            compacting: false,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
         })
@@ -199,6 +200,7 @@ async fn cursor_delta_and_churn_stay_bounded_on_a_real_do() {
                 } else {
                     SessionStatus::Idle
                 },
+                compacting: false,
                 started_at: Some(ts(i)),
                 updated_at: ts(i + 1),
             })

@@ -1,6 +1,5 @@
 //! Claude Code harness: spawns the installed `claude` CLI and speaks its
-//! stream-json protocol directly (spec: docs/research/harness.md; behavior
-//! ported from jolt's `packages/harness/src/claude.ts`).
+//! stream-json protocol directly (see docs/harnesses.md).
 //!
 //! - stdout JSONL frames are normalized into [`AgentEvent`]s (init dedupe,
 //!   subagent filtering, typed tool decoding, error-code mapping).
@@ -34,6 +33,7 @@ use jolt_proto::{
     ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
+use crate::environment::HarnessEnvironment;
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
@@ -96,6 +96,7 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
 /// it at a fake CLI with [`ClaudeHarness::with_executable`].
 pub struct ClaudeHarness {
     executable: Option<PathBuf>,
+    environment: HarnessEnvironment,
     /// Grace between the interrupt control request and SIGTERM.
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
@@ -106,6 +107,7 @@ impl Default for ClaudeHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            environment: HarnessEnvironment::default(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
         }
@@ -120,6 +122,12 @@ impl ClaudeHarness {
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+
+    /// Inject environment variables resolved by the host engine.
+    pub fn with_environment(mut self, environment: HarnessEnvironment) -> Self {
+        self.environment = environment;
         self
     }
 
@@ -145,9 +153,15 @@ impl ClaudeHarness {
         })
     }
 
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+    fn build_command(
+        &self,
+        exe: &PathBuf,
+        request: &RunRequest,
+        environment: &[(String, String)],
+    ) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
+        crate::environment::apply(&mut cmd, environment);
         cmd.args([
             "--print",
             "--input-format",
@@ -250,8 +264,10 @@ impl Harness for ClaudeHarness {
     }
     async fn commands(&self, context: CommandContext) -> Result<Vec<AgentCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
+        let environment = self.environment.resolve(HarnessId::ClaudeCode).await?;
         let mut cmd = Command::new(&exe);
         crate::compose_child_path(&mut cmd, &exe);
+        crate::environment::apply(&mut cmd, &environment);
         cmd.args([
             "--print",
             "--input-format",
@@ -318,7 +334,8 @@ impl Harness for ClaudeHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut cmd = self.build_command(&exe, &request);
+        let environment = self.environment.resolve(HarnessId::ClaudeCode).await?;
+        let mut cmd = self.build_command(&exe, &request, &environment);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -354,8 +371,8 @@ impl Harness for ClaudeHarness {
         // mode). Ultrathink rides every user message — steers included.
         // Staged image attachments are inlined as base64 image content blocks
         // ahead of the text (verified against the real CLI); their path refs
-        // also ride the prompt text, so a skipped/unreadable file degrades to
-        // the old-app behavior (the agent opens the path with its Read tool).
+        // also ride the prompt text, so for a skipped or unreadable inline file
+        // the agent can still open the path with its Read tool.
         let images = load_image_blocks(&request.attachments).await;
         let first = wire::user_message_line_with_images(
             &apply_ultrathink(request.reasoning, &request.prompt),
@@ -371,6 +388,16 @@ impl Harness for ClaudeHarness {
             event_tx,
             controls,
             reasoning: request.reasoning,
+            context_window: if request
+                .model_options
+                .get("contextWindow")
+                .and_then(Value::as_str)
+                == Some("1m")
+            {
+                1_000_000
+            } else {
+                200_000
+            },
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
@@ -494,6 +521,7 @@ struct Session {
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     reasoning: Option<ReasoningLevel>,
+    context_window: u64,
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
@@ -510,6 +538,7 @@ async fn run_session(session: Session) {
         event_tx,
         controls,
         reasoning,
+        context_window,
         interrupt_grace,
         kill_grace,
         stderr_tail,
@@ -522,7 +551,7 @@ async fn run_session(session: Session) {
     } = controls;
     let request_input = Arc::new(request_input);
 
-    let mut norm = Normalizer::new();
+    let mut norm = Normalizer::with_context_window(context_window);
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -588,7 +617,7 @@ async fn run_session(session: Session) {
                 }
                 None => {
                     // Mailbox closed: end the input so the run can finish
-                    // after the current turn (mirrors claude.ts steeredInput).
+                    // after the current turn.
                     steering_open = false;
                     let _ = stdin_tx.send(StdinMsg::Close);
                 }

@@ -1,5 +1,4 @@
-//! Auth — the engine owns the WorkOS session for its device (feature-inventory §3.7,
-//! ARCHITECTURE §5). Port of jolt's `apps/backend/src/auth.ts`.
+//! Auth — the engine owns the WorkOS session for its device (docs/security.md).
 //!
 //! The engine is a public client: it builds the AuthKit authorize URL itself but
 //! delegates the secret-bearing **code exchange** and **refresh** to the edge Worker
@@ -41,7 +40,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 // ---------------------------------------------------------------------------
-// Wire types (feature-inventory §2 AuthRpc)
+// Auth RPC wire types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,7 +133,7 @@ pub struct AuthConfig {
     pub workos_client_id: Option<String>,
     /// WorkOS API base (authorize URL host).
     pub workos_api_base: String,
-    /// Dev-mode bearer/user id (mirrors the old `JOLT_EDGE_TOKEN` behavior).
+    /// Dev-mode bearer/user id.
     pub dev_user_id: String,
     /// Loopback callback port; `None` = ephemeral.
     pub callback_port: Option<u16>,
@@ -413,7 +412,7 @@ impl Auth {
     /// loopback callback server (bound lazily on an ephemeral port).
     pub async fn start_sign_in(&self) -> Result<String, EngineError> {
         if self.inner.workos.is_none() {
-            return Ok(String::new()); // dev mode: nothing to do (TS parity)
+            return Ok(String::new()); // dev mode: nothing to do
         }
         let port = self.ensure_loopback().await?;
         Ok(self.begin_sign_in(&format!("http://127.0.0.1:{port}/callback")))

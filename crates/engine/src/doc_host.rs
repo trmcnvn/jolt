@@ -1,8 +1,7 @@
 //! DocHost — per-chat `SessionDoc` handles: snapshot persistence (debounced), edge room
 //! sync (offline-tolerant), and the HOST-ONLY durable command executor.
 //!
-//! Pragmatic port of jolt's `session-docs.ts` + the `main.ts` executor (spec:
-//! feature-inventory §3.3, ARCHITECTURE §2 "command plane"):
+//! See docs/architecture.md and docs/sync.md:
 //! - the doc IS the outbox: commands and user entries commit locally and sync whenever a
 //!   room connection exists; the engine is fully functional with sync disabled;
 //! - on every doc change (local commit or remote import) the handle re-emits the joined
@@ -11,7 +10,7 @@
 //!   ledger), mark processed BEFORE execute, execute through the sessions engine, then
 //!   write the outcome status back into the doc as the sole outcome writer.
 //!
-//! Chat ownership is gated on the workspace doc (`chats[chat_id].deviceId`), with
+//! Chat ownership is gated on the workspace registry (`chats[chat_id].deviceId`), with
 //! claim-on-first-command for unknown chats. Queueing a command for a chat hosted on
 //! another device POSTs a durable nudge to that device's room (§7 cold-chat delivery);
 //! the host's relay receives it and warm-opens the doc, which drains the queue.
@@ -978,11 +977,11 @@ impl DocHost {
                     SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
                     SteerOutcome::NotSteerable => {
                         // No live steerable run: the durable command still delivers —
-                        // run it as the next turn (jolt's fallback, executor-side).
+                        // run it as the next turn.
                         // After an engine restart `last_request` is empty too, so
                         // rebuild the run config from the chat's workspace row
                         // (jolt derived dispatch config from the chat row the
-                        // same way — sessions.ts:601-620); dispatch's engine-owned
+                        // same way); dispatch's engine-owned
                         // resume then reattaches the prior harness conversation.
                         let request = sessions
                             .last_request(chat_id)

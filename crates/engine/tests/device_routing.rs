@@ -249,6 +249,27 @@ async fn target_device_id_routes_over_the_relay() {
     };
     assert!(remote.is_array());
 
+    // Secret values are local-IPC only. Even a peer that bypasses the normal
+    // forwardable-method list and calls B's relay client directly cannot reach
+    // the secure-storage RPC surface.
+    let remote_client = core_a
+        .dial_device("device-b")
+        .await
+        .expect("direct peer client");
+    let secret_error = remote_client
+        .call(
+            methods::UPSERT_HARNESS_SECRET,
+            serde_json::json!({
+                "label": "must-not-arrive",
+                "environmentVariable": "NOPE",
+                "harnesses": ["pi"],
+                "value": "must-not-arrive",
+            }),
+        )
+        .await
+        .expect_err("relay must reject local-only secret methods");
+    assert!(secret_error.to_string().contains("unknown method"));
+
     // The add-space picker's exact call: browse a folder ON B from A's IPC
     // surface (ListFolders + targetDeviceId, relay-forwarded).
     let browse_dir = dirs.path().join("b-folders");

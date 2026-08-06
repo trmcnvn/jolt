@@ -1,8 +1,6 @@
 /**
- * Vendored from jolt's `@jolt/control` (packages/control/src/wire.ts +
- * parts.ts): the plain-type equivalents of the effect/Schema wire types that
- * the session-doc modules reference. Type-only — no runtime behavior — so the
- * edge package stays dependency-light (no effect).
+ * Plain control-plane types referenced by the session-document modules.
+ * Type-only — no runtime behavior — so the edge package stays dependency-light.
  */
 
 export type ToolCall =
@@ -43,7 +41,7 @@ export interface UserInputQuestion {
     readonly multiSelect?: boolean;
 }
 
-/** Message parts — the structured view of an assistant turn (parts.ts). */
+/** Message parts — the structured view of an assistant turn. */
 export type MessagePart =
     | {
         readonly kind: "text";

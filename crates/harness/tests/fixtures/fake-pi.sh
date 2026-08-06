@@ -78,6 +78,8 @@ while IFS= read -r line; do
           has "$line" '"images":[{"data":' || { fail "$line" prompt "missing image"; continue; }
           respond "$line" prompt '{}'
           emit '{"type":"agent_start"}'
+          emit '{"type":"compaction_start","reason":"threshold"}'
+          emit '{"type":"compaction_end","reason":"threshold","result":{"summary":"shorter"},"aborted":false,"willRetry":false}'
           emit '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"considering"}}'
           emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Hello from Pi"}}'
           emit '{"type":"tool_execution_start","toolCallId":"b1","toolName":"bash","args":{"command":"cargo test"}}'
@@ -111,6 +113,13 @@ while IFS= read -r line; do
           respond "$line" prompt '{}'
           emit '{"type":"agent_start"}'
           emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"working"}}'
+          ;;
+        *scenario:environment*)
+          [ "$JOLT_TEST_SECRET" = available ] || { fail "$line" prompt 'missing secret environment'; continue; }
+          respond "$line" prompt '{}'
+          emit '{"type":"agent_start"}'
+          emit '{"type":"agent_end","messages":[]}'
+          emit '{"type":"agent_settled"}'
           ;;
         *scenario:args*)
           for wanted in '--session-id resume-123' '--approve' '--tools read,grep,find,ls'; do

@@ -1,7 +1,7 @@
 //! EngineRpc — the engine-side `RpcService`: sessions + docs + the workspace-doc
 //! entity surface.
 //!
-//! Methods (feature-inventory §2):
+//! Methods:
 //! - `ListHarnesses` → `[HarnessDescriptor]`
 //! - `ListModels {harness}` → `[Model]`
 //! - `ListCommands {harness}` → Jolt's built-in `[AgentCommand]` catalog
@@ -18,26 +18,26 @@
 //! - AuthRpc: `AuthStatus` (stream), `SignIn`/`SignInHeadless` → `{url}`,
 //!   `CompleteSignIn {code}`, `SignOut`, `ListOrgs`, and automatic provisioning
 //!   of the user's sole hidden "Personal" organization
-//! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
+//! - Repos: `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
-//! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
+//! - Terminals: `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
 //!   real multi-account auth in M6.
-//! - Agent accounts (§3.7): `ListAgentAccounts {forceUsage?}` →
+//! - Agent accounts: `ListAgentAccounts {forceUsage?}` →
 //!   `AgentAccountsSnapshot`, `ActivateAgentAccount`/`ForgetAgentAccount`
 //!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →
 //!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
 //!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
-//! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
+//! - Uploads: `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
 //!   done}` (path-jailed to the uploads dir + workspace-known chat cwds).
 //!
-//! ## Device-addressed routing (`targetDeviceId`, feature-inventory §2.1)
+//! ## Device-addressed routing (`targetDeviceId`)
 //!
 //! ControlRpc methods are relay-forwardable: params may carry `targetDeviceId`. When it
 //! names another device, the call is forwarded verbatim over that device's relay DO via
@@ -71,6 +71,7 @@ use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
+use crate::secrets::HarnessSecrets;
 use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
@@ -122,6 +123,17 @@ fn jolt_commands() -> Vec<AgentCommand> {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageBreakdownParams {
+    #[serde(default = "default_breakdown_days")]
+    days: u16,
+}
+
+fn default_breakdown_days() -> u16 {
+    30
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,6 +258,8 @@ struct ResizeTerminalParams {
 struct ListAgentAccountsParams {
     #[serde(default)]
     force_usage: Option<bool>,
+    #[serde(default)]
+    usage_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +288,23 @@ struct CompleteAgentLoginParams {
     code: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpsertHarnessSecretParams {
+    #[serde(default)]
+    id: Option<String>,
+    label: String,
+    environment_variable: String,
+    harnesses: Vec<HarnessId>,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteHarnessSecretParams {
+    id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadChunkParams {
@@ -299,7 +330,7 @@ struct ReadAttachmentChunkParams {
     offset: u64,
 }
 
-/// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
+/// The workspace mutation surface, tagged by `op`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 enum MutateParams {
@@ -400,6 +431,7 @@ pub struct EngineRpc {
     spaces_sync: crate::SpacesSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
+    secrets: HarnessSecrets,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<jolt_update::Updater>,
@@ -418,6 +450,7 @@ impl EngineRpc {
         spaces_sync: crate::SpacesSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
+        secrets: HarnessSecrets,
     ) -> Self {
         Self {
             sessions,
@@ -430,6 +463,7 @@ impl EngineRpc {
             spaces_sync,
             uploads,
             agent_accounts,
+            secrets,
             auth: None,
             links: None,
             updater: None,
@@ -755,7 +789,34 @@ impl EngineRpc {
     }
 }
 
-/// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
+fn local_only(method: &str) -> bool {
+    matches!(
+        method,
+        methods::LIST_HARNESS_SECRETS
+            | methods::UPSERT_HARNESS_SECRET
+            | methods::DELETE_HARNESS_SECRET
+    )
+}
+
+struct RelayRpc {
+    inner: std::sync::Arc<EngineRpc>,
+}
+
+#[async_trait]
+impl RpcService for RelayRpc {
+    async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        if local_only(method) {
+            return Err(RpcError::UnknownMethod(method.to_owned()));
+        }
+        self.inner.handle(method, params).await
+    }
+}
+
+pub(crate) fn relay_service(inner: std::sync::Arc<EngineRpc>) -> std::sync::Arc<dyn RpcService> {
+    std::sync::Arc::new(RelayRpc { inner })
+}
+
+/// ControlRpc methods that honor `targetDeviceId`. Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
 fn forwardable(method: &str) -> bool {
@@ -767,6 +828,8 @@ fn forwardable(method: &str) -> bool {
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
             | methods::EXTRACT_QUESTIONS
+            | methods::WATCH_CHAT_USAGE
+            | methods::USAGE_BREAKDOWN
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -814,6 +877,7 @@ fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
         methods::WATCH_DOC_MESSAGES
+            | methods::WATCH_CHAT_USAGE
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::UPDATE_STATUS
@@ -1007,6 +1071,25 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(doc_messages_stream(
                     handle.watch_messages(),
                 )))
+            }
+            methods::WATCH_CHAT_USAGE => {
+                let p: ChatParams = parse_params(params)?;
+                let usage = self
+                    .sessions
+                    .watch_usage(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(format!("usage store: {error}")))?;
+                Ok(RpcReply::Stream(watch_stream(usage)))
+            }
+            methods::USAGE_BREAKDOWN => {
+                let p: UsageBreakdownParams = parse_params(params)?;
+                if !matches!(p.days, 7 | 30 | 90) {
+                    return Err(RpcError::BadParams("days must be 7, 30, or 90".into()));
+                }
+                let breakdown = self
+                    .sessions
+                    .usage_breakdown(p.days)
+                    .map_err(|error| RpcError::Failed(format!("usage store: {error}")))?;
+                RpcReply::value(&breakdown)
             }
             methods::EXTRACT_QUESTIONS => {
                 let p: ExtractQuestionsParams = parse_params(params)?;
@@ -1356,11 +1439,16 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_AGENT_ACCOUNTS => {
                 let p: ListAgentAccountsParams = parse_params(params)?;
-                let snapshot = self
-                    .agent_accounts
-                    .list(p.force_usage.unwrap_or(false))
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let snapshot = if p.usage_only {
+                    self.agent_accounts
+                        .usage_snapshot(p.force_usage.unwrap_or(false))
+                        .await
+                } else {
+                    self.agent_accounts
+                        .list(p.force_usage.unwrap_or(false))
+                        .await
+                }
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)
             }
             methods::ACTIVATE_AGENT_ACCOUNT => {
@@ -1412,6 +1500,31 @@ impl RpcService for EngineRpc {
                 let p: LoginIdParams = parse_params(params)?;
                 self.agent_accounts.cancel_login(&p.login_id);
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::LIST_HARNESS_SECRETS => RpcReply::value(&self.secrets.snapshot().await),
+            methods::UPSERT_HARNESS_SECRET => {
+                let p: UpsertHarnessSecretParams = parse_params(params)?;
+                let snapshot = self
+                    .secrets
+                    .upsert(
+                        p.id.as_deref(),
+                        &p.label,
+                        &p.environment_variable,
+                        p.harnesses,
+                        p.value.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
+            methods::DELETE_HARNESS_SECRET => {
+                let p: DeleteHarnessSecretParams = parse_params(params)?;
+                let snapshot = self
+                    .secrets
+                    .delete(&p.id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&snapshot)
             }
             methods::UPLOAD_CHUNK => {
                 let p: UploadChunkParams = parse_params(params)?;
@@ -1475,6 +1588,8 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::LIST_COMMANDS));
         assert!(forwardable(methods::SEARCH_FILES));
+        assert!(!forwardable(methods::UPSERT_HARNESS_SECRET));
+        assert!(local_only(methods::UPSERT_HARNESS_SECRET));
     }
 
     #[test]

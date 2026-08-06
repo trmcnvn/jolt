@@ -138,12 +138,27 @@ pub(crate) fn message_end_error(event: &Value) -> Option<String> {
         .or_else(|| Some("Pi assistant failed".into()))
 }
 
-pub(crate) fn usage(event: &Value) -> Option<AgentEvent> {
+pub(crate) fn usage(event: &Value, context_window: Option<u64>) -> Option<AgentEvent> {
     let usage = event.get("message")?.get("usage")?;
     let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or_default();
+    let input_tokens = number("input");
+    let cache_read_input_tokens = number("cacheRead");
+    let cache_write_input_tokens = number("cacheWrite");
     Some(AgentEvent::Usage {
-        input_tokens: number("input") + number("cacheRead") + number("cacheWrite"),
+        input_tokens,
         output_tokens: number("output"),
+        cache_read_input_tokens,
+        cache_write_input_tokens,
+        cost_usd: usage
+            .get("cost")
+            .and_then(|cost| cost.get("total"))
+            .and_then(Value::as_f64),
+        context_tokens: Some(
+            input_tokens
+                .saturating_add(cache_read_input_tokens)
+                .saturating_add(cache_write_input_tokens),
+        ),
+        context_window,
     })
 }
 
@@ -189,12 +204,21 @@ mod tests {
             Some(AgentEvent::ReasoningDelta { text: "hmm".into() })
         );
         assert_eq!(
-            usage(&json!({"message": {"usage": {
-                "input": 3, "output": 4, "cacheRead": 5, "cacheWrite": 6
-            }}})),
+            usage(
+                &json!({"message": {"usage": {
+                    "input": 3, "output": 4, "cacheRead": 5, "cacheWrite": 6,
+                    "cost": {"total": 0.25}
+                }}}),
+                Some(200_000)
+            ),
             Some(AgentEvent::Usage {
-                input_tokens: 14,
-                output_tokens: 4
+                input_tokens: 3,
+                output_tokens: 4,
+                cache_read_input_tokens: 5,
+                cache_write_input_tokens: 6,
+                cost_usd: Some(0.25),
+                context_tokens: Some(14),
+                context_window: Some(200_000),
             })
         );
         assert_eq!(

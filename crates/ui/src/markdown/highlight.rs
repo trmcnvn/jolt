@@ -4,7 +4,7 @@
 //! carry state for constructs that span lines (block comments, multi-line
 //! strings). Results become `TextRun` colors on the same mono font, so layout is
 //! identical whether or not highlighting has landed — "highlight is pure paint"
-//! (docs/research/mugen-pretext.md §2d).
+//! (docs/using-jolt.md).
 //!
 //! Tokenization runs off the render path (background executor, time-sliced by
 //! the caller); this module is pure and synchronous.
