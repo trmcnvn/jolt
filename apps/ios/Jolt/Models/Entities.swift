@@ -138,11 +138,11 @@ func sortActive(_ chats: [Chat]) -> [Chat] {
 
 // MARK: - Session doc entries
 
-enum MessageRole: String {
+enum MessageRole: String, Codable {
     case user, assistant, system
 }
 
-enum MessageStatus: String {
+enum MessageStatus: String, Codable {
     case streaming, complete, aborted
 }
 

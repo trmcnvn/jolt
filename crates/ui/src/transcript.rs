@@ -23,7 +23,7 @@
 //! inside the 70px band; own-send re-engages with the same glide.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -54,7 +54,9 @@ use crate::theme::Theme;
 /// Re-engage the bottom pin when the user returns within this many px of the end.
 pub const STICK_THRESHOLD_PX: f32 = 70.0;
 /// List overdraw beyond the viewport.
-pub const OVERDRAW_PX: f32 = 320.0;
+/// Two typical viewports of leading overdraw hide historical page fetches
+/// during ordinary scrolling; fast flings still clamp at the cold boundary.
+pub const OVERDRAW_PX: f32 = 1_200.0;
 /// Show the scroll-to-bottom button beyond this distance from the end.
 pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
 /// Vertical gap opening a new turn (new message entry).
@@ -236,6 +238,15 @@ pub enum RowKind {
     },
     ErrorChip {
         message: SharedString,
+    },
+    /// Estimated-height stand-in for a cold transcript page. Rendering it
+    /// starts the fetch; retaining its height makes the scrollbar represent
+    /// the entire conversation before message bodies are decoded.
+    HistoryPlaceholder {
+        page_id: SharedString,
+        estimated_height: f32,
+        loading: bool,
+        failed: bool,
     },
 }
 
@@ -1473,6 +1484,28 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
+                let top = this.list.logical_scroll_top().item_ix;
+                if let Some(Row {
+                    kind: RowKind::HistoryPlaceholder { page_id, .. },
+                    ..
+                }) = this.rows.get(top)
+                {
+                    let page_id = page_id.to_string();
+                    // Clamp to the loaded side of the cold boundary. This
+                    // programmatic reposition discards the current wheel/touch
+                    // momentum; loading never resumes motion without new input.
+                    this.list.scroll_to(gpui::ListOffset {
+                        item_ix: (top + 1).min(this.rows.len()),
+                        offset_in_item: px(0.0),
+                    });
+                    this.pinned = false;
+                    this.spring.reset();
+                    this.state.update(cx, |state, cx| {
+                        state.load_transcript_page(page_id, cx);
+                    });
+                    cx.notify();
+                    return;
+                }
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
@@ -1619,11 +1652,15 @@ impl Transcript {
 
     /// Rebuild rows from app state; splice minimal ranges into the list.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let (selected, entries, echoes) = {
+        let (selected, entries, manifest, pages, loading, errors, echoes) = {
             let s = self.state.read(cx);
             (
                 s.selected_chat.clone(),
                 s.transcript.clone(),
+                s.transcript_manifest.clone(),
+                s.transcript_pages.clone(),
+                s.transcript_loading_pages.clone(),
+                s.transcript_page_errors.clone(),
                 s.pending_echoes().to_vec(),
             )
         };
@@ -1649,12 +1686,55 @@ impl Transcript {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
-        for entry in &entries {
-            new_rows.extend(self.rows_for(entry, false));
+        if let Some(manifest) = &manifest {
+            for descriptor in &manifest.pages {
+                if let Some(page) = pages.iter().find(|page| page.id == descriptor.id) {
+                    for entry in &page.messages {
+                        new_rows.extend(self.rows_for(entry, false));
+                    }
+                } else {
+                    let estimated_height = (descriptor.message_count as f32 * 92.0
+                        + descriptor.estimated_bytes as f32 * 0.18)
+                        .clamp(320.0, 48_000.0);
+                    new_rows.push(Row {
+                        id: SharedString::from(format!("history-page:{}", descriptor.id)),
+                        version: fnv1a(descriptor.revision.as_bytes()),
+                        turn_start: true,
+                        kind: RowKind::HistoryPlaceholder {
+                            page_id: descriptor.id.clone().into(),
+                            estimated_height,
+                            loading: loading.contains(&descriptor.id),
+                            failed: errors.contains(&descriptor.id),
+                        },
+                        entry_id: SharedString::from(format!("history-page:{}", descriptor.id)),
+                        timestamp: None,
+                    });
+                }
+            }
+        } else {
+            for entry in &entries {
+                new_rows.extend(self.rows_for(entry, false));
+            }
         }
         for echo in &echoes {
             new_rows.extend(self.rows_for(echo, true));
         }
+
+        // Loaded-page eviction must release completed markdown trees too; a
+        // virtual list bounds mounted views, not these derived caches.
+        let loaded_entry_ids: HashSet<&str> = pages
+            .iter()
+            .flat_map(|page| page.messages.iter().map(|entry| entry.id.as_str()))
+            .chain(entries.iter().map(|entry| entry.id.as_str()))
+            .chain(echoes.iter().map(|entry| entry.id.as_str()))
+            .collect();
+        self.row_cache
+            .retain(|entry_id, _| loaded_entry_ids.contains(entry_id.as_str()));
+        self.tree_cache.retain(|part_key, _| {
+            part_key
+                .split_once('#')
+                .is_some_and(|(entry_id, _)| loaded_entry_ids.contains(entry_id))
+        });
 
         // Text already streamed before this (re)attach is the veil BASELINE:
         // its rows' veils seed instead of fading (render creates them from
@@ -2127,6 +2207,52 @@ impl Transcript {
                 input_chip(header.clone(), *resolved, &theme)
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::HistoryPlaceholder {
+                page_id,
+                estimated_height,
+                loading,
+                failed,
+            } => {
+                let page_id = page_id.to_string();
+                if !loading && !failed {
+                    let state = self.state.clone();
+                    let requested = page_id.clone();
+                    cx.defer(move |cx| {
+                        state.update(cx, |state, cx| {
+                            state.load_transcript_page(requested, cx);
+                        });
+                    });
+                }
+                let label = if *failed {
+                    "Couldn’t load these messages · Retry"
+                } else {
+                    "Loading earlier messages…"
+                };
+                let state = self.state.clone();
+                let placeholder = div()
+                    .h(px(*estimated_height))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(label);
+                if *failed {
+                    placeholder
+                        .id(SharedString::from(format!("retry-history:{page_id}")))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            let requested = page_id.clone();
+                            state.update(cx, |state, cx| {
+                                state.load_transcript_page(requested, cx);
+                            });
+                        })
+                        .into_any_element()
+                } else {
+                    placeholder.into_any_element()
+                }
+            }
         };
 
         // Hover-revealed timestamp strip: a reserved 16px lane under the
@@ -2706,6 +2832,7 @@ impl Render for Transcript {
             });
         }
         let rail = self.render_rail(cx);
+        let history_loading = !self.state.read(cx).transcript_loading_pages.is_empty();
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
@@ -2723,7 +2850,28 @@ impl Render for Transcript {
                     .size_full()
                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
             )
-            .child(rail);
+            .child(rail)
+            .when(history_loading, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(12.0))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .rounded(px(999.0))
+                                .bg(Theme::of(cx).surface_raised)
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .text_size(px(11.0))
+                                .text_color(Theme::of(cx).text_muted)
+                                .child("Loading messages…"),
+                        ),
+                )
+            });
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {

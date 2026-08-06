@@ -26,7 +26,7 @@
  * (which only exists while traffic keeps the DO awake anyway); scheduled work
  * (checkpoints, history trim, R2 backup §3.3) rides the durable alarm.
  */
-import { LoroDoc, EphemeralStore, VersionVector } from "loro-crdt";
+import { LoroDoc, EphemeralStore, LoroMap, VersionVector } from "loro-crdt";
 import {
   CrdtType,
   JoinErrorCode,
@@ -46,7 +46,13 @@ import {
   COMPACT_LOG_ROWS,
   DO_FLUSH_MS,
   RETAIN_DAYS,
-  materializeTail
+  materializeTail,
+  projectTranscript,
+  readMessageEntries,
+  readMessageEntryRange,
+  refreshTranscriptLivePage,
+  transcriptBootstrap,
+  type TranscriptProjection
 } from "./session-doc";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { appendUpdateRow, ensureUpdateLog, readUpdateRows } from "./update-log";
@@ -122,6 +128,7 @@ const isWasmUseAfterFree = (e: unknown): boolean =>
 
 interface SocketState {
   userId: string;
+  kind?: "transcript";
   /** Joined sub-rooms by crdt magic ("%LOR", "%EPH"). */
   rooms: string[];
   /** True for sockets on a workspace-doc room — org membership was enforced
@@ -131,6 +138,43 @@ interface SocketState {
    * log attribution; never used for authz. */
   deviceId?: string;
 }
+
+interface SubmittedCommand {
+  readonly id: string;
+  readonly kind: string;
+  readonly payload: unknown;
+  readonly issuedBy: string;
+  readonly issuedAt: number;
+  readonly expiresAt: number;
+  readonly basedOn?: unknown;
+}
+
+const commandExists = (input: unknown, commandId: string): boolean => {
+  if (typeof input !== "object" || input === null || !("commands" in input)) return false;
+  if (!Array.isArray(input.commands)) return false;
+  return input.commands.some((entry: unknown) =>
+    typeof entry === "object" && entry !== null && "id" in entry && entry.id === commandId
+  );
+};
+
+const parseSubmittedCommand = (input: unknown): SubmittedCommand | undefined => {
+  if (typeof input !== "object" || input === null) return undefined;
+  if (!("id" in input) || typeof input.id !== "string" || input.id.length === 0) return undefined;
+  if (!("kind" in input) || typeof input.kind !== "string" || input.kind.length === 0) return undefined;
+  if (!("payload" in input)) return undefined;
+  if (!("issuedBy" in input) || typeof input.issuedBy !== "string" || input.issuedBy.length === 0) return undefined;
+  if (!("issuedAt" in input) || typeof input.issuedAt !== "number" || !Number.isFinite(input.issuedAt)) return undefined;
+  if (!("expiresAt" in input) || typeof input.expiresAt !== "number" || !Number.isFinite(input.expiresAt)) return undefined;
+  return {
+    id: input.id,
+    kind: input.kind,
+    payload: input.payload,
+    issuedBy: input.issuedBy,
+    issuedAt: input.issuedAt,
+    expiresAt: input.expiresAt,
+    ...("basedOn" in input ? { basedOn: input.basedOn } : {})
+  };
+};
 
 interface FragmentBatch {
   parts: Uint8Array[];
@@ -154,6 +198,8 @@ export class SessionRoom implements DurableObject {
   private pending: Uint8Array[] = [];
   private pendingBytes = 0;
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
+  private transcriptSequence = 0;
+  private lastTranscriptProjection: TranscriptProjection | undefined;
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
@@ -259,6 +305,26 @@ export class SessionRoom implements DurableObject {
     }
 
     const owner = this.getMeta("owner");
+    if (url.pathname === "/transcript/ws") {
+      if (!workspace) {
+        if (!owner) return json({ error: "not_found" }, 404);
+        if (owner !== userId) return json({ error: "forbidden" }, 403);
+      }
+      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+        return json({ error: "expected_websocket" }, 426);
+      }
+      const pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1]);
+      pair[1].serializeAttachment({ userId, rooms: [], kind: "transcript" } satisfies SocketState);
+      const projection = await this.currentTranscriptProjection();
+      this.lastTranscriptProjection = projection;
+      const bootstrap = {
+        ...transcriptBootstrap(projection),
+        sequence: this.transcriptSequence
+      };
+      pair[1].send(JSON.stringify({ type: "bootstrap", bootstrap }));
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
     if (url.pathname === "/stats" && request.method === "GET") {
       // Observability: what this room holds and who's on it. Owner-gated like
       // every other read (org-membership-gated for workspace rooms).
@@ -316,6 +382,73 @@ export class SessionRoom implements DurableObject {
         console.error("tail materialization failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
         this.escalateWasmPoisoning(e);
         return json({ error: "tail_failed", message: String(e) }, 500);
+      }
+    }
+    if (url.pathname === "/transcript" && request.method === "GET") {
+      if (!workspace) {
+        if (!owner) return json({ error: "not_found" }, 404);
+        if (owner !== userId) return json({ error: "forbidden" }, 403);
+      }
+      try {
+        return json(transcriptBootstrap(await this.currentTranscriptProjection()));
+      } catch (e) {
+        console.error("transcript bootstrap failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+        this.escalateWasmPoisoning(e);
+        return json({ error: "transcript_failed", message: String(e) }, 500);
+      }
+    }
+    if (url.pathname === "/transcript/page" && request.method === "GET") {
+      if (!workspace) {
+        if (!owner) return json({ error: "not_found" }, 404);
+        if (owner !== userId) return json({ error: "forbidden" }, 403);
+      }
+      const pageId = url.searchParams.get("id");
+      if (!pageId) return json({ error: "missing_page_id" }, 400);
+      try {
+        const projection = await this.currentTranscriptProjection();
+        const page = projection.pages.find((candidate) => candidate.id === pageId);
+        return page ? json(page) : json({ error: "page_not_found" }, 404);
+      } catch (e) {
+        console.error("transcript page failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+        this.escalateWasmPoisoning(e);
+        return json({ error: "transcript_failed", message: String(e) }, 500);
+      }
+    }
+    if (url.pathname === "/command" && request.method === "POST") {
+      if (workspace) return json({ error: "unsupported" }, 400);
+      if (!owner) {
+        this.setMeta("owner", userId);
+        const chatId = url.searchParams.get("chatId") ?? "";
+        if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
+      } else if (owner !== userId) {
+        return json({ error: "forbidden" }, 403);
+      }
+      const command = parseSubmittedCommand(await request.json());
+      if (!command) return json({ error: "invalid_command" }, 400);
+      const doc = await this.ensureDoc();
+      if (commandExists(doc.toJSON(), command.id)) {
+        return json({ ok: true, commandId: command.id, duplicate: true });
+      }
+      const from = doc.version();
+      try {
+        const commands = doc.getList("commands");
+        const map = commands.insertContainer(commands.length, new LoroMap());
+        map.set("id", command.id);
+        map.set("kind", command.kind);
+        map.set("payload", command.payload);
+        map.set("issuedBy", command.issuedBy);
+        map.set("issuedAt", command.issuedAt);
+        map.set("expiresAt", command.expiresAt);
+        map.set("status", "pending");
+        if (command.basedOn !== undefined) map.set("basedOn", command.basedOn);
+        doc.commit();
+        const update = doc.export({ mode: "update", from });
+        this.recordLoroUpdates([update]);
+        this.relayServerUpdate(CrdtType.Loro, this.getMeta("chatId") ?? "", [update]);
+        await this.flush();
+        return json({ ok: true, commandId: command.id, duplicate: false });
+      } finally {
+        from.free();
       }
     }
     if (url.pathname === "/diff" && request.method === "GET") {
@@ -420,6 +553,8 @@ export class SessionRoom implements DurableObject {
       ws.close(4411, "session retired");
       return;
     }
+    const socketState = ws.deserializeAttachment() as SocketState | null;
+    if (socketState?.kind === "transcript") return;
     if (typeof message === "string") return; // ping/pong handled by auto-response
     let decoded: ProtocolMessage;
     try {
@@ -799,6 +934,7 @@ export class SessionRoom implements DurableObject {
     // disaster backup to an empty-doc overwrite (round-2 review finding).
     if (!real) return;
     this.setMeta("tailDirty", "1");
+    this.setMeta("transcriptDirty", "1");
     this.setMeta("backupDirty", "1");
     // Real state landed — the backup may advance past a wedge-break drop
     // (the monotonic VV gate in alarm() still has the final say).
@@ -1064,10 +1200,12 @@ export class SessionRoom implements DurableObject {
     if (this.getMeta("retired") === "1" || this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
-      this.flush().catch((e) => {
-        console.error("debounced flush failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
-        this.escalateWasmPoisoning(e);
-      });
+      this.flush()
+        .then(() => this.broadcastTranscript())
+        .catch((e) => {
+          console.error("debounced flush failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+          this.escalateWasmPoisoning(e);
+        });
     }, DO_FLUSH_MS);
   }
 
@@ -1327,6 +1465,62 @@ export class SessionRoom implements DurableObject {
     });
   }
 
+  private async broadcastTranscript(): Promise<void> {
+    const sockets = this.ctx.getWebSockets().filter((ws) => {
+      const state = ws.deserializeAttachment() as SocketState | null;
+      return state?.kind === "transcript";
+    });
+    if (sockets.length === 0) return;
+    const projection = await this.currentTranscriptProjection();
+    const previous = this.lastTranscriptProjection;
+    this.lastTranscriptProjection = projection;
+    const livePage = projection.pages.at(-1);
+    const previousLive = previous?.pages.at(-1);
+    if (
+      previous?.manifest.catalogRevision === projection.manifest.catalogRevision &&
+      previousLive?.revision === livePage?.revision
+    ) return;
+    this.transcriptSequence += 1;
+    const payload = previous?.manifest.catalogRevision === projection.manifest.catalogRevision && livePage
+      ? JSON.stringify({ type: "page", sequence: this.transcriptSequence, page: livePage })
+      : JSON.stringify({
+          type: "bootstrap",
+          bootstrap: { ...transcriptBootstrap(projection), sequence: this.transcriptSequence }
+        });
+    for (const socket of sockets) {
+      try {
+        socket.send(payload);
+      } catch {
+        try { socket.close(1011, "transcript delivery failed"); } catch { /* already gone */ }
+      }
+    }
+  }
+
+  private async currentTranscriptProjection(): Promise<TranscriptProjection> {
+    await this.flush();
+    if (this.getMeta("transcriptDirty") !== "1") {
+      const cached = getJsonBlob<TranscriptProjection>(this.blobs, "transcript-v2");
+      if (cached !== undefined) return cached;
+    }
+    const doc = await this.ensureDoc();
+    const cached = getJsonBlob<TranscriptProjection>(this.blobs, "transcript-v2");
+    const physicalCount = doc.getList("messages").length;
+    const liveDescriptor = cached?.manifest.pages.at(-1);
+    const projection = cached && liveDescriptor && physicalCount === cached.manifest.totalMessages
+      ? refreshTranscriptLivePage(
+          cached,
+          readMessageEntryRange(
+            doc,
+            liveDescriptor.firstOrdinal,
+            liveDescriptor.firstOrdinal + liveDescriptor.messageCount
+          )
+        )
+      : projectTranscript(readMessageEntries(doc));
+    putJsonBlob(this.blobs, "transcript-v2", projection);
+    this.setMeta("transcriptDirty", "0");
+    return projection;
+  }
+
   private async currentTail(): Promise<unknown> {
     await this.flush();
     if (this.getMeta("tailDirty") !== "1") {
@@ -1421,6 +1615,16 @@ export class SessionRoom implements DurableObject {
    * full workspace history after a server reset) blew the loro-protocol
    * message cap and NEVER reached peers live; they only converged via a
    * later rejoin backfill (2026-08-04, the last silent-staleness path). */
+  private relayServerUpdate(crdt: CrdtType, roomId: string, updates: Uint8Array[]): void {
+    for (const ws of this.ctx.getWebSockets()) {
+      const state = ws.deserializeAttachment() as SocketState | null;
+      if (!state?.rooms.includes(crdt)) continue;
+      if (!this.sendUpdates(ws, crdt, roomId, updates)) {
+        try { ws.close(1011, "broadcast delivery failed"); } catch { /* already gone */ }
+      }
+    }
+  }
+
   private relay(from: WebSocket, crdt: CrdtType, roomId: string, updates: Uint8Array[]): void {
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === from) continue;

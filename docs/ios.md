@@ -1,6 +1,6 @@
 # Jolt for iOS
 
-The iOS app is a native SwiftUI viewport onto the same Jolt account. It syncs workspace rows and session documents directly with the edge and sends durable commands to the computer running each session's engine and agent CLI.
+The iOS app is a native SwiftUI viewport onto the same Jolt account. It syncs workspace rows and a tail-first transcript projection from the edge, then sends durable commands to the computer running each session's engine and agent CLI.
 
 ## Requirements and build
 
@@ -16,7 +16,7 @@ Or open `apps/ios/Jolt.xcodeproj` and run the shared `Jolt` scheme.
 
 Swift Package Manager resolves:
 
-- `loro-swift` 1.13.x for session documents;
+- `loro-swift` 1.13.x for compatibility fixtures and document tooling;
 - `swift-markdown` for GFM-compatible transcript rendering.
 
 ## Sign in
@@ -54,7 +54,7 @@ The app shows device online state and warns when a run is queued for an offline 
 | Harness/model popover | Model and effort sheets |
 | Global New Session canvas + space picker | Global New Session route + searchable space sheet |
 | Add-space palette | Device tabs and remote folder browser |
-| gpui virtual list | SwiftUI `LazyVStack` with stable row IDs |
+| gpui virtual list | SwiftUI `LazyVStack` with stable row IDs and estimated unloaded-page placeholders |
 | Hover actions | Context menus |
 
 Engine and desktop devices provide terminals, working-copy diffs, agent account switching, harness secrets, and desktop settings.
@@ -64,12 +64,12 @@ Engine and desktop devices provide terminals, working-copy diffs, agent account 
 The phone uses three paths:
 
 1. **Workspace registry:** JSON WebSocket protocol to the per-user `reg1` registry room for devices, spaces, chats, and session status.
-2. **Session documents:** Loro protocol 0.3 to each chat room for transcript projection and command appends.
+2. **Transcript projection:** an edge WebSocket opens with a compact whole-session manifest and trailing pages; older byte-bounded pages load over authenticated HTTP as scrolling reaches them.
 3. **Device relay:** binary device-room frames carrying RPC when folder browsing, file-mention search, model/ref discovery, worktree creation, or host file upload requires a live engine.
 
-Run, steer, interrupt, and input-answer operations are appended to the session's durable command ledger. The phone then posts a device nudge so a cold host opens the document. If the host is offline, the command remains queued.
+Run, steer, interrupt, and input-answer operations are written to a device-local durable outbox, submitted idempotently to the edge, and appended there to the canonical Loro command ledger. The phone then posts a device nudge so a cold host opens the document. If either network or host is offline, the command remains queued.
 
-Workspace registry and Loro snapshots are cached on disk for fast reopen. Signing out clears identity-scoped document caches. WorkOS tokens remain in Keychain.
+Workspace registry, transcript manifests/pages, and pending commands are cached on disk for instant reopen and offline history. Transcript page files use a byte-budgeted LRU. Signing out clears identity-scoped caches. WorkOS tokens remain in Keychain.
 
 ## Demo and test modes
 
@@ -88,7 +88,7 @@ The project also includes benchmark and edge/relay E2E runners behind launch arg
 
 - App state and authentication: `apps/ios/Jolt/App/`, `apps/ios/Jolt/Auth/`
 - Workspace registry: `apps/ios/Jolt/Sync/Registry*.swift`
-- Session sync: `apps/ios/Jolt/Sync/RoomClient.swift`, `SessionStore.swift`
+- Session sync: `apps/ios/Jolt/Sync/TranscriptProjectionClient.swift`, `SessionStore.swift`
 - Relay RPC: `apps/ios/Jolt/Sync/DeviceRelayClient.swift`
 - Composer and attachments: `apps/ios/Jolt/Composer/`
 - Transcript and Markdown: `apps/ios/Jolt/Transcript/`, `apps/ios/Jolt/Markdown/`

@@ -179,6 +179,24 @@ export default {
     if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/tail", "");
     }
+    if (parts[0] === "transcript" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
+      const path = parts[2] === "page"
+        ? "/transcript/page"
+        : parts[2] === "ws"
+          ? "/transcript/ws"
+          : "/transcript";
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, path);
+    }
+    if (parts[0] === "command" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
+      return forward(
+        env.SESSION_ROOMS,
+        `s2/${parts[1]}`,
+        request,
+        auth.userId,
+        "/command",
+        `?chatId=${parts[1]}`
+      );
+    }
     if (parts[0] === "stats" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/stats", "");
     }

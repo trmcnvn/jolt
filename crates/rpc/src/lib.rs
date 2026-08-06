@@ -38,6 +38,11 @@ pub mod methods {
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    /// Tail-first transcript stream: compact manifest + trailing pages, then
+    /// sequenced live-page deltas.
+    pub const WATCH_TRANSCRIPT_V2: &str = "WatchTranscriptV2";
+    /// Fetch one historical transcript page by its opaque catalog id.
+    pub const GET_TRANSCRIPT_PAGE: &str = "GetTranscriptPage";
     /// Extract prose questions from one completed assistant message.
     pub const EXTRACT_QUESTIONS: &str = "ExtractQuestions";
     /// Nudge every open room client to verify liveness NOW (window focus,

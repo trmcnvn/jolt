@@ -104,25 +104,25 @@ The per-chat Durable Object keeps:
 
 - a current Loro snapshot;
 - a buffered update log;
-- a last-64-message tail projection;
+- a compact transcript catalog, byte-bounded historical pages, and a mutable tail projection;
 - the latest working-copy diff sidecar;
 - ephemeral presence;
 - daily R2 backups.
 
 Dirty update rows flush on a short cadence. Logical updates larger than Durable Object SQLite's row limit are split across continuation rows and reassembled before replay. When the update log reaches the configured threshold, the room folds it losslessly into the snapshot. Daily checkpoint-based trimming discards history beyond the three-day retention frontier while preserving current state. A joining client behind a shallow snapshot's retained frontier receives the full snapshot instead of an unusable partial diff.
 
-The host engine keeps local snapshots and an LRU of open documents. A viewport watch receives a full reset frame first, then entry upserts/text appends rather than a full transcript on each stream commit. Retiring a deleted chat closes its room, prevents stale clients from recreating backups, and removes `backup/<chatId>/latest.loro`.
+The host engine keeps local snapshots and an LRU of open documents. `WatchTranscriptV2` opens with compact whole-session metadata and enough trailing pages to cover at least 64 messages, then sends sequenced deltas only for the mutable live page. Historical pages are fetched by opaque ID and cached under a device byte budget. The older full-reset watch remains only for client compatibility. Retiring a deleted chat closes its room, prevents stale clients from recreating backups, and removes `backup/<chatId>/latest.loro`.
 
 ### Writer discipline
 
-- Any client may append only its own immutable command entries.
+- Authorized clients submit only their own immutable command entries; the edge validates and idempotently appends them to canonical Loro.
 - The chat host is the sole writer of transcript entries and command outcomes.
 - The issuing composer may cancel only its own still-pending command.
 - Full tool inputs remain in the host's local journal; only render-safe projections sync.
 
 ### Offline commands
 
-Commands default to a 24-hour expiry. The host evaluates processed-ID dedupe, expiry, and supersession before executing. Newer pending steer/interrupt entries supersede older entries of the same kind. Interrupts aimed at completed turns are also superseded.
+Commands default to a 24-hour expiry. Mobile and remote viewers persist commands in a device-local outbox before submission; an edge acknowledgement means the command is durable in canonical Loro, while the client-minted transcript message ID acknowledges execution. The host evaluates processed-ID dedupe, expiry, and supersession before executing. Newer pending steer/interrupt entries supersede older entries of the same kind. Interrupts aimed at completed turns are also superseded.
 
 The host stores command claims in SQLite before execution. This prioritizes at-most-once side effects after a crash; recovery marks interrupted run state and resumes from durable journal/doc information where supported.
 

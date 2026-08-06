@@ -77,7 +77,9 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | `ListModels` | unary | yes | Models from one installed harness |
 | `ListCommands` | unary | yes | Jolt composer commands for the target session context |
 | `QueueCommand` | unary | yes | Append a durable run/bash/steer/interrupt/respond-input command |
-| `WatchDocMessages` | stream | yes | Initial transcript reset, then entry/text deltas |
+| `WatchTranscriptV2` | stream | yes | Compact whole-session manifest + trailing pages, then sequenced live-page deltas |
+| `GetTranscriptPage` | unary | yes | Fetch one historical page by opaque page ID |
+| `WatchDocMessages` | stream | yes | Compatibility stream for older clients: initial full reset, then entry/text deltas |
 | `ExtractQuestions` | unary | yes | Extract answerable questions from one completed assistant message |
 | `WatchChatUsage` | stream | yes | Current chat usage from its host ledger |
 | `UsageBreakdown` | unary | yes | 7/30/90-day local usage summary |
@@ -191,7 +193,9 @@ A `RunRequest` carries prompt, concrete model/reasoning/options, cwd, sandbox, a
 
 A subscription receiver drop sends cancellation to the server. Bounded channels apply backpressure instead of allowing an unbounded slow-consumer queue.
 
-Watch streams generally emit the current value first. `WatchDocMessages` is specialized: it emits a reset and then compact transcript delta frames. A client that detects a delta mismatch must resubscribe for another reset.
+Watch streams generally emit the current value first. `WatchTranscriptV2` opens atomically with a compact manifest and enough trailing pages to cover at least 64 messages, then emits sequenced deltas for the mutable live page. A sequence/page mismatch resubscribes for another tail-sized bootstrap. Historical pages come from `GetTranscriptPage`; opaque IDs and page revisions make cached pages safe across reconnects.
+
+`WatchDocMessages` remains as a compatibility surface for older clients. It emits a full reset and then compact transcript delta frames.
 
 ## Compatibility guidance
 

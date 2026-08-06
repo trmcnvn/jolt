@@ -1472,6 +1472,25 @@ async fn rpc_surface_over_in_memory_transport() {
     // Delta protocol: the stream opens with a full reset frame.
     assert_eq!(initial, serde_json::json!({ "reset": [] }));
 
+    let mut paged_stream = client
+        .subscribe(
+            jolt_rpc::methods::WATCH_TRANSCRIPT_V2,
+            serde_json::json!({"chatId": CHAT}),
+        )
+        .await
+        .unwrap();
+    let paged_initial = tokio::time::timeout(Duration::from_secs(5), paged_stream.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let paged_initial: jolt_doc::TranscriptWatchFrame =
+        serde_json::from_value(paged_initial).unwrap();
+    let jolt_doc::TranscriptWatchFrame::Bootstrap { bootstrap } = paged_initial else {
+        panic!("paged stream must open with a bootstrap");
+    };
+    assert_eq!(bootstrap.manifest.total_messages, 0);
+    assert!(bootstrap.pages.is_empty());
+
     // QueueCommand (as this device's composer would over IPC).
     let command = serde_json::to_value(SessionCommandPayload::Run {
         request: run_request("via rpc"),
@@ -1509,6 +1528,49 @@ async fn rpc_surface_over_in_memory_transport() {
         MessagePart::Text { text, .. } => assert_eq!(text, "Hello"),
         other => panic!("unexpected part {other:?}"),
     }
+
+    // The paged stream carries structural bootstraps only when message count
+    // changes, then bounded live-page deltas while the assistant streams.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (page_id, page_revision) = loop {
+        let item = tokio::time::timeout_at(deadline, paged_stream.recv())
+            .await
+            .expect("paged transcript before timeout")
+            .expect("paged stream alive");
+        match serde_json::from_value::<jolt_doc::TranscriptWatchFrame>(item).unwrap() {
+            jolt_doc::TranscriptWatchFrame::Bootstrap { bootstrap } => {
+                if let Some(page) = bootstrap.pages.last()
+                    && page.messages.len() == 2
+                    && page.messages[1].status == Some(MessageStatus::Complete)
+                {
+                    break (page.id.clone(), page.revision.clone());
+                }
+            }
+            jolt_doc::TranscriptWatchFrame::Delta {
+                page_id,
+                page_revision,
+                frame,
+                ..
+            } => {
+                if let jolt_doc::TranscriptFrame::Delta { upsert, .. } = &frame
+                    && upsert
+                        .iter()
+                        .any(|change| change.entry.status == Some(MessageStatus::Complete))
+                {
+                    break (page_id, page_revision);
+                }
+            }
+        }
+    };
+    let fetched: jolt_doc::TranscriptPage = client
+        .call_as(
+            jolt_rpc::methods::GET_TRANSCRIPT_PAGE,
+            serde_json::json!({"chatId": CHAT, "pageId": page_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fetched.revision, page_revision);
+    assert_eq!(fetched.messages.len(), 2);
 
     // WatchSessions eventually reports the settled Idle session.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

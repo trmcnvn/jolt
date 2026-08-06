@@ -13,6 +13,7 @@ pub mod parts;
 pub mod registry;
 pub mod schema;
 pub mod transcript_delta;
+pub mod transcript_page;
 pub mod workspace;
 
 pub use commands::*;
@@ -21,4 +22,5 @@ pub use parts::*;
 pub use registry::*;
 pub use schema::*;
 pub use transcript_delta::*;
+pub use transcript_page::*;
 pub use workspace::*;

@@ -402,25 +402,103 @@ impl Transcript {
         }));
     }
 
+    fn load_and_scroll_to_message(
+        &mut self,
+        message_id: String,
+        page_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.state_entity().update(cx, |state, cx| {
+            state.load_transcript_page(page_id, cx);
+        });
+        self.set_scroll_task(cx.spawn(async move |this, cx| {
+            for _ in 0..300 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let landed = this.update(cx, |transcript, cx| {
+                    let Some(target) = transcript
+                        .rows()
+                        .iter()
+                        .position(|row| row.id.as_ref() == message_id)
+                    else {
+                        return false;
+                    };
+                    transcript.list_state().scroll_to(ListOffset {
+                        item_ix: target,
+                        offset_in_item: px(0.0),
+                    });
+                    cx.notify();
+                    true
+                });
+                if landed.unwrap_or(true) {
+                    return;
+                }
+            }
+        }));
+    }
+
     /// The rail element — an absolute overlay along the transcript's left edge.
     pub fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
-        let (entries, echoes) = {
+        let (entries, echoes, manifest) = {
             let state = self.state_entity().read(cx);
-            (state.transcript.clone(), state.pending_echoes().to_vec())
+            (
+                state.transcript.clone(),
+                state.pending_echoes().to_vec(),
+                state.transcript_manifest.clone(),
+            )
         };
-        let ticks = rail_ticks(&entries, &echoes);
+        let ticks = manifest.as_ref().map_or_else(
+            || rail_ticks(&entries, &echoes),
+            |manifest| {
+                let mut ticks: Vec<RailTick> = manifest
+                    .turns
+                    .iter()
+                    .map(|turn| RailTick {
+                        message_id: turn.message_id.clone(),
+                        prompt: turn.prompt_preview.clone(),
+                        reply: turn.reply_preview.clone(),
+                    })
+                    .collect();
+                for echo in &echoes {
+                    if echo.role == MessageRole::User
+                        && !ticks.iter().any(|tick| tick.message_id == echo.id)
+                    {
+                        ticks.push(RailTick {
+                            message_id: echo.id.clone(),
+                            prompt: user_text(echo),
+                            reply: None,
+                        });
+                    }
+                }
+                ticks
+            },
+        );
         // Map each tick to its transcript row (user rows share the entry id).
-        let pairs: Vec<(RailTick, usize)> = ticks
+        let pairs: Vec<(RailTick, usize, Option<String>)> = ticks
             .into_iter()
             .filter_map(|tick| {
-                let row = self
+                let loaded = self
                     .rows()
                     .iter()
-                    .position(|r| r.id.as_ref() == tick.message_id.as_str())?;
-                Some((tick, row))
+                    .position(|row| row.id.as_ref() == tick.message_id.as_str());
+                let page_id = manifest.as_ref().and_then(|manifest| {
+                    manifest
+                        .turns
+                        .iter()
+                        .find(|turn| turn.message_id == tick.message_id)
+                        .map(|turn| turn.page_id.clone())
+                });
+                let row = loaded.or_else(|| {
+                    let placeholder = format!("history-page:{}", page_id.as_deref()?);
+                    self.rows()
+                        .iter()
+                        .position(|row| row.id.as_ref() == placeholder)
+                })?;
+                Some((tick, row, loaded.is_none().then_some(page_id).flatten()))
             })
             .collect();
         // A minimap of one exchange is noise, not navigation, so hide below
@@ -428,7 +506,7 @@ impl Transcript {
         if pairs.len() < 2 {
             return gpui::Empty.into_any_element();
         }
-        let tick_rows: Vec<usize> = pairs.iter().map(|(_, row)| *row).collect();
+        let tick_rows: Vec<usize> = pairs.iter().map(|(_, row, _)| *row).collect();
         let top_row = self.list_state().logical_scroll_top().item_ix;
         let active = active_tick(&tick_rows, top_row);
         let hover = self.rail_hover();
@@ -460,8 +538,8 @@ impl Transcript {
                 // falls inside (hover then previews what you're reading),
                 // the first prompt of the range otherwise.
                 let rep = active.filter(|&a| a >= start && a < end).unwrap_or(start);
-                let (tick, row) = &pairs[rep];
-                let (tick, row) = (tick.clone(), *row);
+                let (tick, row, unloaded_page) = &pairs[rep];
+                let (tick, row, unloaded_page) = (tick.clone(), *row, unloaded_page.clone());
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
@@ -525,7 +603,11 @@ impl Transcript {
                         cx.notify();
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.scroll_to_row(row, cx);
+                        if let Some(page_id) = unloaded_page.clone() {
+                            this.load_and_scroll_to_message(tick.message_id.clone(), page_id, cx);
+                        } else {
+                            this.scroll_to_row(row, cx);
+                        }
                     }))
                     .child(
                         div()

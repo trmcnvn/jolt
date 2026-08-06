@@ -10,3 +10,4 @@ export * from "./render-parts";
 export * from "./messages";
 export * from "./sidecar";
 export * from "./tail";
+export * from "./transcript-page";

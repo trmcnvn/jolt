@@ -17,7 +17,7 @@
 //! Pure logic (sort order, staleness, gate phase) lives in free functions with
 //! unit tests; rendering reads them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,7 +27,10 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use jolt_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use jolt_doc::{
+    SessionMessageEntry, TranscriptDesync, TranscriptFrame, TranscriptManifest, TranscriptPage,
+    TranscriptWatchFrame,
+};
 use jolt_engine::{Engine, EngineConfig, EngineSupervisor, ScopeKind, ScopeStatus};
 use jolt_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space, UsageSummary};
 use jolt_rpc::{RpcClient, connect_ws, memory_client, methods};
@@ -283,8 +286,14 @@ pub struct AppState {
     /// not reconcile against the empty pre-sync collections.
     pub chats_synced: bool,
     pub spaces_synced: bool,
-    /// Joined transcript of the selected chat (continuations folded engine-side).
+    /// Loaded transcript window, flattened for composer derivations. Historical
+    /// unloaded pages live as compact descriptors in `transcript_manifest`.
     pub transcript: Vec<SessionMessageEntry>,
+    pub transcript_manifest: Option<TranscriptManifest>,
+    pub transcript_pages: Vec<TranscriptPage>,
+    pub transcript_loading_pages: HashSet<String>,
+    pub transcript_page_errors: HashSet<String>,
+    transcript_sequence: u64,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -328,6 +337,11 @@ impl AppState {
             selected_space: None,
             selected_chat: None,
             transcript: Vec::new(),
+            transcript_manifest: None,
+            transcript_pages: Vec::new(),
+            transcript_loading_pages: HashSet::new(),
+            transcript_page_errors: HashSet::new(),
+            transcript_sequence: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             local_device_id: None,
@@ -355,7 +369,7 @@ impl AppState {
         {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
             self.selected_chat = None;
-            self.transcript.clear();
+            self.clear_transcript_projection();
             self.transcript_task = None;
             self.selected_usage = None;
             self.usage_task = None;
@@ -432,6 +446,170 @@ impl AppState {
             AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
             AuthState::SignedOut => None,
         }
+    }
+
+    fn clear_transcript_projection(&mut self) {
+        self.transcript.clear();
+        self.transcript_manifest = None;
+        self.transcript_pages.clear();
+        self.transcript_loading_pages.clear();
+        self.transcript_page_errors.clear();
+        self.transcript_sequence = 0;
+    }
+
+    fn trim_transcript_pages_around(&mut self, page_id: &str) {
+        const PAGE_RADIUS: usize = 4;
+        let Some(manifest) = self.transcript_manifest.as_ref() else {
+            return;
+        };
+        let Some(center) = manifest.pages.iter().position(|page| page.id == page_id) else {
+            return;
+        };
+        let live = manifest.pages.last().map(|page| page.id.as_str());
+        self.transcript_pages.retain(|page| {
+            live == Some(page.id.as_str())
+                || manifest
+                    .pages
+                    .iter()
+                    .position(|descriptor| descriptor.id == page.id)
+                    .is_some_and(|index| index.abs_diff(center) <= PAGE_RADIUS)
+        });
+    }
+
+    fn rebuild_loaded_transcript(&mut self) {
+        self.transcript_pages.sort_by_key(|page| page.first_ordinal);
+        self.transcript = self
+            .transcript_pages
+            .iter()
+            .flat_map(|page| page.messages.iter().cloned())
+            .collect();
+        self.ack_pending_send_from_transcript();
+    }
+
+    pub fn apply_transcript_watch_frame(
+        &mut self,
+        frame: TranscriptWatchFrame,
+    ) -> Result<(), TranscriptDesync> {
+        match frame {
+            TranscriptWatchFrame::Bootstrap { bootstrap } => {
+                self.transcript_sequence = bootstrap.sequence;
+                self.transcript_manifest = Some(bootstrap.manifest);
+                self.transcript_pages = bootstrap.pages;
+                self.transcript_loading_pages.clear();
+                self.transcript_page_errors.clear();
+                self.rebuild_loaded_transcript();
+            }
+            TranscriptWatchFrame::Delta {
+                sequence,
+                page_id,
+                page_revision,
+                frame,
+            } => {
+                if sequence != self.transcript_sequence.wrapping_add(1) {
+                    return Err(TranscriptDesync(format!(
+                        "sequence mismatch: have {}, received {sequence}",
+                        self.transcript_sequence
+                    )));
+                }
+                let Some(page) = self
+                    .transcript_pages
+                    .iter_mut()
+                    .find(|page| page.id == page_id)
+                else {
+                    return Err(TranscriptDesync(format!(
+                        "live page {page_id} is not loaded"
+                    )));
+                };
+                jolt_doc::apply_transcript_frame(&mut page.messages, frame)?;
+                page.revision = page_revision.clone();
+                self.transcript_sequence = sequence;
+                if let Some(manifest) = self.transcript_manifest.as_mut()
+                    && let Some(descriptor) =
+                        manifest.pages.iter_mut().find(|page| page.id == page_id)
+                {
+                    descriptor.revision = page_revision;
+                    descriptor.message_count = page.messages.len();
+                }
+                self.rebuild_loaded_transcript();
+            }
+        }
+        // Projection frames supersede optimistic echoes carrying the same id.
+        if let Some(chat_id) = self.selected_chat.as_deref()
+            && let Some(echoes) = self.echoes.get_mut(chat_id)
+        {
+            let transcript = &self.transcript;
+            echoes.retain(|echo| !transcript.iter().any(|entry| entry.id == echo.id));
+        }
+        Ok(())
+    }
+
+    pub fn load_transcript_page(&mut self, page_id: String, cx: &mut Context<Self>) {
+        if self.transcript_pages.iter().any(|page| page.id == page_id)
+            || !self.transcript_loading_pages.insert(page_id.clone())
+        {
+            return;
+        }
+        self.transcript_page_errors.remove(&page_id);
+        let Some(handle) = self.engine.clone() else {
+            self.transcript_loading_pages.remove(&page_id);
+            return;
+        };
+        let Some(chat_id) = self.selected_chat.clone() else {
+            self.transcript_loading_pages.remove(&page_id);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let mut result = handle
+                .client()
+                .call_as::<TranscriptPage>(
+                    methods::GET_TRANSCRIPT_PAGE,
+                    serde_json::json!({ "chatId": chat_id, "pageId": page_id }),
+                )
+                .await;
+            for delay in [250u64, 1_000] {
+                if result.is_ok() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(delay))
+                    .await;
+                result = handle
+                    .client()
+                    .call_as::<TranscriptPage>(
+                        methods::GET_TRANSCRIPT_PAGE,
+                        serde_json::json!({ "chatId": chat_id, "pageId": page_id }),
+                    )
+                    .await;
+            }
+            this.update(cx, |state, cx| {
+                state.transcript_loading_pages.remove(&page_id);
+                if state.selected_chat.as_deref() != Some(chat_id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(page) => {
+                        state.transcript_page_errors.remove(&page_id);
+                        if !state
+                            .transcript_pages
+                            .iter()
+                            .any(|loaded| loaded.id == page.id)
+                        {
+                            let loaded_id = page.id.clone();
+                            state.transcript_pages.push(page);
+                            state.trim_transcript_pages_around(&loaded_id);
+                            state.rebuild_loaded_transcript();
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%chat_id, %page_id, %error, "transcript page load failed");
+                        state.transcript_page_errors.insert(page_id);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
@@ -746,7 +924,7 @@ impl AppState {
         self.selected_space = None;
         self.selected_chat = None;
         self.selected_usage = None;
-        self.transcript.clear();
+        self.clear_transcript_projection();
         self.transcript_task = None;
         self.usage_task = None;
         self.local_device_id = None;
@@ -791,7 +969,7 @@ impl AppState {
         }
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
-        self.transcript.clear();
+        self.clear_transcript_projection();
         self.transcript_task = None;
         self.selected_usage = None;
         self.usage_task = None;
@@ -1119,23 +1297,60 @@ fn spawn_transcript_watch(
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
             let params = serde_json::json!({ "chatId": chat_id });
-            let mut rx = match handle
+            let (mut rx, paged) = match handle
                 .client()
-                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .subscribe(methods::WATCH_TRANSCRIPT_V2, params.clone())
                 .await
             {
-                Ok(rx) => rx,
-                Err(err) => {
-                    tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
-                    if this.update(cx, |_, _| {}).is_err() {
-                        return;
+                Ok(rx) => (rx, true),
+                Err(v2_error) => match handle
+                    .client()
+                    .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                    .await
+                {
+                    Ok(rx) => {
+                        tracing::info!(%chat_id, %v2_error, "engine lacks paged transcripts; using compatibility watch");
+                        (rx, false)
                     }
-                    cx.background_executor().timer(RETRY_DELAY).await;
-                    continue 'resubscribe;
-                }
+                    Err(err) => {
+                        tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
+                        if this.update(cx, |_, _| {}).is_err() {
+                            return;
+                        }
+                        cx.background_executor().timer(RETRY_DELAY).await;
+                        continue 'resubscribe;
+                    }
+                },
             };
             while let Some(value) = rx.recv().await {
-                let frame: TranscriptFrame = match serde_json::from_value(value) {
+                if !paged {
+                    let frame: TranscriptFrame = match serde_json::from_value(value) {
+                        Ok(frame) => frame,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "malformed compatibility transcript frame; resubscribing");
+                            cx.background_executor().timer(RETRY_DELAY).await;
+                            continue 'resubscribe;
+                        }
+                    };
+                    let mut desync = false;
+                    let alive = this.update(cx, |state, cx| {
+                        if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                            if state.apply_transcript_frame(frame).is_err() {
+                                desync = true;
+                            } else {
+                                cx.notify();
+                            }
+                        }
+                    });
+                    if alive.is_err() {
+                        return;
+                    }
+                    if desync {
+                        continue 'resubscribe;
+                    }
+                    continue;
+                }
+                let frame: TranscriptWatchFrame = match serde_json::from_value(value) {
                     Ok(frame) => frame,
                     Err(err) => {
                         // Schema skew (a newer peer's entry shape arriving
@@ -1151,7 +1366,7 @@ fn spawn_transcript_watch(
                 let alive = this.update(cx, |state, cx| {
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                        if let Err(err) = state.apply_transcript_frame(frame) {
+                        if let Err(err) = state.apply_transcript_watch_frame(frame) {
                             tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
                             desync = true;
                         }

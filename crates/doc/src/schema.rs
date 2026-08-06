@@ -205,6 +205,26 @@ impl SessionDoc {
     /// peer on a newer schema must degrade to a missing row, never blank the
     /// whole transcript — one bad entry took down every publish for the chat
     /// (2026-07-31, "missing field `id`" during a multi-update import).
+    pub fn message_count(&self) -> usize {
+        self.doc.get_list("messages").len()
+    }
+
+    /// Decode one physical message-list entry without materializing its siblings.
+    /// Malformed or transiently incomplete entries follow [`Self::read_entries`]
+    /// and are skipped.
+    pub fn read_entry_at(&self, index: usize) -> Result<Option<SessionMessageEntry>, DocError> {
+        let Some(value) = self.doc.get_list("messages").get(index) else {
+            return Ok(None);
+        };
+        match entry_from_json(value.get_deep_value().to_json_value()) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(err) => {
+                tracing::warn!(index, error = %err, "skipping malformed transcript entry");
+                Ok(None)
+            }
+        }
+    }
+
     pub fn read_entries(&self) -> Result<Vec<SessionMessageEntry>, DocError> {
         // Materialize only the messages container — a whole-doc deep value
         // here also serialized the commands ledger on every 120ms commit tick.

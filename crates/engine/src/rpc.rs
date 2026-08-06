@@ -88,6 +88,13 @@ struct ChatParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct TranscriptPageParams {
+    chat_id: String,
+    page_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
 }
@@ -845,6 +852,8 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
+            | methods::WATCH_TRANSCRIPT_V2
+            | methods::GET_TRANSCRIPT_PAGE
             | methods::EXTRACT_QUESTIONS
             | methods::WATCH_CHAT_USAGE
             | methods::USAGE_BREAKDOWN
@@ -895,6 +904,7 @@ fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
         methods::WATCH_DOC_MESSAGES
+            | methods::WATCH_TRANSCRIPT_V2
             | methods::WATCH_CHAT_USAGE
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
@@ -923,6 +933,36 @@ where
 /// The transcript watch as delta frames (`jolt_doc::transcript_delta`): a
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
+fn transcript_stream(
+    bootstrap: jolt_doc::TranscriptBootstrap,
+    rx: tokio::sync::broadcast::Receiver<jolt_doc::TranscriptWatchFrame>,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold((Some(bootstrap), rx), |(opening, mut rx)| async move {
+        if let Some(bootstrap) = opening {
+            let frame = jolt_doc::TranscriptWatchFrame::Bootstrap { bootstrap };
+            return serde_json::to_value(frame)
+                .ok()
+                .map(|value| (value, (None, rx)));
+        }
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    return serde_json::to_value(frame)
+                        .ok()
+                        .map(|value| (value, (None, rx)));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Ending forces the client to resubscribe for an atomic
+                    // bootstrap instead of applying deltas across a gap.
+                    return None;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+    .boxed()
+}
+
 fn doc_messages_stream(
     rx: watch::Receiver<Vec<jolt_doc::SessionMessageEntry>>,
 ) -> BoxStream<'static, serde_json::Value> {
@@ -1089,6 +1129,34 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(doc_messages_stream(
                     handle.watch_messages(),
                 )))
+            }
+            methods::WATCH_TRANSCRIPT_V2 => {
+                let p: ChatParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let (bootstrap, rx) = handle
+                    .watch_transcript()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                Ok(RpcReply::Stream(transcript_stream(bootstrap, rx)))
+            }
+            methods::GET_TRANSCRIPT_PAGE => {
+                let p: TranscriptPageParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                match handle
+                    .transcript_page(&p.page_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                {
+                    Some(page) => RpcReply::value(&page),
+                    None => Err(RpcError::BadParams(format!(
+                        "unknown transcript page {}",
+                        p.page_id
+                    ))),
+                }
             }
             methods::WATCH_CHAT_USAGE => {
                 let p: ChatParams = parse_params(params)?;

@@ -42,6 +42,7 @@ struct TranscriptView: View {
     /// "scrolling gets laggier the deeper I go" jank.
     @State private var scroll = ScrollState()
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
+    @State private var historyAnchor: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -53,6 +54,30 @@ struct TranscriptView: View {
                                               pendingSends: store.pendingSends)
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
+                if store.unloadedTranscriptHeight > 0 {
+                    VStack {
+                        Spacer(minLength: 0)
+                        if store.historyLoadFailed {
+                            Button("Couldn’t load earlier messages · Retry") {
+                                historyAnchor = rows.first?.id
+                                store.loadPreviousTranscriptPage()
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            Text("Loading earlier messages…")
+                                .onAppear {
+                                    historyAnchor = rows.first?.id
+                                    store.loadPreviousTranscriptPage()
+                                }
+                        }
+                    }
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: store.unloadedTranscriptHeight, alignment: .bottom)
+                    .padding(.bottom, 18)
+                    .id("transcript-history-boundary-\(store.previousTranscriptPageId ?? "head")")
+                }
                 ForEach(rows) { row in
                     rowView(row).id(row.id)
                 }
@@ -77,6 +102,24 @@ struct TranscriptView: View {
             // Warm sessions already have rows at first layout, and `onChange`
             // never fires for an initial value — this is the only hook for them.
             await settleToBottom()
+        }
+        .onChange(of: store.loadingHistory) { _, loading in
+            guard loading, let boundary = rows.first?.id else { return }
+            historyAnchor = boundary
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                scrollPosition.scrollTo(id: boundary, anchor: .top)
+            }
+        }
+        .onChange(of: store.transcriptPages.count) {
+            guard let historyAnchor else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                scrollPosition.scrollTo(id: historyAnchor, anchor: .top)
+            }
+            self.historyAnchor = nil
         }
         .onChange(of: rows.isEmpty) { _, isEmpty in
             // Projection is off-main, so a cached transcript usually lands after

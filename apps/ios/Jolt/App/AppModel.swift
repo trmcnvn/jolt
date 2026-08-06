@@ -18,6 +18,7 @@ final class AppModel {
     var workspace: WorkspaceStore?
     var demo: DemoDataset?
     private var sessionStores: [String: SessionStore] = [:]
+    @ObservationIgnored private var sessionStoreRecency: [String] = []
     private var config: AppConfig?
 
     // Persisted connection settings.
@@ -180,11 +181,14 @@ final class AppModel {
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
+        sessionStoreRecency.removeAll()
         config = nil
         demo = nil
         Keychain.delete(key: "accessToken")
         Keychain.delete(key: "refreshToken")
         DocDisk.wipeAll()  // local doc state belongs to the signed-in identity
+        SessionStore.wipeCommandOutbox()
+        TranscriptPageDisk.wipeAll()
         storedUserId = ""
         storedOrgId = ""
         phase = .signedOut
@@ -489,25 +493,32 @@ final class AppModel {
         guard let config else { return nil }
         if let existing = sessionStores[chat.id] {
             existing.hostDeviceId = chat.deviceId
+            touchSessionStore(chat.id)
             return existing
         }
         let store = SessionStore(chatId: chat.id, config: config)
         store.hostDeviceId = chat.deviceId
         sessionStores[chat.id] = store
+        touchSessionStore(chat.id)
         store.start()
         return store
     }
 
     func releaseSessionStore(chatId: String) {
-        // Preloaded stores stay warm — nothing to evict on navigation.
+        touchSessionStore(chatId)
     }
 
-    /// Warm every non-archived session: stores hydrate from disk instantly
-    /// and keep their rooms syncing, so opening a session never shows a
-    /// loading state.
-    func preloadSessions() {
-        for chat in overviewChats {
-            _ = sessionStore(for: chat)
+    private func touchSessionStore(_ chatId: String) {
+        sessionStoreRecency.removeAll { $0 == chatId }
+        sessionStoreRecency.append(chatId)
+        while sessionStoreRecency.count > 3 {
+            let evicted = sessionStoreRecency.removeFirst()
+            sessionStores.removeValue(forKey: evicted)?.stop()
         }
     }
+
+    /// The workspace registry already carries every sidebar row. Session
+    /// transcripts open tail-first on demand; warming every Loro room was an
+    /// unbounded memory and socket multiplier on iOS.
+    func preloadSessions() {}
 }

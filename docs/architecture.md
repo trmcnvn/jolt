@@ -55,14 +55,14 @@ The supervisor resolves the preferred scope behind the splash. It always owns a 
 
 ### iOS viewport
 
-The SwiftUI app maintains a local workspace-registry replica and Loro session replicas, appends durable commands, and uses relay RPC when an engine must touch a filesystem or CLI.
+The SwiftUI app maintains a local workspace-registry replica and a byte-bounded transcript page cache. It consumes edge manifest/tail streams, submits commands through a durable device-local outbox, and uses relay RPC when an engine must touch a filesystem or CLI. It does not retain complete session Loro documents.
 
 ### Edge
 
 `edge/` is a TypeScript Cloudflare Worker with three Durable Object classes:
 
 - **RegistryRoom:** current-state workspace rows and per-field last-write-wins merge.
-- **SessionRoom:** per-chat Loro synchronization, transcript tail and diff sidecars, compaction, and backups.
+- **SessionRoom:** per-chat canonical Loro synchronization, transcript manifest/page/live projections, durable command submission, diff sidecars, compaction, and backups.
 - **DeviceRoom:** one host socket per engine, client byte relay, durable nudges, and small latest-value sidecars.
 
 The Worker verifies WorkOS JWTs or development bearers before stamping identity into Durable Object requests. It also performs WorkOS code exchange/refresh and serves content-addressed attachments and signed release metadata.
@@ -94,7 +94,9 @@ commands  [ { id, payload, issuedBy, issuedAt, status, ... } ]
 
 Text bodies use `LoroText`, allowing streamed appends to merge efficiently. Large entries split into continuation records at part/code-point boundaries and join during projection.
 
-The host engine writes transcript entries and command outcomes. Any authorized client can append its own command entries. Synced tool projections deliberately omit sensitive or bulky inputs that are not needed for rendering.
+The host engine writes transcript entries and command outcomes. Authorized viewers submit their own idempotent command entries through the edge. Synced tool projections deliberately omit sensitive or bulky inputs that are not needed for rendering.
+
+Viewport transcript state is a derived projection: a compact whole-session manifest, byte-bounded historical pages, and a mutable live tail. Desktop builds the projection beside its local canonical document; iOS and remote viewers consume the edge projection. Unloaded pages remain estimated-height placeholders, so navigation and scrollbar range cover the complete conversation without decoding it.
 
 ### Durable command plane
 
@@ -128,13 +130,14 @@ Some local state is queried from a reachable device through RPC for display.
 ```text
 viewport
   → Mutate createChat in a synced space
-  → append Run command to the chat Loro document
+  → persist Run command in the local outbox
+  → edge idempotently appends it to the chat Loro document
   → POST durable nudge to the host's DeviceRoom
   → host opens/syncs the document
   → host claims command and launches the selected harness
   → normalized events fold into transcript parts every ~120 ms
-  → SessionRoom broadcasts Loro updates
-  → every viewport projects the same transcript
+  → SessionRoom refreshes the mutable tail projection
+  → viewports receive bounded live transcript frames
 ```
 
 ### Live remote RPC

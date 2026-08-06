@@ -15,6 +15,37 @@ export const readMessageEntries = (doc: LoroDoc): ReadonlyArray<SessionMessageEn
   return json.messages ?? [];
 };
 
+/** Materialize only a physical message-list range. This is the streaming hot
+ * path: tool/text updates refresh the mutable page without converting the
+ * complete document or command ledger to JSON. */
+export const readMessageEntryRange = (
+  doc: LoroDoc,
+  start: number,
+  end: number
+): ReadonlyArray<SessionMessageEntry> => {
+  const list = doc.getList("messages");
+  const entries: SessionMessageEntry[] = [];
+  for (let index = start; index < Math.min(end, list.length); index++) {
+    const value = list.get(index);
+    if (typeof value !== "object" || value === null || !("toJSON" in value)) continue;
+    const toJSON = value.toJSON;
+    if (typeof toJSON !== "function") continue;
+    const entry: unknown = toJSON.call(value);
+    if (
+      typeof entry !== "object" || entry === null ||
+      !("id" in entry) || typeof entry.id !== "string" ||
+      !("role" in entry) || !["user", "assistant", "system"].includes(String(entry.role)) ||
+      !("parts" in entry) || !Array.isArray(entry.parts) ||
+      !("createdAt" in entry) || typeof entry.createdAt !== "number" ||
+      !("deviceId" in entry) || typeof entry.deviceId !== "string"
+    ) continue;
+    // Core scalar/container shape is validated above. Part payloads are the
+    // canonical SessionRoom schema and remain forward-compatible at render.
+    entries.push(entry as SessionMessageEntry);
+  }
+  return entries;
+};
+
 /** Materialize the DO's `tail` slot (§5 L2): last-N messages with
  * continuations joined, plus enough meta for the client to render instantly
  * and know how much history the full sync will bring. */

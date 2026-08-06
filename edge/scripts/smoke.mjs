@@ -14,7 +14,7 @@
  *
  * Usage: node scripts/smoke.mjs [baseUrl]   (default http://127.0.0.1:27640)
  */
-import { LoroDoc } from "loro-crdt";
+import { LoroDoc, LoroMap } from "loro-crdt";
 import { LoroWebsocketClient } from "loro-websocket";
 import { LoroAdaptor, LoroEphemeralAdaptor } from "loro-adaptors/loro";
 import { createHash, randomUUID } from "node:crypto";
@@ -60,11 +60,19 @@ const docA = adaptorA.getDoc();
 docA.getMap("meta").set("chatId", chatId);
 docA.getMap("meta").set("schemaVersion", 1);
 const messagesA = docA.getList("messages");
-const m1 = messagesA.insertContainer(0, new (await import("loro-crdt")).LoroMap());
-m1.set("id", "m1");
-m1.set("role", "user");
-m1.set("createdAt", Date.now());
-m1.set("deviceId", "peer-a");
+const addMessage = (id, role, text) => {
+  const message = messagesA.insertContainer(messagesA.length, new LoroMap());
+  message.set("id", id);
+  message.set("role", role);
+  message.set("parts", [{ id: `${id}-text`, kind: "text", text }]);
+  message.set("createdAt", Date.now());
+  message.set("deviceId", "peer-a");
+  message.set("status", "complete");
+};
+addMessage("m1", "user", "smoke prompt 1");
+for (let index = 2; index <= 97; index += 1) {
+  addMessage(`m${index}`, index % 2 === 0 ? "assistant" : "user", `smoke message ${index}`);
+}
 docA.commit();
 ok("peer A joined + wrote");
 
@@ -104,9 +112,87 @@ await new Promise((r) => setTimeout(r, 100));
   if (res.status !== 200) fail(`tail status ${res.status}`);
   const tail = await res.json();
   if (tail.chatId !== chatId) fail(`tail chatId ${tail.chatId}`);
-  if (tail.totalMessages < 1) fail("tail totalMessages");
+  if (tail.totalMessages !== 97) fail(`tail totalMessages ${tail.totalMessages}`);
   ok(`tail (${tail.totalMessages} messages)`);
 }
+
+// ── paged transcript projection + live stream ─────────────────────────────
+let transcriptSocket;
+{
+  const res = await fetch(`${base}/transcript/${chatId}?token=${token}`);
+  if (res.status !== 200) fail(`transcript bootstrap status ${res.status}`);
+  const bootstrap = await res.json();
+  if (bootstrap.manifest?.totalMessages !== 97) fail("transcript manifest total");
+  if (bootstrap.manifest.pages.length < 4) fail("transcript did not paginate");
+  const bootstrappedMessages = bootstrap.pages.reduce((sum, page) => sum + page.messages.length, 0);
+  if (bootstrappedMessages < 64 || bootstrappedMessages >= 97) {
+    fail(`transcript tail bootstrap size ${bootstrappedMessages}`);
+  }
+
+  const historical = bootstrap.manifest.pages[0];
+  if (bootstrap.pages.some((page) => page.id === historical.id)) {
+    fail("historical page unexpectedly included in tail bootstrap");
+  }
+  const pageRes = await fetch(
+    `${base}/transcript/${chatId}/page?id=${encodeURIComponent(historical.id)}&token=${token}`
+  );
+  if (pageRes.status !== 200) fail(`transcript page status ${pageRes.status}`);
+  const page = await pageRes.json();
+  if (page.id !== historical.id || page.messages.length !== historical.messageCount) {
+    fail("transcript historical page mismatch");
+  }
+  ok("transcript tail bootstrap + historical page fetch");
+
+  const intruder = await fetch(`${base}/transcript/${chatId}?token=intruder`);
+  if (intruder.status !== 403) fail(`intruder transcript expected 403, got ${intruder.status}`);
+
+  transcriptSocket = new WebSocket(`${wsBase}/transcript/${chatId}/ws?token=${token}`);
+  const events = [];
+  transcriptSocket.onmessage = (event) => events.push(JSON.parse(String(event.data)));
+  await new Promise((resolve, reject) => {
+    transcriptSocket.onopen = resolve;
+    transcriptSocket.onerror = reject;
+  });
+  await until(() => events.some((event) => event.type === "bootstrap"), "transcript ws bootstrap");
+  addMessage("m98", "assistant", "live transcript update");
+  docA.commit();
+  await until(
+    () => events.some((event) =>
+      event.type === "bootstrap" ||
+      (event.type === "page" && event.page?.messages?.some((message) => message.id === "m98"))
+    ) && events.length > 1,
+    "transcript live page"
+  );
+  ok("transcript websocket bootstrap + live update");
+}
+
+// ── idempotent remote command submission ─────────────────────────────────
+{
+  const commandId = `cmd-${randomUUID()}`;
+  const command = {
+    id: commandId,
+    kind: "run",
+    payload: { prompt: "smoke command" },
+    issuedBy: "smoke-device",
+    issuedAt: Date.now(),
+    expiresAt: Date.now() + 60_000
+  };
+  const submit = () => fetch(`${base}/command/${chatId}?token=${token}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(command)
+  });
+  const first = await (await submit()).json();
+  const duplicate = await (await submit()).json();
+  if (!first.ok || first.duplicate !== false) fail("first command submission");
+  if (!duplicate.ok || duplicate.duplicate !== true) fail("duplicate command submission");
+  await until(
+    () => docA.getList("commands").toJSON().some((entry) => entry.id === commandId),
+    "command replication to host"
+  );
+  ok("idempotent command submission + host replication");
+}
+transcriptSocket.close();
 
 // ── diff sidecar ──────────────────────────────────────────────────────────
 {

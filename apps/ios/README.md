@@ -1,6 +1,6 @@
 # Jolt for iOS
 
-The native SwiftUI viewport for Jolt. It syncs workspace registry rows and per-chat Loro documents, then controls the computer hosting a session through durable commands and relay RPC. No agent engine runs on the phone.
+The native SwiftUI viewport for Jolt. It syncs workspace registry rows and tail-first transcript pages, then controls the computer hosting a session through a durable command outbox and relay RPC. No agent engine or full session document runs on the phone.
 
 ## Build
 

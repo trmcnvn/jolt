@@ -19,13 +19,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use jolt_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
     MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
-    SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
-    join_continuation_entries,
+    SessionCommandStatus, SessionDoc, SessionMessageEntry, TranscriptBootstrap, TranscriptCatalog,
+    TranscriptPage, TranscriptWatchFrame, evaluate_command, join_continuation_entries,
 };
 use jolt_harness::{BashRequest, BashResult};
 use jolt_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
@@ -177,11 +177,22 @@ pub struct DocHost {
 }
 
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
+struct TranscriptProjectionState {
+    sequence: u64,
+    catalog: TranscriptCatalog,
+    live_page: Option<TranscriptPage>,
+}
+
 pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
     doc: Arc<SessionDoc>,
     messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
+    /// V2 tail-first projection. Historical pages are decoded directly from
+    /// Loro only when requested; this state retains compact metadata and the
+    /// mutable live page.
+    transcript_projection: Mutex<Option<TranscriptProjectionState>>,
+    transcript_tx: broadcast::Sender<TranscriptWatchFrame>,
     /// True when the doc changed while nobody watched: the mirror rebuild is
     /// deferred to the next `watch_messages` attach instead of paid per commit.
     mirror_dirty: AtomicBool,
@@ -229,6 +240,113 @@ impl ChatDocHandle {
             self.publish_messages();
         }
         rx
+    }
+
+    /// Tail-first transcript stream. The opening bootstrap and subscription
+    /// are created under the same projection lock, so no live frame can land
+    /// between them.
+    pub fn watch_transcript(
+        &self,
+    ) -> Result<
+        (
+            TranscriptBootstrap,
+            broadcast::Receiver<TranscriptWatchFrame>,
+        ),
+        DocError,
+    > {
+        self.touch();
+        if let Some(room) = lock(&self.room).as_ref() {
+            room.probe();
+        }
+        let mut projection = lock(&self.transcript_projection);
+        if projection.is_none() {
+            let catalog = TranscriptCatalog::build(&self.doc)?;
+            let live_page = catalog.live_page(&self.doc)?;
+            *projection = Some(TranscriptProjectionState {
+                sequence: 0,
+                catalog,
+                live_page,
+            });
+        }
+        let receiver = self.transcript_tx.subscribe();
+        let state = projection.as_ref().expect("projection initialized above");
+        let bootstrap = state.catalog.bootstrap(&self.doc, state.sequence)?;
+        Ok((bootstrap, receiver))
+    }
+
+    pub fn transcript_page(&self, page_id: &str) -> Result<Option<TranscriptPage>, DocError> {
+        self.touch();
+        let mut projection = lock(&self.transcript_projection);
+        if projection.is_none() {
+            let catalog = TranscriptCatalog::build(&self.doc)?;
+            let live_page = catalog.live_page(&self.doc)?;
+            *projection = Some(TranscriptProjectionState {
+                sequence: 0,
+                catalog,
+                live_page,
+            });
+        }
+        projection
+            .as_ref()
+            .expect("projection initialized above")
+            .catalog
+            .page(&self.doc, page_id)
+    }
+
+    fn publish_transcript_if_watched(&self) {
+        if self.transcript_tx.receiver_count() == 0 {
+            // Keep no derived transcript alive for background command-only docs.
+            *lock(&self.transcript_projection) = None;
+            return;
+        }
+        let mut projection = lock(&self.transcript_projection);
+        let Some(state) = projection.as_mut() else {
+            return;
+        };
+        let physical_len = self.doc.message_count();
+        if physical_len != state.catalog.physical_len() {
+            match TranscriptCatalog::build(&self.doc).and_then(|catalog| {
+                state.sequence = state.sequence.wrapping_add(1);
+                let bootstrap = catalog.bootstrap(&self.doc, state.sequence)?;
+                state.live_page = catalog.live_page(&self.doc)?;
+                state.catalog = catalog;
+                Ok(bootstrap)
+            }) {
+                Ok(bootstrap) => {
+                    let _ = self
+                        .transcript_tx
+                        .send(TranscriptWatchFrame::Bootstrap { bootstrap });
+                }
+                Err(err) => {
+                    tracing::warn!(chat = %self.chat_id, error = %err, "transcript catalog rebuild failed")
+                }
+            }
+            return;
+        }
+        let current = match state.catalog.live_page(&self.doc) {
+            Ok(page) => page,
+            Err(err) => {
+                tracing::warn!(chat = %self.chat_id, error = %err, "live transcript page read failed");
+                return;
+            }
+        };
+        let (Some(previous), Some(current)) = (state.live_page.as_ref(), current.as_ref()) else {
+            state.live_page = current;
+            return;
+        };
+        let frame = jolt_doc::diff_transcript(&previous.messages, &current.messages);
+        if frame.is_empty_delta() {
+            return;
+        }
+        state.sequence = state.sequence.wrapping_add(1);
+        let event = TranscriptWatchFrame::Delta {
+            sequence: state.sequence,
+            page_id: current.id.clone(),
+            page_revision: current.revision.clone(),
+            frame,
+        };
+        state.live_page = Some(current.clone());
+        let _ = self.transcript_tx.send(event);
     }
 
     fn touch(&self) {
@@ -445,12 +563,15 @@ impl DocHost {
         // drains, nudges) never watch the transcript, and the first
         // watch_messages attach materializes it on demand.
         let (messages_tx, _) = watch::channel(Vec::new());
+        let (transcript_tx, _) = broadcast::channel(128);
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
             doc: doc.clone(),
             messages_tx,
+            transcript_projection: Mutex::new(None),
+            transcript_tx,
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
@@ -576,7 +697,7 @@ impl DocHost {
     }
 
     fn pinned(&self, handle: &Arc<ChatDocHandle>) -> bool {
-        if handle.messages_tx.receiver_count() > 0 {
+        if handle.messages_tx.receiver_count() > 0 || handle.transcript_tx.receiver_count() > 0 {
             return true;
         }
         // The handle itself holds one doc ref; more means a live writer.
@@ -1177,6 +1298,7 @@ impl DocHost {
             }
             if changed {
                 handle.publish_messages_if_watched();
+                handle.publish_transcript_if_watched();
                 self.save_snapshot(&handle);
             }
         }
@@ -1338,6 +1460,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 }
                 let Some(handle) = weak.upgrade() else { break };
                 handle.publish_messages_if_watched();
+                handle.publish_transcript_if_watched();
                 host.drain_commands(&handle).await;
                 if save_deadline.is_none() {
                     save_deadline = Some(

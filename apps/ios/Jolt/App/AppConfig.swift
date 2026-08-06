@@ -96,6 +96,13 @@ final class AppConfig: @unchecked Sendable {
         return url
     }
 
+    func transcriptSocketURL(chatId: String) async -> URL? {
+        guard let token = await currentToken() else { return nil }
+        var url = wsBase.appending(path: "transcript/\(chatId)/ws")
+        url.append(queryItems: [URLQueryItem(name: "token", value: token)])
+        return url
+    }
+
     /// Decode the JWT payload's `exp` (60s early-refresh margin). Unparseable
     /// tokens read as non-expired — the server is the arbiter.
     private static func isExpired(jwt: String) -> Bool {
