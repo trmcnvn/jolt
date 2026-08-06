@@ -281,7 +281,8 @@ struct SpaceFilterSheet: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(SheetRowButtonStyle(selected: isSelected))
+        .buttonStyle(SheetRowButtonStyle())
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
         .listRowBackground(
             RoundedRectangle(cornerRadius: 8)
                 .fill(isSelected ? Theme.elementActive : Color.clear)
