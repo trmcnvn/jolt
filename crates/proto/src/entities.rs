@@ -75,6 +75,13 @@ pub struct Device {
     pub version: Option<String>,
 }
 
+impl Device {
+    /// Whether this installation can host folders, harnesses, and device RPCs.
+    pub fn is_engine_host(&self) -> bool {
+        !matches!(self.platform.as_str(), "ios" | "android" | "web")
+    }
+}
+
 /// A synced (device, folder) pair — the unit of organization in the sidebar.
 /// Sessions belong to exactly one space; the space fixes their host device and
 /// base cwd. Folders need not be git repos: `git_detected` is stamped by the
@@ -508,4 +515,30 @@ pub enum TerminalEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Device;
+
+    fn device(platform: &str) -> Device {
+        Device {
+            id: platform.to_string(),
+            name: platform.to_string(),
+            platform: platform.to_string(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn viewer_platforms_are_not_engine_hosts() {
+        assert!(!device("ios").is_engine_host());
+        assert!(!device("android").is_engine_host());
+        assert!(!device("web").is_engine_host());
+        assert!(device("macos").is_engine_host());
+        assert!(device("linux").is_engine_host());
+        assert!(device("windows").is_engine_host());
+    }
 }

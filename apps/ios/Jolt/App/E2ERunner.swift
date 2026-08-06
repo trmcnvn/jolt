@@ -31,15 +31,24 @@ enum E2ERunner {
         model.signInDev(edgeURL: URL(string: "http://localhost:8787")!,
                         userId: "devuser", orgId: "dev-org")
 
-        // 1. Workspace room: wait for connection + the engine's device row.
+        // 1. Workspace room: wait for this viewer row + an engine device row.
         guard let workspace = model.workspace else {
             log("FAIL no workspace store")
             return
         }
         // Warm-start probe: rows visible BEFORE any network = disk hydration.
         log("warm-start devices=\(workspace.devices.count) chats=\(workspace.chats.count)")
-        let device = await poll(timeout: 15, label: "workspace device") {
-            workspace.connected ? workspace.devices.first { $0.platform != "ios" } : nil
+        let viewer = await poll(timeout: 15, label: "iOS device registration") {
+            workspace.connected ? workspace.devices.first { $0.id == model.deviceId } : nil
+        }
+        guard let viewer, viewer.platform == "ios" else {
+            log("FAIL iOS registration: \(workspace.devices.map { "\($0.id):\($0.platform)" })")
+            return
+        }
+        log("OK iOS viewer registered; device \(viewer.id) (\(viewer.name))")
+
+        let device = await poll(timeout: 15, label: "workspace engine device") {
+            workspace.connected ? workspace.devices.first(where: \.isEngineHost) : nil
         }
         guard let device else {
             log("FAIL workspace: connected=\(workspace.connected) devices=\(workspace.devices.map(\.id))")
@@ -50,7 +59,7 @@ enum E2ERunner {
         // 2. Device relay: ListFolders on every engine device (stale rig
         // devices linger in the dev workspace doc — report each).
         var listing: FolderListing?
-        for candidate in workspace.devices where candidate.platform != "ios" {
+        for candidate in workspace.devices where candidate.isEngineHost {
             do {
                 let l = try await workspace.listFoldersDetailed(deviceId: candidate.id, path: nil)
                 log("OK relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(l.path) → \(l.entries.count) entries")
@@ -159,7 +168,7 @@ extension E2ERunner {
             log("FAIL no config")
             return
         }
-        for device in workspace.devices where device.platform != "ios" {
+        for device in workspace.devices where device.isEngineHost {
             let status = await config.deviceStatus(deviceId: device.id)
             log("\(device.name) /status → \(status)")
             do {

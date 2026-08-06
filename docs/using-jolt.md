@@ -12,14 +12,14 @@ Moving non-empty Local data into an account requires explicit approval. After th
 
 ### Devices
 
-A device is one Jolt engine installation with a stable local ID. Its engine owns:
+A device is a signed-in Jolt installation with a stable local ID. Engine hosts own:
 
 - agent CLI processes and credentials;
 - local folders, repositories, worktrees, and Jujutsu workspaces;
 - PTYs and working-tree diffs;
 - local transcript snapshots, run journals, and usage records.
 
-Presence indicates recent contact. Jolt also checks the device relay before remote calls, so a stale presence row does not make an offline engine look usable forever. Removing a device cascades through its spaces and sessions without deleting folders or other local files.
+iOS installations are registered viewer devices: they appear in **Settings → Devices** and publish presence, but they cannot host spaces, harnesses, or device RPCs. Presence indicates recent contact. Jolt also checks the device relay before remote calls, so a stale presence row does not make an offline engine look usable forever. Removing an engine device cascades through its spaces and sessions without deleting folders or other local files; viewer devices own no spaces.
 
 ### Spaces
 

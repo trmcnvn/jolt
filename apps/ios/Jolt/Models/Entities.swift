@@ -14,6 +14,10 @@ struct DeviceRow: Identifiable, Hashable {
     var lastSeenAt: Int64?
     var createdAt: Int64?
     var version: String? = nil
+
+    var isEngineHost: Bool {
+        !["ios", "android", "web"].contains(platform)
+    }
 }
 
 struct Space: Identifiable, Hashable {

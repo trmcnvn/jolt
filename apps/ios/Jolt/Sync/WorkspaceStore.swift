@@ -2,9 +2,9 @@
 // host (crates/doc/src/registry.rs + crates/engine WorkspaceHost). Joins the
 // per-user `/registry/{orgId}/ws` room, projects the row table into typed
 // rows, and performs the writes the writer discipline allows a viewer device:
-// chat creates, archives, renames and seen marks. iOS is a viewport, not an
-// engine device, so it owns no device row; it does publish a presence beat
-// (registry presence replaced the old ws room's ephemeral store).
+// its own device registration plus chat creates, archives, renames and seen
+// marks. iOS is a viewport rather than an engine host, but it remains a
+// registered device and publishes the same presence beat as other clients.
 //
 // Reads are OVERLAY reads: the server's authoritative rows plus the pending
 // op-batch queue replayed on top (optimistic local writes, retired on ack).
@@ -13,6 +13,23 @@
 
 import Foundation
 import Observation
+
+func iosDeviceRegistrationFields(id: String, deviceName: String, existing: RegistryRow?,
+                                 at: Int64, version: String?) -> [String: JSONValue] {
+    let existingName = existing?.fields["name"]?.stringValue
+    let name = existingName.flatMap { $0.isEmpty ? nil : $0 } ?? deviceName
+    var fields: [String: JSONValue] = [
+        "id": .string(id),
+        "name": .string(name),
+        "platform": .string("ios"),
+        "lastSeenAt": .int(at),
+        "createdAt": .int(existing?.fields["createdAt"]?.int64Value ?? at),
+    ]
+    if let version, !version.isEmpty {
+        fields["version"] = .string(version)
+    }
+    return fields
+}
 
 @MainActor
 @Observable
@@ -33,6 +50,7 @@ final class WorkspaceStore {
     @ObservationIgnored private var client: RegistryClient?
     @ObservationIgnored private var saver: RegistrySaver?
     @ObservationIgnored private var presenceReceivedAt: [String: Int64] = [:]
+    @ObservationIgnored private var registeredDevice = false
     private let config: AppConfig
 
     init(config: AppConfig) {
@@ -102,6 +120,7 @@ final class WorkspaceStore {
             if outcome == .reseeded {
                 roomLog.info("registry: server behind local state; re-seeding")
             }
+            registerDeviceIfNeeded()
             let now = nowMs()
             for (device, at) in beats {
                 presence[device] = at
@@ -129,6 +148,23 @@ final class WorkspaceStore {
             connected = false
             doc.markDisconnected()
         }
+    }
+
+    /// Register only after the first server state arrives. This preserves a
+    /// synced rename even when the identity cache was cleared by signing out.
+    /// RegistryClient drains writes made by the state callback immediately.
+    private func registerDeviceIfNeeded() {
+        guard !registeredDevice else { return }
+        registeredDevice = true
+
+        let fields = iosDeviceRegistrationFields(
+            id: config.deviceId,
+            deviceName: config.deviceName,
+            existing: doc.overlayRow(kind: "devices", id: config.deviceId),
+            at: nowMs(),
+            version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        )
+        doc.write(kind: "devices", id: config.deviceId, op: .upsert, set: fields)
     }
 
     /// Every local write: re-project the overlay, schedule the snapshot, and

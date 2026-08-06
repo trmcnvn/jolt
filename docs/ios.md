@@ -42,7 +42,7 @@ Development mode can connect to an edge running with `AUTH_MODE=dev`, where the 
 - Archive sessions with a swipe.
 - Use context menus to copy transcript text and code.
 
-The app shows device online state and warns when a run is queued for an offline host.
+The app registers the iPhone as an iOS viewer in the account device list, publishes presence, shows host-device online state, and warns when a run is queued for an offline host.
 
 ## Mobile translations
 

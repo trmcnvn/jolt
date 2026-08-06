@@ -1190,6 +1190,7 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
             let seen = lock(&inner.presence_seen);
             devices
                 .into_iter()
+                .filter(Device::is_engine_host)
                 .filter(|d| d.id != self_id)
                 .filter(|d| {
                     seen.get(&d.id)

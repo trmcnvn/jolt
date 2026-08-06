@@ -55,6 +55,7 @@ impl Render for DeviceSwitcher {
             let state = self.state.read(cx);
             (state.devices.clone(), state.local_device_id.clone())
         };
+        devices.retain(jolt_proto::Device::is_engine_host);
         devices.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)

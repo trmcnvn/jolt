@@ -1025,7 +1025,14 @@ impl Shell {
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
         self.session_search = None;
-        let devices: Vec<Device> = self.state.read(cx).devices.clone();
+        let devices: Vec<Device> = self
+            .state
+            .read(cx)
+            .devices
+            .iter()
+            .filter(|device| device.is_engine_host())
+            .cloned()
+            .collect();
         let local = self.state.read(cx).local_device_id.clone();
         // Land on this device's tab (else the first registered device).
         let device = devices
@@ -1418,7 +1425,14 @@ impl Shell {
                 flow.home.clone(),
             )
         };
-        let devices = self.state.read(cx).devices.clone();
+        let devices: Vec<Device> = self
+            .state
+            .read(cx)
+            .devices
+            .iter()
+            .filter(|device| device.is_engine_host())
+            .cloned()
+            .collect();
         let rows = self.add_space_filtered(cx);
         let query_empty = search.read(cx).is_empty();
         let hairline = crate::theme::hairline(0.06);

@@ -132,9 +132,9 @@ struct NewSpaceSheet: View {
     @State private var creating = false
 
     private var devices: [DeviceRow] {
-        // Engines own folders; this phone can't. Offer every other device.
+        // Engines own folders; this phone can't. Offer every engine host.
         (model.demo?.devices ?? model.workspace?.devices ?? [])
-            .filter { $0.platform != "ios" }
+            .filter(\.isEngineHost)
     }
 
     private var selectedDeviceId: String? {

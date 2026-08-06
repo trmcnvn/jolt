@@ -3259,7 +3259,7 @@ impl Shell {
                     let remotes: Vec<_> = state
                         .devices
                         .iter()
-                        .filter(|device| device.id != *local_id)
+                        .filter(|device| device.id != *local_id && device.is_engine_host())
                         .collect();
                     let online = remotes
                         .iter()
