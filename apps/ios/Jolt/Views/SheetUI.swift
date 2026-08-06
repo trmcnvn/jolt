@@ -35,7 +35,7 @@ struct SheetSeparator: View {
     }
 }
 
-/// Selectable row: title + optional subtitle, accent check when selected.
+/// Selectable row: title + optional subtitle, with a desktop-style wash when selected.
 struct SheetSelectRow: View {
     let title: String
     var subtitle: String?
@@ -64,15 +64,13 @@ struct SheetSelectRow: View {
                     }
                 }
                 Spacer(minLength: 8)
-                Image(systemName: "checkmark")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.text)                    .opacity(selected ? 1 : 0)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(SheetRowButtonStyle())
+        .buttonStyle(SheetRowButtonStyle(selected: selected))
     }
 }
 
@@ -131,11 +129,17 @@ struct SheetLabel: View {
     }
 }
 
-/// Row press feedback: brief white wash, like UIKit cell highlight.
+/// Full-width row feedback: persistent selection wash plus a brief press wash.
 struct SheetRowButtonStyle: ButtonStyle {
+    var selected = false
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .background(configuration.isPressed ? whiteAlpha(0.06) : .clear)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? Theme.elementActive :
+                            (configuration.isPressed ? Theme.elementHover : Color.clear),
+                        in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 

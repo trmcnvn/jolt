@@ -42,8 +42,26 @@ export type RenderToolCall =
   | { readonly _tag: "Mcp"; readonly server?: string; readonly tool: string }
   | { readonly _tag: "Unknown"; readonly name: string };
 
+export interface TurnDiffFileSummary {
+  readonly id: string;
+  readonly path: string;
+  readonly additions: number;
+  readonly deletions: number;
+}
+
+/** The immutable turn-diff fields carried inline with transcript metadata.
+ * Patch pages remain on the host and are intentionally absent here. */
+export interface TurnDiffSummary {
+  readonly catalogRevision: string;
+  readonly files: ReadonlyArray<TurnDiffFileSummary>;
+  readonly additions: number;
+  readonly deletions: number;
+  readonly truncated: boolean;
+}
+
 /** A message part as stored in the session doc: identical to the app-layer
- * {@link MessagePart} except tool calls are render-only. */
+ * {@link MessagePart} except tool calls are render-only and completed turns
+ * may carry an immutable filesystem-change summary. */
 export type SessionMessagePart =
   | Exclude<MessagePart, { kind: "tool" }>
   | {
@@ -51,6 +69,11 @@ export type SessionMessagePart =
       readonly id: string;
       readonly call: RenderToolCall;
       readonly isError?: boolean;
+    }
+  | {
+      readonly kind: "changes";
+      readonly id: string;
+      readonly diff: TurnDiffSummary;
     };
 
 /** Reduce a wire tool call to its render surface. Idempotent — feeding an

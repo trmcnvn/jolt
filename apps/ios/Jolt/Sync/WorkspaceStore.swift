@@ -347,15 +347,26 @@ final class WorkspaceStore {
         return try await relay(for: deviceId).call(method: "SearchFiles", params: params)
     }
 
-    /// Harness integrations registered by the target engine.
+    /// Harness integrations the target device can currently run. The engine's
+    /// descriptor list is static, so probe each model catalog to exclude
+    /// missing CLIs.
     func listHarnesses(deviceId: String) async -> [HarnessInfo]? {
         struct WireHarness: Decodable {
             var id: String
             var name: String
         }
-        let wire: [WireHarness]? = try? await relay(for: deviceId)
-            .call(method: "ListHarnesses", params: [:])
-        return wire?.filter { $0.id != "mock" }.map { HarnessInfo(id: $0.id, label: $0.name) }
+        guard let wire: [WireHarness] = try? await relay(for: deviceId)
+            .call(method: "ListHarnesses", params: [:]) else { return nil }
+        let harnesses = wire
+            .filter { $0.id != "mock" }
+            .map { HarnessInfo(id: $0.id, label: $0.name) }
+        var available: [HarnessInfo] = []
+        for harness in harnesses {
+            if await listModels(deviceId: deviceId, harness: harness.id) != nil {
+                available.append(harness)
+            }
+        }
+        return available
     }
 
     /// ListModels — the target device's live harness catalog (the desktop

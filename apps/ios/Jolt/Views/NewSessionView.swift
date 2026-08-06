@@ -32,9 +32,9 @@ struct NewSessionView: View {
     @State private var showSpacePicker = false
     @State private var showRefPicker = false
     @State private var showCheckoutPicker = false
-    /// Live per-harness catalogs from the space's device (static fallback).
+    /// Live catalogs from the device that owns the selected space.
     @State private var catalogs: [String: [ModelInfo]] = [:]
-    @State private var harnesses = HarnessCatalog.harnesses
+    @State private var harnesses: [HarnessInfo] = []
     @State private var refs: [RepoRef] = []
     @State private var selectedRef: String?
     @State private var checkoutKind: CheckoutKind = .local
@@ -51,7 +51,7 @@ struct NewSessionView: View {
     }
 
     private var models: [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+        catalogs[harness] ?? []
     }
 
     private var selectedModel: ModelInfo? {
@@ -186,7 +186,7 @@ struct NewSessionView: View {
             ), catalogs: catalogs, harnesses: harnesses)
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $pickerItems,
-                      maxSelectionCount: 8, matching: .images)
+                      maxSelectionCount: maxComposerAttachments, matching: .images)
         .onChange(of: pickerItems) { _, items in
             guard !items.isEmpty else { return }
             stage(items)
@@ -200,6 +200,7 @@ struct NewSessionView: View {
             selectedRef = nil
             checkoutKind = .local
             catalogs.removeAll()
+            harnesses = []
             sendError = nil
         }
         .onAppear {
@@ -231,6 +232,7 @@ struct NewSessionView: View {
                 onSend: send,
                 attachments: attachments,
                 onAttach: { showPhotoPicker = true },
+                onPasteImages: pasteImages,
                 onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
             ) {
             if let space {
@@ -556,6 +558,29 @@ struct NewSessionView: View {
         }
     }
 
+    private func pasteImages(_ providers: [NSItemProvider]) {
+        let remaining = maxComposerAttachments - attachments.count
+        guard remaining > 0 else {
+            sendError = "You can attach up to \(maxComposerAttachments) images."
+            return
+        }
+        Task { @MainActor in
+            let result = await stagedPastedAttachments(from: providers, limit: remaining)
+            attachments.append(contentsOf: result.attachments)
+            if result.imageCount == 0 {
+                sendError = "The clipboard doesn't contain an image."
+            } else if result.skippedCount > 0 {
+                sendError = "You can attach up to \(maxComposerAttachments) images."
+            } else if result.failedCount > 0 {
+                sendError = result.failedCount == 1
+                    ? "One image couldn't be attached (unsupported or over 24 MB)."
+                    : "\(result.failedCount) images couldn't be attached (unsupported or over 24 MB)."
+            } else {
+                sendError = nil
+            }
+        }
+    }
+
     private func stage(_ items: [PhotosPickerItem]) {
         Task { @MainActor in
             var failed = 0
@@ -665,14 +690,14 @@ struct ModelPickerSheet: View {
     @Binding var reasoning: String?
     /// True when reconfiguring a live chat: the harness can't change mid-chat.
     var lockedHarness = false
-    /// Live per-harness catalogs from the device (static fallback when absent).
+    /// Live per-harness catalogs from the device.
     var catalogs: [String: [ModelInfo]] = [:]
-    var harnesses = HarnessCatalog.harnesses
+    var harnesses: [HarnessInfo] = []
     /// Present on live VCS chats: checkout label + switchable refs.
     var checkout: SessionCheckoutContext?
 
     private func models(for harness: String) -> [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+        catalogs[harness] ?? []
     }
 
     @State private var switching: String?
@@ -887,18 +912,14 @@ struct ModelPickerSheet: View {
                     ProgressView()
                         .controlSize(.small)
                         .tint(Theme.textMuted)
-                } else {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(Theme.text)
-                        .opacity(selected ? 1 : 0)
                 }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(SheetRowButtonStyle())
+        .buttonStyle(SheetRowButtonStyle(selected: selected))
     }
 
     private func refSubtitle(_ ref: RepoRef, checkout: SessionCheckoutContext) -> String? {
@@ -1029,18 +1050,14 @@ struct RefPickerSheet: View {
                     ProgressView()
                         .controlSize(.small)
                         .tint(Theme.textMuted)
-                } else {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(Theme.text)
-                        .opacity(ref.id == selected ? 1 : 0)
                 }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(SheetRowButtonStyle())
+        .buttonStyle(SheetRowButtonStyle(selected: ref.id == selected))
     }
 
     private func subtitle(for ref: RepoRef) -> String? {
@@ -1129,15 +1146,12 @@ struct CheckoutPickerSheet: View {
                         .foregroundStyle(Theme.textMuted)
                 }
                 Spacer(minLength: 8)
-                Image(systemName: "checkmark")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                    .opacity(rowKind == kind ? 1 : 0)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(SheetRowButtonStyle())
+        .buttonStyle(SheetRowButtonStyle(selected: rowKind == kind))
     }
 }

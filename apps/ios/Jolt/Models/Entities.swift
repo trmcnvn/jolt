@@ -198,15 +198,34 @@ struct RenderToolCall: Hashable {
     var string: (String) -> String? { { key in self.fields[key] as? String } }
 }
 
+/// Compact, immutable turn-diff projection. Patch bodies stay on the host;
+/// mobile only needs the aggregate and per-file stats shown in the transcript.
+struct TurnDiffFileSummary: Codable, Hashable, Identifiable {
+    var id: String
+    var path: String
+    var additions: Int
+    var deletions: Int
+}
+
+struct TurnDiffSummary: Codable, Hashable {
+    var catalogRevision: String
+    var files: [TurnDiffFileSummary]
+    var additions: Int
+    var deletions: Int
+    var truncated: Bool
+}
+
 enum MessagePart: Hashable, Identifiable {
     case text(id: String, text: String)
     case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool)
     case input(id: String, requestId: String, questions: [UserInputQuestion], resolved: Bool)
     case error(id: String, message: String)
+    case changes(id: String, diff: TurnDiffSummary)
 
     var id: String {
         switch self {
-        case .text(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _):
+        case .text(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _),
+             .error(let id, _), .changes(let id, _):
             return id
         }
     }

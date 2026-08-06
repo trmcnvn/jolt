@@ -78,7 +78,9 @@ struct HomeView: View {
                         if model.demo != nil {
                             Text("Demo mode")
                         }
-                        Button("Sign out", role: .destructive) { model.signOut() }
+                        Button("Sign out", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) {
+                            model.signOut()
+                        }
                     } label: {
                         Image(systemName: "person.circle")
                     }
@@ -151,6 +153,13 @@ struct HomeView: View {
 
     private var sessionsSection: some View {
         Section {
+            Text("Sessions")
+                .font(Theme.sans(11, weight: .medium))
+                .foregroundStyle(Theme.textMuted.opacity(0.6))
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
+
             let chats = filteredChats
             if chats.isEmpty {
                 Text(spaceFilter == nil ? "No sessions yet" : "No sessions in this space")
@@ -179,12 +188,6 @@ struct HomeView: View {
                 }
             }
             .motionAnimation(Motion.resort, value: chats.map(\.id))
-        } header: {
-            Text("Sessions")
-                .font(Theme.sans(11, weight: .medium))
-                .foregroundStyle(Theme.textMuted.opacity(0.6))
-                .textCase(nil)
-                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
         }
     }
 
@@ -256,7 +259,8 @@ struct SpaceFilterSheet: View {
     }
 
     private func row(label: String, detail: String?, id: String?) -> some View {
-        Button {
+        let isSelected = selected == id
+        return Button {
             onSelect(id)
             dismiss()
         } label: {
@@ -273,15 +277,16 @@ struct SpaceFilterSheet: View {
                         .foregroundStyle(Theme.textMuted.opacity(0.6))
                         .lineLimit(1)
                 }
-                if selected == id {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Theme.textMuted)
-                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .listRowBackground(Color.clear)
+        .buttonStyle(SheetRowButtonStyle(selected: isSelected))
+        .listRowBackground(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(isSelected ? Theme.elementActive : Color.clear)
+                .padding(.horizontal, 20)
+        )
     }
 }
 

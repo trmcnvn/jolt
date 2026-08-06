@@ -145,6 +145,7 @@ private struct WireMessagePart: Decodable {
     let questions: [UserInputQuestion]?
     let resolved: Bool?
     let message: String?
+    let diff: TurnDiffSummary?
 }
 
 private struct WireMessageEntry: Decodable {
@@ -176,6 +177,9 @@ private struct WireMessageEntry: Decodable {
                               questions: part.questions ?? [], resolved: part.resolved ?? false)
             case "error":
                 return .error(id: part.id, message: part.message ?? "")
+            case "changes":
+                guard let diff = part.diff else { return nil }
+                return .changes(id: part.id, diff: diff)
             default:
                 return nil
             }

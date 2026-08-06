@@ -40,6 +40,30 @@ describe("transcript projection", () => {
     expect(refreshed.manifest.catalogRevision).toBe(projection.manifest.catalogRevision);
   });
 
+  it("preserves immutable turn-change summaries for mobile pages", () => {
+    const assistant: SessionMessageEntry = {
+      ...message(1),
+      parts: [
+        { id: "t0", kind: "text", text: "done" },
+        {
+          id: "changes",
+          kind: "changes",
+          diff: {
+            catalogRevision: "catalog-1",
+            files: [{ id: "f1", path: "src/app.ts", additions: 4, deletions: 1 }],
+            additions: 4,
+            deletions: 1,
+            truncated: false
+          }
+        }
+      ]
+    };
+
+    const projection = projectTranscript([message(0), assistant]);
+
+    expect(projection.pages[0]?.messages[1]?.parts[1]).toEqual(assistant.parts[1]);
+  });
+
   it("keeps continuations joined with their root", () => {
     const root = message(0);
     const continuation: SessionMessageEntry = {

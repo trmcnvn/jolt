@@ -33,9 +33,9 @@ Development mode can connect to an edge running with `AUTH_MODE=dev`, where the 
 - Ask a space's host device to start Claude Code, Codex, or Pi; no harness runs on the phone.
 - Discover harnesses, models, and reasoning levels from the target device.
 - Use the host's configured Git or Jujutsu backend to choose a ref/revision, reuse a worktree/workspace, or create an isolated one.
-- Stream transcripts with Markdown, code highlighting, grouped tools, errors, and input requests.
+- Stream transcripts with Markdown, code highlighting, grouped tools, immutable per-turn changed-file summaries, errors, and input requests.
 - Send, steer, stop, and answer structured questions.
-- Attach images from Photos on the first or any later message; uploads are chunked to the host device.
+- Paste images or attach them from Photos on the first or any later message; uploads are chunked to the host device.
 - Search the host checkout with `@` and send file/directory mentions as cross-platform `jolt-file:` links.
 - Use `/answer`, `/bro`, `!command`, and `!!command` from the composer.
 - Change model, reasoning, and ref for later turns.
@@ -56,8 +56,9 @@ The app registers the iPhone as an iOS viewer in the account device list, publis
 | Add-space palette | Device tabs and remote folder browser |
 | gpui virtual list | SwiftUI `LazyVStack` with stable row IDs and estimated unloaded-page placeholders |
 | Hover actions | Context menus |
+| Turn Changes card with historical diff opening | Collapsed Changes card and expandable file list only |
 
-Engine and desktop devices provide terminals, working-copy diffs, agent account switching, harness secrets, and desktop settings.
+Engine and desktop devices provide terminals, working-copy diffs, historical diff opening, agent account switching, harness secrets, and desktop settings.
 
 ## Synchronization
 

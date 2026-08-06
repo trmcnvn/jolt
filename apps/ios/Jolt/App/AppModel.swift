@@ -274,23 +274,18 @@ final class AppModel {
 
     func listHarnesses(space: Space) async -> [HarnessInfo] {
         if demo != nil { return HarnessCatalog.harnesses }
-        return await workspace?.listHarnesses(deviceId: space.deviceId) ?? HarnessCatalog.harnesses
+        return await workspace?.listHarnesses(deviceId: space.deviceId) ?? []
     }
 
     /// Live model catalog from the space's owning device (the desktop's
-    /// "catalog source = the device that runs the session" rule); static
-    /// fallback when the device is unreachable. Pi has no meaningful static
-    /// catalog because its providers are configured on the host.
+    /// "catalog source = the device that runs the session" rule). Production
+    /// never substitutes models for a harness the host could not resolve.
     func listModels(space: Space, harness: String) async -> [ModelInfo] {
         if demo != nil {
             try? await Task.sleep(nanoseconds: 100_000_000)
             return HarnessCatalog.models(for: harness)
         }
-        if let live = await workspace?.listModels(deviceId: space.deviceId, harness: harness),
-           !live.isEmpty {
-            return live
-        }
-        return HarnessCatalog.models(for: harness)
+        return await workspace?.listModels(deviceId: space.deviceId, harness: harness) ?? []
     }
 
     /// Refs/revisions from the host's active VCS backend.

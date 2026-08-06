@@ -296,6 +296,14 @@ final class SessionStore {
                           resolved: m["resolved"]?.boolValue ?? false)
         case "error":
             return .error(id: id, message: m["message"]?.stringValue ?? "")
+        case "changes":
+            guard let rawDiff = m["diff"]?.jsonObject,
+                  JSONSerialization.isValidJSONObject(rawDiff),
+                  let data = try? JSONSerialization.data(withJSONObject: rawDiff),
+                  let diff = try? JSONDecoder().decode(TurnDiffSummary.self, from: data) else {
+                return nil
+            }
+            return .changes(id: id, diff: diff)
         default:
             return nil
         }

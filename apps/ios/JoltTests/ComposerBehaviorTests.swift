@@ -5,6 +5,26 @@ import BeautifulMermaid
 @testable import Jolt
 
 final class ComposerBehaviorTests: XCTestCase {
+    @MainActor
+    func testNativeComposerPasteRoutesClipboardImage() {
+        let pasteboard = UIPasteboard.general
+        let previousItems = pasteboard.items
+        defer { pasteboard.items = previousItems }
+        pasteboard.image = UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2)).image {
+            $0.cgContext.setFillColor(UIColor.red.cgColor)
+            $0.cgContext.fill(CGRect(origin: .zero, size: CGSize(width: 2, height: 2)))
+        }
+
+        let textView = ImagePasteTextView()
+        var pastedProviders: [NSItemProvider] = []
+        textView.onPasteImages = { pastedProviders = $0 }
+
+        XCTAssertTrue(textView.canPerformAction(#selector(ImagePasteTextView.paste(_:)),
+                                                withSender: nil))
+        textView.paste(nil)
+        XCTAssertEqual(pastedProviders.count, 1)
+    }
+
     func testShellCommandPrefixes() {
         XCTAssertEqual(parseShellCommand("! cargo test"),
                        ShellCommand(command: "cargo test", excludeFromContext: false))

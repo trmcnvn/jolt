@@ -128,6 +128,8 @@ icon_assets![
     (TERMINAL, "terminal"),
     (PLUS, "plus"),
     (CLOSE, "close"),
+    (MAXIMIZE, "maximize"),
+    (RESTORE, "restore"),
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),

@@ -12,9 +12,10 @@ import Foundation
 enum RowKind {
     case user(text: String, blocks: [TopBlock])
     case markdown(block: MDBlock, streaming: Bool)
-    case toolGroup(tools: [ToolItem], autoOpen: Bool)
+    case toolGroup(tools: [ToolItem], active: Bool)
     case inputChip(header: String, resolved: Bool)
     case errorChip(message: String)
+    case changes(diff: TurnDiffSummary)
 }
 
 struct ToolItem: Hashable {
@@ -127,18 +128,22 @@ enum TranscriptRowBuilder {
         }
 
         var first = true
+        let hasChanges = entry.parts.contains { part in
+            if case .changes = part { return true }
+            return false
+        }
         var pendingTools: [ToolItem] = []
         var groupIx = 0
         let lastPartIx = entry.parts.indices.last
 
         func flushTools(lastIx: Int?) {
             guard !pendingTools.isEmpty else { return }
-            let autoOpen = streaming && lastIx == lastPartIx
+            let active = streaming && lastIx == lastPartIx
             let id = "\(entry.id)#g\(groupIx)"
             var version = toolFingerprint(pendingTools)
-            if autoOpen { version ^= 1 }
+            if active { version ^= 1 }
             rows.append(TranscriptRow(id: id, version: version, turnStart: first,
-                                      kind: .toolGroup(tools: pendingTools, autoOpen: autoOpen),
+                                      kind: .toolGroup(tools: pendingTools, active: active),
                                       entryId: entry.id, timestamp: nil, partKey: nil))
             first = false
             pendingTools = []
@@ -148,6 +153,10 @@ enum TranscriptRowBuilder {
         for (ix, part) in entry.parts.enumerated() {
             switch part {
             case .tool(_, let call, let isError, let resolved):
+                // The filesystem snapshot is authoritative. Once it exists,
+                // successful mutation chips are duplicate noise; failed chips
+                // remain visible because they still explain the turn.
+                if hasChanges, resolved, !isError, isFileMutation(call) { continue }
                 pendingTools.append(ToolItem(call: call, isError: isError, resolved: resolved))
                 if ix == lastPartIx { flushTools(lastIx: ix) }
 
@@ -192,9 +201,21 @@ enum TranscriptRowBuilder {
                                           kind: .errorChip(message: message),
                                           entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
+
+            case .changes(let partId, let diff):
+                flushTools(lastIx: ix - 1)
+                rows.append(TranscriptRow(id: "\(entry.id)#\(partId)",
+                                          version: fnv1a(diff.catalogRevision),
+                                          turnStart: first, kind: .changes(diff: diff),
+                                          entryId: entry.id, timestamp: nil, partKey: nil))
+                first = false
             }
         }
         flushTools(lastIx: lastPartIx)
+    }
+
+    private static func isFileMutation(_ call: RenderToolCall) -> Bool {
+        ["writeFile", "editFile", "applyPatch"].contains(call.tag)
     }
 
     private static func parse(text: String, key: String, streaming: Bool,

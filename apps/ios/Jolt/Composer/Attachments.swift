@@ -12,6 +12,7 @@
 import Photos
 import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Text transport
 
@@ -80,6 +81,8 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
 
 // MARK: - Staging
 
+/// Maximum number of images staged in one composer.
+let maxComposerAttachments = 8
 /// Maximum staged attachment size.
 let maxAttachmentBytes = 24 * 1024 * 1024
 /// Base64 chars per `UploadChunk` — sized for the relay link.
@@ -127,6 +130,56 @@ struct StagedAttachment: Identifiable, Hashable {
         if b[0] == 0x52, b[1] == 0x49, b[2] == 0x46, b[3] == 0x46,
            b[8] == 0x57, b[9] == 0x45, b[10] == 0x42, b[11] == 0x50 { return "webp" }
         return nil
+    }
+}
+
+/// Result of loading image item providers supplied by the native paste action.
+struct PastedAttachmentResult {
+    let attachments: [StagedAttachment]
+    let imageCount: Int
+    let failedCount: Int
+    let skippedCount: Int
+}
+
+/// Load copied images without flattening them through `UIPasteboard.image`,
+/// preserving PNG/GIF/WebP bytes when the provider exposes them.
+@MainActor
+func stagedPastedAttachments(from providers: [NSItemProvider],
+                             limit: Int) async -> PastedAttachmentResult {
+    let imageProviders = providers.filter {
+        $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+    }
+    let selected = Array(imageProviders.prefix(max(limit, 0)))
+    var attachments: [StagedAttachment] = []
+    var failed = 0
+    for provider in selected {
+        guard let data = await pastedImageData(from: provider),
+              let attachment = StagedAttachment.stage(data: data) else {
+            failed += 1
+            continue
+        }
+        attachments.append(attachment)
+    }
+    return PastedAttachmentResult(
+        attachments: attachments,
+        imageCount: imageProviders.count,
+        failedCount: failed,
+        skippedCount: imageProviders.count - selected.count
+    )
+}
+
+private func pastedImageData(from provider: NSItemProvider) async -> Data? {
+    let preferredTypes: [UTType] = [.png, .jpeg, .gif, .webP, .heic]
+    let identifier = preferredTypes.first {
+        provider.hasItemConformingToTypeIdentifier($0.identifier)
+    }?.identifier ?? provider.registeredTypeIdentifiers.first {
+        UTType($0)?.conforms(to: .image) == true
+    }
+    guard let identifier else { return nil }
+    return await withCheckedContinuation { continuation in
+        provider.loadDataRepresentation(forTypeIdentifier: identifier) { data, _ in
+            continuation.resume(returning: data)
+        }
     }
 }
 

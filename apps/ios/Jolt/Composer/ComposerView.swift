@@ -24,8 +24,9 @@ struct ComposerShell<Chips: View>: View {
     /// Staged image attachments shown inside the pill. Non-empty forces the
     /// expanded layout, like chips.
     var attachments: [StagedAttachment] = []
-    /// Present the photo picker; nil hides the attach button.
+    /// Present attachment actions; nil hides the attach button.
     var onAttach: (() -> Void)? = nil
+    var onPasteImages: (([NSItemProvider]) -> Void)? = nil
     var onRemoveAttachment: (String) -> Void = { _ in }
     @ViewBuilder var chips: Chips
 
@@ -94,12 +95,20 @@ struct ComposerShell<Chips: View>: View {
     }
 
     private var input: some View {
-        TextField(placeholder, text: $draft, selection: $selection, axis: .vertical)
-            .font(Theme.sans(16))
-            .foregroundStyle(Theme.text)
-            .tint(Theme.text)
-            .lineLimit(1...7)
+        ZStack(alignment: .topLeading) {
+            if draft.isEmpty {
+                Text(placeholder)
+                    .font(Theme.sans(16))
+                    .foregroundStyle(Theme.textFaint)
+                    .allowsHitTesting(false)
+            }
+            ComposerTextInput(
+                text: $draft,
+                selection: $selection,
+                onPasteImages: onPasteImages
+            )
             .focused($focused)
+        }
     }
 
     private var attachButton: some View {
@@ -224,6 +233,7 @@ struct ComposerView: View {
                     onStop: { store.sendInterrupt() },
                     attachments: attachments,
                     onAttach: { showPicker = true },
+                    onPasteImages: pasteImages,
                     onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
                 ) {
                     EmptyView()
@@ -231,7 +241,7 @@ struct ComposerView: View {
             }
         }
         .photosPicker(isPresented: $showPicker, selection: $pickerItems,
-                      maxSelectionCount: 8, matching: .images)
+                      maxSelectionCount: maxComposerAttachments, matching: .images)
         .onChange(of: pickerItems) { _, items in
             guard !items.isEmpty else { return }
             stage(items)
@@ -261,6 +271,29 @@ struct ComposerView: View {
                 composerError = failed == 1
                     ? "One image couldn't be attached (unsupported or over 24 MB)."
                     : "\(failed) images couldn't be attached (unsupported or over 24 MB)."
+            } else {
+                composerError = nil
+            }
+        }
+    }
+
+    private func pasteImages(_ providers: [NSItemProvider]) {
+        let remaining = maxComposerAttachments - attachments.count
+        guard remaining > 0 else {
+            composerError = "You can attach up to \(maxComposerAttachments) images."
+            return
+        }
+        Task { @MainActor in
+            let result = await stagedPastedAttachments(from: providers, limit: remaining)
+            attachments.append(contentsOf: result.attachments)
+            if result.imageCount == 0 {
+                composerError = "The clipboard doesn't contain an image."
+            } else if result.skippedCount > 0 {
+                composerError = "You can attach up to \(maxComposerAttachments) images."
+            } else if result.failedCount > 0 {
+                composerError = result.failedCount == 1
+                    ? "One image couldn't be attached (unsupported or over 24 MB)."
+                    : "\(result.failedCount) images couldn't be attached (unsupported or over 24 MB)."
             } else {
                 composerError = nil
             }

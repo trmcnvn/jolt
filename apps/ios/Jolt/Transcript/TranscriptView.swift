@@ -249,12 +249,10 @@ struct TranscriptView: View {
             case .markdown(let block, let streaming):
                 MarkdownRowView(row: row, block: block, streaming: streaming, veils: veils)
 
-            case .toolGroup(let tools, let autoOpen):
-                ToolGroupView(tools: tools,
-                              open: folds[row.id] ?? autoOpen,
-                              userToggled: folds[row.id] != nil) {
+            case .toolGroup(let tools, let active):
+                ToolGroupView(tools: tools, open: folds[row.id] ?? false, active: active) {
                     withAnimation(reduceMotion ? nil : Motion.resize) {
-                        folds[row.id] = !(folds[row.id] ?? autoOpen)
+                        folds[row.id] = !(folds[row.id] ?? false)
                     }
                 }
 
@@ -263,6 +261,13 @@ struct TranscriptView: View {
 
             case .errorChip(let message):
                 ErrorChipView(message: message)
+
+            case .changes(let diff):
+                TurnChangesView(diff: diff, open: folds[row.id] ?? false) {
+                    withAnimation(reduceMotion ? nil : Motion.resize) {
+                        folds[row.id] = !(folds[row.id] ?? false)
+                    }
+                }
             }
         }
         .padding(.top, row.topGap)
@@ -474,15 +479,94 @@ struct MarkdownRowView: View {
     }
 }
 
+// MARK: - Immutable turn changes
+
+struct TurnChangesView: View {
+    let diff: TurnDiffSummary
+    let open: Bool
+    let toggle: () -> Void
+
+    private var title: String {
+        let count = diff.files.count
+        return "\(count) changed file\(count == 1 ? "" : "s")"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: toggle) {
+                HStack(spacing: 7) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Theme.textMuted.opacity(0.7))
+                        .rotationEffect(.degrees(open ? 90 : 0))
+                        .frame(width: 18, height: 18)
+                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 5))
+                    Text(title)
+                        .font(Theme.sans(12, weight: .medium))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                    Text("+\(diff.additions)")
+                        .font(Theme.mono(12))
+                        .foregroundStyle(Theme.statusCompleted)
+                    Text("−\(diff.deletions)")
+                        .font(Theme.mono(12))
+                        .foregroundStyle(Theme.danger)
+                    Spacer(minLength: 0)
+                }
+                .frame(height: 32)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PressWashButtonStyle(cornerRadius: 6))
+            .accessibilityLabel("\(title), \(diff.additions) additions, \(diff.deletions) deletions")
+            .accessibilityValue(open ? "Expanded" : "Collapsed")
+
+            if open {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(diff.files) { file in
+                        HStack(spacing: 8) {
+                            Text(file.path)
+                                .font(Theme.mono(11))
+                                .foregroundStyle(Theme.textMuted)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 0)
+                            Text("+\(file.additions)")
+                                .font(Theme.mono(11))
+                                .foregroundStyle(Theme.statusCompleted)
+                            Text("−\(file.deletions)")
+                                .font(Theme.mono(11))
+                                .foregroundStyle(Theme.danger)
+                        }
+                        .frame(height: 28)
+                        .padding(.horizontal, 8)
+                    }
+                }
+                .padding(.top, 2)
+                .padding(.bottom, 4)
+            }
+        }
+        .padding(6)
+        .background(Theme.surfaceRaised.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.border.opacity(0.8), lineWidth: 1))
+    }
+}
+
 // MARK: - Tool group (transcript.rs render_tool_group)
+
+func visibleToolRange(toolCount: Int, open: Bool, active: Bool) -> Range<Int> {
+    if open { return 0..<toolCount }
+    if active, toolCount > 0 { return (toolCount - 1)..<toolCount }
+    return 0..<0
+}
 
 struct ToolGroupView: View {
     let tools: [ToolItem]
     let open: Bool
-    let userToggled: Bool
+    let active: Bool
     let toggle: () -> Void
 
     var body: some View {
+        let visibleTools = visibleToolRange(toolCount: tools.count, open: open, active: active)
         VStack(alignment: .leading, spacing: 0) {
             // Header stays quiet even on failure — chips carry the red.
             Button(action: toggle) {
@@ -504,10 +588,10 @@ struct ToolGroupView: View {
             }
             .buttonStyle(PressWashButtonStyle(cornerRadius: 6))
 
-            if open {
+            if !visibleTools.isEmpty {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(tools.enumerated()), id: \.offset) { _, tool in
-                        ToolChipRow(tool: tool)
+                    ForEach(visibleTools, id: \.self) { index in
+                        ToolChipRow(tool: tools[index])
                     }
                 }
                 .padding(.top, 2)

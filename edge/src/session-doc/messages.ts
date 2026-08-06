@@ -7,7 +7,7 @@
  */
 import type { UserInputQuestion } from "./control-types";
 import { MSG_INLINE_MAX } from "./constants";
-import type { RenderToolCall, SessionMessagePart } from "./render-parts";
+import type { RenderToolCall, SessionMessagePart, TurnDiffSummary } from "./render-parts";
 
 export type SessionMessageRole = "user" | "assistant" | "system";
 
@@ -21,7 +21,7 @@ export type SessionMessageRole = "user" | "assistant" | "system";
  */
 export interface DocMessagePart {
   readonly id: string;
-  readonly kind: "text" | "tool" | "input" | "error";
+  readonly kind: "text" | "tool" | "input" | "error" | "changes";
   /** kind === "text" — LoroText in the doc, string in mirror state. */
   readonly text?: string;
   /** kind === "tool" — render-only (§1.2). */
@@ -32,6 +32,8 @@ export interface DocMessagePart {
   readonly resolved?: boolean;
   /** kind === "error". */
   readonly message?: string;
+  /** kind === "changes" — compact metadata only; no patch bodies. */
+  readonly diff?: TurnDiffSummary;
 }
 
 /** App-layer parts → doc parts. Input parts key on their requestId. */
@@ -58,6 +60,8 @@ export const toDocParts = (
         };
       case "error":
         return { id: p.id, kind: "error", message: p.message };
+      case "changes":
+        return { id: p.id, kind: "changes", diff: p.diff };
     }
   });
 
@@ -86,6 +90,10 @@ export const fromDocParts = (
         };
       case "error":
         return { kind: "error", id: p.id, message: p.message ?? "" };
+      case "changes":
+        return p.diff
+          ? { kind: "changes", id: p.id, diff: p.diff }
+          : { kind: "text", id: p.id, text: "" };
       default:
         return { kind: "text", id: p.id, text: p.text ?? "" };
     }

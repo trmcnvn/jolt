@@ -25,7 +25,7 @@ use gpui_tokio::Tokio;
 use jolt_proto::{HarnessId, UsageBreakdown, UsageBreakdownRow, UsageDay};
 use jolt_rpc::methods;
 
-use crate::changes::Changes;
+use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 #[cfg(any(debug_assertions, feature = "debug-ui"))]
 use crate::debug::{PerformanceHud, TogglePerformanceHud};
@@ -696,6 +696,8 @@ pub struct Shell {
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     changes: Option<Entity<Changes>>,
+    changes_expanded: bool,
+    changes_sub: Option<Subscription>,
     #[cfg(any(debug_assertions, feature = "debug-ui"))]
     performance_hud: Option<Entity<PerformanceHud>>,
     /// Chat outlet vs settings pages.
@@ -985,6 +987,8 @@ impl Shell {
             file_drag_active: false,
             terminal: None,
             changes: None,
+            changes_expanded: false,
+            changes_sub: None,
             #[cfg(any(debug_assertions, feature = "debug-ui"))]
             performance_hud,
             route,
@@ -1131,6 +1135,8 @@ impl Shell {
         // newly routed runtime while leaving both engine runtimes alive.
         self.terminal = None;
         self.changes = None;
+        self.changes_expanded = false;
+        self.changes_sub = None;
         self.devices_page = None;
         self.archived_page = None;
         self.add_space = None;
@@ -1217,6 +1223,7 @@ impl Shell {
             }
             self.right_tween = None;
             self.terminal_tween = None;
+            self.set_changes_expanded(false, cx);
             let panels = self.panels.get(&self.panel_key(cx));
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
@@ -1424,7 +1431,19 @@ impl Shell {
                 changes.ensure_watch(cx);
             });
         } else if let Some(changes) = self.changes.clone() {
+            self.set_changes_expanded(false, cx);
             changes.update(cx, Changes::stop_watch);
+        }
+        cx.notify();
+    }
+
+    fn set_changes_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if self.changes_expanded == expanded {
+            return;
+        }
+        self.changes_expanded = expanded;
+        if let Some(changes) = self.changes.clone() {
+            changes.update(cx, |changes, cx| changes.set_expanded_view(expanded, cx));
         }
         cx.notify();
     }
@@ -1456,6 +1475,17 @@ impl Shell {
             return changes.clone();
         }
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+        changes.update(cx, |changes, cx| {
+            changes.set_expanded_view(self.changes_expanded, cx)
+        });
+        self.changes_sub = Some(cx.subscribe(
+            &changes,
+            |this: &mut Shell, _, event: &ChangesEvent, cx| match event {
+                ChangesEvent::ToggleExpanded => {
+                    this.set_changes_expanded(!this.changes_expanded, cx)
+                }
+            },
+        ));
         self.changes = Some(changes.clone());
         changes
     }
@@ -1465,6 +1495,7 @@ impl Shell {
         if visible {
             self.changes_pane(cx).update(cx, Changes::ensure_watch);
         } else if let Some(changes) = self.changes.clone() {
+            self.set_changes_expanded(false, cx);
             changes.update(cx, Changes::stop_watch);
         }
     }
@@ -4320,6 +4351,25 @@ impl Shell {
         }
     }
 
+    fn render_expanded_changes(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let changes = self.changes_pane(cx);
+        changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+        div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .mx(px(8.0))
+            .mb(px(8.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.bg)
+            .overflow_hidden()
+            .child(changes)
+            .into_any_element()
+    }
+
     /// Right "Changes" pane — hidden by default, drag-resizable; content is the
     /// lazy [`Changes`] diff viewer (created on first open).
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -4943,6 +4993,11 @@ impl Render for Shell {
                     || this.delete_space_confirm.is_some()
                     || this.add_space.is_some()
                     || this.session_search.is_some();
+                if event.keystroke.key == "escape" && this.changes_expanded {
+                    this.set_changes_expanded(false, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key == "escape"
                     && matches!(this.route, Route::Chat)
                     && this.state.read(cx).selected_chat.is_none()
@@ -5088,19 +5143,30 @@ impl Render for Shell {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx)
                 });
 
-                let sidebar = self.render_sidebar(cx);
+                // The expanded Changes view replaces the app body while the
+                // titlebar remains available for navigation.
+                let on_chat = matches!(self.route, Route::Chat);
+                let expanded_changes = on_chat && self.changes_expanded && self.right_pane_open(cx);
+                let sidebar = if expanded_changes {
+                    Empty.into_any_element()
+                } else {
+                    self.render_sidebar(cx)
+                };
                 let sidebar_handle = self.resize_handle(
                     "sidebar-resize",
                     || SidebarResize,
                     |shell, _| shell.settings.sidebar_width = SIDEBAR_DEFAULT,
                     cx,
                 );
-                let main = self.render_main(cx);
+                let main = if expanded_changes {
+                    Empty.into_any_element()
+                } else {
+                    self.render_main(cx)
+                };
                 // The Changes pane is chat-scoped chrome, so the Settings route
                 // never renders it. The per-session open flags stay
                 // intact for the return trip.
-                let on_chat = matches!(self.route, Route::Chat);
-                let right: AnyElement = if on_chat {
+                let right: AnyElement = if on_chat && !expanded_changes {
                     self.render_right_pane(cx)
                 } else {
                     Empty.into_any_element()
@@ -5175,7 +5241,11 @@ impl Render for Shell {
                 // through the titlebar, down to the bottom edge). Its width
                 // rides the same tween as the sidebar, so the tone melts away
                 // with the collapse instead of vanishing in a frame.
-                let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+                let sidebar_now = if expanded_changes {
+                    0.0
+                } else {
+                    self.eval_tween(self.sidebar_tween, self.sidebar_target())
+                };
                 // Hairline on its right edge — full height like the tone,
                 // so the sidebar column reads as its own surface.
                 let sidebar_tone = div()
@@ -5187,22 +5257,26 @@ impl Render for Shell {
                     .bg(crate::theme::wash(0.05))
                     .border_r_1()
                     .border_color(border_color);
+                let body: AnyElement = if expanded_changes {
+                    self.render_expanded_changes(cx)
+                } else {
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_row()
+                        .child(sidebar)
+                        .child(sidebar_seam)
+                        .child(card)
+                        .child(right)
+                        .into_any_element()
+                };
                 let page = div()
                     .size_full()
                     .flex()
                     .flex_col()
                     .child(title_bar)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .flex_row()
-                            .child(sidebar)
-                            .child(sidebar_seam)
-                            .child(card)
-                            .child(right),
-                    )
+                    .child(body)
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(sidebar_tone)

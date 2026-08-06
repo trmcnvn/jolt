@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, Entity, ListAlignment, ListScrollEvent, ListState, Render,
-    SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
+    AnyElement, App, Context, Entity, EventEmitter, ListAlignment, ListScrollEvent, ListState,
+    Render, ScrollHandle, SharedString, Subscription, Task, Window, div, font, list, prelude::*,
+    px,
 };
 use jolt_proto::{
     CheckoutDiffManifest, CheckoutDiffPage, CheckoutDiffWatchFrame, DiffCompleteness,
@@ -28,8 +29,13 @@ pub const NOTICE_HEIGHT: f32 = 24.0;
 pub const GUTTER_WIDTH: f32 = 36.0;
 pub const MARKER_WIDTH: f32 = 28.0;
 pub const ACCENT_BAR_WIDTH: f32 = 3.0;
+const MONOSPACE_GLYPH_WIDTH_RATIO: f32 = 0.62;
 const PAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const HIGHLIGHT_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+pub enum ChangesEvent {
+    ToggleExpanded,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -267,6 +273,31 @@ pub fn lang_for_path(path: &str) -> Option<Lang> {
     lang_for_tag(path.rsplit('/').next()?.rsplit('.').next()?)
 }
 
+fn display_columns(text: &str) -> usize {
+    text.chars().fold(0, |columns, character| {
+        if character == '\t' {
+            columns + (4 - columns % 4)
+        } else {
+            columns + 1
+        }
+    })
+}
+
+fn file_display_columns(file: &FileDiff) -> usize {
+    let mut max_columns = file_notices(file)
+        .iter()
+        .map(|notice| display_columns(notice))
+        .max()
+        .unwrap_or(0);
+    for hunk in &file.hunks {
+        max_columns = max_columns.max(display_columns(&hunk.header));
+        for line in &hunk.lines {
+            max_columns = max_columns.max(display_columns(&line.text));
+        }
+    }
+    max_columns
+}
+
 fn hash64(parts: &[&str]) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     for part in parts {
@@ -301,14 +332,17 @@ enum ChangeRowKind {
         file: usize,
     },
     Notice {
+        file: usize,
         page_id: String,
         notice: usize,
     },
     HunkHeader {
+        file: usize,
         page_id: String,
         hunk: usize,
     },
     Line {
+        file: usize,
         page_id: String,
         hunk: usize,
         line: usize,
@@ -460,6 +494,7 @@ pub struct Changes {
     watch_key: Option<(String, Option<String>)>,
     watch_task: Option<Task<()>>,
     source: Option<DiffSource>,
+    expanded_view: bool,
     error: Option<SharedString>,
     manifest: Option<CheckoutDiffManifest>,
     sequence: u64,
@@ -474,6 +509,8 @@ pub struct Changes {
     highlights: HashMap<String, HighlightSlot>,
     highlight_order: VecDeque<String>,
     highlight_bytes: usize,
+    horizontal_scrolls: HashMap<String, ScrollHandle>,
+    file_columns: HashMap<String, usize>,
     rows: Vec<ChangeRow>,
     list: ListState,
     _observe: Subscription,
@@ -494,6 +531,7 @@ impl Changes {
             watch_key: None,
             watch_task: None,
             source: None,
+            expanded_view: false,
             error: None,
             manifest: None,
             sequence: 0,
@@ -508,6 +546,8 @@ impl Changes {
             highlights: HashMap::new(),
             highlight_order: VecDeque::new(),
             highlight_bytes: 0,
+            horizontal_scrolls: HashMap::new(),
+            file_columns: HashMap::new(),
             rows: Vec::new(),
             list,
             _observe: observe,
@@ -520,6 +560,13 @@ impl Changes {
         cx.notify();
     }
 
+    pub fn set_expanded_view(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if self.expanded_view != expanded {
+            self.expanded_view = expanded;
+            cx.notify();
+        }
+    }
+
     pub fn stop_watch(&mut self, cx: &mut Context<Self>) {
         self.enabled = false;
         self.watch_key = None;
@@ -528,6 +575,7 @@ impl Changes {
         self.manifest = None;
         self.page_tasks.clear();
         self.loading.clear();
+        self.horizontal_scrolls.clear();
         self.rebuild_rows();
         cx.notify();
     }
@@ -559,6 +607,7 @@ impl Changes {
         self.error = None;
         self.sequence = 0;
         self.expanded.clear();
+        self.horizontal_scrolls.clear();
         self.loading.clear();
         self.page_errors.clear();
         self.pages.clear();
@@ -649,6 +698,7 @@ impl Changes {
         self.manifest = None;
         self.sequence = 0;
         self.expanded.clear();
+        self.horizontal_scrolls.clear();
         self.loading.clear();
         self.page_errors.clear();
         self.rebuild_rows();
@@ -759,6 +809,8 @@ impl Changes {
             .retain(|id| referenced.contains(id.as_str()));
         self.expanded
             .retain(|id| manifest.files.iter().any(|file| &file.id == id));
+        self.horizontal_scrolls
+            .retain(|id, _| manifest.files.iter().any(|file| &file.id == id));
         self.sequence = sequence;
         self.manifest = Some(manifest);
         for page in bootstrap_pages {
@@ -897,8 +949,10 @@ impl Changes {
 
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
+        let mut file_columns = HashMap::new();
         if let Some(manifest) = &self.manifest {
             for (file_index, file) in manifest.files.iter().enumerate() {
+                self.horizontal_scrolls.entry(file.id.clone()).or_default();
                 rows.push(ChangeRow {
                     id: format!("file:{}", file.id),
                     version: hash64(&[&file.id, &manifest.catalog_revision]),
@@ -927,11 +981,18 @@ impl Changes {
                         });
                         continue;
                     };
+                    file_columns
+                        .entry(file.id.clone())
+                        .and_modify(|columns: &mut usize| {
+                            *columns = (*columns).max(file_display_columns(&page.file));
+                        })
+                        .or_insert_with(|| file_display_columns(&page.file));
                     for (notice, _) in file_notices(&page.file).iter().enumerate() {
                         rows.push(ChangeRow {
                             id: format!("{page_id}:notice:{notice}"),
                             version: page.access,
                             kind: ChangeRowKind::Notice {
+                                file: file_index,
                                 page_id: page_id.clone(),
                                 notice,
                             },
@@ -943,6 +1004,7 @@ impl Changes {
                             id: format!("{page_id}:hunk:{hunk}"),
                             version: page.access,
                             kind: ChangeRowKind::HunkHeader {
+                                file: file_index,
                                 page_id: page_id.clone(),
                                 hunk,
                             },
@@ -952,6 +1014,7 @@ impl Changes {
                                 id: format!("{page_id}:hunk:{hunk}:line:{line}"),
                                 version: page.access,
                                 kind: ChangeRowKind::Line {
+                                    file: file_index,
                                     page_id: page_id.clone(),
                                     hunk,
                                     line,
@@ -967,6 +1030,7 @@ impl Changes {
         if let Some((range, count)) = row_splice(&self.rows, &rows) {
             self.list.splice(range, count);
         }
+        self.file_columns = file_columns;
         self.rows = rows;
     }
 
@@ -1064,6 +1128,58 @@ impl Changes {
         );
     }
 
+    fn file_content_width(&self, file_index: usize, cx: &App) -> f32 {
+        let Some(file) = self
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.files.get(file_index))
+        else {
+            return 0.0;
+        };
+        let columns = self.file_columns.get(&file.id).copied().unwrap_or(0);
+        ACCENT_BAR_WIDTH
+            + 2.0 * GUTTER_WIDTH
+            + MARKER_WIDTH
+            + 2.0 * Theme::SPACE_LG
+            + columns as f32
+                * f32::from(Theme::of(cx).font_sizes.code)
+                * MONOSPACE_GLYPH_WIDTH_RATIO
+    }
+
+    fn scroll_file_row(
+        &self,
+        row_id: &str,
+        file_index: usize,
+        content: AnyElement,
+        cx: &App,
+    ) -> AnyElement {
+        let Some(file) = self
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.files.get(file_index))
+        else {
+            return content;
+        };
+        let Some(scroll) = self.horizontal_scrolls.get(&file.id) else {
+            return content;
+        };
+        let mut scroller = div()
+            .id(SharedString::from(format!("diff-scroll:{row_id}")))
+            .w_full()
+            .overflow_x_scroll()
+            .track_scroll(scroll)
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(self.file_content_width(file_index, cx)))
+                    .child(content),
+            );
+        // A one-axis GPUI scroller otherwise maps vertical wheel deltas onto
+        // its horizontal axis. Preserve vertical movement for the virtual list.
+        scroller.style().restrict_scroll_to_axis = Some(true);
+        scroller.into_any_element()
+    }
+
     fn render_row(
         &mut self,
         index: usize,
@@ -1073,6 +1189,7 @@ impl Changes {
         let Some(row) = self.rows.get(index).cloned() else {
             return gpui::Empty.into_any_element();
         };
+        let row_id = row.id.clone();
         match row.kind {
             ChangeRowKind::FileHeader { file } => self.render_file_header(index, file, cx),
             ChangeRowKind::PagePlaceholder { file, page_id } => {
@@ -1104,14 +1221,18 @@ impl Changes {
                     .child(label)
                     .into_any_element()
             }
-            ChangeRowKind::Notice { page_id, notice } => {
+            ChangeRowKind::Notice {
+                file,
+                page_id,
+                notice,
+            } => {
                 let theme = Theme::of(cx);
                 let text = self
                     .pages
                     .get(&page_id)
                     .and_then(|page| file_notices(&page.file).get(notice).cloned())
                     .unwrap_or_default();
-                div()
+                let content = div()
                     .h(px(NOTICE_HEIGHT))
                     .flex()
                     .items_center()
@@ -1119,9 +1240,14 @@ impl Changes {
                     .text_size(px(11.0))
                     .text_color(theme.text_faint)
                     .child(SharedString::from(text))
-                    .into_any_element()
+                    .into_any_element();
+                self.scroll_file_row(&row_id, file, content, cx)
             }
-            ChangeRowKind::HunkHeader { page_id, hunk } => {
+            ChangeRowKind::HunkHeader {
+                file,
+                page_id,
+                hunk,
+            } => {
                 let theme = Theme::of(cx);
                 let header = self
                     .pages
@@ -1129,7 +1255,7 @@ impl Changes {
                     .and_then(|page| page.file.hunks.get(hunk))
                     .map(|hunk| hunk.header.clone())
                     .unwrap_or_default();
-                div()
+                let content = div()
                     .h(px(HUNK_HEADER_HEIGHT))
                     .flex()
                     .items_center()
@@ -1139,16 +1265,19 @@ impl Changes {
                     .text_size(px(11.0))
                     .text_color(theme.text_faint)
                     .child(SharedString::from(header))
-                    .into_any_element()
+                    .into_any_element();
+                self.scroll_file_row(&row_id, file, content, cx)
             }
             ChangeRowKind::Line {
+                file,
                 page_id,
                 hunk,
                 line,
                 flat_line,
             } => {
                 self.request_highlight(&page_id, cx);
-                self.render_line(&page_id, hunk, line, flat_line, cx)
+                let content = self.render_line(&page_id, hunk, line, flat_line, cx);
+                self.scroll_file_row(&row_id, file, content, cx)
             }
         }
     }
@@ -1172,6 +1301,7 @@ impl Changes {
         let click_file = file.clone();
         div()
             .id(SharedString::from(format!("file-hdr-{index}")))
+            .w_full()
             .h(px(FILE_HEADER_HEIGHT))
             .flex()
             .items_center()
@@ -1474,7 +1604,31 @@ impl Render for Changes {
                                         .text_color(theme.warning)
                                         .child("Partial snapshot"),
                                 )
-                            }),
+                            })
+                            .child(
+                                div()
+                                    .id("toggle-expanded-diff")
+                                    .size(px(26.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .text_color(theme.text_muted)
+                                    .hover(|style| style.bg(crate::theme::wash(0.08)))
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(ChangesEvent::ToggleExpanded);
+                                    }))
+                                    .child(
+                                        crate::icons::icon(if self.expanded_view {
+                                            crate::icons::RESTORE
+                                        } else {
+                                            crate::icons::MAXIMIZE
+                                        })
+                                        .size(px(15.0))
+                                        .text_color(theme.text_muted),
+                                    ),
+                            ),
                     )
                     .child(
                         list(self.list.clone(), cx.processor(Self::render_row))
@@ -1502,6 +1656,8 @@ impl Render for Changes {
     }
 }
 
+impl EventEmitter<ChangesEvent> for Changes {}
+
 fn empty_state(label: &'static str, theme: &Theme) -> AnyElement {
     div()
         .flex_1()
@@ -1517,6 +1673,12 @@ fn empty_state(label: &'static str, theme: &Theme) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_columns_expands_tabs_to_four_column_stops() {
+        assert_eq!(display_columns("a\tb"), 5);
+        assert_eq!(display_columns("abcd\te"), 9);
+    }
 
     #[test]
     fn parses_basic_patch() {
