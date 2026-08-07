@@ -1,9 +1,7 @@
-//! Device-local data scopes and the one-time account-layout migration.
+//! Device-local Local and Account data scopes.
 //!
-//! Local data always lives in `scopes/local/current`. Account data lives in
-//! `scopes/accounts/<org>/<user>`. The old `orgs/<org>/<user>` directory is
-//! moved, never adopted in place, so every runtime has one canonical scope
-//! root after migration.
+//! Local data lives in `scopes/local/current`. Account data lives in
+//! `scopes/accounts/<org>/<user>`.
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +14,6 @@ use crate::{EngineError, new_id};
 
 const SCOPES_DIR: &str = "scopes";
 const LOCAL_SCOPE_ID: &str = "local-scope-id";
-const MIGRATION_MARKER: &str = "scope-layout-v1.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,12 +69,6 @@ impl ScopeLayout {
 
     pub fn has_account_data(&self, org_id: &str, user_id: &str) -> bool {
         self.account_dir(org_id, user_id).exists()
-            || self
-                .root
-                .join("orgs")
-                .join(sanitize(org_id))
-                .join(sanitize(user_id))
-                .exists()
     }
 
     pub fn ensure_local(&self) -> Result<PathBuf, EngineError> {
@@ -99,75 +90,12 @@ impl ScopeLayout {
         Ok(id.trim().to_string())
     }
 
-    /// Move the old account store and installation device id into the canonical
-    /// account scope. Every step is idempotent so a crash can resume safely.
-    pub fn migrate_account(
-        &self,
-        org_id: &str,
-        user_id: &str,
-    ) -> Result<AccountScope, EngineError> {
-        let target = self.account_dir(org_id, user_id);
-        let legacy = self
-            .root
-            .join("orgs")
-            .join(sanitize(org_id))
-            .join(sanitize(user_id));
-        let existed = target.exists() || legacy.exists();
-
-        if !target.exists() {
-            std::fs::create_dir_all(
-                target
-                    .parent()
-                    .ok_or_else(|| EngineError::Other("account scope has no parent".into()))?,
-            )?;
-            if legacy.exists() {
-                std::fs::rename(&legacy, &target)?;
-            } else {
-                std::fs::create_dir_all(&target)?;
-            }
-        }
-
-        let legacy_device = self.root.join("device-id");
-        move_if_absent(&legacy_device, &target.join("device-id"))?;
-        // A canonical account scope may already own its device id after a
-        // partial migration. Never let the leftover installation id become a
-        // different account's relay identity.
-        if legacy_device.exists() {
-            let retired = self.root.join(SCOPES_DIR).join("legacy-device-id");
-            std::fs::create_dir_all(
-                retired
-                    .parent()
-                    .ok_or_else(|| EngineError::Other("legacy device id has no parent".into()))?,
-            )?;
-            if !retired.exists() {
-                std::fs::rename(&legacy_device, retired)?;
-            } else {
-                std::fs::remove_file(&legacy_device)?;
-            }
-        }
-        let legacy_uploads = self.root.join("uploads");
-        let movable_uploads = std::fs::symlink_metadata(&legacy_uploads)
-            .ok()
-            .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
-        if movable_uploads && !target.join("uploads").exists() {
-            let scoped_uploads = target.join("uploads");
-            std::fs::rename(&legacy_uploads, &scoped_uploads)?;
-            if let Err(error) = create_upload_compat_link(&legacy_uploads, &scoped_uploads) {
-                let _ = std::fs::rename(&scoped_uploads, &legacy_uploads);
-                return Err(EngineError::Io(error));
-            }
-        }
-
-        let marker = MigrationMarker {
-            version: 1,
-            org_id: org_id.to_string(),
-            user_id: user_id.to_string(),
-        };
-        write_json_atomic(&target.join(MIGRATION_MARKER), &marker)?;
-        Ok(AccountScope {
-            dir: target,
-            existed,
-        })
+    /// Open the canonical account scope, creating it on first use.
+    pub fn ensure_account(&self, org_id: &str, user_id: &str) -> Result<AccountScope, EngineError> {
+        let dir = self.account_dir(org_id, user_id);
+        let existed = dir.exists();
+        std::fs::create_dir_all(&dir)?;
+        Ok(AccountScope { dir, existed })
     }
 
     /// Merge Local into an existing account store while both runtimes are
@@ -217,12 +145,6 @@ impl ScopeLayout {
         std::fs::rename(&local, &target)?;
         // Local-only identity is not meaningful once the scope is account-bound.
         let _ = std::fs::remove_file(target.join(LOCAL_SCOPE_ID));
-        let marker = MigrationMarker {
-            version: 1,
-            org_id: org_id.to_string(),
-            user_id: user_id.to_string(),
-        };
-        write_json_atomic(&target.join(MIGRATION_MARKER), &marker)?;
         self.ensure_local()?;
         Ok(AccountScope {
             dir: target,
@@ -236,14 +158,6 @@ pub struct AccountScope {
     pub dir: PathBuf,
     /// The account already had device-local data before this startup.
     pub existed: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MigrationMarker {
-    version: u32,
-    org_id: String,
-    user_id: String,
 }
 
 fn read_id(path: &Path) -> Result<String, EngineError> {
@@ -309,10 +223,7 @@ fn merge_docs(
         save_snapshot(&target, REGISTRY_DOC_ID, &target_registry.to_bytes()?)?;
     }
 
-    for (chat_id, source_bytes) in snapshots
-        .iter()
-        .filter(|(id, _)| id != REGISTRY_DOC_ID && id != "workspace2")
-    {
+    for (chat_id, source_bytes) in snapshots.iter().filter(|(id, _)| id != REGISTRY_DOC_ID) {
         let target_bytes: Option<Vec<u8>> = target
             .query_row(
                 "SELECT bytes FROM snapshots WHERE doc_id = ?1",
@@ -444,58 +355,6 @@ fn copy_tree_missing(source: &Path, target: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn move_if_absent(from: &Path, to: &Path) -> Result<(), EngineError> {
-    if from.exists() && !to.exists() {
-        std::fs::rename(from, to)?;
-    }
-    Ok(())
-}
-
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), EngineError> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| EngineError::Other(format!("scope manifest: {error}")))?;
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, bytes)?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn create_upload_compat_link(link: &Path, target: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(windows)]
-fn create_upload_compat_link(link: &Path, target: &Path) -> std::io::Result<()> {
-    match std::os::windows::fs::symlink_dir(target, link) {
-        Ok(()) => Ok(()),
-        Err(_) => copy_directory(target, link),
-    }
-}
-
-#[cfg(windows)]
-fn copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let target = destination.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_directory(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), target)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_upload_compat_link(_link: &Path, _target: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "upload compatibility links are unsupported on this platform",
-    ))
-}
-
 fn sanitize(id: &str) -> String {
     id.chars()
         .map(|character| {
@@ -513,36 +372,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_account_data_is_moved_and_local_is_distinct() {
+    fn account_and_local_scopes_are_distinct() {
         let root = tempfile::tempdir().unwrap();
-        let legacy = root.path().join("orgs/org/user");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("docs.sqlite3"), b"docs").unwrap();
-        std::fs::write(root.path().join("device-id"), b"account-device").unwrap();
-        std::fs::create_dir_all(root.path().join("uploads")).unwrap();
-        std::fs::write(root.path().join("uploads/image.png"), b"image").unwrap();
-
         let layout = ScopeLayout::new(root.path());
         let local = layout.ensure_local().unwrap();
-        let account = layout.migrate_account("org", "user").unwrap();
+        let account = layout.ensure_account("org", "user").unwrap();
 
-        assert!(!legacy.exists());
-        assert_eq!(
-            std::fs::read(account.dir.join("docs.sqlite3")).unwrap(),
-            b"docs"
-        );
-        assert_eq!(
-            std::fs::read_to_string(account.dir.join("device-id")).unwrap(),
-            "account-device"
-        );
         assert!(local.join(LOCAL_SCOPE_ID).exists());
         assert_ne!(local, account.dir);
-        assert_eq!(
-            std::fs::read(root.path().join("uploads/image.png")).unwrap(),
-            b"image",
-            "legacy absolute attachment paths remain readable"
-        );
-        assert!(account.dir.join("uploads/image.png").exists());
+        assert!(!account.existed);
+        assert!(layout.ensure_account("org", "user").unwrap().existed);
     }
 
     #[test]

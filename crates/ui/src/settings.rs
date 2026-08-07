@@ -46,57 +46,35 @@ pub const SAVE_DEBOUNCE_MS: u64 = 400;
 const FILE_NAME: &str = "ui-settings.json";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct ScopeNavigation {
     pub last_space_id: Option<String>,
-    pub open_tabs: Option<Vec<String>>,
+    pub open_tabs: Vec<String>,
     pub active_tab_id: Option<String>,
     pub space_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct UiSettings {
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
-    /// Legacy: the grouped-by-project toggle predates spaces (which group by
-    /// folder inherently). Kept for file compatibility; no longer read.
-    pub sidebar_grouped: bool,
     /// The last active space — restored on boot and used as the new-session
     /// fallback when the sidebar filter is "All spaces".
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
-    /// Device-local open session tabs in drag order. `None` identifies a
-    /// pre-tabs settings file and triggers a one-time legacy-order migration.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_tabs: Option<Vec<String>>,
+    /// Device-local open session tabs in drag order.
+    pub open_tabs: Vec<String>,
     /// Last active session tab, restored when it is still open and live.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tab_id: Option<String>,
     /// Sidebar session filter (`None` = All spaces).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub space_filter: Option<String>,
-    /// Navigation snapshots partitioned by Local/Account scope. The top-level
-    /// fields above are the currently active snapshot for compatibility.
-    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    /// Navigation snapshots partitioned by Local/Account scope.
     pub scope_navigation: std::collections::HashMap<String, ScopeNavigation>,
-    /// Legacy per-space tab order. Read only by the open-tabs migration.
-    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub tab_order: std::collections::HashMap<String, Vec<String>>,
-    /// Legacy manual space order; retained for settings-file compatibility.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub space_order: Vec<String>,
     /// Deliver app-wide alerts through the operating system instead of in-app
     /// toasts.
     pub system_notifications_enabled: bool,
     pub right_pane_width: f32,
-    /// Legacy: panel open flags are session-scoped in-memory state now via
-    /// `shell::SessionPanels`. Kept for file compatibility; no longer read or
-    /// written by the shell.
-    pub right_pane_open: bool,
     pub terminal_height: f32,
-    /// Legacy — see [`Self::right_pane_open`].
-    pub terminal_open: bool,
     /// Customizable shortcut combinations.
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
@@ -108,7 +86,6 @@ pub struct UiSettings {
     /// Font family for application chrome, prose, and controls.
     pub ui_font: String,
     /// Font family used only by the chat composer.
-    #[serde(default)]
     pub prompt_font: String,
     /// Font family for code, diffs, and hotkey chips.
     pub code_font: String,
@@ -132,19 +109,14 @@ impl Default for UiSettings {
         Self {
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
-            sidebar_grouped: false,
             last_space_id: None,
-            open_tabs: None,
+            open_tabs: Vec::new(),
             active_tab_id: None,
             space_filter: None,
             scope_navigation: std::collections::HashMap::new(),
-            tab_order: std::collections::HashMap::new(),
-            space_order: Vec::new(),
             system_notifications_enabled: false,
             right_pane_width: RIGHT_PANE_DEFAULT,
-            right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
-            terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
             light_theme: crate::themes::JOLT_THEME_ID.into(),
@@ -174,6 +146,7 @@ pub enum ShortcutId {
     CloseTab,
     PreviousTranscriptTurn,
     NextTranscriptTurn,
+    SearchTranscript,
     OpenSettings,
     OpenSpacesDropdown,
     AddSpace,
@@ -221,6 +194,7 @@ impl ShortcutId {
             ShortcutId::CloseTab,
             ShortcutId::PreviousTranscriptTurn,
             ShortcutId::NextTranscriptTurn,
+            ShortcutId::SearchTranscript,
             ShortcutId::OpenSettings,
             ShortcutId::OpenSpacesDropdown,
             ShortcutId::AddSpace,
@@ -255,6 +229,7 @@ impl ShortcutId {
             ShortcutId::CloseTab => "Close current tab",
             ShortcutId::PreviousTranscriptTurn => "Previous transcript prompt",
             ShortcutId::NextTranscriptTurn => "Next transcript prompt",
+            ShortcutId::SearchTranscript => "Search transcript",
             ShortcutId::OpenSettings => "Open settings",
             ShortcutId::OpenSpacesDropdown => "Open spaces dropdown",
             ShortcutId::AddSpace => "Add space",
@@ -289,6 +264,7 @@ impl ShortcutId {
             ShortcutId::CloseTab => "mod-w",
             ShortcutId::PreviousTranscriptTurn => "mod-shift-up",
             ShortcutId::NextTranscriptTurn => "mod-shift-down",
+            ShortcutId::SearchTranscript => "mod-f",
             ShortcutId::OpenSettings => "mod-,",
             ShortcutId::OpenSpacesDropdown => "mod-shift-k",
             ShortcutId::AddSpace => "mod-k",
@@ -321,13 +297,14 @@ impl ShortcutId {
 /// "mod-e"); translated to "cmd-e"/"ctrl-e" at bind time by
 /// [`platform_combo`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct KeymapConfig {
     pub new_session: String,
     pub clear_input: String,
     pub close_tab: String,
     pub previous_transcript_turn: String,
     pub next_transcript_turn: String,
+    pub search_transcript: String,
     pub open_settings: String,
     pub open_spaces_dropdown: String,
     pub add_space: String,
@@ -362,6 +339,7 @@ impl Default for KeymapConfig {
             close_tab: ShortcutId::CloseTab.default_combo().into(),
             previous_transcript_turn: ShortcutId::PreviousTranscriptTurn.default_combo().into(),
             next_transcript_turn: ShortcutId::NextTranscriptTurn.default_combo().into(),
+            search_transcript: ShortcutId::SearchTranscript.default_combo().into(),
             open_settings: ShortcutId::OpenSettings.default_combo().into(),
             open_spaces_dropdown: ShortcutId::OpenSpacesDropdown.default_combo().into(),
             add_space: ShortcutId::AddSpace.default_combo().into(),
@@ -398,6 +376,7 @@ impl KeymapConfig {
             ShortcutId::CloseTab => &self.close_tab,
             ShortcutId::PreviousTranscriptTurn => &self.previous_transcript_turn,
             ShortcutId::NextTranscriptTurn => &self.next_transcript_turn,
+            ShortcutId::SearchTranscript => &self.search_transcript,
             ShortcutId::OpenSettings => &self.open_settings,
             ShortcutId::OpenSpacesDropdown => &self.open_spaces_dropdown,
             ShortcutId::AddSpace => &self.add_space,
@@ -432,6 +411,7 @@ impl KeymapConfig {
             ShortcutId::CloseTab => self.close_tab = combo,
             ShortcutId::PreviousTranscriptTurn => self.previous_transcript_turn = combo,
             ShortcutId::NextTranscriptTurn => self.next_transcript_turn = combo,
+            ShortcutId::SearchTranscript => self.search_transcript = combo,
             ShortcutId::OpenSettings => self.open_settings = combo,
             ShortcutId::OpenSpacesDropdown => self.open_spaces_dropdown = combo,
             ShortcutId::AddSpace => self.add_space = combo,
@@ -657,9 +637,8 @@ mod tests {
         let settings = UiSettings {
             sidebar_width: 300.0,
             sidebar_collapsed: true,
-            sidebar_grouped: true,
             last_space_id: Some("space-1".into()),
-            open_tabs: Some(vec!["b".into(), "a".into()]),
+            open_tabs: vec!["b".into(), "a".into()],
             active_tab_id: Some("a".into()),
             space_filter: Some("space-1".into()),
             scope_navigation: std::collections::HashMap::from([(
@@ -669,16 +648,9 @@ mod tests {
                     ..ScopeNavigation::default()
                 },
             )]),
-            tab_order: std::collections::HashMap::from([(
-                "space-1".to_string(),
-                vec!["b".to_string(), "a".to_string()],
-            )]),
-            space_order: vec!["space-2".to_string(), "space-1".to_string()],
             system_notifications_enabled: true,
             right_pane_width: 700.0,
-            right_pane_open: true,
             terminal_height: 320.0,
-            terminal_open: true,
             keymap: KeymapConfig {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
@@ -700,36 +672,6 @@ mod tests {
         assert_eq!(UiSettings::load(dir.path()), settings);
     }
 
-    /// A settings file written before light mode existed has no `appearance`
-    /// key; it must load as "follow the OS" rather than failing the whole parse
-    /// and resetting every other preference to defaults.
-    #[test]
-    fn settings_without_appearance_default_to_system() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            UiSettings::path(dir.path()),
-            r#"{
-                "sidebarWidth": 300,
-                "systemNotificationsEnabled": true,
-                "uiFont": "Avenir Next"
-            }"#,
-        )
-        .unwrap();
-        let loaded = UiSettings::load(dir.path());
-        assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
-        assert_eq!(loaded.ui_font, "Avenir Next");
-        assert_eq!(loaded.prompt_font, "Avenir Next");
-        assert_eq!(loaded.code_font, crate::theme::DEFAULT_CODE_FONT);
-        assert_eq!(loaded.terminal_font, crate::theme::DEFAULT_CODE_FONT);
-        assert_eq!(loaded.font_sizes(), crate::theme::FontSizes::default());
-        assert!(loaded.terminal_command.is_empty());
-        assert_eq!(loaded.sidebar_width, 300.0);
-        assert!(
-            loaded.system_notifications_enabled,
-            "other keys still parse"
-        );
-    }
-
     #[test]
     fn missing_and_corrupt_files_yield_defaults() {
         let dir = tempfile::tempdir().unwrap();
@@ -741,17 +683,16 @@ mod tests {
     #[test]
     fn loaded_values_are_clamped() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            UiSettings::path(dir.path()),
-            r#"{
-                "sidebarWidth": 10000,
-                "rightPaneWidth": 1,
-                "fontSizeInterface": 255,
-                "fontSizePrompt": 1,
-                "fontSizeCode": 255,
-                "fontSizeTerminal": 1
-            }"#,
-        )
+        UiSettings {
+            sidebar_width: 10_000.0,
+            right_pane_width: 1.0,
+            font_size_interface: 255,
+            font_size_prompt: 1,
+            font_size_code: 255,
+            font_size_terminal: 1,
+            ..Default::default()
+        }
+        .save(dir.path())
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.sidebar_width, SIDEBAR_MAX);
@@ -784,7 +725,7 @@ mod tests {
         assert_eq!(d.sidebar_width, 256.0);
         assert_eq!(d.right_pane_width, 520.0);
         assert_eq!(d.terminal_height, 280.0);
-        assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
+        assert!(!d.sidebar_collapsed);
         assert_eq!(d.ui_font, crate::theme::DEFAULT_UI_FONT);
         assert_eq!(d.prompt_font, crate::theme::DEFAULT_UI_FONT);
         assert_eq!(d.code_font, crate::theme::DEFAULT_CODE_FONT);
@@ -809,6 +750,7 @@ mod tests {
             "mod-shift-up"
         );
         assert_eq!(keymap.get(ShortcutId::NextTranscriptTurn), "mod-shift-down");
+        assert_eq!(keymap.get(ShortcutId::SearchTranscript), "mod-f");
         assert_eq!(keymap.get(ShortcutId::OpenSettings), "mod-,");
         assert_eq!(keymap.get(ShortcutId::OpenSpacesDropdown), "mod-shift-k");
         assert_eq!(keymap.get(ShortcutId::AddSpace), "mod-k");
@@ -912,54 +854,24 @@ mod tests {
     }
 
     #[test]
-    fn keymap_survives_old_settings_files() {
-        // Files written before the keymap existed load with defaults.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(UiSettings::path(dir.path()), r#"{"sidebarWidth": 300}"#).unwrap();
-        let loaded = UiSettings::load(dir.path());
-        assert_eq!(loaded.keymap, KeymapConfig::default());
-        assert!(!loaded.sidebar_grouped);
-    }
-
-    #[test]
-    fn old_keymap_gains_new_hotkey_defaults() {
-        let keymap: KeymapConfig = serde_json::from_str(
-            r#"{
-                "toggleSidebar": "mod-shift-e",
-                "toggleChanges": "mod-b",
-                "toggleTerminal": "mod-`"
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
-        assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
-        assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-w");
-        assert_eq!(
-            keymap.get(ShortcutId::PreviousTranscriptTurn),
-            "mod-shift-up"
-        );
-        assert_eq!(keymap.get(ShortcutId::NextTranscriptTurn), "mod-shift-down");
-        assert_eq!(keymap.get(ShortcutId::OpenSettings), "mod-,");
-        assert_eq!(keymap.get(ShortcutId::OpenSpacesDropdown), "mod-shift-k");
-        assert_eq!(keymap.get(ShortcutId::AddSpace), "mod-k");
-        assert_eq!(keymap.get(ShortcutId::SearchSessions), "mod-shift-f");
-        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-e");
-        assert_eq!(keymap.get(ShortcutId::NewTerminalTab), "mod-t");
-        assert_eq!(keymap.get(ShortcutId::CloseTerminalTab), "mod-shift-w");
-        assert_eq!(keymap.get(ShortcutId::SelectTab1), "mod-1");
-        assert_eq!(keymap.get(ShortcutId::SelectLastTab), "mod-9");
-        assert_eq!(keymap.get(ShortcutId::Quit), "mod-q");
-    }
-
-    #[test]
     fn terminal_height_clamps_on_load() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(UiSettings::path(dir.path()), r#"{"terminalHeight": 5}"#).unwrap();
+        UiSettings {
+            terminal_height: 5.0,
+            ..Default::default()
+        }
+        .save(dir.path())
+        .unwrap();
         assert_eq!(
             UiSettings::load(dir.path()).terminal_height,
             TERMINAL_MIN_HEIGHT
         );
-        std::fs::write(UiSettings::path(dir.path()), r#"{"terminalHeight": 99999}"#).unwrap();
+        UiSettings {
+            terminal_height: 99_999.0,
+            ..Default::default()
+        }
+        .save(dir.path())
+        .unwrap();
         assert_eq!(
             UiSettings::load(dir.path()).terminal_height,
             TERMINAL_ABS_MAX_HEIGHT

@@ -8,9 +8,10 @@
 //! the active tab; Cmd/Ctrl+` toggles the panel (the shell owns the height animation and
 //! persistence).
 //!
-//! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
-//! (base64) feed the [`Emulator`]; query responses write back; the stream
-//! reconnects with exponential backoff resuming from `afterSeq`; Exit removes
+//! Data path per tab: `OpenTerminal` → binary `SubscribeTerminalV2` stream;
+//! raw data bytes feed the [`Emulator`].
+//! Query responses write back; the stream reconnects with exponential backoff
+//! resuming from `afterSeq`; Exit removes
 //! the tab and releases its engine-side replay buffer. Keyboard bytes coalesce for 12 ms
 //! before `WriteTerminal`; viewport-driven resizes debounce 80 ms before
 //! `ResizeTerminal` (the emulator resizes immediately).
@@ -24,7 +25,7 @@ use gpui::{
     Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
-use jolt_proto::{TerminalEvent, TerminalSession};
+use jolt_proto::TerminalSession;
 use jolt_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
@@ -33,7 +34,7 @@ use crate::shell::CloseCurrentTab;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
-use super::emulator::{CellSnapshot, CursorSnapshot, Emulator};
+use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, MouseWheelDirection};
 use super::view::{
     COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
     cell_at, keystroke_bytes, paste_bytes, terminal_bg,
@@ -144,15 +145,22 @@ pub fn shell_title(shell: &str) -> String {
     }
 }
 
-fn decode_base64(data: &str) -> Vec<u8> {
-    crate::simd_base64::decode(data.as_bytes()).unwrap_or_else(|err| {
-        tracing::warn!(error = %err, "terminal: dropping undecodable data frame");
-        Vec::new()
-    })
-}
-
 fn encode_base64(bytes: &[u8]) -> String {
     crate::simd_base64::encode(bytes)
+}
+
+fn terminal_mouse_modifiers(modifiers: &gpui::Modifiers) -> libghostty_vt::key::Mods {
+    let mut result = libghostty_vt::key::Mods::empty();
+    if modifiers.shift {
+        result |= libghostty_vt::key::Mods::SHIFT;
+    }
+    if modifiers.alt {
+        result |= libghostty_vt::key::Mods::ALT;
+    }
+    if modifiers.control {
+        result |= libghostty_vt::key::Mods::CTRL;
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +182,36 @@ pub struct GridGeometry {
     pub line_h: f32,
     pub cols: u16,
     pub rows: u16,
+}
+
+enum PanelTerminalEvent {
+    Data {
+        seq: u64,
+        data: Vec<u8>,
+    },
+    Exit,
+    ReplayGap {
+        requested_after: u64,
+        oldest_available: u64,
+    },
+}
+
+fn decode_terminal_event(bytes: &[u8]) -> Result<PanelTerminalEvent, String> {
+    jolt_rpc::terminal_wire::decode(bytes)
+        .map(|event| match event {
+            jolt_rpc::terminal_wire::TerminalBinaryEvent::Data { seq, data } => {
+                PanelTerminalEvent::Data { seq, data }
+            }
+            jolt_rpc::terminal_wire::TerminalBinaryEvent::Exit { .. } => PanelTerminalEvent::Exit,
+            jolt_rpc::terminal_wire::TerminalBinaryEvent::ReplayGap {
+                requested_after,
+                oldest_available,
+            } => PanelTerminalEvent::ReplayGap {
+                requested_after,
+                oldest_available,
+            },
+        })
+        .map_err(|err| err.to_string())
 }
 
 struct TerminalTab {
@@ -408,7 +446,7 @@ impl TerminalPanel {
         cx.notify();
     }
 
-    /// OpenTerminal, then pump SubscribeTerminal with reconnect backoff.
+    /// OpenTerminal, then pump SubscribeTerminalV2 with reconnect backoff.
     fn spawn_session(
         chat: String,
         key: u64,
@@ -495,20 +533,18 @@ impl TerminalPanel {
                 };
                 let Some(after_seq) = after_seq else { return }; // tab closed
 
-                let subscribed = engine
+                let params = with_target(
+                    serde_json::json!({ "terminalId": terminal_id, "afterSeq": after_seq }),
+                    &target,
+                );
+                let mut rx = match engine
                     .client()
-                    .subscribe(
-                        methods::SUBSCRIBE_TERMINAL,
-                        with_target(
-                            serde_json::json!({ "terminalId": terminal_id, "afterSeq": after_seq }),
-                            &target,
-                        ),
-                    )
-                    .await;
-                let mut rx = match subscribed {
+                    .subscribe_binary(methods::SUBSCRIBE_TERMINAL_V2, params)
+                    .await
+                {
                     Ok(rx) => rx,
                     Err(err) => {
-                        tracing::debug!(error = %err, attempt, "SubscribeTerminal failed; backing off");
+                        tracing::debug!(error = %err, attempt, "SubscribeTerminalV2 failed; backing off");
                         cx.background_executor()
                             .timer(Duration::from_millis(backoff_ms(attempt)))
                             .await;
@@ -517,11 +553,11 @@ impl TerminalPanel {
                     }
                 };
 
-                while let Some(value) = rx.recv().await {
-                    let event: TerminalEvent = match serde_json::from_value(value) {
+                while let Some(bytes) = rx.recv().await {
+                    let event = match decode_terminal_event(&bytes) {
                         Ok(event) => event,
                         Err(err) => {
-                            tracing::warn!(error = %err, "terminal: malformed stream frame");
+                            tracing::warn!(%err, "terminal: malformed stream frame");
                             continue;
                         }
                     };
@@ -558,17 +594,17 @@ impl TerminalPanel {
         chat: &str,
         key: u64,
         engine: &EngineHandle,
-        event: TerminalEvent,
+        event: PanelTerminalEvent,
         cx: &mut Context<Self>,
     ) -> StreamDisposition {
         let target = self.chat_target(chat, cx);
         match event {
-            TerminalEvent::Data { seq, data } => {
+            PanelTerminalEvent::Data { seq, data } => {
                 let Some(tab) = self.tab_mut(chat, key) else {
                     return StreamDisposition::Stop;
                 };
                 tab.last_seq = seq;
-                let responses = tab.emulator.feed(&decode_base64(&data));
+                let responses = tab.emulator.feed(&data);
                 if !responses.is_empty()
                     && let Some(id) = tab.terminal_id.clone()
                 {
@@ -592,7 +628,28 @@ impl TerminalPanel {
                 cx.notify();
                 StreamDisposition::Continue
             }
-            TerminalEvent::Exit { .. } => {
+            PanelTerminalEvent::ReplayGap {
+                requested_after,
+                oldest_available,
+            } => {
+                let Some(tab) = self.tab_mut(chat, key) else {
+                    return StreamDisposition::Stop;
+                };
+                tracing::warn!(
+                    requested_after,
+                    oldest_available,
+                    "terminal replay window was exceeded"
+                );
+                let (cols, rows) = (tab.emulator.cols() as u16, tab.emulator.rows() as u16);
+                tab.emulator = Emulator::new(cols, rows);
+                tab.last_seq = oldest_available.saturating_sub(1);
+                tab.emulator.feed(
+                    b"\x1b[33m[terminal output replay was truncated while disconnected]\x1b[0m\r\n",
+                );
+                cx.notify();
+                StreamDisposition::Continue
+            }
+            PanelTerminalEvent::Exit => {
                 let Some((terminal_id, now_empty)) = self.remove_tab(chat, key) else {
                     return StreamDisposition::Stop;
                 };
@@ -892,10 +949,17 @@ impl TerminalPanel {
         true
     }
 
-    fn scroll_active(&mut self, delta_lines: f32, cx: &mut Context<Self>) {
+    fn scroll_active(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        let delta_lines = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => {
+                f32::from(delta.y) / Theme::of(cx).font_sizes.terminal_line_height()
+            }
+        };
         if delta_lines == 0.0 {
             return;
         }
+        let hit = self.grid_cell_at(event.position);
         let Some(chat) = self.selected_chat(cx) else {
             return;
         };
@@ -913,7 +977,29 @@ impl TerminalPanel {
             return;
         }
         tab.scroll_remainder -= step as f32;
-        if tab.emulator.scroll(step) {
+
+        let report = if event.modifiers.shift {
+            None
+        } else {
+            hit.and_then(|hit| {
+                let direction = if step > 0 {
+                    MouseWheelDirection::Up
+                } else {
+                    MouseWheelDirection::Down
+                };
+                tab.emulator
+                    .mouse_wheel_report(
+                        direction,
+                        hit.row,
+                        hit.col,
+                        terminal_mouse_modifiers(&event.modifiers),
+                    )
+                    .map(|report| report.repeat(step.unsigned_abs() as usize))
+            })
+        };
+        if let Some(report) = report {
+            self.queue_input(&report, cx);
+        } else if tab.emulator.scroll(step) {
             cx.notify();
         }
     }
@@ -1321,13 +1407,7 @@ impl Render for TerminalPanel {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
-                        let lines = match event.delta {
-                            ScrollDelta::Lines(delta) => delta.y,
-                            ScrollDelta::Pixels(delta) => {
-                                f32::from(delta.y) / Theme::of(cx).font_sizes.terminal_line_height()
-                            }
-                        };
-                        this.scroll_active(lines, cx);
+                        this.scroll_active(event, cx);
                     }))
                     .child(TerminalElement::new(cx.entity(), focused)),
             )
@@ -1431,26 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_events_deserialize_per_contract() {
-        let data: TerminalEvent =
-            serde_json::from_str(r#"{"type":"data","seq":7,"data":"aGk="}"#).unwrap();
-        assert_eq!(
-            data,
-            TerminalEvent::Data {
-                seq: 7,
-                data: "aGk=".into()
-            }
-        );
-        let exit: TerminalEvent =
-            serde_json::from_str(r#"{"type":"exit","seq":8,"exitCode":130}"#).unwrap();
-        assert_eq!(
-            exit,
-            TerminalEvent::Exit {
-                seq: 8,
-                exit_code: 130,
-                signal: None
-            }
-        );
+    fn terminal_session_deserializes_per_contract() {
         let session: TerminalSession =
             serde_json::from_str(r#"{"id":"t1","cwd":"/w","shell":"/bin/zsh"}"#).unwrap();
         assert_eq!(session.id, "t1");
@@ -1458,18 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn base64_round_trip_and_tolerance() {
-        assert_eq!(decode_base64("aGk="), b"hi".to_vec());
-        assert_eq!(
-            decode_base64("aGk"),
-            b"hi".to_vec(),
-            "unpadded input tolerated"
-        );
-        assert_eq!(
-            decode_base64("!!!"),
-            Vec::<u8>::new(),
-            "garbage decodes to nothing"
-        );
+    fn terminal_input_is_base64_encoded() {
         assert_eq!(encode_base64(b"hi"), "aGk=");
     }
 }

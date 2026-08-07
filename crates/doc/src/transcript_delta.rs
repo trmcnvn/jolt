@@ -1,4 +1,4 @@
-//! Delta frames for `WatchDocMessages`.
+//! Delta frames for mutable transcript pages.
 //!
 //! The watch used to re-serialize the entire transcript on every 120ms commit
 //! tick (measured at 1.13MB per frame on a 1.6MB chat, ~4 copies deep through
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::parts::MessagePart;
 use crate::schema::SessionMessageEntry;
 
-/// One `WatchDocMessages` stream item.
+/// One transcript-page update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TranscriptFrame {

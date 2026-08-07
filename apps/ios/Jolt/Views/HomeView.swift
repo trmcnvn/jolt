@@ -320,45 +320,6 @@ struct SpaceFilterSheet: View {
 
 // MARK: - Rows
 
-struct SpaceRow: View {
-    @Environment(AppModel.self) private var model
-    let space: Space
-
-    var body: some View {
-        HStack(spacing: 8) {
-            // Leading 6pt aggregate dot — position stable, most-urgent member.
-            let agg = model.spaceIndicator(space.id)
-            Circle()
-                .fill((agg == .working || agg == .awaitingInput) ? (agg?.dotColor ?? whiteAlpha(0.14)) : whiteAlpha(0.14))
-                .frame(width: 6, height: 6)
-            Image(systemName: "folder")
-                .font(.system(size: 13))
-                .foregroundStyle(Theme.textMuted)
-            Text(space.displayName)
-                .font(Theme.sans(13, weight: .medium))
-                .foregroundStyle(Theme.text)
-                .lineLimit(1)
-            Spacer(minLength: 8)
-            deviceTag
-            Image(systemName: "chevron.right")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(Theme.textFaint.opacity(0.6))
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 8)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var deviceTag: some View {
-        let online = model.deviceOnline(space.deviceId)
-        let name = model.deviceName(space.deviceId)
-        return Text(online ? "@ \(name)" : "@ \(name) · offline")
-            .font(Theme.sans(12))
-            .foregroundStyle(online ? Theme.textMuted.opacity(0.6) : Theme.warning.opacity(0.8))
-            .lineLimit(1)
-    }
-}
-
 /// The desktop session row (shell.rs `render_chat_row`), line for line: the
 /// status rail leads a muted context line carrying the space name and the
 /// relative time; the title sits on its own line below; harness mark and branch

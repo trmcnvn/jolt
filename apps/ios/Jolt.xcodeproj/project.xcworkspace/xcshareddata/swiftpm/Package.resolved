@@ -20,15 +20,6 @@
       }
     },
     {
-      "identity" : "loro-swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/loro-dev/loro-swift.git",
-      "state" : {
-        "revision" : "625f3e696fca4be3ae77de8b3404fa6753554f21",
-        "version" : "1.13.3"
-      }
-    },
-    {
       "identity" : "ratex",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/erweixin/RaTeX",

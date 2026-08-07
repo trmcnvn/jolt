@@ -277,6 +277,59 @@ impl SessionsEngine {
         let _ = self.inner.titles.set(titles);
     }
 
+    /// Regenerate an existing chat title from its first user prompt using the
+    /// host device's configured harness and economy model.
+    pub async fn regenerate_title(&self, chat_id: &str) -> Result<(), EngineError> {
+        let host =
+            self.inner.doc_host.get().ok_or_else(|| {
+                EngineError::Other("doc host not wired into sessions engine".into())
+            })?;
+        let workspace = host
+            .workspace()
+            .ok_or_else(|| EngineError::Other("workspace not wired into doc host".into()))?;
+        let chat = workspace
+            .chat(chat_id)?
+            .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
+        if chat.device_id != self.inner.device_id {
+            return Err(EngineError::Other(
+                "chat title must be regenerated on its host device".into(),
+            ));
+        }
+        let cwd = chat
+            .cwd
+            .as_deref()
+            .ok_or_else(|| EngineError::Other("chat has no workspace folder".into()))?;
+        let prompt = self
+            .doc_handle(chat_id)?
+            .doc()
+            .read_entries()?
+            .into_iter()
+            .find_map(|entry| {
+                if entry.role != MessageRole::User {
+                    return None;
+                }
+                let text = entry
+                    .parts
+                    .into_iter()
+                    .filter_map(|part| match part {
+                        MessagePart::Text { text, .. } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.trim().is_empty()).then_some(text)
+            })
+            .ok_or_else(|| EngineError::Other("chat has no user prompt to title".into()))?;
+        let titles = self
+            .inner
+            .titles
+            .get()
+            .ok_or_else(|| EngineError::Other("chat title generator unavailable".into()))?;
+        titles
+            .regenerate(chat_id, host.harness_for(chat_id), &prompt, cwd)
+            .await
+    }
+
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
         let host =
             self.inner.doc_host.get().ok_or_else(|| {
@@ -1592,7 +1645,6 @@ async fn drive_run(
                 DoneStatus::Errored,
                 Some(&message),
                 goal_signal,
-                None,
                 0,
                 goal_turn_started
                     .elapsed()
@@ -1725,11 +1777,8 @@ async fn drive_run(
             },
             _ = tokio::time::sleep_until(flush_at), if dirty => {
                 // Coalesced STREAM_COMMIT_MS tick: one doc commit per window.
-                // Hold back a possible private goal-control tail so it never
-                // flashes in transcript watches while the response streams.
-                let visible = goal_visible_parts(&folded);
                 if let Err(err) = sync_segment(
-                    doc_ref, &mut writer, &entry_id, &device_id, segment_started, &visible,
+                    doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
                 ) {
                     tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
                 }
@@ -1934,7 +1983,6 @@ async fn drive_run(
         }
 
         if let AgentEvent::Done { status, error, .. } = &event {
-            let goal_control = take_goal_control(&mut folded);
             let goal_signal = mcp_lease.as_ref().and_then(McpLease::take_goal_signal);
             let goal_after_turn = finish_goal_turn(
                 &inner,
@@ -1943,7 +1991,6 @@ async fn drive_run(
                 *status,
                 error.as_deref().or(goal_turn_error.as_deref()),
                 goal_signal,
-                goal_control,
                 goal_turn_tokens,
                 goal_turn_started
                     .elapsed()
@@ -2110,33 +2157,9 @@ async fn drive_run(
     inner.set_status(&chat_id, final_status, false);
 }
 
-fn goal_visible_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
-    let mut visible = parts.to_vec();
-    for part in &mut visible {
-        if let MessagePart::Text { text, .. } = part {
-            crate::goals::hide_control_tail(text);
-        }
-    }
-    visible
-}
-
-fn take_goal_control(parts: &mut [MessagePart]) -> Option<crate::goals::GoalControl> {
-    let mut result = None;
-    for part in parts.iter_mut().rev() {
-        if let MessagePart::Text { text, .. } = part {
-            let control = crate::goals::extract_control(text);
-            crate::goals::hide_control_tail(text);
-            if result.is_none() {
-                result = control;
-            }
-        }
-    }
-    result
-}
-
 #[allow(
     clippy::too_many_arguments,
-    reason = "goal finalization combines one turn's terminal event, control signal, and usage"
+    reason = "goal finalization combines one turn's terminal event, MCP signal, and usage"
 )]
 fn finish_goal_turn(
     inner: &Inner,
@@ -2145,7 +2168,6 @@ fn finish_goal_turn(
     done: DoneStatus,
     error: Option<&str>,
     signal: Option<crate::mcp::McpGoalSignal>,
-    control: Option<crate::goals::GoalControl>,
     tokens: u64,
     elapsed_ms: u64,
 ) -> Option<jolt_proto::Goal> {
@@ -2156,7 +2178,6 @@ fn finish_goal_turn(
         done,
         error,
         signal,
-        control,
         tokens,
         elapsed_ms,
     )
@@ -2173,7 +2194,6 @@ fn finish_goal_turn_in_workspace(
     done: DoneStatus,
     error: Option<&str>,
     signal: Option<crate::mcp::McpGoalSignal>,
-    control: Option<crate::goals::GoalControl>,
     tokens: u64,
     elapsed_ms: u64,
 ) -> Option<jolt_proto::Goal> {
@@ -2224,27 +2244,8 @@ fn finish_goal_turn_in_workspace(
                 debug_assert_eq!(expected_revision, goal.revision);
                 apply_goal_blocker(&mut goal, Some(blocker_key), summary);
             } else {
-                let control = control.filter(|control| control.matches(&goal));
-                match control {
-                    Some(control)
-                        if control.outcome == crate::goals::GoalOutcome::Complete
-                            && !control.summary.trim().is_empty() =>
-                    {
-                        goal.status = jolt_proto::GoalStatus::Complete;
-                        goal.pause_source = None;
-                        goal.status_message = Some(control.summary);
-                        goal.blocker_key = None;
-                        goal.blocker_streak = 0;
-                    }
-                    Some(control) if control.outcome == crate::goals::GoalOutcome::Blocked => {
-                        let key = control.blocker_key.filter(|key| !key.trim().is_empty());
-                        apply_goal_blocker(&mut goal, key, control.summary);
-                    }
-                    _ => {
-                        goal.blocker_key = None;
-                        goal.blocker_streak = 0;
-                    }
-                }
+                goal.blocker_key = None;
+                goal.blocker_streak = 0;
             }
         }
 
@@ -2256,9 +2257,6 @@ fn finish_goal_turn_in_workspace(
             goal.status = jolt_proto::GoalStatus::BudgetLimited;
             goal.pause_source = None;
             goal.status_message = Some("Token budget reached".into());
-        }
-        if goal.status == jolt_proto::GoalStatus::Active {
-            goal.control_nonce = new_id();
         }
         goal.revision = goal.revision.saturating_add(1);
         Ok(Some(goal))
@@ -2478,7 +2476,6 @@ mod tests {
             DoneStatus::Completed,
             None,
             None,
-            None,
             42,
             100,
         )
@@ -2508,7 +2505,6 @@ mod tests {
                     blocker_key: "waiting-for-review".into(),
                     summary: "Waiting for review".into(),
                 }),
-                None,
                 1,
                 1,
             )

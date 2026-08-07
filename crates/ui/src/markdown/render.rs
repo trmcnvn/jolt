@@ -1546,6 +1546,20 @@ fn render_code_block(
             )
         }));
 
+    let mut code_scroller = div()
+        .id(scroll_id)
+        .overflow_x_scroll()
+        .px(px(CODE_PADDING_X))
+        .py(px(CODE_PADDING_Y))
+        .font_family(theme.font_mono.clone())
+        .text_size(px(f32::from(theme.font_sizes.code)))
+        .line_height(px(theme.font_sizes.code_line_height()))
+        .whitespace_nowrap()
+        .child(code_lines);
+    // A one-axis GPUI scroller otherwise maps vertical wheel deltas onto its
+    // horizontal axis. Preserve vertical movement for the transcript list.
+    code_scroller.style().restrict_scroll_to_axis = Some(true);
+
     div()
         .rounded(px(10.0))
         // Faint white wash over the near-black code surface, with a hairline
@@ -1569,18 +1583,7 @@ fn render_code_block(
                     .child(SharedString::from(lang.to_string())),
             )
         })
-        .child(
-            div()
-                .id(scroll_id)
-                .overflow_x_scroll()
-                .px(px(CODE_PADDING_X))
-                .py(px(CODE_PADDING_Y))
-                .font_family(theme.font_mono.clone())
-                .text_size(px(f32::from(theme.font_sizes.code)))
-                .line_height(px(theme.font_sizes.code_line_height()))
-                .whitespace_nowrap()
-                .child(code_lines),
-        )
+        .child(code_scroller)
         // Overlay LAST so it paints above the header/body.
         .children(copy_button)
         .into_any_element()

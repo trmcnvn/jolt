@@ -5,7 +5,6 @@
 // ids until the host writes matching transcript entries.
 
 import Foundation
-import Loro
 import Observation
 
 private let pendingSendOverlayTtlMs: Int64 = 30_000
@@ -121,14 +120,7 @@ final class SessionStore {
         retryOutbox()
     }
 
-    /// Backgrounding hook: persist immediately.
-    func flushToDisk() {
-        // Transcript pages and commands are persisted independently; there is
-        // no full iOS Loro session snapshot in projection mode.
-    }
-
-    /// Foreground hook: revive the room after a suspension (see
-    /// RoomClient.kick).
+    /// Foreground hook: revive transcript delivery after a suspension.
     func kickRoom() {
         projectionClient?.reconnect()
         retryOutbox()
@@ -239,92 +231,6 @@ final class SessionStore {
         }
     }
 
-    // MARK: Legacy local decoder (demo/bench fixtures)
-
-    /// Whole-doc decode used only by synthetic demo/benchmark fixtures.
-    nonisolated static func decodeEntries(from doc: LoroDoc) -> [MessageEntry]? {
-        guard let root = doc.getDeepValue().mapValue else { return nil }
-        let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
-        return joinContinuations(raw)
-    }
-
-    nonisolated private static func entryFrom(_ value: LoroValue) -> MessageEntry? {
-        guard let m = value.mapValue,
-              let id = m["id"]?.stringValue,
-              let roleStr = m["role"]?.stringValue,
-              let role = MessageRole(rawValue: roleStr) else { return nil }
-        let parts = (m["parts"]?.listValue ?? []).compactMap(partFrom)
-        return MessageEntry(id: id, role: role, parts: parts,
-                            createdAt: m["createdAt"]?.i64Value ?? 0,
-                            deviceId: m["deviceId"]?.stringValue ?? "",
-                            status: m["status"]?.stringValue.flatMap(MessageStatus.init(rawValue:)),
-                            continuationOf: m["continuationOf"]?.stringValue)
-    }
-
-    nonisolated private static func partFrom(_ value: LoroValue) -> MessagePart? {
-        guard let m = value.mapValue,
-              let id = m["id"]?.stringValue,
-              let kind = m["kind"]?.stringValue else { return nil }
-        switch kind {
-        case "text":
-            return .text(id: id, text: m["text"]?.stringValue ?? "")
-        case "tool":
-            guard let callMap = m["call"]?.mapValue else { return nil }
-            let tag = callMap["kind"]?.stringValue ?? "unknown"
-            var fields: [String: AnyHashable] = [:]
-            for (k, v) in callMap where k != "kind" {
-                if let s = v.stringValue { fields[k] = s }
-                else if let b = v.boolValue { fields[k] = b }
-                else if let i = v.i64Value { fields[k] = i }
-                else if let list = v.listValue {
-                    // ApplyPatch changes / Todo items — keep a JSON echo.
-                    fields[k] = list.map { "\($0.jsonObject)" }
-                }
-            }
-            // isError presence IS the resolution marker (schema.rs:96).
-            let isError = m["isError"]?.boolValue
-            return .tool(id: id, call: RenderToolCall(tag: tag, fields: fields),
-                         isError: isError ?? false, resolved: isError != nil)
-        case "input":
-            var questions: [UserInputQuestion] = []
-            if let list = m["questions"]?.listValue,
-               let data = try? JSONSerialization.data(withJSONObject: list.map(\.jsonObject)),
-               let decoded = try? JSONDecoder().decode([UserInputQuestion].self, from: data) {
-                questions = decoded
-            }
-            return .input(id: id, requestId: id, questions: questions,
-                          resolved: m["resolved"]?.boolValue ?? false)
-        case "error":
-            return .error(id: id, message: m["message"]?.stringValue ?? "")
-        case "changes":
-            guard let rawDiff = m["diff"]?.jsonObject,
-                  JSONSerialization.isValidJSONObject(rawDiff),
-                  let data = try? JSONSerialization.data(withJSONObject: rawDiff),
-                  let diff = try? JSONDecoder().decode(TurnDiffSummary.self, from: data) else {
-                return nil
-            }
-            return .changes(id: id, diff: diff)
-        default:
-            return nil
-        }
-    }
-
-    /// schema.rs join_continuation_entries: concatenate continuation parts onto
-    /// the root in list order; orphans surface standalone.
-    nonisolated static func joinContinuations(_ raw: [MessageEntry]) -> [MessageEntry] {
-        var roots: [MessageEntry] = []
-        var index: [String: Int] = [:]
-        for entry in raw {
-            if let rootId = entry.continuationOf, let ix = index[rootId] {
-                roots[ix].parts.append(contentsOf: entry.parts)
-            } else {
-                index[entry.id] = roots.count
-                roots.append(entry)
-            }
-        }
-        return roots
-    }
-
     // MARK: Derived
 
     var lastEntryId: String? { entries.last?.id }
@@ -335,10 +241,6 @@ final class SessionStore {
     }
 
     var hasPendingSends: Bool { !pendingSends.isEmpty }
-
-    var liveEntry: MessageEntry? {
-        entries.last(where: { $0.status == .streaming })
-    }
 
     /// The unresolved input request to surface in the question panel.
     var openInputRequest: (entryId: String, requestId: String, questions: [UserInputQuestion])? {

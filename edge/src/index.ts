@@ -1,6 +1,6 @@
 /**
  * Jolt edge Worker (docs/architecture.md): JWT auth at the
- * edge, then forwarding into per-session, per-workspace, and per-device
+ * edge, then forwarding into per-session, registry, and per-device
  * Durable Objects. It also serves content-addressed R2 attachments and WorkOS
  * authentication routes.
  *
@@ -19,8 +19,6 @@
  *   POST /diff/:chatId                — host publishes manifest + missing pages
  *   GET  /snapshot/:chatId            — repair: read current doc snapshot
  *   POST /append/:chatId              — repair: merge-import a Loro update
- *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss; legacy clients)
- *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
  *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
  *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
  *   GET  /registry/:orgId/rows        — registry full-table repair read
@@ -35,7 +33,7 @@
  */
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
-import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import { AUTH_USER_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
@@ -61,8 +59,7 @@ const forward = (
   request: Request,
   userId: string,
   path: string,
-  search?: string,
-  roomKind?: "workspace"
+  search?: string
 ): Promise<Response> => {
   const stub = ns.get(ns.idFromName(name));
   const url = new URL(request.url);
@@ -70,7 +67,6 @@ const forward = (
   if (search !== undefined) url.search = search;
   const headers = new Headers(request.headers);
   headers.set(AUTH_USER_HEADER, userId);
-  if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
   return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
 };
 
@@ -94,7 +90,7 @@ const orgMismatch = ({
   tokenOrgId,
   url
 }: {
-  route: "workspace" | "registry";
+  route: "registry";
   requestedOrgId: string;
   tokenOrgId: string | undefined;
   url: URL;
@@ -168,8 +164,8 @@ export default {
       // `s2/` = the WorkOS staging→production identity break: rooms are
       // claim-on-first-join per user id, and prod issued a fresh id for
       // everyone — a new namespace lets prod identities claim fresh rooms
-      // while hosts re-upload doc state from their local snapshots (same
-      // playbook as `ws3` below). Frame-level room ids stay the bare chatId.
+      // while hosts re-upload doc state from their local snapshots.
+      // Frame-level room ids stay the bare chatId.
       return forward(
         env.SESSION_ROOMS,
         `s2/${parts[1]}`,
@@ -273,73 +269,8 @@ export default {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
     }
 
-    // ── Legacy workspace rooms: same SessionRoom DO class;
-    //    the caller's WorkOS org claim (`org_id`) must equal the URL's orgId,
-    //    and the room itself is derived from the caller's OWN user id — the
-    //    workspace doc (spaces, chats index, devices) is per-user; teammates
-    //    in the same org can never address each other's rooms. ──────────────
-    if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
-      const orgId = parts[1];
-      if (auth.orgId !== orgId) {
-        return orgMismatch({ route: "workspace", requestedOrgId: orgId, tokenOrgId: auth.orgId, url });
-      }
-      // `ws4` = the 2026-08-04 incident break: the ws3 instance's storage was
-      // left with causally-broken update rows by the abort-thrash loop (acks
-      // outran the debounced flush) and could not be trusted again even after
-      // /reset-log; a name bump allocates a virgin DO. (`ws3` was the per-user
-      // privacy break, `ws2` the spaces overhaul.) Legacy rooms are orphaned
-      // (hibernated, ~zero cost). URL path stays `/workspace/:orgId/*`; the
-      // name is worker-internal — clients echo their own roomId strings.
-      const room = `ws4/${orgId}/${auth.userId}`;
-      if (parts[2] === "ws") {
-        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-          return json({ error: "expected websocket" }, 426);
-        }
-        return forward(
-          env.SESSION_ROOMS,
-          room,
-          request,
-          auth.userId,
-          "/ws",
-          `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`,
-          "workspace"
-        );
-      }
-      if (parts[2] === "tail" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/tail", "", "workspace");
-      }
-      // Observability: log/snapshot sizes for the per-user workspace room, so a
-      // human can see whether the compaction budget is holding (org-membership
-      // was already checked above; the DO bypasses the owner gate for
-      // workspace kind).
-      if (parts[2] === "stats" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/stats", "", "workspace");
-      }
-      // Raw doc snapshot: the repair/reseed read (2026-08-04: a device stranded
-      // behind the shallow-locked rebuild converges by replacing its local
-      // workspace doc with this — see the incident repair recipe).
-      if (parts[2] === "snapshot" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/snapshot", "", "workspace");
-      }
-      // Operator wedge-break: clear a workspace room whose update log grew big
-      // enough to CPU-reset the DO on every cold start (org-membership already
-      // checked; state re-uploads from each device's local doc on rejoin).
-      if (parts[2] === "reset-log" && request.method === "POST") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/reset-log", "", "workspace");
-      }
-      // Merge-safe repair write (the chat rooms' /append, for the workspace
-      // doc): lets an operator seed a reset room with ONE compact
-      // locally-exported history blob instead of waiting for every device to
-      // re-upload its whole doc — the N-way redundant re-seed is what kept
-      // ballooning the update log after the 2026-08-05 wedge breaks.
-      if (parts[2] === "append" && request.method === "POST") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/append", "", "workspace");
-      }
-    }
-
-    // ── registry rooms (docs/sync.md): the row-table replacement for
-    //    the Loro workspace doc. Same trust shape as /workspace: org claim
-    //    must match the URL, room derived from the caller's OWN user id, DO
+    // ── registry rooms (docs/sync.md): org claim must match the URL,
+    //    room derived from the caller's OWN user id, and the DO
     //    trusts the stamped header. `reg1` = first registry generation. ─────
     if (parts[0] === "registry" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];

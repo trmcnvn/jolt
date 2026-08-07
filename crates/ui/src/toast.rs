@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Context, Entity, Global, Render, SharedString, SystemNotification,
@@ -16,7 +16,7 @@ use gpui::{
 use crate::icons;
 use crate::theme::Theme;
 
-const DEFAULT_DURATION: Duration = Duration::from_secs(10);
+const DEFAULT_DURATION: Duration = Duration::from_secs(5);
 const MAX_VISIBLE: usize = 4;
 const PRIMARY_ACTION_ID: &str = "primary";
 
@@ -102,11 +102,30 @@ impl Toast {
         self.auto_dismiss = false;
         self
     }
+
+    fn should_auto_dismiss(&self) -> bool {
+        self.auto_dismiss && self.action.is_none()
+    }
 }
 
 struct ActiveToast {
     toast: Toast,
     dismiss_task: Option<Task<()>>,
+    remaining: Duration,
+    started_at: Option<Instant>,
+}
+
+impl ActiveToast {
+    fn remaining_at(&self, now: Instant) -> Duration {
+        self.started_at.map_or(self.remaining, |started_at| {
+            self.remaining
+                .saturating_sub(now.saturating_duration_since(started_at))
+        })
+    }
+
+    fn progress_at(&self, now: Instant) -> f32 {
+        self.remaining_at(now).as_secs_f32() / DEFAULT_DURATION.as_secs_f32()
+    }
 }
 
 #[derive(Clone)]
@@ -195,37 +214,51 @@ impl ToastCenter {
         if self.active.len() == MAX_VISIBLE {
             self.active.remove(0);
         }
-        let dismiss_task = toast
-            .auto_dismiss
-            .then(|| Self::schedule_dismiss(toast.id.clone(), cx));
+        let should_auto_dismiss = toast.should_auto_dismiss();
+        let dismiss_task = should_auto_dismiss
+            .then(|| Self::schedule_dismiss(toast.id.clone(), DEFAULT_DURATION, cx));
         self.active.push(ActiveToast {
             toast,
             dismiss_task,
+            remaining: DEFAULT_DURATION,
+            started_at: should_auto_dismiss.then(Instant::now),
         });
         cx.notify();
     }
 
-    fn schedule_dismiss(id: SharedString, cx: &mut Context<Self>) -> Task<()> {
+    fn schedule_dismiss(id: SharedString, duration: Duration, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |center, cx| {
-            cx.background_executor().timer(DEFAULT_DURATION).await;
+            cx.background_executor().timer(duration).await;
             center
                 .update(cx, |center, cx| center.dismiss_in_app(&id, cx))
                 .ok();
         })
     }
 
-    fn pause_dismiss(&mut self, id: &str) {
-        if let Some(active) = self.active.iter_mut().find(|active| active.toast.id == id) {
+    fn pause_dismiss(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(active) = self.active.iter_mut().find(|active| active.toast.id == id)
+            && let Some(started_at) = active.started_at.take()
+        {
+            active.remaining = active
+                .remaining
+                .saturating_sub(Instant::now().saturating_duration_since(started_at));
             active.dismiss_task = None;
+            cx.notify();
         }
     }
 
     fn resume_dismiss(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(active) = self.active.iter_mut().find(|active| active.toast.id == id)
-            && active.toast.auto_dismiss
-            && active.dismiss_task.is_none()
+            && active.toast.should_auto_dismiss()
+            && active.started_at.is_none()
         {
-            active.dismiss_task = Some(Self::schedule_dismiss(active.toast.id.clone(), cx));
+            active.started_at = Some(Instant::now());
+            active.dismiss_task = Some(Self::schedule_dismiss(
+                active.toast.id.clone(),
+                active.remaining,
+                cx,
+            ));
+            cx.notify();
         }
     }
 
@@ -236,10 +269,15 @@ impl ToastCenter {
 }
 
 impl Render for ToastCenter {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
+        let now = Instant::now();
+        if !cx.reduce_motion() && self.active.iter().any(|active| active.started_at.is_some()) {
+            window.request_animation_frame();
+        }
         let rows = self.active.iter().rev().enumerate().map(|(index, active)| {
             let toast = active.toast.clone();
+            let progress = active.progress_at(now);
             let dismiss_id = toast.id.clone();
             let close_dismiss_id = dismiss_id.clone();
             let hover_id = toast.id.clone();
@@ -315,7 +353,7 @@ impl Render for ToastCenter {
                 .occlude()
                 .on_hover(cx.listener(move |center, hovering, _, cx| {
                     if *hovering {
-                        center.pause_dismiss(hover_id.as_ref());
+                        center.pause_dismiss(hover_id.as_ref(), cx);
                     } else {
                         center.resume_dismiss(hover_id.as_ref(), cx);
                     }
@@ -323,7 +361,20 @@ impl Render for ToastCenter {
                 .flex()
                 .flex_col()
                 .child(main);
-            if let Some(action) = toast.action.clone() {
+            if toast.should_auto_dismiss() {
+                card = card.child(
+                    div()
+                        .w_full()
+                        .h(px(3.0))
+                        .bg(crate::theme::wash(0.05))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(progress))
+                                .bg(tone.opacity(0.85)),
+                        ),
+                );
+            } else if let Some(action) = toast.action.clone() {
                 card = card.child(
                     div()
                         .w_full()
@@ -390,4 +441,37 @@ pub fn configure(system_notifications_enabled: bool, cx: &mut App) {
 
 pub fn show(toast: Toast, cx: &mut App) {
     layer(cx).update(cx, |center, cx| center.show(toast, cx));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_actionless_nonpersistent_toasts_auto_dismiss() {
+        let plain = Toast::new("plain", "Plain", ToastKind::Info);
+        assert!(plain.should_auto_dismiss());
+
+        let actionable = Toast::new("action", "Action", ToastKind::Info)
+            .action(ToastAction::new("Retry", |_| {}));
+        assert!(!actionable.should_auto_dismiss());
+
+        let persistent = Toast::new("persistent", "Persistent", ToastKind::Info).persistent();
+        assert!(!persistent.should_auto_dismiss());
+    }
+
+    #[test]
+    fn progress_counts_down_over_the_default_duration() {
+        let started_at = Instant::now();
+        let active = ActiveToast {
+            toast: Toast::new("plain", "Plain", ToastKind::Info),
+            dismiss_task: None,
+            remaining: DEFAULT_DURATION,
+            started_at: Some(started_at),
+        };
+
+        assert_eq!(active.progress_at(started_at), 1.0);
+        assert_eq!(active.progress_at(started_at + DEFAULT_DURATION / 2), 0.5);
+        assert_eq!(active.progress_at(started_at + DEFAULT_DURATION), 0.0);
+    }
 }

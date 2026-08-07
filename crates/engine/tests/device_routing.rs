@@ -183,8 +183,9 @@ fn registry() -> Arc<HarnessRegistry> {
 }
 
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
-    std::fs::create_dir_all(dir).expect("create data dir");
-    std::fs::write(dir.join("device-id"), device_id).expect("write device id");
+    let scope = dir.join("scopes/accounts/dev-org/dev-user");
+    std::fs::create_dir_all(&scope).expect("create data dir");
+    std::fs::write(scope.join("device-id"), device_id).expect("write device id");
     EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles")
 }
 
@@ -295,16 +296,15 @@ async fn target_device_id_routes_over_the_relay() {
         "remote folder listing must come from B's filesystem: {names:?}"
     );
 
-    // Streaming proxy: WatchDocMessages against B's doc from A's IPC surface.
+    // Streaming proxy: WatchTranscriptV2 against B's doc from A's IPC surface.
     let mut stream = client
         .subscribe(
-            methods::WATCH_DOC_MESSAGES,
+            methods::WATCH_TRANSCRIPT_V2,
             serde_json::json!({ "chatId": "chat-remote", "targetDeviceId": "device-b" }),
         )
         .await
         .expect("remote subscribe");
-    // The watch emits its current value first ([] if B's publish pass hasn't run yet),
-    // then re-emits on every doc change — read until B's entry arrives.
+    // The watch opens with a bootstrap and then emits live-page updates.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let item = tokio::time::timeout_at(deadline, stream.recv())
@@ -357,8 +357,8 @@ async fn target_device_id_routes_over_the_relay() {
     core_b.shutdown().await;
 }
 
-/// M5: terminals are device-addressable — OpenTerminal/WriteTerminal forward as
-/// unary calls and SubscribeTerminal proxies its stream through the relay.
+/// Terminals are device-addressable: control calls stay JSON while binary V2
+/// output crosses both the engine proxy and DeviceRoom without base64.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_stream_proxies_over_the_relay() {
     use base64::Engine as _;
@@ -427,14 +427,14 @@ async fn terminal_stream_proxies_over_the_relay() {
         "cwd from B's chat row"
     );
 
-    // SubscribeTerminal: the stream is proxied item-by-item through the relay.
+    // SubscribeTerminalV2: arbitrary binary output is proxied unchanged.
     let mut stream = client
-        .subscribe(
-            methods::SUBSCRIBE_TERMINAL,
+        .subscribe_binary(
+            methods::SUBSCRIBE_TERMINAL_V2,
             serde_json::json!({ "terminalId": terminal_id, "targetDeviceId": "device-b" }),
         )
         .await
-        .expect("remote subscribe");
+        .expect("remote binary subscribe");
     client
         .call(
             methods::WRITE_TERMINAL,
@@ -453,11 +453,10 @@ async fn terminal_stream_proxies_over_the_relay() {
             .await
             .expect("proxied terminal output before timeout")
             .expect("stream alive");
-        if item["type"] == "data" {
-            let bytes = BASE64
-                .decode(item["data"].as_str().expect("data"))
-                .expect("valid base64");
-            transcript.extend(bytes);
+        if let jolt_rpc::terminal_wire::TerminalBinaryEvent::Data { data, .. } =
+            jolt_rpc::terminal_wire::decode(&item).expect("valid terminal binary frame")
+        {
+            transcript.extend(data);
         }
         if String::from_utf8_lossy(&transcript).contains("r3lay-22") {
             break;

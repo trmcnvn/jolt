@@ -9,25 +9,11 @@ const ROW_CAP = 2 * 1024 * 1024;
 class FakeSql {
   rows: { seq: number; bytes: ArrayBuffer; received_at: number; cont: number }[] = [];
   private seq = 0;
-  private hasCont;
-
-  constructor({ legacy = false } = {}) {
-    // legacy=true simulates a table created before the `cont` column existed.
-    this.hasCont = !legacy;
-  }
-
   exec(query: string, ...params: unknown[]): Iterable<Record<string, unknown>> {
     if (query.startsWith("CREATE TABLE")) return [];
-    if (query.startsWith("ALTER TABLE")) {
-      if (this.hasCont) throw new Error("duplicate column name: cont");
-      this.hasCont = true;
-      for (const row of this.rows) row.cont = 0;
-      return [];
-    }
     if (query.startsWith("INSERT INTO updates")) {
       const bytes = params[0] as ArrayBuffer;
       if (bytes.byteLength > ROW_CAP) throw new Error("string or blob too big: SQLITE_TOOBIG");
-      if (!this.hasCont && query.includes("cont")) throw new Error("table updates has no column named cont");
       this.rows.push({
         seq: ++this.seq,
         bytes,
@@ -109,21 +95,7 @@ describe("update log chunking", () => {
     expect(sameBytes(back[0], view)).toBe(true);
   });
 
-  it("migrates a legacy table and reads its rows as one update each", () => {
-    const sql = new FakeSql({ legacy: true });
-    // Legacy rows written before the cont column existed.
-    sql.rows.push(
-      { seq: 1, bytes: bytesOf(10, 1).buffer as ArrayBuffer, received_at: 1, cont: 0 },
-      { seq: 2, bytes: bytesOf(11, 2).buffer as ArrayBuffer, received_at: 2, cont: 0 }
-    );
-    ensureUpdateLog(asSql(sql));
-    expect(readAll(sql).length).toBe(2);
-    // And post-migration appends work, including chunked ones.
-    appendUpdateRow(asSql(sql), bytesOf(CHUNK_BYTES + 1, 3), 3);
-    expect(readAll(sql).length).toBe(3);
-  });
-
-  it("ensureUpdateLog is idempotent on an already-migrated table", () => {
+  it("ensureUpdateLog is idempotent", () => {
     const sql = new FakeSql();
     ensureUpdateLog(asSql(sql));
     ensureUpdateLog(asSql(sql));

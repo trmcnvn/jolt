@@ -17,20 +17,15 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
 }
 
-/// Ordered, append-only migrations. Each entry runs once inside a transaction;
-/// `schema_migrations` records what has been applied.
-const MIGRATIONS: &[&str] = &[
-    // v1 — snapshots + processed-command ledger
-    "CREATE TABLE snapshots (
-        doc_id   TEXT PRIMARY KEY,
-        bytes    BLOB NOT NULL,
-        saved_at INTEGER NOT NULL
-     ) STRICT;
-     CREATE TABLE processed_commands (
-        command_id   TEXT PRIMARY KEY,
-        processed_at INTEGER NOT NULL
-     ) STRICT;",
-];
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS snapshots (
+    doc_id   TEXT PRIMARY KEY,
+    bytes    BLOB NOT NULL,
+    saved_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS processed_commands (
+    command_id   TEXT PRIMARY KEY,
+    processed_at INTEGER NOT NULL
+) STRICT;";
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
 ///
@@ -46,11 +41,11 @@ impl DocsStore {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)?;
-        let mut conn = Connection::open(data_dir.join("docs.sqlite3"))?;
+        let conn = Connection::open(data_dir.join("docs.sqlite3"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        migrate(&mut conn)?;
+        conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -79,8 +74,7 @@ impl DocsStore {
         Ok(())
     }
 
-    /// Delete the snapshot row for `doc_id` (destructive schema breaks: the
-    /// legacy `workspace` row is dropped on open). Missing rows are a no-op.
+    /// Delete the snapshot row for `doc_id`. Missing rows are a no-op.
     pub fn delete_snapshot(&self, doc_id: &str) -> Result<(), StoreError> {
         self.conn()
             .execute("DELETE FROM snapshots WHERE doc_id = ?1", params![doc_id])?;
@@ -116,34 +110,6 @@ impl DocsStore {
         // connection itself is still usable.
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version    INTEGER PRIMARY KEY,
-            applied_at INTEGER NOT NULL
-         ) STRICT",
-    )?;
-    let current: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
-        |row| row.get(0),
-    )?;
-    for (index, sql) in MIGRATIONS.iter().enumerate() {
-        let version = index as i64 + 1;
-        if version <= current {
-            continue;
-        }
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-            params![version, now_ms()],
-        )?;
-        tx.commit()?;
-    }
-    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -196,14 +162,14 @@ mod tests {
     }
 
     #[test]
-    fn reopen_preserves_data_and_migrations_are_idempotent() {
+    fn reopen_preserves_data() {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = DocsStore::open(dir.path()).unwrap();
             store.save_snapshot("chat-1", b"persisted").unwrap();
             store.mark_processed("cmd-1").unwrap();
         }
-        let store = DocsStore::open(dir.path()).unwrap(); // re-runs migrate()
+        let store = DocsStore::open(dir.path()).unwrap();
         assert_eq!(
             store.load_snapshot("chat-1").unwrap().as_deref(),
             Some(&b"persisted"[..])

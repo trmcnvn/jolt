@@ -49,7 +49,6 @@ final class AppModel {
 
     func restore() {
         if demo != nil { return }
-        DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
         // Debug-rig config overrides (cfprefsd caching defeats external
         // defaults writes; the app applying them itself always sticks).
@@ -335,7 +334,7 @@ final class AppModel {
         guard let workspace else { return "Not connected" }
         return await workspace.switchRef(deviceId: space.deviceId,
                                          repoPath: space.path,
-                                         refName: ref.revision ?? ref.name)
+                                         refName: ref.revision)
     }
 
     /// Mid-session ref switch: retarget onto an existing isolated checkout,
@@ -365,7 +364,7 @@ final class AppModel {
         guard let workspace else { return "Not connected" }
         let error = await workspace.switchRef(deviceId: chat.deviceId,
                                               repoPath: cwd,
-                                              refName: ref.revision ?? ref.name)
+                                              refName: ref.revision)
         if error == nil {
             // The host's checkout watcher reconciles chat.branch eventually;
             // stamp it optimistically so the UI answers immediately.
@@ -384,7 +383,7 @@ final class AppModel {
         }
         return await workspace?.createWorktree(deviceId: space.deviceId,
                                                repoPath: space.path,
-                                               revision: base.revision ?? base.name)
+                                               revision: base.revision)
     }
 
     func uploadAttachment(deviceId: String, chatId: String,
@@ -477,14 +476,13 @@ final class AppModel {
         workspace?.markSeen(chatId: chatId)
     }
 
-    /// Persist every open doc now (app backgrounding).
+    /// Persist workspace state immediately when backgrounding.
     func flushDocs() {
         workspace?.flushToDisk()
-        sessionStores.values.forEach { $0.flushToDisk() }
     }
 
-    /// Foreground hook: kick every room NOW (see RoomClient.kick) — after a
-    /// suspension the workspace room in particular stayed dead while chat
+    /// Foreground hook: revive every network client after a suspension. The
+    /// registry connection in particular previously stayed dead while chat
     /// views reconnected on open, freezing sidebar rows and Working
     /// indicators against perfectly live transcripts (2026-08-04).
     func foregrounded() {
@@ -527,7 +525,7 @@ final class AppModel {
     }
 
     /// The workspace registry already carries every sidebar row. Session
-    /// transcripts open tail-first on demand; warming every Loro room was an
+    /// transcripts open tail-first on demand; warming every transcript was an
     /// unbounded memory and socket multiplier on iOS.
     func preloadSessions() {}
 }

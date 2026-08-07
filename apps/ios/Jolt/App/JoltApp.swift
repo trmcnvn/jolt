@@ -1,5 +1,5 @@
 // Jolt for iOS — a viewport onto the Jolt mesh. The phone is a peer
-// device: it joins the workspace and session doc rooms and drives remote
+// device: it joins the workspace registry and transcript projections and drives remote
 // engines through the durable command queue.
 
 import SwiftUI
@@ -24,7 +24,7 @@ struct JoltApp: App {
                         model.flushDocs()
                     } else if phase == .active {
                         // Suspension kills sockets without running any
-                        // failure path — without this kick the workspace
+                        // failure path — without this kick the registry
                         // room stays dead after foregrounding while chat
                         // views reconnect on open (frozen sidebar/Working
                         // indicators against live transcripts, 2026-08-04).

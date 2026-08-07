@@ -432,6 +432,25 @@ impl Transcript {
         }));
     }
 
+    /// Land on a page-backed message selected outside the transcript (for
+    /// example, from the transcript search command center).
+    pub fn scroll_to_message(
+        &mut self,
+        message_id: String,
+        page_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self
+            .rows()
+            .iter()
+            .position(|row| row.entry_id.as_ref() == message_id)
+        {
+            self.scroll_to_row(row, cx);
+        } else {
+            self.load_and_scroll_to_message(message_id, page_id, cx);
+        }
+    }
+
     fn load_and_scroll_to_message(
         &mut self,
         message_id: String,
@@ -450,7 +469,7 @@ impl Transcript {
                     let Some(target) = transcript
                         .rows()
                         .iter()
-                        .position(|row| row.id.as_ref() == message_id)
+                        .position(|row| row.entry_id.as_ref() == message_id)
                     else {
                         return false;
                     };

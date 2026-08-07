@@ -16,10 +16,7 @@ xcodebuild -project Jolt.xcodeproj -scheme Jolt \
 
 Or open `apps/ios/Jolt.xcodeproj` and run the shared `Jolt` scheme.
 
-Swift Package Manager resolves:
-
-- `loro-swift` 1.13.x for compatibility fixtures and document tooling;
-- `swift-markdown` for GFM-compatible transcript rendering.
+Swift Package Manager resolves `swift-markdown` for GFM-compatible transcript rendering, plus the native math and Mermaid renderers.
 
 ## Sign in
 

@@ -5769,7 +5769,7 @@ impl Composer {
         let sent_at = chrono::Utc::now();
         let created_at = sent_at.timestamp_millis();
 
-        // Image-only sends echo the same body `with_attachments` will use, so
+        // Image-only sends echo the same body `with_uploaded_attachments` will use, so
         // the bubble never renders empty (refs are upserted in post-upload).
         let echo_text = if text.is_empty() && !staged.is_empty() {
             attachments::ATTACHMENT_ONLY_TEXT.to_string()
@@ -5949,7 +5949,7 @@ impl Composer {
 
                 // Stage every attachment on the host device (sequential — the
                 // chunks share one channel), then thread the refs into the
-                // prompt text (`with_attachments`, the persisted transport)
+                // prompt text (`with_uploaded_attachments`, the persisted transport)
                 // and the paths onto the Run request (inline image blocks).
                 let mut content = text.clone();
                 let mut uploaded_attachments = Vec::new();
@@ -6417,7 +6417,7 @@ impl Composer {
             .flex_row()
             .items_center()
             .gap(px(10.0))
-            .child(loaders::activity_orb(
+            .child(loaders::activity_spinner(
                 "bro-spinner",
                 &theme,
                 16.0,
@@ -6454,7 +6454,7 @@ impl Composer {
             .flex_row()
             .items_center()
             .gap(px(10.0))
-            .child(loaders::activity_orb(
+            .child(loaders::activity_spinner(
                 "question-extraction-spinner",
                 &theme,
                 16.0,
@@ -6769,7 +6769,9 @@ impl Composer {
                 div()
                     .id("question-panel-content")
                     .flex_1()
-                    .min_h_0()
+                    // Keep a short two-line prompt fully visible. Tight window
+                    // layouts should scroll only genuinely long questions.
+                    .min_h(px(46.0))
                     .overflow_y_scroll()
                     .track_scroll(&self.wizard_scroll)
                     .px(px(16.0))
@@ -6798,7 +6800,7 @@ impl Composer {
                         .overflow_y_scroll()
                         .track_scroll(&self.wizard_options_scroll)
                         .px(px(16.0))
-                        .pb(px(12.0))
+                        .pb(px(8.0))
                         .when(question.multi_select, |el| {
                             el.child(
                                 div()
@@ -6810,7 +6812,7 @@ impl Composer {
                         })
                         .child(
                             div()
-                                .mt(px(12.0))
+                                .mt(px(8.0))
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.0))
@@ -7925,8 +7927,13 @@ mod tests {
             status: None,
             continuation_of: None,
         };
-        let with_attachment =
-            attachments::with_attachments("second prompt", &["/tmp/image.png".into()]);
+        let with_attachment = attachments::with_uploaded_attachments(
+            "second prompt",
+            &[attachments::UploadedAttachment {
+                path: "/tmp/image.png".into(),
+                sha256: "0123456789abcdef".repeat(4),
+            }],
+        );
         let transcript = vec![
             entry("u1", MessageRole::User, "first prompt"),
             entry("a1", MessageRole::Assistant, "response"),
@@ -7934,7 +7941,13 @@ mod tests {
             entry(
                 "u3",
                 MessageRole::User,
-                &attachments::with_attachments("", &["/tmp/only.png".into()]),
+                &attachments::with_uploaded_attachments(
+                    "",
+                    &[attachments::UploadedAttachment {
+                        path: "/tmp/only.png".into(),
+                        sha256: "0123456789abcdef".repeat(4),
+                    }],
+                ),
             ),
         ];
         let echoes = vec![entry("u4", MessageRole::User, "latest prompt")];

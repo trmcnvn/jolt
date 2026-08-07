@@ -865,7 +865,7 @@ impl AccountsPage {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(crate::loaders::activity_orb(
+                                .child(crate::loaders::activity_spinner(
                                     "login-poll",
                                     &theme,
                                     16.0,

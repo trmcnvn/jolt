@@ -95,9 +95,4 @@ enum HarnessCatalog {
         default: return level.capitalized
         }
     }
-
-    static func modelLabel(harness: String, modelId: String?) -> String {
-        guard let modelId else { return defaultModel(for: harness)?.label ?? "Select model" }
-        return models(for: harness).first { $0.id == modelId }?.label ?? modelId
-    }
 }

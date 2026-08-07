@@ -4,9 +4,8 @@
 //!
 //! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
 //! artifacts live in the `jolt-releases` R2 bucket, served pre-auth at
-//! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
-//! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
-//! releases published before the manifest existed.
+//! `{edge}/releases/*`. `manifest.json` carries the latest version and SHA-256
+//! digest for every artifact.
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.jolt/app/<ver>` + `current` symlink — the curl|sh
@@ -51,16 +50,13 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60)
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
-    /// Artifact file name → metadata. Empty for pre-manifest releases resolved
-    /// via `latest.txt` — downloads then skip checksum verification (with a log).
-    #[serde(default)]
+    /// Artifact file name → verified metadata.
     pub files: BTreeMap<String, FileMeta>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
-    #[serde(default)]
-    pub sha256: Option<String>,
+    pub sha256: String,
 }
 
 /// Artifact-name platform pair — `uname`-style strings matching the packaging
@@ -91,8 +87,7 @@ pub fn mac_app_artifact(version: &str) -> String {
 }
 
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
-/// Unparseable versions never count as newer — a garbage `latest.txt` must not
-/// trigger an update loop.
+/// Unparseable versions never count as newer.
 pub fn version_newer(latest: &str, current: &str) -> bool {
     fn parts(v: &str) -> Option<Vec<u64>> {
         let nums: Vec<u64> = v
@@ -109,45 +104,23 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-/// Fetch the newest release metadata: `manifest.json`, falling back to
-/// `latest.txt` (version only, no checksums) for pre-manifest releases.
+/// Fetch and validate the newest release manifest.
 pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
-    let base = edge_url.trim_end_matches('/');
-    let client = http_client()?;
-    let manifest_url = format!("{base}/releases/manifest.json");
-    match client.get(&manifest_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let manifest: Manifest = resp.json().await.context("parsing manifest.json")?;
-            if manifest.version.trim().is_empty() {
-                bail!("manifest.json has an empty version");
-            }
-            return Ok(manifest);
-        }
-        Ok(resp) => {
-            tracing::debug!(status = %resp.status(), "manifest.json unavailable; trying latest.txt")
-        }
-        Err(err) => tracing::debug!(error = %err, "manifest.json fetch failed; trying latest.txt"),
-    }
-    let latest_url = format!("{base}/releases/latest.txt");
-    let version = client
-        .get(&latest_url)
+    let url = format!("{}/releases/manifest.json", edge_url.trim_end_matches('/'));
+    let manifest: Manifest = http_client()?
+        .get(&url)
         .send()
         .await
-        .context("fetching latest.txt")?
+        .context("fetching manifest.json")?
         .error_for_status()
-        .context("fetching latest.txt")?
-        .text()
+        .context("fetching manifest.json")?
+        .json()
         .await
-        .context("reading latest.txt")?
-        .trim()
-        .to_string();
-    if version.is_empty() {
-        bail!("latest.txt is empty");
+        .context("parsing manifest.json")?;
+    if manifest.version.trim().is_empty() {
+        bail!("manifest.json has an empty version");
     }
-    Ok(Manifest {
-        version,
-        files: BTreeMap::new(),
-    })
+    Ok(manifest)
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -226,9 +199,9 @@ pub fn refresh_linux_desktop_integration() -> anyhow::Result<()> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"));
-        let (applications_dir, desktop_changed) =
+        let (applications_dir, integration_changed) =
             install_linux_desktop_integration(&app_root, &data_home)?;
-        if desktop_changed {
+        if integration_changed {
             match std::process::Command::new("update-desktop-database")
                 .arg(&applications_dir)
                 .status()
@@ -264,18 +237,33 @@ fn install_linux_desktop_integration(
     let desktop = render_desktop_entry(&template, &executable)?;
 
     let icon_path = current.join("jolt.png");
-    let icon =
+    let icon_1024 =
         std::fs::read(&icon_path).with_context(|| format!("reading {}", icon_path.display()))?;
+    let icon_512_path = current.join("jolt-512.png");
+    let icon_512 = match std::fs::read(&icon_512_path) {
+        Ok(icon) => icon,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => icon_1024.clone(),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", icon_512_path.display()));
+        }
+    };
     let applications_dir = data_home.join("applications");
-    let icon_dir = data_home.join("icons/hicolor/1024x1024/apps");
+    let icon_512_dir = data_home.join("icons/hicolor/512x512/apps");
+    let icon_1024_dir = data_home.join("icons/hicolor/1024x1024/apps");
     std::fs::create_dir_all(&applications_dir)
         .with_context(|| format!("creating {}", applications_dir.display()))?;
-    std::fs::create_dir_all(&icon_dir)
-        .with_context(|| format!("creating {}", icon_dir.display()))?;
-    atomic_write_if_changed(&icon_dir.join("jolt.png"), &icon)?;
+    for icon_dir in [&icon_512_dir, &icon_1024_dir] {
+        std::fs::create_dir_all(icon_dir)
+            .with_context(|| format!("creating {}", icon_dir.display()))?;
+    }
+    let icon_512_changed = atomic_write_if_changed(&icon_512_dir.join("jolt.png"), &icon_512)?;
+    let icon_1024_changed = atomic_write_if_changed(&icon_1024_dir.join("jolt.png"), &icon_1024)?;
     let desktop_changed =
         atomic_write_if_changed(&applications_dir.join("jolt.desktop"), desktop.as_bytes())?;
-    Ok((applications_dir, desktop_changed))
+    Ok((
+        applications_dir,
+        icon_512_changed || icon_1024_changed || desktop_changed,
+    ))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -386,8 +374,8 @@ fn atomic_write_if_changed(path: &Path, contents: &[u8]) -> anyhow::Result<bool>
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest sha256 when
-/// present. Writes through a `.partial` sidecar so an interrupted download never
+/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest SHA-256.
+/// Writes through a `.partial` sidecar so an interrupted download never
 /// leaves a plausible-looking artifact behind.
 pub async fn download_release_file(
     edge_url: &str,
@@ -396,13 +384,11 @@ pub async fn download_release_file(
     dest: &Path,
 ) -> anyhow::Result<()> {
     let url = format!("{}/releases/{file}", edge_url.trim_end_matches('/'));
-    let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
-    if expected.is_none() {
-        tracing::warn!(
-            file,
-            "no checksum in release metadata; skipping verification"
-        );
-    }
+    let expected = &manifest
+        .files
+        .get(file)
+        .with_context(|| format!("manifest has no metadata for {file}"))?
+        .sha256;
     let partial = dest.with_extension("partial");
     let resp = http_client()?
         .get(&url)
@@ -423,12 +409,10 @@ pub async fn download_release_file(
     }
     out.flush().await.ok();
     drop(out);
-    if let Some(expected) = expected {
-        let actual = hex(&hasher.finalize());
-        if !actual.eq_ignore_ascii_case(expected.trim()) {
-            tokio::fs::remove_file(&partial).await.ok();
-            bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
-        }
+    let actual = hex(&hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected.trim()) {
+        tokio::fs::remove_file(&partial).await.ok();
+        bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
     }
     tokio::fs::rename(&partial, dest)
         .await
@@ -939,20 +923,14 @@ mod tests {
     }
 
     #[test]
-    fn manifest_parses_with_and_without_files() {
+    fn manifest_requires_artifact_metadata() {
         let full: Manifest = serde_json::from_str(
             r#"{"version":"0.1.1","files":{"jolt-0.1.1-linux-x86_64.tar.gz":{"sha256":"abc"}}}"#,
         )
         .unwrap();
         assert_eq!(full.version, "0.1.1");
-        assert_eq!(
-            full.files["jolt-0.1.1-linux-x86_64.tar.gz"]
-                .sha256
-                .as_deref(),
-            Some("abc")
-        );
-        let bare: Manifest = serde_json::from_str(r#"{"version":"0.1.1"}"#).unwrap();
-        assert!(bare.files.is_empty());
+        assert_eq!(full.files["jolt-0.1.1-linux-x86_64.tar.gz"].sha256, "abc");
+        assert!(serde_json::from_str::<Manifest>(r#"{"version":"0.1.1"}"#).is_err());
     }
 
     #[test]
@@ -995,6 +973,10 @@ mod tests {
         assert_eq!(applications, data_home.join("applications"));
         let desktop = std::fs::read_to_string(applications.join("jolt.desktop")).unwrap();
         assert!(desktop.contains(&format!("Exec=\"{}\"", current.join("jolt").display())));
+        assert_eq!(
+            std::fs::read(data_home.join("icons/hicolor/512x512/apps/jolt.png")).unwrap(),
+            b"icon"
+        );
         assert_eq!(
             std::fs::read(data_home.join("icons/hicolor/1024x1024/apps/jolt.png")).unwrap(),
             b"icon"

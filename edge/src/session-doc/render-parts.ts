@@ -77,8 +77,7 @@ export type SessionMessagePart =
     };
 
 /** Reduce a wire tool call to its render surface. Idempotent — feeding an
- * already-sanitized call back through is a no-op, which is what makes the
- * one-time migration and live path share this function. Unrecognized tags
+ * already-sanitized call back through is a no-op. Unrecognized tags
  * (from a future harness) pass through untouched rather than being dropped —
  * better to store an unknown shape than to erase a rendered call. */
 export const sanitizeToolCall = (call: ToolCall | RenderToolCall): RenderToolCall => {
@@ -137,9 +136,7 @@ export const sanitizeToolCall = (call: ToolCall | RenderToolCall): RenderToolCal
   }
 };
 
-/** Apply the render-only policy across a parts array (used on the live stream
- * path from the first token, and retroactively by the migration backfill —
- * the 7.3MB-message era shrinks to render size). */
+/** Apply the render-only policy across a live parts array. */
 export const toRenderParts = (
   parts: ReadonlyArray<MessagePart | SessionMessagePart>
 ): ReadonlyArray<SessionMessagePart> =>

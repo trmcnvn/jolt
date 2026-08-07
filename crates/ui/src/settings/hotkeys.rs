@@ -88,7 +88,8 @@ impl HotkeyCategory {
             | ShortcutId::ClearInput
             | ShortcutId::CloseTab
             | ShortcutId::PreviousTranscriptTurn
-            | ShortcutId::NextTranscriptTurn => Self::SessionActions,
+            | ShortcutId::NextTranscriptTurn
+            | ShortcutId::SearchTranscript => Self::SessionActions,
             ShortcutId::SelectTab1
             | ShortcutId::SelectTab2
             | ShortcutId::SelectTab3
@@ -219,6 +220,7 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::CloseTab => "Close the current local tab without archiving its session.",
         ShortcutId::PreviousTranscriptTurn => "Scroll to the previous user prompt.",
         ShortcutId::NextTranscriptTurn => "Scroll to the next user prompt.",
+        ShortcutId::SearchTranscript => "Find text in the current transcript.",
         ShortcutId::OpenSettings => "Open the settings page.",
         ShortcutId::OpenSpacesDropdown => "Open the sidebar space filter.",
         ShortcutId::AddSpace => "Open the folder browser to add a space.",

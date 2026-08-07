@@ -66,9 +66,13 @@ ln -sf "$app_root/current/jolt" "$HOME/.local/bin/jolt"
 # --- desktop integration -----------------------------------------------------
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 applications_dir="$data_home/applications"
-icon_dir="$data_home/icons/hicolor/1024x1024/apps"
-mkdir -p "$applications_dir" "$icon_dir"
-install -m 644 "$dest/jolt.png" "$icon_dir/jolt.png"
+icon_dir_512="$data_home/icons/hicolor/512x512/apps"
+icon_dir_1024="$data_home/icons/hicolor/1024x1024/apps"
+mkdir -p "$applications_dir" "$icon_dir_512" "$icon_dir_1024"
+icon_512="$dest/jolt-512.png"
+[ -f "$icon_512" ] || icon_512="$dest/jolt.png"
+install -m 644 "$icon_512" "$icon_dir_512/jolt.png"
+install -m 644 "$dest/jolt.png" "$icon_dir_1024/jolt.png"
 
 # Desktop launchers do not reliably inherit ~/.local/bin in PATH. Point the
 # entry at the managed `current` symlink so upgrades remain atomic.

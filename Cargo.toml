@@ -89,6 +89,7 @@ sha2 = "0.11"
 memchr = "2.8"
 notify = "8"
 portable-pty = "0.9"
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Post-0.2.1 master pins Ghostty ab0b9da, which includes the explicit SIMD
 # printable-run scan from f2a7652 (the optimization described in
 # mitchellh.com/writing/everyone-should-know-simd).

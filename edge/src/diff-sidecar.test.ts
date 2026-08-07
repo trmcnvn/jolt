@@ -44,7 +44,17 @@ const sidecar = {
 
 describe("parseDiffSidecar", () => {
   it("accepts the paged projection wire shape", () => {
-    expect(parseDiffSidecar(sidecar)?.manifest.files[0]?.path).toBe("a.rs");
+    const parsed = parseDiffSidecar(sidecar);
+    expect(parsed?.manifest.files[0]?.path).toBe("a.rs");
+    expect(parsed?.manifest.pages[0]?.splitLineCount).toBe(2);
+  });
+
+  it("preserves split-row estimates", () => {
+    const manifest = {
+      ...sidecar.manifest,
+      pages: [{ ...sidecar.manifest.pages[0], splitLineCount: 1 }]
+    };
+    expect(parseDiffSidecar({ ...sidecar, manifest })?.manifest.pages[0]?.splitLineCount).toBe(1);
   });
 
   it("rejects malformed nested descriptors", () => {

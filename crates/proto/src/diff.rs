@@ -22,6 +22,8 @@ pub struct DiffPageDescriptor {
     pub notice_count: usize,
     pub hunk_count: usize,
     pub line_count: usize,
+    /// Visual line rows when deletions and additions are paired side by side.
+    pub split_line_count: usize,
     pub estimated_bytes: usize,
 }
 

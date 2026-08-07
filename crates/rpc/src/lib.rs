@@ -1,16 +1,18 @@
 //! jolt-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
 //! transports, plus the device-room relay transport ({s,k,to,from} frames — [`device_room`]).
 //!
-//! Framing: ndjson envelopes, one JSON object per WebSocket text message or per
-//! line on byte transports:
+//! Framing: control uses ndjson envelopes, one JSON object per WebSocket text
+//! message or per line on byte transports. Binary stream items use versioned
+//! WebSocket binary messages keyed by the same request id:
 //!
 //! - client → server: `{id, method, params}` to invoke, `{id, cancel: true}` to stop a stream;
 //! - server → client: `{id, ok}` / `{id, err}` for unary calls,
 //!   `{id, item}`* then `{id, done: true}` (or `{id, err}`) for streams.
 //!
-//! The server dispatches into an [`RpcService`]; the [`RpcClient`] offers `call` and
-//! `subscribe`. Both ends run over any pair of string channels, so the in-memory transport
-//! ([`memory_client`]) exercises the exact same code path as the WebSocket one.
+//! The server dispatches into an [`RpcService`]; the [`RpcClient`] offers `call`,
+//! `subscribe`, and `subscribe_binary`. Both ends run over [`WireFrame`] channels,
+//! so the in-memory transport ([`memory_client`]) exercises the exact same code
+//! path as WebSocket text and binary messages.
 
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod device_room;
 mod server;
+pub mod terminal_wire;
 
 pub use client::{RpcClient, connect_ws};
 pub use device_room::{
@@ -39,12 +42,13 @@ pub mod methods {
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const CANCEL_QUEUED_PROMPT: &str = "CancelQueuedPrompt";
     pub const WATCH_QUEUED_PROMPTS: &str = "WatchQueuedPrompts";
-    pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Tail-first transcript stream: compact manifest + trailing pages, then
     /// sequenced live-page deltas.
     pub const WATCH_TRANSCRIPT_V2: &str = "WatchTranscriptV2";
     /// Fetch one historical transcript page by its opaque catalog id.
     pub const GET_TRANSCRIPT_PAGE: &str = "GetTranscriptPage";
+    /// Search all messages in one transcript and return page-backed anchors.
+    pub const SEARCH_TRANSCRIPT: &str = "SearchTranscript";
     /// Extract prose questions from one completed assistant message.
     pub const EXTRACT_QUESTIONS: &str = "ExtractQuestions";
     /// Nudge every open room client to verify liveness NOW (window focus,
@@ -53,7 +57,7 @@ pub mod methods {
     pub const PROBE_SYNC: &str = "ProbeSync";
     /// Live sync introspection (`jolt sync` / debug surfaces): per-room
     /// connection state, last pushed-frame/ack ages, rejoin/probe/resync
-    /// counters for the workspace room and every open chat doc. No params;
+    /// counters for the registry connection and every open chat doc. No params;
     /// IPC-only.
     pub const SYNC_STATUS: &str = "SyncStatus";
     pub const WATCH_CHATS: &str = "WatchChats";
@@ -75,6 +79,9 @@ pub mod methods {
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     pub const MUTATE: &str = "Mutate";
+    /// Regenerate a session name from its first prompt with the host harness's
+    /// economy model. Relay-forwardable to the session's host device.
+    pub const REGENERATE_CHAT_TITLE: &str = "RegenerateChatTitle";
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
@@ -109,9 +116,10 @@ pub mod methods {
     /// Per-device active VCS backend and executable availability.
     pub const VCS_SETTINGS: &str = "VcsSettings";
     pub const SET_VCS_BACKEND: &str = "SetVcsBackend";
-    // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
+    // Terminals (ControlRpc, relay-forwardable; V2 carries binary output).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
-    pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
+    /// Binary terminal output stream; control remains JSON RPC.
+    pub const SUBSCRIBE_TERMINAL_V2: &str = "SubscribeTerminalV2";
     pub const WRITE_TERMINAL: &str = "WriteTerminal";
     pub const RESIZE_TERMINAL: &str = "ResizeTerminal";
     pub const CLOSE_TERMINAL: &str = "CloseTerminal";
@@ -167,6 +175,64 @@ pub enum RpcError {
     Closed,
 }
 
+/// One transport message. JSON control frames remain text while high-volume
+/// stream items use binary WebSocket messages end-to-end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireFrame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+const BINARY_MAGIC: &[u8; 4] = b"JRPB";
+const BINARY_VERSION: u8 = 1;
+const BINARY_STREAM_ITEM: u8 = 1;
+const BINARY_HEADER_LEN: usize = 14;
+
+pub(crate) fn encode_binary_stream_item(id: u64, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(BINARY_HEADER_LEN + payload.len());
+    frame.extend_from_slice(BINARY_MAGIC);
+    frame.extend_from_slice(&[BINARY_VERSION, BINARY_STREAM_ITEM]);
+    frame.extend_from_slice(&id.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+pub(crate) fn decode_binary_stream_item(bytes: &[u8]) -> Result<(u64, &[u8]), RpcError> {
+    if bytes.get(..4) != Some(BINARY_MAGIC) {
+        return Err(RpcError::Transport("binary RPC frame: bad magic".into()));
+    }
+    if bytes.get(4) != Some(&BINARY_VERSION) {
+        return Err(RpcError::Transport(
+            "binary RPC frame: unsupported version".into(),
+        ));
+    }
+    if bytes.get(5) != Some(&BINARY_STREAM_ITEM) {
+        return Err(RpcError::Transport(
+            "binary RPC frame: unknown opcode".into(),
+        ));
+    }
+    let id = u64::from_le_bytes(
+        binary_payload(bytes, 6, 8, "RPC stream id")?
+            .try_into()
+            .map_err(|_| RpcError::Transport("binary RPC frame: invalid stream id".into()))?,
+    );
+    Ok((id, &bytes[BINARY_HEADER_LEN..]))
+}
+
+pub(crate) fn binary_payload<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    len: usize,
+    field: &str,
+) -> Result<&'a [u8], RpcError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| RpcError::Transport(format!("binary frame: {field} length overflow")))?;
+    bytes
+        .get(offset..end)
+        .ok_or_else(|| RpcError::Transport(format!("binary frame: truncated {field}")))
+}
+
 /// A client-originated frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientFrame {
@@ -199,6 +265,8 @@ pub enum RpcReply {
     Value(serde_json::Value),
     /// Stream — each item sent as `{id, item}`, then `{id, done: true}` when it ends.
     Stream(BoxStream<'static, serde_json::Value>),
+    /// Binary stream — each item is one binary frame, followed by JSON `{id, done}`.
+    BinaryStream(BoxStream<'static, Vec<u8>>),
 }
 
 impl RpcReply {
@@ -227,8 +295,8 @@ pub fn parse_params<T: serde::de::DeserializeOwned>(
 /// Same envelopes, same dispatch loop as the WebSocket path — the in-process UI
 /// transport deliberately keeps the serialization boundary (docs/rpc.md).
 pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
-    let (client_out, server_in) = tokio::sync::mpsc::channel::<String>(256);
-    let (server_out, client_in) = tokio::sync::mpsc::channel::<String>(256);
+    let (client_out, server_in) = tokio::sync::mpsc::channel::<WireFrame>(256);
+    let (server_out, client_in) = tokio::sync::mpsc::channel::<WireFrame>(256);
     tokio::spawn(serve_connection(service, server_out, server_in));
     RpcClient::new(client_out, client_in)
 }
@@ -256,6 +324,9 @@ mod tests {
                     ))
                 }
                 "Never" => Ok(RpcReply::Stream(futures::stream::pending().boxed())),
+                "Bytes" => Ok(RpcReply::BinaryStream(
+                    futures::stream::iter([vec![0, 1, 0x80, 0xff], b"second".to_vec()]).boxed(),
+                )),
                 "Boom" => Err(RpcError::Failed("boom".into())),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
@@ -289,6 +360,14 @@ mod tests {
             ]
         );
 
+        let mut binary = client
+            .subscribe_binary("Bytes", serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(binary.recv().await, Some(vec![0, 1, 0x80, 0xff]));
+        assert_eq!(binary.recv().await, Some(b"second".to_vec()));
+        assert_eq!(binary.recv().await, None);
+
         let err = client
             .call("Boom", serde_json::Value::Null)
             .await
@@ -316,6 +395,14 @@ mod tests {
         assert_eq!(items.recv().await, Some(serde_json::json!(0)));
         assert_eq!(items.recv().await, Some(serde_json::json!(1)));
         assert_eq!(items.recv().await, None);
+
+        let mut binary = client
+            .subscribe_binary("Bytes", serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(binary.recv().await, Some(vec![0, 1, 0x80, 0xff]));
+        assert_eq!(binary.recv().await, Some(b"second".to_vec()));
+        assert_eq!(binary.recv().await, None);
     }
 
     #[tokio::test]

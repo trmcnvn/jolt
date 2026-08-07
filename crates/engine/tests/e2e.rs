@@ -2080,7 +2080,8 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         Some((SessionCommandStatus::Applied, None))
     );
     // Journal closed with a Done — nothing left to recover.
-    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+    let journal =
+        RunJournal::open(dir.path().join("scopes/accounts/dev-org/dev-user/journals")).unwrap();
     assert!(journal.stale_sessions().unwrap().is_empty());
     assert_eq!(
         core.sessions.session_status(CHAT).map(|s| s.status),
@@ -2175,7 +2176,7 @@ async fn processed_commands_are_skipped_on_redelivery() {
     // Simulate a crash AFTER mark-processed but BEFORE execute/outcome: the ledger has
     // the id, the doc still says pending.
     {
-        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        let store = DocsStore::open(dir.path().join("scopes/accounts/dev-org/dev-user")).unwrap();
         assert!(store.mark_processed("cmd-crashed").unwrap());
     }
 
@@ -2209,7 +2210,7 @@ async fn processed_commands_are_skipped_on_redelivery() {
     assert!(core.sessions.session_status(CHAT).is_none());
 
     // Direct ledger-evaluation check: re-evaluating a processed command = Skip.
-    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    let store = DocsStore::open(dir.path().join("scopes/accounts/dev-org/dev-user")).unwrap();
     let commands = handle.doc().read_commands().unwrap();
     let entry = commands.iter().find(|c| c.id == "cmd-crashed").unwrap();
     let is_processed = |id: &str| store.is_processed(id).unwrap_or(false);
@@ -2231,13 +2232,15 @@ async fn processed_commands_are_skipped_on_redelivery() {
 async fn recover_stale_journal_stamps_aborted_on_boot() {
     let dir = tempfile::tempdir().unwrap();
     let device_id = "dev-host-fixed";
-    std::fs::create_dir_all(dir.path()).unwrap();
-    std::fs::write(dir.path().join("device-id"), device_id).unwrap();
+    let scope = dir.path().join("scopes/accounts/dev-org/dev-user");
+    std::fs::create_dir_all(&scope).unwrap();
+    std::fs::write(scope.join("device-id"), device_id).unwrap();
 
     // Craft the crash state: a journal without a terminal Done + a doc snapshot whose
     // assistant entry is still `streaming`.
     {
-        let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+        let journal =
+            RunJournal::open(dir.path().join("scopes/accounts/dev-org/dev-user/journals")).unwrap();
         journal
             .append(
                 CHAT,
@@ -2269,7 +2272,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             }])
             .unwrap();
         // No finish — the "process" dies here with the entry still streaming.
-        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        let store = DocsStore::open(dir.path().join("scopes/accounts/dev-org/dev-user")).unwrap();
         store
             .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
             .unwrap();
@@ -2293,7 +2296,8 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
     }
 
     // Journal closed with a synthetic Done{interrupted}; no longer stale.
-    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+    let journal =
+        RunJournal::open(dir.path().join("scopes/accounts/dev-org/dev-user/journals")).unwrap();
     assert!(journal.stale_sessions().unwrap().is_empty());
     let (_, last) = journal.last_event(CHAT).unwrap().unwrap();
     assert!(matches!(
@@ -2363,7 +2367,7 @@ async fn rpc_surface_over_in_memory_transport() {
         ])
     );
 
-    // WatchSessions + WatchDocMessages streams.
+    // Session and paged transcript streams.
     let mut sessions_stream = client
         .subscribe(jolt_rpc::methods::WATCH_SESSIONS, serde_json::Value::Null)
         .await
@@ -2373,20 +2377,6 @@ async fn rpc_surface_over_in_memory_transport() {
         .unwrap()
         .unwrap();
     assert_eq!(first_sessions, serde_json::json!([]));
-
-    let mut messages_stream = client
-        .subscribe(
-            jolt_rpc::methods::WATCH_DOC_MESSAGES,
-            serde_json::json!({"chatId": CHAT}),
-        )
-        .await
-        .unwrap();
-    let initial = tokio::time::timeout(Duration::from_secs(5), messages_stream.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    // Delta protocol: the stream opens with a full reset frame.
-    assert_eq!(initial, serde_json::json!({ "reset": [] }));
 
     let mut paged_stream = client
         .subscribe(
@@ -2421,29 +2411,6 @@ async fn rpc_surface_over_in_memory_transport() {
         .await
         .unwrap();
     assert!(queued["commandId"].is_string());
-
-    // The doc-messages stream emits delta frames until the transcript settles:
-    // user entry + completed assistant entry with the folded parts. Applying
-    // each frame client-side mirrors what both viewports do.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut materialized: Vec<SessionMessageEntry> = vec![];
-    let settled = loop {
-        let item = tokio::time::timeout_at(deadline, messages_stream.recv())
-            .await
-            .expect("doc messages before timeout")
-            .expect("stream alive");
-        let frame: jolt_doc::TranscriptFrame = serde_json::from_value(item).unwrap();
-        jolt_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
-        if materialized.len() == 2 && materialized[1].status == Some(MessageStatus::Complete) {
-            break materialized;
-        }
-    };
-    assert_eq!(settled[0].id, "m-rpc-1");
-    assert_eq!(settled[0].role, MessageRole::User);
-    match &settled[1].parts[0] {
-        MessagePart::Text { text, .. } => assert_eq!(text, "Hello"),
-        other => panic!("unexpected part {other:?}"),
-    }
 
     // The paged stream carries structural bootstraps only when message count
     // changes, then bounded live-page deltas while the assistant streams.
@@ -2487,6 +2454,23 @@ async fn rpc_surface_over_in_memory_transport() {
         .unwrap();
     assert_eq!(fetched.revision, page_revision);
     assert_eq!(fetched.messages.len(), 2);
+    assert_eq!(fetched.messages[0].id, "m-rpc-1");
+    assert_eq!(fetched.messages[0].role, MessageRole::User);
+    match &fetched.messages[1].parts[0] {
+        MessagePart::Text { text, .. } => assert_eq!(text, "Hello"),
+        other => panic!("unexpected part {other:?}"),
+    }
+
+    let search: Vec<jolt_doc::TranscriptSearchResult> = client
+        .call_as(
+            jolt_rpc::methods::SEARCH_TRANSCRIPT,
+            serde_json::json!({"chatId": CHAT, "query": "via RPC"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search.len(), 1);
+    assert_eq!(search[0].message_id, "m-rpc-1");
+    assert_eq!(search[0].page_id, fetched.id);
 
     // WatchSessions eventually reports the settled Idle session.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

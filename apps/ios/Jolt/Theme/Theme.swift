@@ -18,8 +18,6 @@ enum Theme {
     static let surfaceRaised = neutral(0.235)
     /// Hover/pressed wash for interactive rows (white, low alpha).
     static let elementHover = whiteAlpha(0.06)
-    /// Active/selected wash.
-    static let elementActive = whiteAlpha(0.10)
     /// Hairline border — white at low alpha so it reads on any surface.
     static let border = whiteAlpha(0.08)
     /// Stronger border for focused/raised edges.
@@ -32,7 +30,6 @@ enum Theme {
 
     // ---- paint: accents ----
     static let accent = oklch(0.673, 0.182, 276.935)        // indigo-400
-    static let accentStrong = oklch(0.585, 0.233, 277.117)  // indigo-500
     static let danger = oklch(0.704, 0.191, 22.216)         // red-400
     static let dangerSoft = oklch(0.808, 0.114, 19.571)     // red-300
     static let warning = oklch(0.828, 0.189, 84.429)        // amber-400
@@ -55,11 +52,6 @@ enum Theme {
     // ---- numbers drive layout (pt) ----
     static let bubbleRadius: CGFloat = 16
     static let panelRadius: CGFloat = 10
-    static let controlRadius: CGFloat = 6
-    static let spaceXS: CGFloat = 4
-    static let spaceSM: CGFloat = 8
-    static let spaceMD: CGFloat = 12
-    static let spaceLG: CGFloat = 16
 }
 
 // MARK: - Fonts
@@ -95,11 +87,6 @@ extension Theme {
             .traits: traits,
         ])
         return UIFont(descriptor: descriptor, size: size)
-    }
-
-    static func monoUI(_ size: CGFloat) -> UIFont {
-        UIFont(name: fontMonoName, size: size)
-            ?? .monospacedSystemFont(ofSize: size, weight: .regular)
     }
 }
 

@@ -1,17 +1,7 @@
-// Transcript load benchmark — launch with `-bench`. Builds a synthetic session
-// doc the size of a long agent transcript and times the three stages that run
-// between "cached bytes on disk" and "rows on screen":
-//
-//   decode   SessionStore.decodeEntries — getDeepValue + whole-doc walk
-//   cold     row build with empty caches — what EVERY rebuild used to cost
-//   warm     row build with the completed-parse memo primed — cost per doc update
-//   cached   TranscriptBuilderCache at an unchanged revision — cost per scroll frame
-//
-// cold is the pre-change number for both warm and cached, so the same run gives
-// the before/after. Results append to Documents/bench.log for simctl to read.
+// Transcript rendering benchmark — launch with `-bench`. Builds a synthetic
+// long transcript and measures cold, warm, and revision-cached row projection.
 
 import Foundation
-import Loro
 
 @MainActor
 enum BenchRunner {
@@ -39,26 +29,10 @@ enum BenchRunner {
         log("done")
     }
 
-    // MARK: Measurement
-
     private static func measure(turns: Int) {
-        let doc = buildDoc(turns: turns)
-        let snapshot = (try? doc.export(mode: .snapshot)) ?? Data()
-        let bytes = snapshot.count
-
-        // Stage 0 — the disk hydration import (DocDisk.load). STILL on the main
-        // thread: it has to finish before the room join for the backfill to be
-        // incremental, so it was left alone. Measured to size that trade.
-        let importMs = best(3) {
-            _ = try? LoroDoc().importWith(bytes: snapshot, origin: "disk")
-        }
-
-        // Stage 1 — projection. Unchanged in cost; the fix moved it off the
-        // main thread, so this is the main-thread stall that used to happen.
         var entries: [MessageEntry] = []
-        let decode = time { entries = SessionStore.decodeEntries(from: doc) ?? [] }
+        let build = time { entries = syntheticEntries(turns: turns) }
 
-        // Stage 2 — cold row build (empty caches). The OLD per-rebuild cost.
         var rowCount = 0
         let cold = best(3) {
             var parsers: [String: IncrementalMarkdownParser] = [:]
@@ -68,7 +42,6 @@ enum BenchRunner {
             rowCount = rows.count
         }
 
-        // Stage 3 — warm rebuild: memo primed, as after any doc update.
         var parsers: [String: IncrementalMarkdownParser] = [:]
         var memo: [String: CompletedParse] = [:]
         _ = TranscriptRowBuilder.rows(entries: entries, pendingSends: [],
@@ -78,112 +51,89 @@ enum BenchRunner {
                                           parsers: &parsers, completed: &memo)
         }
 
-        // Stage 4 — revision-gated cache: the scroll-frame path.
         let cache = TranscriptBuilderCache()
         _ = cache.rows(revision: 1, entries: entries, pendingSends: [])
         let cached = best(5) {
             _ = cache.rows(revision: 1, entries: entries, pendingSends: [])
         }
 
-        log("--- \(turns) turns · \(entries.count) entries · \(rowCount) rows · \(bytes / 1024) KB snapshot")
-        log(String(format: "disk import (ON MAIN)   %8.2f ms", importMs))
-        log(String(format: "decode (now off-main)   %8.2f ms", decode))
-        log(String(format: "row build cold  [was]   %8.2f ms", cold))
-        log(String(format: "row build warm  [now]   %8.2f ms   %.0fx", warm, cold / max(warm, 0.0001)))
-        log(String(format: "scroll frame    [now]   %8.4f ms   %.0fx", cached, cold / max(cached, 0.0001)))
+        log("--- \(turns) turns · \(entries.count) entries · \(rowCount) rows")
+        log(String(format: "fixture build              %8.2f ms", build))
+        log(String(format: "row build cold             %8.2f ms", cold))
+        log(String(format: "row build warm             %8.2f ms   %.0fx", warm, cold / max(warm, 0.0001)))
+        log(String(format: "scroll frame               %8.4f ms   %.0fx", cached, cold / max(cached, 0.0001)))
     }
 
     private static func time(_ body: () -> Void) -> Double {
-        let t0 = CFAbsoluteTimeGetCurrent()
+        let start = CFAbsoluteTimeGetCurrent()
         body()
-        return (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        return (CFAbsoluteTimeGetCurrent() - start) * 1_000
     }
 
-    /// Best-of-n: the floor is the honest number for cache behaviour (noise
-    /// only ever adds).
-    private static func best(_ n: Int, _ body: () -> Void) -> Double {
+    private static func best(_ count: Int, _ body: () -> Void) -> Double {
         var lowest = Double.greatestFiniteMagnitude
-        for _ in 0..<n { lowest = min(lowest, time(body)) }
+        for _ in 0..<count { lowest = min(lowest, time(body)) }
         return lowest
     }
 
-    /// A big synthetic transcript for the `-big` demo route — stresses the
-    /// scroll-settle path with far more lazy rows than the demo dataset has.
+    /// A large transcript for the `-big` demo route.
     static func syntheticEntries(turns: Int) -> [MessageEntry] {
-        SessionStore.decodeEntries(from: buildDoc(turns: turns)) ?? []
-    }
-
-    // MARK: Synthetic doc (schema.rs shape — see SessionStore.entryFrom)
-
-    private static func buildDoc(turns: Int) -> LoroDoc {
-        let doc = LoroDoc()
-        let messages = doc.getList(id: "messages")
-        for i in 0..<turns {
-            let user = try! messages.pushContainer(child: LoroMap())
-            try! user.insert(key: "id", v: "u\(i)")
-            try! user.insert(key: "role", v: "user")
-            try! user.insert(key: "createdAt", v: Int64(i * 1000))
-            try! user.insert(key: "deviceId", v: "bench")
-            try! user.insert(key: "status", v: "complete")
-            let uparts = try! user.insertContainer(key: "parts", child: LoroList())
-            try! addText(to: uparts, id: "t0", text: "Turn \(i): the ref dropdown still hangs on open — dig into it.")
-
-            let bot = try! messages.pushContainer(child: LoroMap())
-            try! bot.insert(key: "id", v: "a\(i)")
-            try! bot.insert(key: "role", v: "assistant")
-            try! bot.insert(key: "createdAt", v: Int64(i * 1000 + 1))
-            try! bot.insert(key: "deviceId", v: "dev-mac")
-            try! bot.insert(key: "status", v: "complete")
-            let aparts = try! bot.insertContainer(key: "parts", child: LoroList())
-            try! addText(to: aparts, id: "t0", text: prose(i))
-            for t in 0..<4 {
-                try! addTool(to: aparts, id: "k\(i).\(t)", index: i * 4 + t)
-            }
-            try! addText(to: aparts, id: "t1", text: closing(i))
+        (0..<turns).flatMap { index in
+            [
+                MessageEntry(
+                    id: "u\(index)",
+                    role: .user,
+                    parts: [.text(id: "t0", text: "Turn \(index): the ref dropdown still hangs on open — dig into it.")],
+                    createdAt: Int64(index * 1_000),
+                    deviceId: "bench",
+                    status: .complete,
+                    continuationOf: nil
+                ),
+                MessageEntry(
+                    id: "a\(index)",
+                    role: .assistant,
+                    parts: assistantParts(index: index),
+                    createdAt: Int64(index * 1_000 + 1),
+                    deviceId: "dev-mac",
+                    status: .complete,
+                    continuationOf: nil
+                ),
+            ]
         }
-        return doc
     }
 
-    private static func addText(to parts: LoroList, id: String, text: String) throws {
-        let p = try parts.pushContainer(child: LoroMap())
-        try p.insert(key: "id", v: id)
-        try p.insert(key: "kind", v: "text")
-        try p.insert(key: "text", v: text)
+    private static func assistantParts(index: Int) -> [MessagePart] {
+        var parts: [MessagePart] = [.text(id: "t0", text: prose(index))]
+        for tool in 0..<4 {
+            let callIndex = index * 4 + tool
+            parts.append(.tool(id: "k\(index).\(tool)", call: toolCall(callIndex),
+                               isError: callIndex % 17 == 0, resolved: true))
+        }
+        parts.append(.text(id: "t1", text: closing(index)))
+        return parts
     }
 
-    private static func addTool(to parts: LoroList, id: String, index: Int) throws {
-        let p = try parts.pushContainer(child: LoroMap())
-        try p.insert(key: "id", v: id)
-        try p.insert(key: "kind", v: "tool")
-        try p.insert(key: "isError", v: index % 17 == 0)
-        let call = try p.insertContainer(key: "call", child: LoroMap())
+    private static func toolCall(_ index: Int) -> RenderToolCall {
         switch index % 4 {
         case 0:
-            try call.insert(key: "kind", v: "exec")
-            try call.insert(key: "command", v: "rg -n 'render_branch_popover' crates/ui/src")
+            RenderToolCall(tag: "exec", fields: ["command": "rg -n 'render_branch_popover' crates/ui/src"])
         case 1:
-            try call.insert(key: "kind", v: "readFile")
-            try call.insert(key: "path", v: "crates/ui/src/pickers.rs")
+            RenderToolCall(tag: "readFile", fields: ["path": "crates/ui/src/pickers.rs"])
         case 2:
-            try call.insert(key: "kind", v: "editFile")
-            try call.insert(key: "path", v: "crates/ui/src/pickers.rs")
+            RenderToolCall(tag: "editFile", fields: ["path": "crates/ui/src/pickers.rs"])
         default:
-            try call.insert(key: "kind", v: "search")
-            try call.insert(key: "pattern", v: "render_branch_popover\\(")
+            RenderToolCall(tag: "search", fields: ["pattern": "render_branch_popover\\("])
         }
     }
 
-    /// A realistic assistant block: headings, prose, a list, a table, code.
-    private static func prose(_ i: Int) -> String {
+    private static func prose(_ index: Int) -> String {
         """
-        ## Pass \(i): where the dropdown stalls
+        ## Pass \(index): where the dropdown stalls
 
         The dropdown's open handler awaits `loadRefs()` **before** it paints, so
         the menu can't render until the full ref index resolves. On a repo with
         many refs that's a visible hang, and it is paid again on every open
         because the result is never memoized between mounts.
-
-        Three things stack up here:
 
         1. `loadRefs()` walks every ref and builds a fresh array each call
         2. The handler `await`s it inline instead of rendering an empty menu
@@ -195,19 +145,17 @@ enum BenchRunner {
         | `useRefIndex` | O(refs) | no |
         | paint | O(visible) | n/a |
 
-        > The fix is to paint first and fill in — the index can arrive late.
-
         ```ts
-        const refs = useRefIndex()          // memoized, suspense-free
+        const refs = useRefIndex()
         useEffect(() => { void warmRefIndex() }, [])
         return <Menu items={refs ?? []} loading={refs == null} />
         ```
         """
     }
 
-    private static func closing(_ i: Int) -> String {
+    private static func closing(_ index: Int) -> String {
         """
-        Landed the pass-\(i) change behind `refIndexCache`. Open latency drops to
+        Landed the pass-\(index) change behind `refIndexCache`. Open latency drops to
         a paint, and the index warms in the background on first hover.
         """
     }

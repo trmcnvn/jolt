@@ -219,6 +219,7 @@ impl Shell {
         }
         self.add_space = None;
         self.session_search = None;
+        self.transcript_search = None;
         self.user_menu_open = false;
         self.open_spaces_menu(window, cx);
     }
@@ -657,6 +658,7 @@ impl Shell {
 
     pub(super) fn open_session_search(&mut self, cx: &mut Context<Self>) {
         self.add_space = None;
+        self.transcript_search = None;
         self.spaces_menu = None;
         self.user_menu_open = false;
         let search =
@@ -880,7 +882,7 @@ impl Shell {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(loaders::activity_orb(
+                                    .child(loaders::activity_spinner(
                                         format!("session-search-working-{chat_id}"),
                                         &theme,
                                         16.0,
@@ -1021,6 +1023,7 @@ impl Shell {
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
         self.session_search = None;
+        self.transcript_search = None;
         let devices: Vec<Device> = self
             .state
             .read(cx)

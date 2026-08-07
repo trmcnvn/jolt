@@ -8,8 +8,7 @@
 //
 // Reads are OVERLAY reads: the server's authoritative rows plus the pending
 // op-batch queue replayed on top (optimistic local writes, retired on ack).
-// Field names are identical to the old Loro rows (camelCase, epoch-ms
-// timestamps) so the projection — and every view above it — is unchanged.
+// Registry fields use camelCase names and epoch-millisecond timestamps.
 
 import Foundation
 import Observation
@@ -229,7 +228,6 @@ final class WorkspaceStore {
                let status = GoalStatus(rawValue: statusValue) {
                 goal = Goal(id: id,
                             revision: UInt64(max(0, g["revision"]?.int64Value ?? 0)),
-                            controlNonce: g["controlNonce"]?.stringValue,
                             objective: objective,
                             status: status,
                             statusMessage: g["statusMessage"]?.stringValue,
@@ -511,20 +509,6 @@ final class WorkspaceStore {
     /// per-chat session doc remains — this removes the index entry only.
     func deleteChat(chatId: String) {
         doc.deleteRows([("chats", chatId), ("sessions", chatId)])
-        afterLocalWrite()
-    }
-
-    /// Hard-delete a space and cascade to its chats: ONE batch tombstones the
-    /// space row and every chat/session row whose spaceId matches — the
-    /// server applies the batch atomically.
-    func deleteSpace(spaceId: String) {
-        var keys: [(kind: String, id: String)] = []
-        for chat in chats where chat.spaceId == spaceId {
-            keys.append(("chats", chat.id))
-            keys.append(("sessions", chat.id))
-        }
-        keys.append(("spaces", spaceId))
-        doc.deleteRows(keys)
         afterLocalWrite()
     }
 

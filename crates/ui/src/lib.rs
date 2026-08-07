@@ -43,6 +43,8 @@ pub mod transcript;
 
 use std::borrow::Cow;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, LazyLock};
 
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
@@ -61,6 +63,20 @@ static FONT_GEIST_MONO: &[u8] = include_bytes!("../assets/fonts/GeistMono.ttf");
 static FONT_GEIST_MEDIUM: &[u8] = include_bytes!("../assets/fonts/Geist-Medium.ttf");
 static FONT_GEIST_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/Geist-SemiBold.ttf");
 static FONT_GEIST_BOLD: &[u8] = include_bytes!("../assets/fonts/Geist-Bold.ttf");
+
+/// X11 cannot resolve the freedesktop desktop icon from `app_id`; it needs the
+/// RGBA pixels on the window's `_NET_WM_ICON` property.
+#[cfg(target_os = "linux")]
+static LINUX_APP_ICON: LazyLock<Option<Arc<image::RgbaImage>>> = LazyLock::new(|| {
+    const BYTES: &[u8] = include_bytes!("../../../dist/jolt-512.png");
+    match image::load_from_memory(BYTES) {
+        Ok(image) => Some(Arc::new(image.into_rgba8())),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to decode Linux app icon");
+            None
+        }
+    }
+});
 
 /// Register the embedded fonts with the gpui text system. Failure is non-fatal:
 /// the theme's system fallbacks take over (same families the CSS stack names).
@@ -123,7 +139,7 @@ struct ReopenState {
 
 impl gpui::Global for ReopenState {}
 
-/// Run the headed app: tokio bridge up, engine bootstrap kicked off (probe →
+/// Run the headed app: tokio bridge up, engine bootstrap kicked off (dial →
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
 pub fn run_app(config: UiConfig) {
@@ -243,6 +259,8 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // change and never comes back.
             window_background: theme::Theme::of(cx).window_background_appearance(),
             app_id: Some("jolt".into()),
+            #[cfg(target_os = "linux")]
+            icon: LINUX_APP_ICON.as_ref().cloned(),
             ..Default::default()
         },
         move |window, cx| {

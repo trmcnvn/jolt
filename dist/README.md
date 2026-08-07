@@ -11,7 +11,7 @@ Produces `target/package/jolt-<version>-linux-<arch>.tar.gz` containing:
 
 - `jolt` — the binary (headed by default; `jolt headless` runs the engine alone)
 - `jolt.desktop` — XDG desktop entry
-- `jolt.png` — 1024×1024 app icon (vector source `jolt.svg`)
+- `jolt-512.png` and `jolt.png` — 512×512 and 1024×1024 app icons (vector source `jolt.svg`)
 - `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and

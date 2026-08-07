@@ -111,16 +111,19 @@ final class DemoDataset {
         let seeded: [RepoRef]
         if spacePath.hasSuffix("/jolt") {
             seeded = [
-                RepoRef(name: "main", current: true, worktreePath: nil),
-                RepoRef(name: "veil-fade", current: false,
+                RepoRef(name: "main", revision: "main", current: true, worktreePath: nil),
+                RepoRef(name: "veil-fade", revision: "veil-fade", current: false,
                         worktreePath: "/Users/dev/.jolt/worktrees/jolt-veil-fade"),
-                RepoRef(name: "feature/diff-pane", current: false, worktreePath: nil),
-                RepoRef(name: "fix/tool-colors", current: false, worktreePath: nil),
+                RepoRef(name: "feature/diff-pane", revision: "feature/diff-pane", current: false,
+                        worktreePath: nil),
+                RepoRef(name: "fix/tool-colors", revision: "fix/tool-colors", current: false,
+                        worktreePath: nil),
             ]
         } else {
             seeded = [
-                RepoRef(name: "main", current: true, worktreePath: nil),
-                RepoRef(name: "staging", current: false, worktreePath: nil),
+                RepoRef(name: "main", revision: "main", current: true, worktreePath: nil),
+                RepoRef(name: "staging", revision: "staging", current: false,
+                        worktreePath: nil),
             ]
         }
         refsByPath[spacePath] = seeded

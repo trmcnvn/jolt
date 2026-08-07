@@ -1,4 +1,4 @@
-//! Client side: request/stream multiplexing over string frames + the WebSocket dialer.
+//! Client-side JSON and binary stream multiplexing plus the WebSocket dialer.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,7 +8,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::{ClientFrame, RpcError, ServerFrame};
+use crate::{ClientFrame, RpcError, ServerFrame, WireFrame, decode_binary_stream_item};
 
 /// Per-stream queue depth. Bounded: route_frame awaits a full queue, pausing
 /// the connection reader — transport backpressure instead of unbounded growth
@@ -19,6 +19,7 @@ const STREAM_QUEUE_CAP: usize = 256;
 enum Pending {
     Call(oneshot::Sender<Result<serde_json::Value, RpcError>>),
     Stream(mpsc::Sender<serde_json::Value>),
+    BinaryStream(mpsc::Sender<Vec<u8>>),
 }
 
 struct Shared {
@@ -31,10 +32,11 @@ impl Shared {
     }
 }
 
-/// A multiplexing RPC client over any string-frame duplex ([`crate::memory_client`] or
-/// [`connect_ws`]). Cheap to clone-by-Arc internally; use one per connection.
+/// A multiplexing RPC client over any [`WireFrame`] duplex
+/// ([`crate::memory_client`] or [`connect_ws`]). Cheap to clone by internal Arc;
+/// use one per connection.
 pub struct RpcClient {
-    out: mpsc::Sender<String>,
+    out: mpsc::Sender<WireFrame>,
     shared: Arc<Shared>,
     next_id: AtomicU64,
     reader: tokio::task::JoinHandle<()>,
@@ -42,7 +44,7 @@ pub struct RpcClient {
 
 impl RpcClient {
     /// Wrap an existing duplex: `out` carries client frames, `inbound` server frames.
-    pub fn new(out: mpsc::Sender<String>, mut inbound: mpsc::Receiver<String>) -> Self {
+    pub fn new(out: mpsc::Sender<WireFrame>, mut inbound: mpsc::Receiver<WireFrame>) -> Self {
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
         });
@@ -50,19 +52,33 @@ impl RpcClient {
         let reader_out = out.clone();
         let reader = tokio::spawn(async move {
             while let Some(payload) = inbound.recv().await {
-                for line in payload.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let frame: ServerFrame = match serde_json::from_str(line) {
-                        Ok(frame) => frame,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "rpc: dropping malformed server frame");
-                            continue;
+                match payload {
+                    WireFrame::Text(payload) => {
+                        for line in payload.lines() {
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let frame: ServerFrame = match serde_json::from_str(line) {
+                                Ok(frame) => frame,
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "rpc: dropping malformed server frame");
+                                    continue;
+                                }
+                            };
+                            route_frame(&reader_shared, &reader_out, frame).await;
                         }
-                    };
-                    route_frame(&reader_shared, &reader_out, frame).await;
+                    }
+                    WireFrame::Binary(frame) => {
+                        let (id, payload) = match decode_binary_stream_item(&frame) {
+                            Ok(decoded) => decoded,
+                            Err(err) => {
+                                tracing::warn!(error = %err, "rpc: dropping malformed binary frame");
+                                continue;
+                            }
+                        };
+                        route_binary_frame(&reader_shared, &reader_out, id, payload).await;
+                    }
                 }
             }
             // Connection closed: fail everything still pending.
@@ -141,10 +157,36 @@ impl RpcClient {
         Ok(rx)
     }
 
+    /// Binary streaming request. Items preserve WebSocket boundaries and avoid
+    /// JSON/base64 conversion.
+    pub async fn subscribe_binary(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<mpsc::Receiver<Vec<u8>>, RpcError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        self.shared.lock().insert(id, Pending::BinaryStream(tx));
+        self.send(ClientFrame {
+            id,
+            method: Some(method.into()),
+            params,
+            cancel: false,
+        })
+        .await
+        .inspect_err(|_| {
+            self.shared.lock().remove(&id);
+        })?;
+        Ok(rx)
+    }
+
     async fn send(&self, frame: ClientFrame) -> Result<(), RpcError> {
         let json = serde_json::to_string(&frame)
             .map_err(|e| RpcError::Transport(format!("serialize frame: {e}")))?;
-        self.out.send(json).await.map_err(|_| RpcError::Closed)
+        self.out
+            .send(WireFrame::Text(json))
+            .await
+            .map_err(|_| RpcError::Closed)
     }
 }
 
@@ -154,14 +196,14 @@ impl Drop for RpcClient {
     }
 }
 
-async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: ServerFrame) {
+async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<WireFrame>, frame: ServerFrame) {
     let id = frame.id;
     if let Some(err) = frame.err {
         match shared.lock().remove(&id) {
             Some(Pending::Call(tx)) => {
                 let _ = tx.send(Err(RpcError::Failed(err)));
             }
-            Some(Pending::Stream(_)) | None => {
+            Some(Pending::Stream(_) | Pending::BinaryStream(_)) | None => {
                 // Stream errored: the sender drop closes the receiver.
                 tracing::debug!(id, %err, "rpc: stream ended with error");
             }
@@ -194,13 +236,40 @@ async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: Se
                 params: serde_json::Value::Null,
                 cancel: true,
             }) {
-                let _ = out.send(json).await;
+                let _ = out.send(WireFrame::Text(json)).await;
             }
         }
         return;
     }
     if frame.done {
         shared.lock().remove(&id);
+    }
+}
+
+async fn route_binary_frame(
+    shared: &Arc<Shared>,
+    out: &mpsc::Sender<WireFrame>,
+    id: u64,
+    payload: &[u8],
+) {
+    let tx = match shared.lock().get(&id) {
+        Some(Pending::BinaryStream(tx)) => Some(tx.clone()),
+        _ => None,
+    };
+    let dead = match tx {
+        Some(tx) => tx.send(payload.to_vec()).await.is_err(),
+        None => false,
+    };
+    if dead {
+        shared.lock().remove(&id);
+        if let Ok(json) = serde_json::to_string(&ClientFrame {
+            id,
+            method: None,
+            params: serde_json::Value::Null,
+            cancel: true,
+        }) {
+            let _ = out.send(WireFrame::Text(json)).await;
+        }
     }
 }
 
@@ -219,14 +288,19 @@ pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
         .map_err(|_| RpcError::Transport(format!("timed out dialing {url}")))?
         .map_err(|e| RpcError::Transport(e.to_string()))?;
     let (mut sink, mut stream) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
-    let (in_tx, in_rx) = mpsc::channel::<String>(256);
+    let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(256);
+    let (in_tx, in_rx) = mpsc::channel::<WireFrame>(256);
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 frame = out_rx.recv() => match frame {
-                    Some(text) => {
+                    Some(WireFrame::Text(text)) => {
                         if sink.send(WsMessage::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(WireFrame::Binary(bytes)) => {
+                        if sink.send(WsMessage::Binary(bytes.into())).await.is_err() {
                             break;
                         }
                     }
@@ -237,7 +311,12 @@ pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
                 },
                 message = stream.next() => match message {
                     Some(Ok(WsMessage::Text(text))) => {
-                        if in_tx.send(text.to_string()).await.is_err() {
+                        if in_tx.send(WireFrame::Text(text.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Binary(bytes))) => {
+                        if in_tx.send(WireFrame::Binary(bytes.to_vec())).await.is_err() {
                             break;
                         }
                     }

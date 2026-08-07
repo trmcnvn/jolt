@@ -7,7 +7,6 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A1000000000000000000B001 /* Loro in Frameworks */ = {isa = PBXBuildFile; productRef = A1000000000000000000P002 /* Loro */; };
 		A1000000000000000000B002 /* Markdown in Frameworks */ = {isa = PBXBuildFile; productRef = A1000000000000000000P004 /* Markdown */; };
 		A1000000000000000000B003 /* RaTeX in Frameworks */ = {isa = PBXBuildFile; productRef = A1000000000000000000P006 /* RaTeX */; };
 		A1000000000000000000B004 /* BeautifulMermaid in Frameworks */ = {isa = PBXBuildFile; productRef = A1000000000000000000P008 /* BeautifulMermaid */; };
@@ -59,7 +58,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A1000000000000000000B001 /* Loro in Frameworks */,
 				A1000000000000000000B002 /* Markdown in Frameworks */,
 				A1000000000000000000B003 /* RaTeX in Frameworks */,
 				A1000000000000000000B004 /* BeautifulMermaid in Frameworks */,
@@ -107,7 +105,6 @@
 			);
 			name = Jolt;
 			packageProductDependencies = (
-				A1000000000000000000P002 /* Loro */,
 				A1000000000000000000P004 /* Markdown */,
 				A1000000000000000000P006 /* RaTeX */,
 				A1000000000000000000P008 /* BeautifulMermaid */,
@@ -162,7 +159,6 @@
 			mainGroup = A1000000000000000000G000;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				A1000000000000000000P001 /* XCRemoteSwiftPackageReference "loro-swift" */,
 				A1000000000000000000P003 /* XCRemoteSwiftPackageReference "swift-markdown" */,
 				A1000000000000000000P005 /* XCRemoteSwiftPackageReference "RaTeX" */,
 				A1000000000000000000P007 /* XCRemoteSwiftPackageReference "beautiful-mermaid-swift" */,
@@ -443,14 +439,6 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		A1000000000000000000P001 /* XCRemoteSwiftPackageReference "loro-swift" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/loro-dev/loro-swift.git";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 1.13.3;
-			};
-		};
 		A1000000000000000000P003 /* XCRemoteSwiftPackageReference "swift-markdown" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/swiftlang/swift-markdown.git";
@@ -478,11 +466,6 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		A1000000000000000000P002 /* Loro */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = A1000000000000000000P001 /* XCRemoteSwiftPackageReference "loro-swift" */;
-			productName = Loro;
-		};
 		A1000000000000000000P004 /* Markdown */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = A1000000000000000000P003 /* XCRemoteSwiftPackageReference "swift-markdown" */;

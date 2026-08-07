@@ -4091,7 +4091,6 @@ dependencies = [
 name = "jolt-harness"
 version = "0.1.2"
 dependencies = [
- "anyhow",
  "async-trait",
  "base64 0.23.1",
  "futures",
@@ -4114,17 +4113,14 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
- "uuid",
 ]
 
 [[package]]
 name = "jolt-rpc"
 version = "0.1.2"
 dependencies = [
- "anyhow",
  "async-trait",
  "futures",
- "jolt-proto",
  "jolt-sync",
  "serde",
  "serde_json",
@@ -4169,6 +4165,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "image",
  "jolt-doc",
  "jolt-engine",
  "jolt-proto",

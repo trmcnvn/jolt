@@ -3950,9 +3950,12 @@ mod tests {
 
     #[test]
     fn user_rows_split_attachment_refs_from_text() {
-        let content = crate::attachments::with_attachments(
+        let content = crate::attachments::with_uploaded_attachments(
             "what color is this?",
-            &["/data/uploads/ab12-red.png".to_string()],
+            &[crate::attachments::UploadedAttachment {
+                path: "/data/uploads/ab12-red.png".into(),
+                sha256: "0123456789abcdef".repeat(4),
+            }],
         );
         let mut entry = assistant("u2", MessageStatus::Complete, vec![]);
         entry.role = MessageRole::User;
@@ -3980,7 +3983,13 @@ mod tests {
         assert_eq!(attachments[0].name, "ab12-red.png");
 
         // Image-only send: no bubble text, refs parsed.
-        let only = crate::attachments::with_attachments("", &["/a/p.png".to_string()]);
+        let only = crate::attachments::with_uploaded_attachments(
+            "",
+            &[crate::attachments::UploadedAttachment {
+                path: "/a/p.png".into(),
+                sha256: "0123456789abcdef".repeat(4),
+            }],
+        );
         entry.parts = vec![text_part("t0", &only)];
         let rows = rows_for_entry(&entry, false, &mut parse);
         let RowKind::User {

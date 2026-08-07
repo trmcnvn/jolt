@@ -68,6 +68,7 @@ impl DiffProjection {
                         notice_count: metrics.notices,
                         hunk_count: metrics.hunks,
                         line_count: metrics.lines,
+                        split_line_count: metrics.split_lines,
                         estimated_bytes: page.patch.len(),
                     };
                     row_count += descriptor.row_count;
@@ -319,8 +320,44 @@ fn split_hunk(prefix: &str, hunk: &str) -> (Vec<ProjectedPage>, bool) {
         chunk.clear();
     };
 
-    for line in body.split_inclusive('\n') {
-        if !chunk.is_empty() && chunk.len() + line.len() > budget {
+    let lines: Vec<_> = body.split_inclusive('\n').collect();
+    let mut protected_change_end = 0usize;
+    for (index, line) in lines.iter().copied().enumerate() {
+        if index >= protected_change_end && matches!(line.as_bytes().first(), Some(b'+' | b'-')) {
+            let mut end = index;
+            let mut bytes = 0usize;
+            let mut has_old = false;
+            let mut has_new = false;
+            while end < lines.len() && matches!(lines[end].as_bytes().first(), Some(b'+' | b'-')) {
+                bytes += lines[end].len();
+                has_old |= lines[end].starts_with('-');
+                has_new |= lines[end].starts_with('+');
+                end += 1;
+            }
+            // Keep ordinary replacement blocks on one page so a split viewer
+            // can pair their old and new sides. Very large one-sided blocks
+            // and replacements above the hard page bound still split by line.
+            if has_old && has_new && bytes <= hard_line_limit {
+                if !chunk.is_empty() && chunk.len() + bytes > budget {
+                    flush(
+                        &mut pages,
+                        &mut chunk,
+                        chunk_old,
+                        chunk_new,
+                        chunk_old_count,
+                        chunk_new_count,
+                        chunk_rows,
+                    );
+                    chunk_old = old_line;
+                    chunk_new = new_line;
+                    chunk_old_count = 0;
+                    chunk_new_count = 0;
+                    chunk_rows = 0;
+                }
+                protected_change_end = end;
+            }
+        }
+        if !chunk.is_empty() && chunk.len() + line.len() > budget && index >= protected_change_end {
             flush(
                 &mut pages,
                 &mut chunk,
@@ -406,6 +443,7 @@ struct PageMetrics {
     notices: usize,
     hunks: usize,
     lines: usize,
+    split_lines: usize,
 }
 
 fn page_metrics(patch: &str) -> PageMetrics {
@@ -413,18 +451,47 @@ fn page_metrics(patch: &str) -> PageMetrics {
         notices: notice_rows(patch),
         hunks: 0,
         lines: 0,
+        split_lines: 0,
     };
     let mut in_hunk = false;
+    let mut old_change_lines = 0usize;
+    let mut new_change_lines = 0usize;
+    let flush_change = |metrics: &mut PageMetrics, old: &mut usize, new: &mut usize| {
+        metrics.split_lines += (*old).max(*new);
+        *old = 0;
+        *new = 0;
+    };
     for line in patch.lines() {
         if line.starts_with("@@") {
+            flush_change(&mut metrics, &mut old_change_lines, &mut new_change_lines);
             metrics.hunks += 1;
             in_hunk = true;
-        } else if in_hunk && matches!(line.as_bytes().first(), Some(b'+' | b'-' | b' ' | b'\\')) {
-            metrics.lines += 1;
-        } else if in_hunk {
-            in_hunk = false;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        match line.as_bytes().first().copied() {
+            Some(b'-') => {
+                metrics.lines += 1;
+                old_change_lines += 1;
+            }
+            Some(b'+') => {
+                metrics.lines += 1;
+                new_change_lines += 1;
+            }
+            Some(b' ') | Some(b'\\') => {
+                flush_change(&mut metrics, &mut old_change_lines, &mut new_change_lines);
+                metrics.lines += 1;
+                metrics.split_lines += 1;
+            }
+            _ => {
+                flush_change(&mut metrics, &mut old_change_lines, &mut new_change_lines);
+                in_hunk = false;
+            }
         }
     }
+    flush_change(&mut metrics, &mut old_change_lines, &mut new_change_lines);
     metrics
 }
 
@@ -484,6 +551,26 @@ mod tests {
             truncated,
             checksum: patch.len().to_string(),
         }
+    }
+
+    #[test]
+    fn page_metrics_count_paired_split_rows() {
+        let patch = "diff --git a/a b/a\n@@ -1,3 +1,2 @@\n-old one\n-old two\n+new\n context\n";
+        let metrics = page_metrics(patch);
+        assert_eq!(metrics.lines, 4);
+        assert_eq!(metrics.split_lines, 3);
+    }
+
+    #[test]
+    fn replacement_block_stays_pairable_below_hard_page_limit() {
+        let deleted = format!("-{}\n", "a".repeat(2048)).repeat(40);
+        let added = format!("+{}\n", "b".repeat(2048)).repeat(40);
+        let section =
+            format!("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,40 +1,40 @@\n{deleted}{added}");
+        let projected = project_file(&section);
+        assert_eq!(projected.pages.len(), 1);
+        assert!(projected.pages[0].patch.len() > DIFF_PAGE_TARGET_BYTES);
+        assert!(projected.pages[0].patch.len() <= DIFF_PAGE_MAX_BYTES);
     }
 
     #[test]

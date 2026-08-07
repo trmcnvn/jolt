@@ -1070,11 +1070,11 @@ impl Pickers {
             // t3code `reuseExistingWorktree` path.
             self.config.branch = Some(row.name.clone());
             self.config.checkout = CheckoutKind::Local;
-            self.config.revision = row.revision.clone().or_else(|| Some(row.name.clone()));
+            self.config.revision = Some(row.revision.clone());
         } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
             // Base pick for a new worktree, or the already-current ref.
             self.config.branch = Some(row.name.clone());
-            self.config.revision = row.revision.clone().or_else(|| Some(row.name.clone()));
+            self.config.revision = Some(row.revision.clone());
         } else {
             // Local mode + a plain non-current ref: CHECK OUT the space
             // folder (full t3code `switchRef` — picking `main` means "put my
@@ -1103,7 +1103,7 @@ impl Pickers {
         self.switch_error = None;
         self.switching = Some(row.name.clone());
         let ref_name = row.name.clone();
-        let revision = row.revision.clone().unwrap_or_else(|| row.name.clone());
+        let revision = row.revision.clone();
         let jujutsu = row.kind != jolt_proto::RepoRefKind::Branch;
         self.switch_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
@@ -1182,7 +1182,7 @@ impl Pickers {
         self.switch_error = None;
         self.switching = Some(row.name.clone());
         let ref_name = row.name.clone();
-        let revision = row.revision.clone().unwrap_or_else(|| row.name.clone());
+        let revision = row.revision.clone();
         let retarget = row.worktree_path.clone();
         self.switch_task = Some(cx.spawn(async move |this, cx| {
             let result = match retarget {
@@ -1536,7 +1536,7 @@ impl Pickers {
         self.config
             .revision
             .clone()
-            .or_else(|| self.selected_ref().and_then(|row| row.revision.clone()))
+            .or_else(|| self.selected_ref().map(|row| row.revision.clone()))
             .or_else(|| self.effective_ref_name())
     }
 
@@ -1834,6 +1834,43 @@ impl Pickers {
                         .child(suffix),
                 )
             })
+    }
+
+    /// The empty new-session canvas's inline target-space link. It owns its
+    /// popover state but selects through the shared app state, so the composer
+    /// follows without changing the sidebar filter.
+    pub(crate) fn render_new_chat_space_link(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let label = {
+            let state = self.state.read(cx);
+            state.selected_space_row().map(|space| {
+                let (device, _) = state.space_device_tag(space, chrono::Utc::now());
+                SharedString::from(format!("{} {device}", space.display_name()))
+            })
+        }?;
+        let link = div()
+            .id("new-chat-space-selector")
+            .underline()
+            .cursor_pointer()
+            .hover(|style| style.text_color(theme.text_muted.opacity(0.9)))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle(PickerKind::Space, window, cx)))
+            .child(label);
+        if self.open != Some(PickerKind::Space) {
+            return Some(link.into_any_element());
+        }
+        let content = self.render_space_popover(cx);
+        let popover = self.popover_frame(300.0, content, cx);
+        Some(
+            link.relative()
+                .child(popover::anchored_menu_below(
+                    "new-chat-space-popover",
+                    popover,
+                ))
+                .into_any_element(),
+        )
     }
 
     /// A footer-row trigger (t3code ghost `Button size="xs"`): leading icon,
@@ -3159,7 +3196,7 @@ mod tests {
     ) -> RepoRef {
         RepoRef {
             name: name.into(),
-            revision: None,
+            revision: name.into(),
             kind,
             current,
             worktree_path: worktree_path.map(str::to_string),

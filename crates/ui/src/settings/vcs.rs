@@ -151,7 +151,7 @@ impl Render for VcsPage {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(crate::loaders::activity_orb(
+                            .child(crate::loaders::activity_spinner(
                                 "vcs-settings-loading",
                                 &theme,
                                 16.0,

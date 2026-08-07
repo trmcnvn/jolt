@@ -1,4 +1,4 @@
-//! jolt-doc — session & workspace Loro doc schemas and the typed mirror layer.
+//! jolt-doc — session document schemas and the workspace registry model.
 //!
 //! The schema shape (container names, part maps with LoroText bodies, command entries)
 //! is shared with the edge tail materializer and TypeScript peers.
@@ -14,7 +14,6 @@ pub mod registry;
 pub mod schema;
 pub mod transcript_delta;
 pub mod transcript_page;
-pub mod workspace;
 
 pub use commands::*;
 pub use constants::*;
@@ -23,4 +22,3 @@ pub use registry::*;
 pub use schema::*;
 pub use transcript_delta::*;
 pub use transcript_page::*;
-pub use workspace::*;

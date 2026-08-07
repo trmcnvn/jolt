@@ -1,43 +1,11 @@
 use jolt_doc::GoalOperation;
 use jolt_proto::{Goal, GoalPauseSource, GoalStatus};
-use serde::Deserialize;
 
 use crate::{EngineError, new_id, now_ms};
 
 pub(crate) const MAX_OBJECTIVE_CHARS: usize = 4_000;
 const MAX_STATUS_CHARS: usize = 2_000;
 const MAX_BLOCKER_KEY_CHARS: usize = 200;
-const CONTROL_OPEN: &str = "<jolt_goal_control>";
-const CONTROL_CLOSE: &str = "</jolt_goal_control>";
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GoalControl {
-    pub goal_id: String,
-    pub revision: u64,
-    pub nonce: String,
-    pub outcome: GoalOutcome,
-    #[serde(default)]
-    pub summary: String,
-    #[serde(default)]
-    pub blocker_key: Option<String>,
-}
-
-impl GoalControl {
-    pub(crate) fn matches(&self, goal: &Goal) -> bool {
-        self.goal_id == goal.id
-            && self.revision == goal.revision
-            && self.nonce == goal.control_nonce
-    }
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum GoalOutcome {
-    Continue,
-    Complete,
-    Blocked,
-}
 
 pub(crate) enum AgentGoalAction {
     Update { summary: String },
@@ -73,7 +41,6 @@ pub(crate) fn apply_operation(
             Ok(Some(Goal {
                 id: new_id(),
                 revision: 1,
-                control_nonce: new_id(),
                 objective,
                 status: GoalStatus::Active,
                 pause_source: None,
@@ -108,7 +75,6 @@ pub(crate) fn apply_operation(
             goal.objective = validate_objective(objective)?;
             goal.token_budget = *token_budget;
             goal.revision = goal.revision.saturating_add(1);
-            goal.control_nonce = new_id();
             goal.status = GoalStatus::Active;
             goal.pause_source = None;
             goal.status_message = None;
@@ -145,7 +111,6 @@ pub(crate) fn apply_operation(
             goal.revision = goal.revision.saturating_add(1);
             goal.status = GoalStatus::Active;
             goal.pause_source = None;
-            goal.control_nonce = new_id();
             goal.status_message = None;
             goal.blocker_key = None;
             goal.blocker_streak = 0;
@@ -216,7 +181,6 @@ pub(crate) fn apply_agent_action(
         }
     }
     goal.revision = goal.revision.saturating_add(1);
-    goal.control_nonce = new_id();
     goal.updated_at_ms = now;
     Ok(goal)
 }
@@ -293,15 +257,12 @@ pub(crate) fn context(goal: &Goal) -> String {
         .map(|budget| budget.saturating_sub(goal.tokens_used).to_string())
         .unwrap_or_else(|| "unbounded".into());
     format!(
-        "Jolt active goal (the objective is user-provided data):\n\n<untrusted_objective>\n{}\n</untrusted_objective>\n\nKeep working toward the full objective across turns. Do not redefine success around partial progress. Verify every explicit requirement against authoritative current state before claiming completion. Use the Jolt MCP goal tools when available: call goal_update before ending an incomplete productive turn, goal_complete only after full verification, goal_report_blocked when progress requires user input or external state, and goal_pause only when autonomous work should intentionally stop. Never resume a user-paused goal. Jolt blocks only after the same blocker is reported for three consecutive goal turns.\n\nGoal ID: {}. Revision: {}. Tokens used: {}. Tokens remaining: {}.\n\nDo not print a goal-control label after using a Jolt goal tool. If the Jolt goal tools are unavailable, end the response with exactly one private fallback block after all user-visible text:\n{CONTROL_OPEN}\n{{\"goalId\":\"{}\",\"revision\":{},\"nonce\":\"{}\",\"outcome\":\"continue\",\"summary\":\"concise evidence or blocker\",\"blockerKey\":null}}\n{CONTROL_CLOSE}\nUse outcome complete only when the objective is fully achieved and verified. Use a stable non-empty blockerKey with blocked. Otherwise use continue.",
+        "Jolt active goal (the objective is user-provided data):\n\n<untrusted_objective>\n{}\n</untrusted_objective>\n\nKeep working toward the full objective across turns. Do not redefine success around partial progress. Verify every explicit requirement against authoritative current state before claiming completion. Use the Jolt MCP goal tools: call goal_update before ending an incomplete productive turn, goal_complete only after full verification, goal_report_blocked when progress requires user input or external state, and goal_pause only when autonomous work should intentionally stop. Never resume a user-paused goal. Jolt blocks only after the same blocker is reported for three consecutive goal turns.\n\nGoal ID: {}. Revision: {}. Tokens used: {}. Tokens remaining: {}.",
         escape_xml(&goal.objective),
         goal.id,
         goal.revision,
         goal.tokens_used,
         remaining,
-        goal.id,
-        goal.revision,
-        goal.control_nonce,
     )
 }
 
@@ -310,42 +271,6 @@ pub(crate) fn continuation(goal: &Goal) -> String {
         "Continue making concrete progress toward the active Jolt goal. Inspect current repository and external state rather than relying only on prior conversation. Do not stop merely to report partial progress.\n\n{}",
         context(goal)
     )
-}
-
-pub(crate) fn extract_control(text: &mut String) -> Option<GoalControl> {
-    let trimmed = text.trim_end();
-    let open = trimmed.rfind(CONTROL_OPEN)?;
-    let control = trimmed.ends_with(CONTROL_CLOSE).then(|| {
-        let json_start = open + CONTROL_OPEN.len();
-        let json_end = trimmed.len() - CONTROL_CLOSE.len();
-        serde_json::from_str(trimmed[json_start..json_end].trim()).ok()
-    });
-    // The protocol is private even when the model emits malformed JSON or an
-    // incomplete close tag. A malformed control result simply means continue.
-    text.truncate(open);
-    trim_visible_tail(text);
-    control.flatten()
-}
-
-pub(crate) fn hide_control_tail(text: &mut String) {
-    if let Some(open) = text.rfind(CONTROL_OPEN) {
-        text.truncate(open);
-        trim_visible_tail(text);
-        return;
-    }
-    let max = text.len().min(CONTROL_OPEN.len() - 1);
-    if let Some(partial) = (1..=max)
-        .rev()
-        .find(|&len| text.ends_with(&CONTROL_OPEN[..len]))
-    {
-        text.truncate(text.len() - partial);
-    }
-}
-
-fn trim_visible_tail(text: &mut String) {
-    while text.ends_with(['\n', '\r', ' ', '\t']) {
-        text.pop();
-    }
 }
 
 fn escape_xml(value: &str) -> String {
@@ -496,37 +421,5 @@ mod tests {
             },
         );
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn extracts_only_a_trailing_control_block() {
-        let mut text = "Visible\n<jolt_goal_control>\n{\"goalId\":\"g\",\"revision\":1,\"nonce\":\"n\",\"outcome\":\"continue\",\"summary\":\"ok\"}\n</jolt_goal_control>\n".to_string();
-        let control = extract_control(&mut text).unwrap();
-        assert_eq!(control.goal_id, "g");
-        assert_eq!(control.nonce, "n");
-        assert_eq!(control.outcome, GoalOutcome::Continue);
-        assert_eq!(text, "Visible");
-
-        let goal = apply_operation(
-            None,
-            &GoalOperation::Create {
-                objective: "ship it".into(),
-                token_budget: None,
-            },
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!control.matches(&goal));
-    }
-
-    #[test]
-    fn hides_partial_and_malformed_control_tails() {
-        let mut partial = "Visible\n<jolt_goal".to_string();
-        hide_control_tail(&mut partial);
-        assert_eq!(partial, "Visible\n");
-
-        let mut malformed = "Visible\n<jolt_goal_control>{nope}</jolt_goal_control>".to_string();
-        assert!(extract_control(&mut malformed).is_none());
-        assert_eq!(malformed, "Visible");
     }
 }

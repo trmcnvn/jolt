@@ -56,6 +56,19 @@ pub enum LineKind {
     Meta,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLayout {
+    Unified,
+    Split,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReviewSide {
+    Old,
+    New,
+    Both,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffLine {
     pub kind: LineKind,
@@ -330,6 +343,20 @@ struct HighlightSlot {
     _task: Option<Task<()>>,
 }
 
+#[derive(Default)]
+struct FileHorizontalScrolls {
+    unified: ScrollHandle,
+    old: ScrollHandle,
+    new: ScrollHandle,
+}
+
+#[derive(Default)]
+struct FileColumns {
+    unified: usize,
+    old: usize,
+    new: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ChangeRowKind {
     FileHeader {
@@ -353,17 +380,21 @@ enum ChangeRowKind {
         hunk: usize,
     },
     Line {
+        point: ReviewLinePoint,
+    },
+    SplitLine {
         file: usize,
         page_id: String,
-        hunk: usize,
-        line: usize,
-        flat_line: usize,
+        old: Option<ReviewLinePoint>,
+        new: Option<ReviewLinePoint>,
     },
     ReviewEditor {
         comment_id: String,
+        side: ReviewSide,
     },
     ReviewComment {
         comment_id: String,
+        side: ReviewSide,
     },
 }
 
@@ -373,6 +404,67 @@ struct ReviewLinePoint {
     page_id: String,
     hunk: usize,
     line: usize,
+    flat_line: usize,
+    side: ReviewSide,
+}
+
+impl ReviewLinePoint {
+    fn same_line(&self, other: &Self) -> bool {
+        self.file == other.file
+            && self.page_id == other.page_id
+            && self.hunk == other.hunk
+            && self.line == other.line
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SplitLineSlot {
+    Pair {
+        old: Option<usize>,
+        new: Option<usize>,
+    },
+    Full(usize),
+}
+
+fn split_line_slots(lines: &[DiffLine]) -> Vec<SplitLineSlot> {
+    let mut slots = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        match lines[index].kind {
+            LineKind::Context => {
+                slots.push(SplitLineSlot::Pair {
+                    old: Some(index),
+                    new: Some(index),
+                });
+                index += 1;
+            }
+            LineKind::Meta => {
+                slots.push(SplitLineSlot::Full(index));
+                index += 1;
+            }
+            LineKind::Add | LineKind::Del => {
+                let start = index;
+                while index < lines.len()
+                    && matches!(lines[index].kind, LineKind::Add | LineKind::Del)
+                {
+                    index += 1;
+                }
+                let old: Vec<_> = (start..index)
+                    .filter(|line| lines[*line].kind == LineKind::Del)
+                    .collect();
+                let new: Vec<_> = (start..index)
+                    .filter(|line| lines[*line].kind == LineKind::Add)
+                    .collect();
+                for pair in 0..old.len().max(new.len()) {
+                    slots.push(SplitLineSlot::Pair {
+                        old: old.get(pair).copied(),
+                        new: new.get(pair).copied(),
+                    });
+                }
+            }
+        }
+    }
+    slots
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -389,6 +481,13 @@ struct ChangeRow {
     id: String,
     version: u64,
     kind: ChangeRowKind,
+}
+
+#[derive(Clone)]
+struct VisualRowAnchor {
+    id: String,
+    point: Option<ReviewLinePoint>,
+    offset: gpui::Pixels,
 }
 
 fn row_splice(old: &[ChangeRow], new: &[ChangeRow]) -> Option<(Range<usize>, usize)> {
@@ -558,6 +657,22 @@ fn review_line_kind(kind: LineKind) -> Option<DiffReviewLineKind> {
     }
 }
 
+fn review_side(anchor: &DiffReviewAnchor) -> ReviewSide {
+    match (anchor.old_lines, anchor.new_lines) {
+        (Some(_), None) => ReviewSide::Old,
+        (None, Some(_)) => ReviewSide::New,
+        _ => ReviewSide::Both,
+    }
+}
+
+fn side_contains_line(side: ReviewSide, line: &DiffLine) -> bool {
+    match side {
+        ReviewSide::Old => line.old_no.is_some(),
+        ReviewSide::New => line.new_no.is_some(),
+        ReviewSide::Both => line.old_no.is_some() || line.new_no.is_some(),
+    }
+}
+
 fn excerpt_matches_line(excerpt: &DiffReviewExcerptLine, line: &DiffLine) -> bool {
     review_line_kind(line.kind) == Some(excerpt.kind)
         && line.old_no == excerpt.old_number
@@ -596,6 +711,7 @@ pub struct Changes {
     watch_task: Option<Task<()>>,
     source: Option<DiffSource>,
     expanded_view: bool,
+    layout: DiffLayout,
     error: Option<SharedString>,
     manifest: Option<CheckoutDiffManifest>,
     sequence: u64,
@@ -610,8 +726,8 @@ pub struct Changes {
     highlights: HashMap<String, HighlightSlot>,
     highlight_order: VecDeque<String>,
     highlight_bytes: usize,
-    horizontal_scrolls: HashMap<String, ScrollHandle>,
-    file_columns: HashMap<String, usize>,
+    horizontal_scrolls: HashMap<String, FileHorizontalScrolls>,
+    file_columns: HashMap<String, FileColumns>,
     rows: Vec<ChangeRow>,
     file_header_rows: Vec<usize>,
     review_key: Option<String>,
@@ -646,6 +762,7 @@ impl Changes {
             watch_task: None,
             source: None,
             expanded_view: false,
+            layout: DiffLayout::Unified,
             error: None,
             manifest: None,
             sequence: 0,
@@ -866,54 +983,55 @@ impl Changes {
         Some((file, line))
     }
 
-    fn line_row_index(&self, point: &ReviewLinePoint) -> Option<usize> {
-        self.rows.iter().position(|row| {
-            matches!(
-                &row.kind,
-                ChangeRowKind::Line {
-                    file,
-                    page_id,
-                    hunk,
-                    line,
-                    ..
-                } if *file == point.file
-                    && page_id == &point.page_id
-                    && *hunk == point.hunk
-                    && *line == point.line
-            )
-        })
+    fn loaded_line_points(&self, file: usize, side: ReviewSide) -> Vec<ReviewLinePoint> {
+        let Some(descriptor) = self
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.files.get(file))
+        else {
+            return Vec::new();
+        };
+        let mut points = Vec::new();
+        for page_id in &descriptor.page_ids {
+            let Some(page) = self.pages.get(page_id) else {
+                continue;
+            };
+            let mut flat_line = 0;
+            for (hunk, value) in page.file.hunks.iter().enumerate() {
+                for line in 0..value.lines.len() {
+                    points.push(ReviewLinePoint {
+                        file,
+                        page_id: page_id.clone(),
+                        hunk,
+                        line,
+                        flat_line,
+                        side,
+                    });
+                    flat_line += 1;
+                }
+            }
+        }
+        points
     }
 
     fn point_for_excerpt(
         &self,
         file_id: &str,
         excerpt: &DiffReviewExcerptLine,
+        side: ReviewSide,
     ) -> Option<ReviewLinePoint> {
-        for row in &self.rows {
-            let ChangeRowKind::Line {
-                file,
-                page_id,
-                hunk,
-                line,
-                ..
-            } = &row.kind
-            else {
-                continue;
-            };
-            let point = ReviewLinePoint {
-                file: *file,
-                page_id: page_id.clone(),
-                hunk: *hunk,
-                line: *line,
-            };
-            let Some((descriptor, value)) = self.line_value(&point) else {
-                continue;
-            };
-            if descriptor.id == file_id && excerpt_matches_line(excerpt, &value) {
-                return Some(point);
-            }
-        }
-        None
+        let file = self
+            .manifest
+            .as_ref()?
+            .files
+            .iter()
+            .position(|file| file.id == file_id)?;
+        self.loaded_line_points(file, side)
+            .into_iter()
+            .find(|point| {
+                self.line_value(point)
+                    .is_some_and(|(_, line)| excerpt_matches_line(excerpt, &line))
+            })
     }
 
     fn anchor_between(
@@ -921,11 +1039,12 @@ impl Changes {
         left: &ReviewLinePoint,
         right: &ReviewLinePoint,
     ) -> Option<DiffReviewAnchor> {
-        if left.file != right.file {
+        if left.file != right.file || left.side != right.side {
             return None;
         }
-        let left_index = self.line_row_index(left)?;
-        let right_index = self.line_row_index(right)?;
+        let points = self.loaded_line_points(left.file, left.side);
+        let left_index = points.iter().position(|point| point.same_line(left))?;
+        let right_index = points.iter().position(|point| point.same_line(right))?;
         let (start, end) = if left_index <= right_index {
             (left_index, right_index)
         } else {
@@ -933,28 +1052,11 @@ impl Changes {
         };
         let file = self.manifest.as_ref()?.files.get(left.file)?.clone();
         let mut excerpt = Vec::new();
-        for row in &self.rows[start..=end] {
-            let ChangeRowKind::Line {
-                file: row_file,
-                page_id,
-                hunk,
-                line,
-                ..
-            } = &row.kind
-            else {
-                continue;
-            };
-            if *row_file != left.file {
+        for point in &points[start..=end] {
+            let (_, value) = self.line_value(point)?;
+            if !side_contains_line(left.side, &value) {
                 continue;
             }
-            let value = self
-                .pages
-                .get(page_id)?
-                .file
-                .hunks
-                .get(*hunk)?
-                .lines
-                .get(*line)?;
             let Some(kind) = review_line_kind(value.kind) else {
                 continue;
             };
@@ -962,22 +1064,28 @@ impl Changes {
                 kind,
                 old_number: value.old_no,
                 new_number: value.new_no,
-                text: value.text.clone(),
+                text: value.text,
             });
         }
         if excerpt.is_empty() {
             return None;
         }
+        let old_lines = (left.side != ReviewSide::New)
+            .then(|| {
+                InclusiveLineRange::containing(excerpt.iter().filter_map(|line| line.old_number))
+            })
+            .flatten();
+        let new_lines = (left.side != ReviewSide::Old)
+            .then(|| {
+                InclusiveLineRange::containing(excerpt.iter().filter_map(|line| line.new_number))
+            })
+            .flatten();
         Some(DiffReviewAnchor {
             file_id: file.id,
             path: file.path,
             old_path: file.old_path,
-            old_lines: InclusiveLineRange::containing(
-                excerpt.iter().filter_map(|line| line.old_number),
-            ),
-            new_lines: InclusiveLineRange::containing(
-                excerpt.iter().filter_map(|line| line.new_number),
-            ),
+            old_lines,
+            new_lines,
             excerpt,
         })
     }
@@ -998,20 +1106,26 @@ impl Changes {
                 .diff_comments()
                 .iter()
                 .find(|comment| comment.id == comment_id)
-            && let Some(first) = comment.anchor.excerpt.first()
-            && let Some(first_point) = self.point_for_excerpt(&comment.anchor.file_id, first)
-            && let Some(anchor) = self.anchor_between(&first_point, &point)
         {
-            if let Some(comment) = self
-                .diff_comments_mut()
-                .and_then(|comments| comments.iter_mut().find(|comment| comment.id == comment_id))
-            {
-                comment.anchor = anchor;
-                comment.updated_at = chrono::Utc::now();
+            let side = review_side(&comment.anchor);
+            if side != point.side {
+                return;
             }
-            self.schedule_review_save(cx);
-            self.rebuild_rows();
-            cx.notify();
+            if let Some(first) = comment.anchor.excerpt.first()
+                && let Some(first_point) =
+                    self.point_for_excerpt(&comment.anchor.file_id, first, side)
+                && let Some(anchor) = self.anchor_between(&first_point, &point)
+            {
+                if let Some(comment) = self.diff_comments_mut().and_then(|comments| {
+                    comments.iter_mut().find(|comment| comment.id == comment_id)
+                }) {
+                    comment.anchor = anchor;
+                    comment.updated_at = chrono::Utc::now();
+                }
+                self.schedule_review_save(cx);
+                self.rebuild_rows();
+                cx.notify();
+            }
             return;
         }
         let Some(anchor) = self.anchor_between(&point, &point) else {
@@ -1399,11 +1513,79 @@ impl Changes {
         cx.notify();
     }
 
-    pub fn set_expanded_view(&mut self, expanded: bool, cx: &mut Context<Self>) {
-        if self.expanded_view != expanded {
-            self.expanded_view = expanded;
-            cx.notify();
+    fn effective_layout(&self) -> DiffLayout {
+        if self.expanded_view {
+            self.layout
+        } else {
+            DiffLayout::Unified
         }
+    }
+
+    fn visual_row_anchor(&self) -> Option<VisualRowAnchor> {
+        let top = self.list.logical_scroll_top();
+        let row = self.rows.get(top.item_ix)?;
+        let point = match &row.kind {
+            ChangeRowKind::Line { point } => Some(point.clone()),
+            ChangeRowKind::SplitLine { old, new, .. } => old.clone().or_else(|| new.clone()),
+            _ => None,
+        };
+        Some(VisualRowAnchor {
+            id: row.id.clone(),
+            point,
+            offset: top.offset_in_item,
+        })
+    }
+
+    fn restore_visual_row_anchor(&self, anchor: Option<VisualRowAnchor>) {
+        let Some(anchor) = anchor else {
+            return;
+        };
+        let row = self.rows.iter().position(|row| {
+            row.id == anchor.id
+                || anchor.point.as_ref().is_some_and(|point| match &row.kind {
+                    ChangeRowKind::Line { point: candidate } => candidate.same_line(point),
+                    ChangeRowKind::SplitLine { old, new, .. } => old
+                        .iter()
+                        .chain(new.iter())
+                        .any(|candidate| candidate.same_line(point)),
+                    _ => false,
+                })
+        });
+        if let Some(item_ix) = row {
+            self.list.scroll_to(gpui::ListOffset {
+                item_ix,
+                offset_in_item: anchor.offset,
+            });
+        }
+    }
+
+    fn rebuild_rows_preserving_anchor(&mut self) {
+        let anchor = self.visual_row_anchor();
+        self.rebuild_rows();
+        self.restore_visual_row_anchor(anchor);
+    }
+
+    fn set_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
+        if self.layout == layout {
+            return;
+        }
+        self.layout = layout;
+        if self.expanded_view {
+            self.rebuild_rows_preserving_anchor();
+        }
+        cx.notify();
+    }
+
+    pub fn set_expanded_view(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if self.expanded_view == expanded {
+            return;
+        }
+        let old_layout = self.effective_layout();
+        self.expanded_view = expanded;
+        if old_layout != self.effective_layout() {
+            self.rebuild_rows_preserving_anchor();
+        }
+        cx.notify();
     }
 
     pub fn stop_watch(&mut self, cx: &mut Context<Self>) {
@@ -1821,8 +2003,10 @@ impl Changes {
         let mut rows = Vec::new();
         let mut file_header_rows = Vec::new();
         let mut file_columns = HashMap::new();
+        let layout = self.effective_layout();
         let editing_comment = self.editing_comment.as_deref();
-        let mut review_rows: HashMap<ReviewLineKey, Vec<(String, bool, u64)>> = HashMap::new();
+        let mut review_rows: HashMap<ReviewLineKey, Vec<(String, bool, u64, ReviewSide)>> =
+            HashMap::new();
         for comment in self.diff_comments() {
             let Some(last) = comment.anchor.excerpt.last() else {
                 continue;
@@ -1838,6 +2022,7 @@ impl Changes {
                 comment.id.clone(),
                 editing_comment == Some(comment.id.as_str()),
                 hash64(&[&comment.id, &comment.body, &comment.updated_at.to_rfc3339()]),
+                review_side(&comment.anchor),
             ));
         }
         if let Some(manifest) = &self.manifest {
@@ -1872,12 +2057,21 @@ impl Changes {
                         });
                         continue;
                     };
-                    file_columns
+                    let columns = file_columns
                         .entry(file.id.clone())
-                        .and_modify(|columns: &mut usize| {
-                            *columns = (*columns).max(file_display_columns(&page.file));
-                        })
-                        .or_insert_with(|| file_display_columns(&page.file));
+                        .or_insert_with(FileColumns::default);
+                    columns.unified = columns.unified.max(file_display_columns(&page.file));
+                    for hunk in &page.file.hunks {
+                        for line in &hunk.lines {
+                            let width = display_columns(&line.text);
+                            if line.old_no.is_some() {
+                                columns.old = columns.old.max(width);
+                            }
+                            if line.new_no.is_some() {
+                                columns.new = columns.new.max(width);
+                            }
+                        }
+                    }
                     for (notice, _) in file_notices(&page.file).iter().enumerate() {
                         rows.push(ChangeRow {
                             id: format!("{page_id}:notice:{notice}"),
@@ -1900,39 +2094,120 @@ impl Changes {
                                 hunk,
                             },
                         });
-                        for line in 0..value.lines.len() {
-                            rows.push(ChangeRow {
-                                id: format!("{page_id}:hunk:{hunk}:line:{line}"),
-                                version: page.access,
-                                kind: ChangeRowKind::Line {
-                                    file: file_index,
-                                    page_id: page_id.clone(),
-                                    hunk,
-                                    line,
-                                    flat_line,
-                                },
-                            });
-                            if let Some(key) = review_line_key(&file.id, &value.lines[line])
-                                && let Some(attached) = review_rows.get(&key)
-                            {
-                                for (comment_id, editing, version) in attached {
+                        let append_reviews = |rows: &mut Vec<ChangeRow>, lines: &[usize]| {
+                            let mut seen = HashSet::new();
+                            for line in lines {
+                                let Some(key) = review_line_key(&file.id, &value.lines[*line])
+                                else {
+                                    continue;
+                                };
+                                let Some(attached) = review_rows.get(&key) else {
+                                    continue;
+                                };
+                                for (comment_id, editing, version, side) in attached {
+                                    if !seen.insert(comment_id.clone()) {
+                                        continue;
+                                    }
                                     rows.push(ChangeRow {
                                         id: format!("review:{comment_id}"),
                                         version: *version,
                                         kind: if *editing {
                                             ChangeRowKind::ReviewEditor {
                                                 comment_id: comment_id.clone(),
+                                                side: *side,
                                             }
                                         } else {
                                             ChangeRowKind::ReviewComment {
                                                 comment_id: comment_id.clone(),
+                                                side: *side,
                                             }
                                         },
                                     });
                                 }
                             }
-                            flat_line += 1;
+                        };
+                        match layout {
+                            DiffLayout::Unified => {
+                                for line in 0..value.lines.len() {
+                                    rows.push(ChangeRow {
+                                        id: format!("{page_id}:hunk:{hunk}:line:{line}"),
+                                        version: page.access,
+                                        kind: ChangeRowKind::Line {
+                                            point: ReviewLinePoint {
+                                                file: file_index,
+                                                page_id: page_id.clone(),
+                                                hunk,
+                                                line,
+                                                flat_line: flat_line + line,
+                                                side: ReviewSide::Both,
+                                            },
+                                        },
+                                    });
+                                    append_reviews(&mut rows, &[line]);
+                                }
+                            }
+                            DiffLayout::Split => {
+                                for slot in split_line_slots(&value.lines) {
+                                    match slot {
+                                        SplitLineSlot::Full(line) => {
+                                            rows.push(ChangeRow {
+                                                id: format!("{page_id}:hunk:{hunk}:line:{line}"),
+                                                version: page.access,
+                                                kind: ChangeRowKind::Line {
+                                                    point: ReviewLinePoint {
+                                                        file: file_index,
+                                                        page_id: page_id.clone(),
+                                                        hunk,
+                                                        line,
+                                                        flat_line: flat_line + line,
+                                                        side: ReviewSide::Both,
+                                                    },
+                                                },
+                                            });
+                                            append_reviews(&mut rows, &[line]);
+                                        }
+                                        SplitLineSlot::Pair { old, new } => {
+                                            let point = |line: usize, side| ReviewLinePoint {
+                                                file: file_index,
+                                                page_id: page_id.clone(),
+                                                hunk,
+                                                line,
+                                                flat_line: flat_line + line,
+                                                side,
+                                            };
+                                            let old_point =
+                                                old.map(|line| point(line, ReviewSide::Old));
+                                            let new_point =
+                                                new.map(|line| point(line, ReviewSide::New));
+                                            rows.push(ChangeRow {
+                                                id: format!(
+                                                    "{page_id}:hunk:{hunk}:split:{}:{}",
+                                                    old.map_or_else(
+                                                        || "x".into(),
+                                                        |line| line.to_string()
+                                                    ),
+                                                    new.map_or_else(
+                                                        || "x".into(),
+                                                        |line| line.to_string()
+                                                    )
+                                                ),
+                                                version: page.access,
+                                                kind: ChangeRowKind::SplitLine {
+                                                    file: file_index,
+                                                    page_id: page_id.clone(),
+                                                    old: old_point,
+                                                    new: new_point,
+                                                },
+                                            });
+                                            let attached: Vec<_> =
+                                                old.into_iter().chain(new).collect();
+                                            append_reviews(&mut rows, &attached);
+                                        }
+                                    }
+                                }
+                            }
                         }
+                        flat_line += value.lines.len();
                     }
                 }
             }
@@ -2047,10 +2322,38 @@ impl Changes {
         else {
             return 0.0;
         };
-        let columns = self.file_columns.get(&file.id).copied().unwrap_or(0);
+        let columns = self
+            .file_columns
+            .get(&file.id)
+            .map_or(0, |columns| columns.unified);
         ACCENT_BAR_WIDTH
             + REVIEW_GUTTER_WIDTH
             + 2.0 * GUTTER_WIDTH
+            + MARKER_WIDTH
+            + 2.0 * Theme::SPACE_LG
+            + columns as f32
+                * f32::from(Theme::of(cx).font_sizes.code)
+                * MONOSPACE_GLYPH_WIDTH_RATIO
+    }
+
+    fn split_content_width(&self, file_index: usize, side: ReviewSide, cx: &App) -> f32 {
+        let Some(file) = self
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.files.get(file_index))
+        else {
+            return 0.0;
+        };
+        let columns = self.file_columns.get(&file.id).map_or(0, |columns| {
+            if side == ReviewSide::Old {
+                columns.old
+            } else {
+                columns.new
+            }
+        });
+        ACCENT_BAR_WIDTH
+            + REVIEW_GUTTER_WIDTH
+            + GUTTER_WIDTH
             + MARKER_WIDTH
             + 2.0 * Theme::SPACE_LG
             + columns as f32
@@ -2079,7 +2382,7 @@ impl Changes {
             .id(SharedString::from(format!("diff-scroll:{row_id}")))
             .w_full()
             .overflow_x_scroll()
-            .track_scroll(scroll)
+            .track_scroll(&scroll.unified)
             .child(
                 div()
                     .w_full()
@@ -2088,6 +2391,45 @@ impl Changes {
             );
         // A one-axis GPUI scroller otherwise maps vertical wheel deltas onto
         // its horizontal axis. Preserve vertical movement for the virtual list.
+        scroller.style().restrict_scroll_to_axis = Some(true);
+        scroller.into_any_element()
+    }
+
+    fn scroll_split_cell(
+        &self,
+        row_id: &str,
+        file_index: usize,
+        side: ReviewSide,
+        content: AnyElement,
+        cx: &App,
+    ) -> AnyElement {
+        let Some(file) = self
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.files.get(file_index))
+        else {
+            return content;
+        };
+        let Some(scrolls) = self.horizontal_scrolls.get(&file.id) else {
+            return content;
+        };
+        let (suffix, scroll) = match side {
+            ReviewSide::Old => ("old", &scrolls.old),
+            ReviewSide::New => ("new", &scrolls.new),
+            ReviewSide::Both => ("both", &scrolls.unified),
+        };
+        let mut scroller = div()
+            .id(SharedString::from(format!("diff-scroll:{row_id}:{suffix}")))
+            .w_1_2()
+            .flex_none()
+            .overflow_x_scroll()
+            .track_scroll(scroll)
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(self.split_content_width(file_index, side, cx)))
+                    .child(content),
+            );
         scroller.style().restrict_scroll_to_axis = Some(true);
         scroller.into_any_element()
     }
@@ -2180,22 +2522,32 @@ impl Changes {
                     .into_any_element();
                 self.scroll_file_row(&row_id, file, content, cx)
             }
-            ChangeRowKind::Line {
+            ChangeRowKind::Line { point } => {
+                self.request_highlight(&point.page_id, cx);
+                let content = self.render_line(&point, cx);
+                self.scroll_file_row(&row_id, point.file, content, cx)
+            }
+            ChangeRowKind::SplitLine {
                 file,
                 page_id,
-                hunk,
-                line,
-                flat_line,
+                old,
+                new,
             } => {
                 self.request_highlight(&page_id, cx);
-                let content = self.render_line(file, &page_id, hunk, line, flat_line, cx);
-                self.scroll_file_row(&row_id, file, content, cx)
+                let old_content = self.render_split_cell(old.as_ref(), ReviewSide::Old, cx);
+                let new_content = self.render_split_cell(new.as_ref(), ReviewSide::New, cx);
+                div()
+                    .w_full()
+                    .flex()
+                    .child(self.scroll_split_cell(&row_id, file, ReviewSide::Old, old_content, cx))
+                    .child(self.scroll_split_cell(&row_id, file, ReviewSide::New, new_content, cx))
+                    .into_any_element()
             }
-            ChangeRowKind::ReviewEditor { comment_id } => {
-                self.render_review_editor(&comment_id, cx)
+            ChangeRowKind::ReviewEditor { comment_id, side } => {
+                self.render_review_editor(&comment_id, side, cx)
             }
-            ChangeRowKind::ReviewComment { comment_id } => {
-                self.render_review_comment(&comment_id, cx)
+            ChangeRowKind::ReviewComment { comment_id, side } => {
+                self.render_review_comment(&comment_id, side, cx)
             }
         }
     }
@@ -2330,9 +2682,15 @@ impl Changes {
             .as_ref()
             .and_then(|manifest| manifest.pages.iter().find(|page| page.id == page_id));
         let height = descriptor.map_or(80.0, |page| {
+            let line_count =
+                if self.effective_layout() == DiffLayout::Split && page.split_line_count > 0 {
+                    page.split_line_count
+                } else {
+                    page.line_count
+                };
             (page.notice_count as f32 * NOTICE_HEIGHT
                 + page.hunk_count as f32 * HUNK_HEADER_HEIGHT
-                + page.line_count as f32 * Theme::of(cx).font_sizes.diff_line_height())
+                + line_count as f32 * Theme::of(cx).font_sizes.diff_line_height())
             .clamp(44.0, 24_000.0)
         });
         let failed = self.page_errors.contains(&page_id);
@@ -2378,21 +2736,13 @@ impl Changes {
             .into_any_element()
     }
 
-    fn render_line(
-        &mut self,
-        file_index: usize,
-        page_id: &str,
-        hunk: usize,
-        line: usize,
-        flat_line: usize,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_line(&mut self, point: &ReviewLinePoint, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(value) = self
             .pages
-            .get(page_id)
-            .and_then(|page| page.file.hunks.get(hunk))
-            .and_then(|hunk| hunk.lines.get(line))
+            .get(&point.page_id)
+            .and_then(|page| page.file.hunks.get(point.hunk))
+            .and_then(|hunk| hunk.lines.get(point.line))
             .cloned()
         else {
             return gpui::Empty.into_any_element();
@@ -2416,7 +2766,7 @@ impl Changes {
         let current_file_id = self
             .manifest
             .as_ref()
-            .and_then(|manifest| manifest.files.get(file_index))
+            .and_then(|manifest| manifest.files.get(point.file))
             .map(|file| file.id.as_str());
         let selected = self
             .editing_comment
@@ -2441,9 +2791,9 @@ impl Changes {
         };
         let tokens = self
             .highlights
-            .get(page_id)
+            .get(&point.page_id)
             .and_then(|slot| slot.lines.as_ref())
-            .and_then(|lines| lines.get(flat_line))
+            .and_then(|lines| lines.get(point.flat_line))
             .map_or(&[][..], Vec::as_slice);
         let mono = font(theme.font_mono.clone());
         let runs = render::runs_with_palette(
@@ -2466,14 +2816,15 @@ impl Changes {
                     number.map(|number| number.to_string()).unwrap_or_default(),
                 ))
         };
-        let point = ReviewLinePoint {
-            file: file_index,
-            page_id: page_id.to_string(),
-            hunk,
-            line,
-        };
+        let point = point.clone();
         let add_point = point.clone();
-        let hover_group: SharedString = format!("reviewable-line:{page_id}:{hunk}:{line}").into();
+        let add_review_id: SharedString =
+            format!("add-review:{}:{}:{}", point.page_id, point.hunk, point.line).into();
+        let hover_group: SharedString = format!(
+            "reviewable-line:{}:{}:{}",
+            point.page_id, point.hunk, point.line
+        )
+        .into();
         div()
             .id(hover_group.clone())
             .group(hover_group.clone())
@@ -2503,9 +2854,7 @@ impl Changes {
                     .justify_center()
                     .child(
                         div()
-                            .id(SharedString::from(format!(
-                                "add-review:{page_id}:{hunk}:{line}"
-                            )))
+                            .id(add_review_id)
                             .size(px(18.0))
                             .flex()
                             .items_center()
@@ -2559,13 +2908,242 @@ impl Changes {
             .into_any_element()
     }
 
-    fn render_review_editor(&self, comment_id: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn render_split_cell(
+        &mut self,
+        point: Option<&ReviewLinePoint>,
+        side: ReviewSide,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let Some(point) = point else {
+            return div()
+                .w_full()
+                .h(px(theme.font_sizes.diff_line_height()))
+                .bg(crate::theme::ink(0.018))
+                .when(side == ReviewSide::Old, |element| {
+                    element
+                        .border_r_1()
+                        .border_color(crate::theme::hairline(0.05))
+                })
+                .into_any_element();
+        };
+        let Some(value) = self
+            .pages
+            .get(&point.page_id)
+            .and_then(|page| page.file.hunks.get(point.hunk))
+            .and_then(|hunk| hunk.lines.get(point.line))
+            .cloned()
+        else {
+            return gpui::Empty.into_any_element();
+        };
+        let current_file_id = self
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.files.get(point.file))
+            .map(|file| file.id.as_str());
+        let selected = self
+            .editing_comment
+            .as_ref()
+            .and_then(|id| {
+                self.diff_comments()
+                    .iter()
+                    .find(|comment| &comment.id == id)
+            })
+            .is_some_and(|comment| {
+                let anchor_side = review_side(&comment.anchor);
+                current_file_id == Some(comment.anchor.file_id.as_str())
+                    && (anchor_side == ReviewSide::Both || anchor_side == side)
+                    && comment
+                        .anchor
+                        .excerpt
+                        .iter()
+                        .any(|excerpt| excerpt_matches_line(excerpt, &value))
+            });
+        let (marker, color, background) = match value.kind {
+            LineKind::Add => ("+", theme.diff_add, Some(theme.diff_add.opacity(0.055))),
+            LineKind::Del => ("−", theme.diff_del, Some(theme.diff_del.opacity(0.055))),
+            _ => ("·", theme.text_faint.opacity(0.5), None),
+        };
+        let tokens = self
+            .highlights
+            .get(&point.page_id)
+            .and_then(|slot| slot.lines.as_ref())
+            .and_then(|lines| lines.get(point.flat_line))
+            .map_or(&[][..], Vec::as_slice);
+        let mono = font(theme.font_mono.clone());
+        let runs = render::runs_with_palette(
+            &value.text,
+            tokens,
+            &mono,
+            theme.text.opacity(0.92),
+            |class| render::token_color(class, &theme),
+        );
+        let number = if side == ReviewSide::Old {
+            value.old_no
+        } else {
+            value.new_no
+        };
+        let point = point.clone();
+        let add_point = point.clone();
+        let suffix = if side == ReviewSide::Old {
+            "old"
+        } else {
+            "new"
+        };
+        let hover_group: SharedString = format!(
+            "reviewable-line:{}:{}:{}:{suffix}",
+            point.page_id, point.hunk, point.line
+        )
+        .into();
+        let add_review_id: SharedString = format!(
+            "add-review:{}:{}:{}:{suffix}",
+            point.page_id, point.hunk, point.line
+        )
+        .into();
+        div()
+            .id(hover_group.clone())
+            .group(hover_group.clone())
+            .w_full()
+            .h(px(theme.font_sizes.diff_line_height()))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .when(side == ReviewSide::Old, |element| {
+                element
+                    .border_r_1()
+                    .border_color(crate::theme::hairline(0.05))
+            })
+            .when(selected, |element| element.bg(theme.accent.opacity(0.14)))
+            .when(!selected, |element| {
+                element.when_some(background, |element, background| element.bg(background))
+            })
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    this.select_review_line(point.clone(), event.modifiers().shift, window, cx);
+                }),
+            )
+            .child(div().w(px(ACCENT_BAR_WIDTH)).h_full().when(
+                value.kind == LineKind::Add || value.kind == LineKind::Del,
+                |element| element.bg(color.opacity(0.55)),
+            ))
+            .child(
+                div()
+                    .w(px(REVIEW_GUTTER_WIDTH))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id(add_review_id)
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .opacity(0.0)
+                            .group_hover(hover_group, |style| {
+                                style.opacity(1.0).bg(theme.element_hover)
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(
+                                move |this, event: &gpui::ClickEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.select_review_line(
+                                        add_point.clone(),
+                                        event.modifiers().shift,
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            ))
+                            .child(
+                                crate::icons::icon(crate::icons::PLUS)
+                                    .size(px(11.0))
+                                    .text_color(theme.text),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(GUTTER_WIDTH))
+                    .flex()
+                    .justify_end()
+                    .pr(px(8.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint.opacity(0.8))
+                    .child(SharedString::from(
+                        number.map(|number| number.to_string()).unwrap_or_default(),
+                    )),
+            )
+            .child(
+                div()
+                    .w(px(MARKER_WIDTH))
+                    .flex()
+                    .justify_center()
+                    .font_family(theme.font_mono.clone())
+                    .text_color(color)
+                    .child(marker),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .pl(px(12.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(f32::from(theme.font_sizes.code)))
+                    .whitespace_nowrap()
+                    .child(gpui::StyledText::new(value.text.clone()).with_runs(runs)),
+            )
+            .into_any_element()
+    }
+
+    fn render_review_lane(&self, side: ReviewSide, content: AnyElement) -> AnyElement {
+        if self.effective_layout() != DiffLayout::Split || side == ReviewSide::Both {
+            return content;
+        }
+        let border = crate::theme::hairline(0.05);
+        let empty = || div().w_1_2().min_w_0();
+        match side {
+            ReviewSide::Old => div()
+                .w_full()
+                .flex()
+                .items_stretch()
+                .child(
+                    div()
+                        .w_1_2()
+                        .min_w_0()
+                        .border_r_1()
+                        .border_color(border)
+                        .child(content),
+                )
+                .child(empty())
+                .into_any_element(),
+            ReviewSide::New => div()
+                .w_full()
+                .flex()
+                .items_stretch()
+                .child(empty().border_r_1().border_color(border))
+                .child(div().w_1_2().min_w_0().child(content))
+                .into_any_element(),
+            ReviewSide::Both => content,
+        }
+    }
+
+    fn render_review_editor(
+        &self,
+        comment_id: &str,
+        side: ReviewSide,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(editor) = self.comment_editor.clone() else {
             return gpui::Empty.into_any_element();
         };
         let delete_id = comment_id.to_string();
-        div()
+        let content = div()
             .w_full()
             .px(px(Theme::SPACE_MD))
             .py(px(Theme::SPACE_SM))
@@ -2617,10 +3195,16 @@ impl Changes {
                             ),
                     ),
             )
-            .into_any_element()
+            .into_any_element();
+        self.render_review_lane(side, content)
     }
 
-    fn render_review_comment(&self, comment_id: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn render_review_comment(
+        &self,
+        comment_id: &str,
+        side: ReviewSide,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(comment) = self
             .diff_comments()
@@ -2631,7 +3215,7 @@ impl Changes {
         };
         let edit_id = comment_id.to_string();
         let delete_id = comment_id.to_string();
-        div()
+        let content = div()
             .w_full()
             .px(px(Theme::SPACE_MD))
             .py(px(Theme::SPACE_SM))
@@ -2700,7 +3284,8 @@ impl Changes {
                             ),
                     ),
             )
-            .into_any_element()
+            .into_any_element();
+        self.render_review_lane(side, content)
     }
 }
 
@@ -2717,13 +3302,15 @@ impl Render for Changes {
         let review_sending = self.review_sending;
         let newer_available = self.newer_manifest.is_some();
         let showing_turn = matches!(self.source, Some(DiffSource::Turn { .. }));
+        let expanded_view = self.expanded_view;
+        let layout = self.layout;
         let content: AnyElement = match self.manifest.as_ref() {
             None if self.state.read(cx).selected_chat_row().is_some() => div()
                 .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(crate::loaders::activity_orb(
+                .child(crate::loaders::activity_spinner(
                     "changes-preparing",
                     &theme,
                     16.0,
@@ -2800,6 +3387,66 @@ impl Render for Changes {
                                         .text_size(px(10.0))
                                         .text_color(theme.warning)
                                         .child("Partial snapshot"),
+                                )
+                            })
+                            .when(expanded_view, |element| {
+                                element.child(
+                                    div()
+                                        .h(px(26.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.0))
+                                        .bg(theme.surface_raised)
+                                        .child(
+                                            div()
+                                                .id("diff-layout-unified")
+                                                .size(px(26.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(6.0))
+                                                .cursor_pointer()
+                                                .text_color(theme.text_muted)
+                                                .when(layout == DiffLayout::Unified, |button| {
+                                                    button
+                                                        .bg(theme.element_hover)
+                                                        .text_color(theme.text)
+                                                })
+                                                .hover(|style| style.bg(theme.element_hover))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.set_layout(DiffLayout::Unified, cx);
+                                                }))
+                                                .child(
+                                                    crate::icons::icon(crate::icons::LIST)
+                                                        .size(px(14.0)),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("diff-layout-split")
+                                                .size(px(26.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(6.0))
+                                                .cursor_pointer()
+                                                .text_color(theme.text_muted)
+                                                .when(layout == DiffLayout::Split, |button| {
+                                                    button
+                                                        .bg(theme.element_hover)
+                                                        .text_color(theme.text)
+                                                })
+                                                .hover(|style| style.bg(theme.element_hover))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.set_layout(DiffLayout::Split, cx);
+                                                }))
+                                                .child(
+                                                    crate::icons::icon(
+                                                        crate::icons::SIDEBAR_MINIMALISTIC,
+                                                    )
+                                                    .size(px(14.0)),
+                                                ),
+                                        ),
                                 )
                             })
                             .child(
@@ -2954,6 +3601,57 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].additions, 1);
         assert_eq!(files[0].deletions, 1);
+    }
+
+    #[test]
+    fn split_rows_pair_change_blocks_and_duplicate_context() {
+        let line = |kind| DiffLine {
+            kind,
+            old_no: None,
+            new_no: None,
+            text: String::new(),
+        };
+        let lines = [
+            line(LineKind::Del),
+            line(LineKind::Del),
+            line(LineKind::Add),
+            line(LineKind::Context),
+            line(LineKind::Meta),
+        ];
+        assert_eq!(
+            split_line_slots(&lines),
+            vec![
+                SplitLineSlot::Pair {
+                    old: Some(0),
+                    new: Some(2),
+                },
+                SplitLineSlot::Pair {
+                    old: Some(1),
+                    new: None,
+                },
+                SplitLineSlot::Pair {
+                    old: Some(3),
+                    new: Some(3),
+                },
+                SplitLineSlot::Full(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn review_side_uses_the_selected_coordinate_set() {
+        let anchor = |old_lines, new_lines| DiffReviewAnchor {
+            file_id: "file".into(),
+            path: "a.rs".into(),
+            old_path: None,
+            old_lines,
+            new_lines,
+            excerpt: Vec::new(),
+        };
+        let line = Some(InclusiveLineRange { start: 4, end: 4 });
+        assert_eq!(review_side(&anchor(line, None)), ReviewSide::Old);
+        assert_eq!(review_side(&anchor(None, line)), ReviewSide::New);
+        assert_eq!(review_side(&anchor(line, line)), ReviewSide::Both);
     }
 
     #[test]

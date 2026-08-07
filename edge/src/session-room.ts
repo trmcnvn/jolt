@@ -1,9 +1,7 @@
 /**
  * SessionRoom — one Durable Object per doc room, speaking loro-protocol over
- * hibernatable WebSockets (design §2, §3.1). Two doc kinds share this class:
- * chat session docs (room name = chatId, claim-on-first-join ownership) and
- * workspace docs (room name = `ws/{orgId}`, org-membership authz enforced by
- * the Worker — the DO sees the ROOM_KIND_HEADER stamp and skips ownership).
+ * hibernatable WebSockets (design §2, §3.1). Each room owns one chat session
+ * document and uses claim-on-first-join ownership.
  *
  * Persistence model:
  * - `updates` — append-only incoming update log, buffered in memory during
@@ -59,7 +57,7 @@ import {
 } from "./session-doc";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { appendUpdateRow, ensureUpdateLog, readUpdateRows } from "./update-log";
-import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import { AUTH_USER_HEADER, type Env } from "./env";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETAIN_MS = RETAIN_DAYS * DAY_MS;
@@ -117,7 +115,7 @@ const PENALTY_PROBE_MAX_BYTES = 4096;
  * flows (trim, fold, alarm, idle release) free-and-replace the cached doc
  * around `await`s, so a stale wrapper can outlive its wasm memory. 2026-08-04
  * evening: one such interleaving left `this.doc` dangling in a live instance —
- * every join/update/tail on the ws3 workspace room threw for 2.5h fleet-wide,
+ * every join, update, and tail read threw until the instance recycled,
  * and nothing recycled the instance because the error is neither a RangeError
  * nor a RuntimeError (the wasm-poison tripwire ignored it). Check liveness
  * before every reuse; rematerialization is a ~tens-of-ms cold replay. */
@@ -134,9 +132,6 @@ interface SocketState {
   kind?: "transcript" | "diff";
   /** Joined sub-rooms by crdt magic ("%LOR", "%EPH"). */
   rooms: string[];
-  /** True for sockets on a workspace-doc room — org membership was enforced
-   * by the Worker, so the per-chat ownership discipline does not apply. */
-  workspace?: boolean;
   /** Dialing engine's device id (from `&device=`, Worker-validated) — pure
    * log attribution; never used for authz. */
   deviceId?: string;
@@ -268,11 +263,7 @@ export class SessionRoom implements DurableObject {
     const url = new URL(request.url);
     const userId = request.headers.get(AUTH_USER_HEADER);
     if (!userId) return new Response("unauthenticated", { status: 401 });
-    // Workspace rooms: the Worker already checked org membership; every
-    // member may read/write, so the owner gates below are bypassed.
-    const workspace = request.headers.get(ROOM_KIND_HEADER) === "workspace";
-
-    if (url.pathname === "/retire" && request.method === "POST" && !workspace) {
+    if (url.pathname === "/retire" && request.method === "POST") {
       const owner = this.getMeta("owner");
       if (owner && owner !== userId) return json({ error: "forbidden" }, 403);
       if (!owner) this.setMeta("owner", userId);
@@ -282,7 +273,7 @@ export class SessionRoom implements DurableObject {
       return json({ ok: true });
     }
 
-    if (!workspace && this.getMeta("retired") === "1") {
+    if (this.getMeta("retired") === "1") {
       return json({ error: "retired" }, 410);
     }
 
@@ -295,7 +286,6 @@ export class SessionRoom implements DurableObject {
       const state: SocketState = {
         userId,
         rooms: [],
-        ...(workspace ? { workspace } : {}),
         ...(deviceId ? { deviceId } : {})
       };
       pair[1].serializeAttachment(state);
@@ -310,10 +300,8 @@ export class SessionRoom implements DurableObject {
 
     const owner = this.getMeta("owner");
     if (url.pathname === "/transcript/ws") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
         return json({ error: "expected_websocket" }, 426);
       }
@@ -330,10 +318,8 @@ export class SessionRoom implements DurableObject {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     if (url.pathname === "/diff/ws") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
         return json({ error: "expected_websocket" }, 426);
       }
@@ -349,12 +335,8 @@ export class SessionRoom implements DurableObject {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     if (url.pathname === "/stats" && request.method === "GET") {
-      // Observability: what this room holds and who's on it. Owner-gated like
-      // every other read (org-membership-gated for workspace rooms).
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       try {
         await this.flush();
         const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
@@ -392,10 +374,8 @@ export class SessionRoom implements DurableObject {
       }
     }
     if (url.pathname === "/tail" && request.method === "GET") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       try {
         return json(await this.currentTail());
       } catch (e) {
@@ -408,10 +388,8 @@ export class SessionRoom implements DurableObject {
       }
     }
     if (url.pathname === "/transcript" && request.method === "GET") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       try {
         return json(transcriptBootstrap(await this.currentTranscriptProjection()));
       } catch (e) {
@@ -421,10 +399,8 @@ export class SessionRoom implements DurableObject {
       }
     }
     if (url.pathname === "/transcript/page" && request.method === "GET") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       const pageId = url.searchParams.get("id");
       if (!pageId) return json({ error: "missing_page_id" }, 400);
       try {
@@ -438,7 +414,6 @@ export class SessionRoom implements DurableObject {
       }
     }
     if (url.pathname === "/command" && request.method === "POST") {
-      if (workspace) return json({ error: "unsupported" }, 400);
       if (!owner) {
         this.setMeta("owner", userId);
         const chatId = url.searchParams.get("chatId") ?? "";
@@ -475,18 +450,14 @@ export class SessionRoom implements DurableObject {
       }
     }
     if (url.pathname === "/diff" && request.method === "GET") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       const diff = getJsonBlob<StoredDiffSidecar>(this.blobs, "diff-v2");
       return diff === undefined ? json({ error: "not_found" }, 404) : json(diff);
     }
     if (url.pathname === "/diff/page" && request.method === "GET") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       const id = url.searchParams.get("id");
       if (!id) return json({ error: "missing_page_id" }, 400);
       const sidecar = getJsonBlob<StoredDiffSidecar>(this.blobs, "diff-v2");
@@ -497,10 +468,8 @@ export class SessionRoom implements DurableObject {
       return page === undefined ? json({ error: "page_not_found" }, 404) : json(page);
     }
     if (url.pathname === "/diff" && request.method === "POST") {
-      if (!workspace) {
-        if (!owner) this.setMeta("owner", userId);
-        else if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) this.setMeta("owner", userId);
+      else if (owner !== userId) return json({ error: "forbidden" }, 403);
       const sidecar = parseDiffSidecar(await request.json());
       if (!sidecar) return json({ error: "invalid_diff_sidecar" }, 400);
       const previous = getJsonBlob<StoredDiffSidecar>(this.blobs, "diff-v2");
@@ -532,10 +501,8 @@ export class SessionRoom implements DurableObject {
     }
     if (url.pathname === "/snapshot" && request.method === "GET") {
       // Repair/inspection read: the doc's full current snapshot bytes.
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       try {
         await this.flush();
         const doc = await this.ensureDoc();
@@ -553,10 +520,8 @@ export class SessionRoom implements DurableObject {
     if (url.pathname === "/append" && request.method === "POST") {
       // MERGE-safe repair write: import a Loro update (never replaces the
       // doc). Same durability bookkeeping as a WS DocUpdate.
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
       const body = new Uint8Array(await request.arrayBuffer());
       const doc = await this.ensureDoc();
       try {
@@ -573,37 +538,6 @@ export class SessionRoom implements DurableObject {
         this.sendUpdates(ws, CrdtType.Loro, roomId, [body]);
       }
       return json({ ok: true });
-    }
-    if (url.pathname === "/reset-log" && request.method === "POST") {
-      // WEDGE BREAK: drop the persisted update log + snapshot so the NEXT cold
-      // `ensureDoc` starts from empty instead of replaying a log so large it
-      // exceeds the DO CPU limit and resets before any client can join (which
-      // also blocks the compaction that would have shrunk it — a permanent
-      // wedge). Deliberately does NOT call `ensureDoc`, so it stays cheap
-      // enough to land on an already-wedged DO. State is not lost: every engine
-      // holds the full workspace doc locally and re-uploads it on the next join
-      // (CRDT merge), exactly like the `ws3` fresh-namespace recovery. Presence
-      // is ephemeral and simply re-published. Owner/chatId meta are preserved.
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
-      const before = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
-        | number
-        | undefined;
-      this.dropLog();
-      this.doc?.free(); // release the wasm memory, don't wait on GC finalizers
-      this.doc = undefined; // force a fresh (empty) materialization next join
-      // Boot any currently-attached %LOR/%EPH sockets so their hung/half-cold
-      // sessions bail and reconnect into the now-empty doc.
-      for (const sock of this.ctx.getWebSockets()) {
-        try {
-          sock.close(4410, "room reset");
-        } catch {
-          /* already gone */
-        }
-      }
-      return json({ ok: true, clearedUpdateRows: before ?? 0 });
     }
     return new Response("not found", { status: 404 });
   }
@@ -735,20 +669,17 @@ export class SessionRoom implements DurableObject {
   }
 
   private async handleJoin(ws: WebSocket, state: SocketState, message: JoinRequest): Promise<void> {
-    if (!state.workspace) {
-      // Chat rooms: claim-on-first-join ownership, then owner-only forever.
-      const owner = this.getMeta("owner");
-      if (!owner) this.setMeta("owner", state.userId);
-      else if (owner !== state.userId) {
-        this.send(ws, {
-          type: MessageType.JoinError,
-          crdt: message.crdt,
-          roomId: message.roomId,
-          code: JoinErrorCode.AuthFailed,
-          message: "not the room owner"
-        });
-        return;
-      }
+    const owner = this.getMeta("owner");
+    if (!owner) this.setMeta("owner", state.userId);
+    else if (owner !== state.userId) {
+      this.send(ws, {
+        type: MessageType.JoinError,
+        crdt: message.crdt,
+        roomId: message.roomId,
+        code: JoinErrorCode.AuthFailed,
+        message: "not the room owner"
+      });
+      return;
     }
     if (!this.getMeta("chatId") && message.roomId) this.setMeta("chatId", message.roomId);
 
@@ -1093,7 +1024,7 @@ export class SessionRoom implements DurableObject {
       if (isLive(this.doc)) return this.doc;
       // Dangling wrapper (freed by a concurrent trim/release while another
       // flow still held the instance): drop it and rematerialize instead of
-      // handing every caller a guaranteed throw (the 2026-08-04 ws3 wedge).
+      // handing every caller a guaranteed throw.
       console.error(
         "cached doc was freed (dangling wrapper); rematerializing",
         `room=${this.getMeta("chatId") ?? "?"}`
@@ -1102,21 +1033,18 @@ export class SessionRoom implements DurableObject {
     }
     // AUTOMATED WEDGE BREAK: a cold replay that exceeds the DO CPU limit kills
     // the invocation before `replayAttempts` is cleared below — and every
-    // reconnecting client cold-starts the room into the same death, forever
-    // (the manual escape is POST /reset-log). Count consecutive replay deaths;
-    // past the limit, drop the log+snapshot exactly like /reset-log does.
+    // reconnecting client cold-starts the room into the same death forever.
+    // Count consecutive replay deaths; past the limit, drop the log and snapshot.
     // Recovery is by design lossless-enough: every engine holds the full doc
     // locally and re-uploads whatever the server lacks on its next join.
     const attempts = Number(this.getMeta("replayAttempts") ?? "0");
     if (attempts >= REPLAY_CRASH_LIMIT) {
       this.dropLog();
-      // Boot every attached socket, exactly like POST /reset-log. The
+      // Boot every attached socket after resetting persisted state. The
       // automated wedge break used to swap the doc out from UNDER live
       // sessions: their next writes carried deps the emptied doc lacks,
       // imports failed, clients burned their capped invalid-rejoin resyncs
-      // and then sat LATCHED — rows frozen on a healthy-looking socket
-      // (2026-08-04: work-metal's workspace status never updated again
-      // after the 20:16Z wedge-break while its chat rooms streamed fine).
+      // and then sat latched with a healthy-looking socket.
       // A close → redial → empty-VV join re-uploads full state instead.
       for (const sock of this.ctx.getWebSockets()) {
         try {
@@ -1130,9 +1058,8 @@ export class SessionRoom implements DurableObject {
     // INCIDENT (2026-07-30): a CPU-limit kill ROLLS BACK the event's
     // uncommitted storage writes — so the increment above died with every
     // crash, the count never reached the limit, and the wedge break never
-    // fired on the exact failure it was built for. The ws3 workspace room
-    // died 7 times in two minutes and then sat wedged for 3+ hours until a
-    // manual engine restart. sync() makes the count durable BEFORE the risky
+    // fired on the exact failure it was built for. sync() makes the count
+    // durable before the risky
     // replay below, so consecutive deaths are actually counted; clients
     // redialing on their join deadline (crates/sync/src/room.rs) supply the
     // attempts, and the room self-heals within REPLAY_CRASH_LIMIT dials.
@@ -1166,8 +1093,8 @@ export class SessionRoom implements DurableObject {
     // extra sync, cold path only. Deliberate consequence: a deterministic
     // POST-replay death (a doc so big its snapshot export blows the CPU
     // limit) gets no automatic wedge-break — destroying state over an export
-    // problem is worse than looping loudly. That class is watched via
-    // lastReplayMs creep and escaped manually with POST /reset-log.
+    // problem is worse than looping loudly. That class is watched through
+    // lastReplayMs telemetry.
     await this.ctx.storage.sync();
     // Cold-start telemetry (Workers Logs + /stats): the replay cost is the
     // wedge risk — watch lastReplayMs trend toward the CPU limit to catch the
@@ -1230,7 +1157,7 @@ export class SessionRoom implements DurableObject {
     this.doc = undefined;
   }
 
-  /** Drop the persisted update log + snapshot (the /reset-log storage clear):
+  /** Drop the persisted update log and snapshot during automated recovery:
    * the next materialization starts empty and engines re-upload state on
    * rejoin. Preserves owner/chatId meta. */
   private dropLog(): void {
@@ -1344,38 +1271,12 @@ export class SessionRoom implements DurableObject {
       (this.blobs.get("snapshot")?.length ?? 0) + Number(this.getMeta("updateBytes") ?? "0") >
       TRIM_FORCE_BYTES
     ) {
-      // Snapshot AND log bytes: after a wedge-break reset the re-uploaded
-      // full histories live as LOG ROWS against an empty snapshot (observed
-      // live: 0B snapshot + 119 rows replaying for 7 SECONDS), so a
-      // snapshot-only gate never fired while every cold start ballooned the
-      // heap with the same megabytes.
       // No aged checkpoint but the full history is already a heap hazard:
-      // trim at the current frontier (see TRIM_FORCE_BYTES).
-      // Any workspace-room generation (ws3/, ws4/, …) — matching the literal
-      // "ws3/" silently dropped this protection when fb6492c bumped the room
-      // name to ws4: the ws4 room force-trimmed at the LIVE frontier on
-      // 2026-08-05 02:37Z (and likely 00:55Z), stranding in-flight peers —
-      // the exact incident b019439 added this guard for. Chat rooms are bare
-      // UUIDs (hex — never a "ws" prefix), so the pattern cannot collide.
-      if (/^ws\d+\//.test(this.getMeta("chatId") ?? "")) {
-        // WORKSPACE rooms: never force-trim at the LIVE frontier. Every
-        // device writes this doc concurrently, so a live-frontier shallow
-        // start orphans any peer whose next ops depend on history just
-        // discarded — their pushes InvalidUpdate forever and, worse, a
-        // post-wedge-break trim can shallow-lock the room before all
-        // engines finish re-uploading (2026-08-04: the 20:34Z force-trim
-        // froze on a partial rebuild; the whole fleet needed manual doc
-        // surgery to converge). Trim only at a checkpoint ≥1 day old —
-        // every recently-active device has passed it, and dropLog clears
-        // checkpoints, so a freshly reset room gets a full day of grace to
-        // re-form before any trim. Chat rooms (single-owner, the 2026-08-04
-        // whale imports) keep the immediate live-frontier trim.
-        const aged = checkpoints.filter((c) => now - c.at >= DAY_MS).pop();
-        if (!aged) return false;
-        frontiers = aged.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
-      } else {
-        frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
-      }
+      // trim the single-owner chat at its current frontier.
+      frontiers = doc.frontiers().map((f) => ({
+        peer: String(f.peer) as `${number}`,
+        counter: f.counter
+      }));
     } else {
       return false;
     }
@@ -1673,8 +1574,7 @@ export class SessionRoom implements DurableObject {
 
   /** Relay accepted updates to every other member socket via sendUpdates —
    * NOT a single pre-encoded frame. broadcast() used to encode the batch
-   * once, so a reassembled >256KB client push (a device re-uploading its
-   * full workspace history after a server reset) blew the loro-protocol
+   * once, so a reassembled >256KB client push blew the loro-protocol
    * message cap and NEVER reached peers live; they only converged via a
    * later rejoin backfill (2026-08-04, the last silent-staleness path). */
   private relayServerUpdate(crdt: CrdtType, roomId: string, updates: Uint8Array[]): void {

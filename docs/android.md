@@ -153,7 +153,7 @@ Android should use the existing mobile protocols rather than joining complete Lo
 4. **Relay RPC:** binary WebSocket to `/device/{deviceId}/ws?role=client&connId=...`, carrying `uleb128(header length) + header JSON + NDJSON RPC payload`.
 5. **Attachments:** relay RPC stages host-local uploads; authenticated R2 reads use `/attachments/{chatId}/{sha256}` before falling back to host relay chunks.
 
-There is no supported Loro JVM binding in the current Loro language set, but this is not a parity blocker: registry synchronization is JSON and mobile transcripts/commands already use edge projections. Do not add a WASM runtime or JNI bridge solely to reproduce legacy iOS fixtures.
+There is no supported Loro JVM binding in the current Loro language set, but this is not a parity blocker: registry synchronization is JSON and mobile transcripts and commands use edge projections.
 
 ### Local persistence
 

@@ -1,15 +1,20 @@
-//! Loaders: the jolt pulse loader, dotted activity orb, gradient matrix spinner, and boot
-//! splash content. All motion routes through `crate::motion` pure helpers, so
-//! the math is unit-tested and these elements are testable-by-compile.
+//! Loaders: the jolt pulse loader, terminal-style activity spinner, gradient matrix
+//! spinner, and boot splash content. All motion routes through `crate::motion`
+//! pure helpers, so the math is unit-tested and these elements are
+//! testable-by-compile.
 //!
 //! Rendering pattern: repeating loaders share leased clocks in `motion` so
 //! instances stay phase-locked and stop scheduling when unmounted. The compact
-//! activity orb is capped at 15fps; cell loaders animate inside fixed slots.
+//! activity spinner updates its isolated glyph view at 10fps; cell loaders
+//! animate inside fixed slots.
 //! Motion never shifts surrounding layout, while reduced motion snaps every
 //! loader to a static frame.
 
+use std::collections::HashMap;
+
 use gpui::{
-    AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, canvas, div, px,
+    AnyElement, App, AppContext, Context, EntityId, Global, Hsla, IntoElement, ParentElement,
+    Render, SharedString, Styled, WeakEntity, div, px,
 };
 
 use crate::motion::{self, GRADIENT_SPIN, JOLT_PULSE, PULSE_STAGGER, SPLASH_OUT};
@@ -76,65 +81,87 @@ pub fn jolt_loader(
 
 pub use jolt_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 
-/// Display-linked violet activity orb used while work is in progress.
+const ACTIVITY_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const ACTIVITY_SPINNER_FPS: f32 = 10.0;
+
+type ActivitySpinnerKey = (EntityId, SharedString);
+
+#[derive(Default)]
+struct ActivitySpinnerRegistry(HashMap<ActivitySpinnerKey, WeakEntity<ActivitySpinner>>);
+
+impl Global for ActivitySpinnerRegistry {}
+
+struct ActivitySpinner {
+    size_px: f32,
+    color: Hsla,
+    font_family: SharedString,
+}
+
+impl Render for ActivitySpinner {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let frame = activity_spinner_frame(motion::activity_spinner_elapsed(cx.entity_id(), cx));
+        div()
+            .size(px(self.size_px))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .font_family(self.font_family.clone())
+            .text_size(px(self.size_px))
+            .line_height(px(self.size_px))
+            .text_color(self.color)
+            .child(frame)
+    }
+}
+
+fn activity_spinner_frame(elapsed_secs: f32) -> &'static str {
+    let index = (elapsed_secs * ACTIVITY_SPINNER_FPS) as usize % ACTIVITY_SPINNER_FRAMES.len();
+    ACTIVITY_SPINNER_FRAMES[index]
+}
+
+/// A terminal-style activity spinner used while work is in progress.
 ///
-/// This is the compact connecting state from `thinking-orbs`: nearby drifting
-/// nodes wire themselves into a constellation carrying a bright packet.
-pub fn activity_orb(
+/// Each instance lives in its own GPUI view, so the shared 10fps clock
+/// invalidates only the glyph instead of the parent shell or settings view.
+/// Reduced motion renders the first glyph without scheduling updates.
+pub fn activity_spinner(
     key: impl Into<SharedString>,
     theme: &Theme,
     size_px: f32,
-    view: EntityId,
+    owner: EntityId,
     cx: &mut App,
 ) -> impl IntoElement {
-    let _key = key.into();
-    let orb_color = theme.code_text;
-    let time = if cx.reduce_motion() {
-        0.6
-    } else {
-        motion::activity_elapsed(view, cx) * jolt_proto::motion::ACTIVITY_WEB_SPEED
+    let registry_key = (owner, key.into());
+    let existing = {
+        let registry = cx.default_global::<ActivitySpinnerRegistry>();
+        registry.0.retain(|_, spinner| spinner.upgrade().is_some());
+        registry.0.get(&registry_key).and_then(WeakEntity::upgrade)
     };
-    let frame = jolt_proto::motion::activity_orb_frame(time, size_px);
 
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            for line in &frame.lines {
-                let mut builder = gpui::PathBuilder::stroke(px(line.width));
-                builder.move_to(gpui::point(
-                    bounds.left() + px(size_px * line.x1),
-                    bounds.top() + px(size_px * line.y1),
-                ));
-                builder.line_to(gpui::point(
-                    bounds.left() + px(size_px * line.x2),
-                    bounds.top() + px(size_px * line.y2),
-                ));
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, orb_color.opacity(line.opacity));
-                }
+    if let Some(spinner) = existing {
+        spinner.update(cx, |spinner, cx| {
+            if spinner.size_px != size_px
+                || spinner.color != theme.code_text
+                || spinner.font_family != theme.font_mono
+            {
+                spinner.size_px = size_px;
+                spinner.color = theme.code_text;
+                spinner.font_family = theme.font_mono.clone();
+                cx.notify();
             }
-            for dot in &frame.dots {
-                let radius = dot.radius.max(0.3);
-                let dot_bounds = gpui::Bounds::new(
-                    gpui::point(
-                        bounds.left() + px(size_px * dot.x - radius),
-                        bounds.top() + px(size_px * dot.y - radius),
-                    ),
-                    gpui::size(px(radius * 2.0), px(radius * 2.0)),
-                );
-                window.paint_quad(gpui::quad(
-                    dot_bounds,
-                    px(radius),
-                    orb_color.opacity(dot.opacity * (1.0 - dot.ink)),
-                    px(0.0),
-                    gpui::transparent_black(),
-                    gpui::BorderStyle::default(),
-                ));
-            }
-        },
-    )
-    .size(px(size_px))
-    .flex_none()
+        });
+        spinner
+    } else {
+        let spinner = cx.new(|_| ActivitySpinner {
+            size_px,
+            color: theme.code_text,
+            font_family: theme.font_mono.clone(),
+        });
+        cx.default_global::<ActivitySpinnerRegistry>()
+            .0
+            .insert(registry_key, spinner.downgrade());
+        spinner
+    }
 }
 
 /// The gradient matrix spinner: a 3×3 grid of round cells tinted per row from
@@ -257,5 +284,17 @@ const _: () = {
     assert!(SPLASH_OUT.delay_ms == 150);
     assert!(JOLT_PULSE.duration_ms == 2400);
     assert!(GRADIENT_SPIN.duration_ms == 750);
-    assert!(jolt_proto::motion::ACTIVITY_WEB_SPEED == 6.63);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_spinner_advances_at_glyph_cadence() {
+        assert_eq!(activity_spinner_frame(0.0), "⠋");
+        assert_eq!(activity_spinner_frame(0.11), "⠙");
+        assert_eq!(activity_spinner_frame(0.99), "⠏");
+        assert_eq!(activity_spinner_frame(1.01), "⠋");
+    }
+}

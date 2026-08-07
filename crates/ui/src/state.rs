@@ -3,8 +3,8 @@
 //!
 //! ## EngineHandle
 //! The UI talks the same typed RPC whether the engine is in-process or a separate
-//! daemon (docs/architecture.md). [`EngineHandle::bootstrap`] probes the localhost IPC
-//! port: if an engine is listening it connects over WebSocket
+//! daemon (docs/architecture.md). [`EngineHandle::bootstrap`] dials the localhost IPC
+//! port: if an engine completes the WebSocket handshake it connects
 //! ([`RemoteEngine`]); otherwise it embeds one via [`EngineCore::assemble`] and an
 //! in-memory RPC transport ([`InProcessEngine`]) — same envelopes, same dispatch.
 //!
@@ -28,8 +28,8 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use jolt_doc::{
-    QueuedPrompt, SessionMessageEntry, TranscriptDesync, TranscriptFrame, TranscriptManifest,
-    TranscriptPage, TranscriptWatchFrame,
+    QueuedPrompt, SessionMessageEntry, TranscriptDesync, TranscriptManifest, TranscriptPage,
+    TranscriptWatchFrame,
 };
 use jolt_engine::{Engine, EngineConfig, EngineSupervisor, ScopeKind, ScopeStatus};
 use jolt_proto::{
@@ -47,7 +47,7 @@ use jolt_rpc::{RpcClient, connect_ws, memory_client, methods};
 pub struct EngineBootConfig {
     /// Data directory for the embedded engine (`~/.jolt`).
     pub data_dir: PathBuf,
-    /// Localhost IPC port to probe / serve.
+    /// Localhost IPC port to dial / serve.
     pub ipc_port: u16,
     /// Edge base URL for the embedded engine.
     pub edge_url: String,
@@ -134,39 +134,34 @@ impl EngineBackend for RemoteEngine {
     }
 }
 
-/// Cheaply clonable handle to whichever backend won the probe.
+/// Cheaply clonable handle to whichever backend won bootstrap.
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<dyn EngineBackend>,
 }
 
 impl EngineHandle {
-    /// Probe the IPC port and connect (daemon listening) or embed (nothing there).
+    /// Dial the IPC port and connect (daemon listening) or embed (nothing there).
     /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
     /// tokio tasks.
     pub async fn bootstrap(config: EngineBootConfig) -> anyhow::Result<EngineHandle> {
         let url = format!("ws://127.0.0.1:{}", config.ipc_port);
-        let probe = tokio::time::timeout(
-            std::time::Duration::from_millis(750),
-            tokio::net::TcpStream::connect(("127.0.0.1", config.ipc_port)),
-        )
-        .await;
-        if matches!(probe, Ok(Ok(_))) {
-            tracing::info!(%url, "engine daemon detected; connecting");
-            match connect_ws(&url).await {
-                Ok(client) => {
-                    return Ok(EngineHandle {
-                        inner: Arc::new(RemoteEngine { client, url }),
-                    });
-                }
-                // Something is on the port but it is not an engine (or it is
-                // wedged). Fall through and embed: a stranger holding 27654
-                // should cost other viewports, not this window.
-                Err(err) => tracing::warn!(%url, error = %err, "not an engine; embedding instead"),
+        // Dial WebSocket directly. A separate TCP probe is redundant and makes
+        // the engine log a protocol warning when the probe disconnects without
+        // completing a WebSocket handshake.
+        match connect_ws(&url).await {
+            Ok(client) => {
+                tracing::info!(%url, "connected to engine daemon");
+                return Ok(EngineHandle {
+                    inner: Arc::new(RemoteEngine { client, url }),
+                });
             }
+            // Nothing is listening, or the process on the port is not a usable
+            // engine. Fall through and embed so it cannot hang this viewport.
+            Err(err) => tracing::debug!(%url, error = %err, "engine daemon unavailable"),
         }
 
-        tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
+        tracing::info!(data_dir = %config.data_dir.display(), "embedding engine");
         let engine_config = EngineConfig {
             data_dir: config.data_dir,
             edge_url: config.edge_url,
@@ -635,23 +630,6 @@ impl AppState {
         self.ack_pending_send_from_transcript();
     }
 
-    /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
-    /// diverged; the watch task resubscribes for a fresh reset.
-    pub fn apply_transcript_frame(
-        &mut self,
-        frame: TranscriptFrame,
-    ) -> Result<(), TranscriptDesync> {
-        jolt_doc::apply_transcript_frame(&mut self.transcript, frame)?;
-        if let Some(chat_id) = self.selected_chat.as_deref()
-            && let Some(echoes) = self.echoes.get_mut(chat_id)
-        {
-            let transcript = &self.transcript;
-            echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
-        }
-        self.ack_pending_send_from_transcript();
-        Ok(())
-    }
-
     /// Add an optimistic transcript echo (prompt or pending shell command).
     pub fn push_echo(&mut self, chat_id: &str, entry: SessionMessageEntry) {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
@@ -893,7 +871,7 @@ impl AppState {
 
     // ---- gpui glue ----
 
-    /// Kick off (or retry) the engine bootstrap: probe → connect-or-embed on
+    /// Kick off (or retry) the engine bootstrap: dial → connect-or-embed on
     /// tokio, then attach subscriptions. Safe to call again after `Failed`.
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
         let data_dir = config.data_dir.clone();
@@ -1311,6 +1289,7 @@ fn spawn_scope_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 return;
             }
         };
+        let mut received_status = false;
         while let Some(value) = rx.recv().await {
             let status: ScopeStatus = match serde_json::from_value(value) {
                 Ok(status) => status,
@@ -1319,6 +1298,7 @@ fn spawn_scope_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                     continue;
                 }
             };
+            received_status = true;
             if this
                 .update(cx, |state, cx| {
                     let changed = state.scope.as_ref().map(|old| old.active) != Some(status.active);
@@ -1333,6 +1313,18 @@ fn spawn_scope_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
             {
                 break;
             }
+        }
+        // Account-only headless engines do not expose scope switching and
+        // reject this stream. RPC stream errors arrive as a closed receiver
+        // after subscribe succeeds, so treat a close before the first frame as
+        // unsupported.
+        if !received_status {
+            tracing::debug!("scope watch unsupported; continuing with the engine's fixed scope");
+            this.update(cx, |state, cx| {
+                state.connection = ConnectionStatus::Ready;
+                cx.notify();
+            })
+            .ok();
         }
     })
 }
@@ -1523,59 +1515,22 @@ fn spawn_transcript_watch(
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
             let params = serde_json::json!({ "chatId": chat_id });
-            let (mut rx, paged) = match handle
+            let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_TRANSCRIPT_V2, params.clone())
+                .subscribe(methods::WATCH_TRANSCRIPT_V2, params)
                 .await
             {
-                Ok(rx) => (rx, true),
-                Err(v2_error) => match handle
-                    .client()
-                    .subscribe(methods::WATCH_DOC_MESSAGES, params)
-                    .await
-                {
-                    Ok(rx) => {
-                        tracing::info!(%chat_id, %v2_error, "engine lacks paged transcripts; using compatibility watch");
-                        (rx, false)
-                    }
-                    Err(err) => {
-                        tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
-                        if this.update(cx, |_, _| {}).is_err() {
-                            return;
-                        }
-                        cx.background_executor().timer(RETRY_DELAY).await;
-                        continue 'resubscribe;
-                    }
-                },
-            };
-            while let Some(value) = rx.recv().await {
-                if !paged {
-                    let frame: TranscriptFrame = match serde_json::from_value(value) {
-                        Ok(frame) => frame,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "malformed compatibility transcript frame; resubscribing");
-                            cx.background_executor().timer(RETRY_DELAY).await;
-                            continue 'resubscribe;
-                        }
-                    };
-                    let mut desync = false;
-                    let alive = this.update(cx, |state, cx| {
-                        if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                            if state.apply_transcript_frame(frame).is_err() {
-                                desync = true;
-                            } else {
-                                cx.notify();
-                            }
-                        }
-                    });
-                    if alive.is_err() {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
                         return;
                     }
-                    if desync {
-                        continue 'resubscribe;
-                    }
-                    continue;
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
                 }
+            };
+            while let Some(value) = rx.recv().await {
                 let frame: TranscriptWatchFrame = match serde_json::from_value(value) {
                     Ok(frame) => frame,
                     Err(err) => {
@@ -1700,10 +1655,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_stranger_on_the_ipc_port_does_not_wedge_the_window() {
-        // The port probe only proves *something* is listening. A process that
-        // accepts TCP and never speaks WebSocket used to hang the dial forever;
-        // now it times out and we embed instead, losing only the ability to
-        // serve other viewports.
+        // A process that accepts TCP and never speaks WebSocket used to hang
+        // the dial forever; now it times out and we embed instead, losing only
+        // the ability to serve other viewports.
         let squatter = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();

@@ -1,6 +1,5 @@
-// Registry room client — a Swift port of crates/sync/src/registry.rs, the
-// text-frame sibling of RoomClient (which still carries the Loro session
-// docs). JSON text frames over one WebSocket to /registry/{orgId}/ws:
+// Registry room client — a Swift port of crates/sync/src/registry.rs.
+// JSON text frames travel over one WebSocket to /registry/{orgId}/ws:
 // hello/cursor handshake, push/ack for pending op batches, merged-row
 // broadcasts, presence beats, probe/redial liveness, reconnect with backoff.
 //
@@ -104,7 +103,7 @@ actor RegistryClient {
         await pushPending()
     }
 
-    /// Foreground hook (the registry twin of RoomClient.kick): suspension
+    /// Foreground hook: suspension
     /// kills the socket without running any failure path. A dead or unjoined
     /// session redials NOW on fresh backoff; a joined one gets an immediate
     /// deadline-checked probe (post-suspend sockets are half-open more often

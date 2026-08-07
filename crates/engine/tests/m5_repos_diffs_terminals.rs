@@ -9,8 +9,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use jolt_engine::doc_host::EdgeConfig;
-use jolt_engine::{EngineCore, HarnessRegistry, Repos, Terminals, capture_diff};
-use jolt_proto::TerminalEvent;
+use jolt_engine::{EngineCore, HarnessRegistry, Repos, TerminalOutput, Terminals, capture_diff};
 use jolt_rpc::methods;
 
 // ---------------------------------------------------------------------------
@@ -64,11 +63,11 @@ fn assemble(dir: &Path) -> EngineCore {
     core
 }
 
-fn decoded(events: &[TerminalEvent]) -> String {
+fn decoded(events: &[TerminalOutput]) -> String {
     let mut out = Vec::new();
     for event in events {
-        if let TerminalEvent::Data { data, .. } = event {
-            out.extend(BASE64.decode(data).expect("valid base64"));
+        if let TerminalOutput::Data { data, .. } = event {
+            out.extend_from_slice(data);
         }
     }
     String::from_utf8_lossy(&out).to_string()
@@ -77,9 +76,9 @@ fn decoded(events: &[TerminalEvent]) -> String {
 /// Drain a terminal subscription until `predicate` matches the decoded transcript
 /// (or the deadline hits).
 async fn drain_until(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalEvent>,
-    events: &mut Vec<TerminalEvent>,
-    predicate: impl Fn(&[TerminalEvent]) -> bool,
+    rx: &mut tokio::sync::mpsc::Receiver<TerminalOutput>,
+    events: &mut Vec<TerminalOutput>,
+    predicate: impl Fn(&[TerminalOutput]) -> bool,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while !predicate(events) {
@@ -670,7 +669,9 @@ async fn terminal_e2e_replay_live_resize_exit() {
     assert_eq!(session.cwd, tmp.path().to_string_lossy());
 
     // Live subscribe, then run a command whose OUTPUT differs from the echoed input.
-    let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
+    let mut rx = terminals
+        .subscribe_output(&session.id, None)
+        .expect("subscribe");
     let mut events = Vec::new();
     terminals
         .write(&session.id, &BASE64.encode("echo m4rk3r-$((40+2))\n"))
@@ -692,7 +693,7 @@ async fn terminal_e2e_replay_live_resize_exit() {
         .write(&session.id, &BASE64.encode("echo aft3r-$((10+1))\n"))
         .expect("write");
     let mut rx2 = terminals
-        .subscribe(&session.id, None)
+        .subscribe_output(&session.id, None)
         .expect("re-subscribe");
     let mut events2 = Vec::new();
     drain_until(&mut rx2, &mut events2, |events| {
@@ -701,17 +702,13 @@ async fn terminal_e2e_replay_live_resize_exit() {
     })
     .await;
     // The replay was re-delivered from seq 0 — first event seq is 1.
-    let first_seq = match events2.first().expect("replayed events") {
-        TerminalEvent::Data { seq, .. } | TerminalEvent::Exit { seq, .. } => *seq,
-    };
+    let first_seq = events2.first().expect("replayed events").seq();
     assert_eq!(first_seq, 1);
 
     // afterSeq resume skips already-seen events.
-    let last_seen = match events2.last().expect("events") {
-        TerminalEvent::Data { seq, .. } | TerminalEvent::Exit { seq, .. } => *seq,
-    };
+    let last_seen = events2.last().expect("events").seq();
     let mut rx3 = terminals
-        .subscribe(&session.id, Some(last_seen))
+        .subscribe_output(&session.id, Some(last_seen))
         .expect("resume");
 
     // Exit: shell terminates, Exit event lands on every live stream, streams end.
@@ -722,18 +719,18 @@ async fn terminal_e2e_replay_live_resize_exit() {
     drain_until(&mut rx3, &mut events3, |events| {
         events
             .iter()
-            .any(|e| matches!(e, TerminalEvent::Exit { .. }))
+            .any(|e| matches!(e, TerminalOutput::Exit { .. }))
     })
     .await;
     match events3.last().expect("exit event") {
-        TerminalEvent::Exit { exit_code, .. } => assert_eq!(*exit_code, 3),
+        TerminalOutput::Exit { exit_code, .. } => assert_eq!(*exit_code, 3),
         other => panic!("expected exit last, got {other:?}"),
     }
     assert!(rx3.recv().await.is_none(), "stream ends after exit");
 
     // Exited-session replay: subscribe again → full replay then immediate end.
     let mut rx4 = terminals
-        .subscribe(&session.id, None)
+        .subscribe_output(&session.id, None)
         .expect("post-exit subscribe");
     let mut events4 = Vec::new();
     while let Some(event) = rx4.recv().await {
@@ -742,7 +739,7 @@ async fn terminal_e2e_replay_live_resize_exit() {
     assert!(decoded(&events4).contains("m4rk3r-42"));
     assert!(matches!(
         events4.last(),
-        Some(TerminalEvent::Exit { exit_code: 3, .. })
+        Some(TerminalOutput::Exit { exit_code: 3, .. })
     ));
 
     // Writes to an exited terminal fail; close removes it entirely.
@@ -753,7 +750,7 @@ async fn terminal_e2e_replay_live_resize_exit() {
     );
     terminals.close(&session.id).expect("close");
     assert!(
-        terminals.subscribe(&session.id, None).is_err(),
+        terminals.subscribe_output(&session.id, None).is_err(),
         "closed terminal is gone"
     );
 }
@@ -771,12 +768,14 @@ async fn terminal_launch_command_runs_in_the_session_directory() {
             Some("printf 'custom-launch:'; pwd; exit 7"),
         )
         .expect("open custom command");
-    let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
+    let mut rx = terminals
+        .subscribe_output(&session.id, None)
+        .expect("subscribe");
     let mut events = Vec::new();
     drain_until(&mut rx, &mut events, |events| {
         events
             .iter()
-            .any(|event| matches!(event, TerminalEvent::Exit { .. }))
+            .any(|event| matches!(event, TerminalOutput::Exit { .. }))
     })
     .await;
     let cwd = tmp.path().canonicalize().expect("canonical cwd");
@@ -787,7 +786,7 @@ async fn terminal_launch_command_runs_in_the_session_directory() {
     );
     assert!(matches!(
         events.last(),
-        Some(TerminalEvent::Exit { exit_code: 7, .. })
+        Some(TerminalOutput::Exit { exit_code: 7, .. })
     ));
     terminals.close(&session.id).expect("close");
 }
@@ -1066,12 +1065,12 @@ async fn rpc_dispatch_for_m5_methods() {
     assert_eq!(session["cwd"], repo_path);
 
     let mut stream = client
-        .subscribe(
-            methods::SUBSCRIBE_TERMINAL,
+        .subscribe_binary(
+            methods::SUBSCRIBE_TERMINAL_V2,
             serde_json::json!({ "terminalId": terminal_id }),
         )
         .await
-        .expect("SubscribeTerminal");
+        .expect("SubscribeTerminalV2");
     client
         .call(
             methods::WRITE_TERMINAL,
@@ -1085,15 +1084,14 @@ async fn rpc_dispatch_for_m5_methods() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut transcript = Vec::new();
     loop {
-        let item = tokio::time::timeout_at(deadline, stream.recv())
+        let bytes = tokio::time::timeout_at(deadline, stream.recv())
             .await
             .expect("terminal output before timeout")
             .expect("stream alive");
-        if item["type"] == "data" {
-            let bytes = BASE64
-                .decode(item["data"].as_str().expect("data"))
-                .expect("valid base64");
-            transcript.extend(bytes);
+        if let jolt_rpc::terminal_wire::TerminalBinaryEvent::Data { data, .. } =
+            jolt_rpc::terminal_wire::decode(&bytes).expect("valid terminal frame")
+        {
+            transcript.extend(data);
         }
         if String::from_utf8_lossy(&transcript).contains("rpc-t3st-9") {
             break;

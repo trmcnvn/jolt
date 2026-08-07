@@ -29,6 +29,21 @@ fn pass(message: &str) {
     println!("PASS: {message}");
 }
 
+fn complete_assistant(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    match value {
+        serde_json::Value::Array(values) => values.iter().find_map(complete_assistant),
+        serde_json::Value::Object(fields) => {
+            if fields.get("role").and_then(|value| value.as_str()) == Some("assistant")
+                && fields.get("status").and_then(|value| value.as_str()) == Some("complete")
+            {
+                return Some(value);
+            }
+            fields.values().find_map(complete_assistant)
+        }
+        _ => None,
+    }
+}
+
 async fn device_id(client: &RpcClient, label: &str) -> String {
     match client
         .call(methods::LOCAL_DEVICE, serde_json::json!({}))
@@ -212,14 +227,11 @@ async fn main() {
     // 5a. Assistant entry executed by A arrives back on B, complete, with the mock text.
     let (by_device, text) = wait_stream(
         &b,
-        methods::WATCH_DOC_MESSAGES,
+        methods::WATCH_TRANSCRIPT_V2,
         serde_json::json!({ "chatId": chat_id }),
         "assistant transcript on B",
         |item| {
-            let entry = item.as_array()?.iter().find(|entry| {
-                entry.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                    && entry.get("status").and_then(|v| v.as_str()) == Some("complete")
-            })?;
+            let entry = complete_assistant(item)?;
             let device = entry.get("deviceId")?.as_str()?.to_string();
             let text = entry.to_string();
             Some((device, text))

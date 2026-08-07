@@ -89,44 +89,6 @@ struct SheetSelectionIndicator: View {
     }
 }
 
-/// Navigation-style row: title + trailing detail + chevron.
-struct SheetLinkRow: View {
-    let title: String
-    var detail: String?
-    var systemImage: String?
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                if let systemImage {
-                    Image(systemName: systemImage)
-                        .font(.system(size: 15))
-                        .foregroundStyle(Theme.textMuted)
-                        .frame(width: 22)
-                }
-                Text(title)
-                    .font(Theme.sans(15))
-                    .foregroundStyle(Theme.text)
-                Spacer(minLength: 8)
-                if let detail {
-                    Text(detail)
-                        .font(Theme.sans(14))
-                        .foregroundStyle(Theme.textMuted)
-                        .lineLimit(1)
-                }
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Theme.textFaint)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(SheetRowButtonStyle())
-    }
-}
-
 /// Uppercase tracked section label above a card.
 struct SheetLabel: View {
     let text: String

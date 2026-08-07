@@ -19,6 +19,7 @@ use crate::composer;
 #[cfg(any(debug_assertions, feature = "debug-ui"))]
 use crate::debug::TogglePerformanceHud;
 use crate::settings::{KeymapConfig, ShortcutId, platform_combo};
+use crate::shell::SearchTranscriptPalette;
 
 actions!(
     jolt,
@@ -148,6 +149,8 @@ pub fn app_menus() -> Vec<Menu> {
             MenuItem::os_action("Paste", composer::Paste, OsAction::Paste),
             MenuItem::separator(),
             MenuItem::os_action("Select All", composer::SelectAll, OsAction::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("Find in Transcript", SearchTranscriptPalette),
         ]),
     ];
     // Appearance lives under View on every platform — it is the only View verb

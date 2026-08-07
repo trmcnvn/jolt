@@ -37,21 +37,12 @@ func withAttachments(text: String, uploads: [UploadedAttachment]) -> String {
     return "\(body)\n\nAttached images (local files — open them to view):\n\(refs)"
 }
 
-/// Legacy path-only transport retained for old call sites and compatibility
-/// tests. New uploads should always use the content-addressed overload above.
-func withAttachments(text: String, paths: [String]) -> String {
-    guard !paths.isEmpty else { return text }
-    let body = text.isEmpty ? attachmentOnlyText : text
-    let refs = paths.map { "- \($0)" }.joined(separator: "\n")
-    return "\(body)\n\nAttached images (local files — open them to view):\n\(refs)"
-}
-
 /// An attachment ref parsed back out of a user message's text.
 struct UserImageAttachment: Identifiable, Hashable {
     let id: String
     let path: String
     let name: String
-    let sha256: String?
+    let sha256: String
 }
 
 struct ParsedUserMessage {
@@ -82,14 +73,13 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
         return ParsedUserMessage(text: content, attachments: [])
     }
     let refs = Array(lines[(markerIx + 1)...])
-    let parsedRefs = refs.enumerated().compactMap { offset, line -> (String, String?)? in
+    let parsedRefs = refs.enumerated().compactMap { offset, line -> (String, String)? in
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard trimmed.hasPrefix("- ") else { return nil }
         let path = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
         guard !path.isEmpty else { return nil }
-        let sha256 = refs.indices.contains(offset + 1)
-            ? parseAttachmentSHA256(refs[offset + 1])
-            : nil
+        guard refs.indices.contains(offset + 1),
+              let sha256 = parseAttachmentSHA256(refs[offset + 1]) else { return nil }
         return (path, sha256)
     }
     let attachments = parsedRefs.enumerated().map { index, ref in
@@ -270,7 +260,7 @@ func uploadAttachmentChunked(relay: DeviceRelayClient, chatId: String,
 
 /// Decoded transcript images keyed by `(deviceId, path)`. Content-addressed
 /// refs load from authenticated R2 first and fall back to the owning device's
-/// 45KB relay chunks; legacy path-only refs remain host-dependent. The cache is
+/// 45KB relay chunks. The cache is
 /// seeded after sends and bounded by an encoded-byte LRU budget.
 @MainActor
 @Observable
@@ -397,9 +387,8 @@ final class AttachmentImageCache {
     private static func readEdgeImage(config: AppConfig, chatId: String,
                                       attachment: UserImageAttachment)
         async -> (name: String, image: UIImage, bytes: Int)? {
-        guard let sha256 = attachment.sha256,
-              let token = await config.currentToken() else { return nil }
-        let url = config.edgeURL.appending(path: "attachments/\(chatId)/\(sha256)")
+        guard let token = await config.currentToken() else { return nil }
+        let url = config.edgeURL.appending(path: "attachments/\(chatId)/\(attachment.sha256)")
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         guard let (data, response) = try? await URLSession.shared.data(for: request),
@@ -416,7 +405,6 @@ final class AttachmentImageCache {
         async -> (name: String, image: UIImage, bytes: Int)? {
         struct Chunk: Decodable {
             var name: String
-            var mimeType: String
             var data: String
             var nextOffset: UInt64
             var done: Bool

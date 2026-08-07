@@ -1,11 +1,11 @@
-// Entity model — Swift mirrors of the workspace/session doc rows
-// (crates/doc/src/workspace.rs, schema.rs) and the derived display state
+// Entity model — Swift mirrors of workspace-registry and session-projection
+// rows plus their derived display state
 // (crates/ui/src/state.rs, entities.rs). Field names match the doc schema
 // exactly; derivations (indicator, staleness, attention rank) are ports.
 
 import Foundation
 
-// MARK: - Workspace doc rows
+// MARK: - Workspace registry rows
 
 struct DeviceRow: Identifiable, Hashable {
     var id: String
@@ -52,7 +52,6 @@ enum GoalStatus: String, Hashable, Codable {
 struct Goal: Hashable, Codable {
     var id: String
     var revision: UInt64
-    var controlNonce: String?
     var objective: String
     var status: GoalStatus
     var statusMessage: String?
@@ -289,7 +288,7 @@ enum RepoRefKind: String, Codable, Hashable {
 
 struct RepoRef: Codable, Hashable, Identifiable {
     var name: String
-    var revision: String? = nil
+    var revision: String
     var kind: RepoRefKind = .branch
     var current: Bool = false
     var worktreePath: String?
@@ -363,29 +362,6 @@ func hasShellPrefix(_ text: String) -> Bool {
 }
 
 let broPrompt = "Restate your last message. Stop using jargon and speak coherently. State it more simply and concisely, like one human talking to another."
-
-enum SessionCommandPayload {
-    case run(request: RunRequest, messageId: String)
-    case hiddenPrompt(request: RunRequest)
-    case queue(request: RunRequest, messageId: String)
-    case resumeQueue
-    case bash(command: String, excludeFromContext: Bool, cwd: String, messageId: String)
-    case steer(prompt: String, messageId: String?)
-    case interrupt
-    case respondInput(requestId: String, answers: [UserInputAnswer])
-
-    var kind: String {
-        switch self {
-        case .run, .hiddenPrompt: return "run"
-        case .queue: return "queue"
-        case .resumeQueue: return "resumeQueue"
-        case .bash: return "bash"
-        case .steer: return "steer"
-        case .interrupt: return "interrupt"
-        case .respondInput: return "respondInput"
-        }
-    }
-}
 
 func nowMs() -> Int64 {
     Int64(Date().timeIntervalSince1970 * 1000)

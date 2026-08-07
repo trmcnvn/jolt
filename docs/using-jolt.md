@@ -29,7 +29,7 @@ The owning engine detects whether the folder is under the selected version-contr
 
 ### Sessions
 
-A session is one durable conversation attached to a space. Its row records the host device, folder, checkout, harness configuration, title, activity, and seen state. The transcript and command queue live in a separate Loro document. After the first completed exchange, an untitled session is named asynchronously with an economy-tier model; a user rename always wins, and Jolt-created worktree branches can be renamed with the generated title.
+A session is one durable conversation attached to a space. Its row records the host device, folder, checkout, harness configuration, title, activity, and seen state. The transcript and command queue live in a separate Loro document. After the first completed exchange, an untitled session is named asynchronously with an economy-tier model; a user rename always wins, and Jolt-created worktree branches can be renamed with the generated title. The session-row context menu can regenerate an existing name through the same model path.
 
 The desktop shows an attention-sorted session list and device-local, cross-space tabs. Closing a tab only closes that local viewport; the synced session keeps running and remains in the sidebar. Archiving is an explicit session-row action. The searchable **Archived sessions** page opens from the user menu and restores archived sessions across devices.
 

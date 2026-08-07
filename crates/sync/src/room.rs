@@ -74,8 +74,7 @@ const SILENCE_LEASE: Duration = Duration::from_secs(40);
 /// on their own, wedging the actor with no session, no error, and no log
 /// line. Expiry maps to `SyncError::WebSocket` and the normal backoff redial.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// INCIDENT (2026-07-30): the workspace DO (`ws3/{orgId}/{userId}`) refused
-/// upgrades for ~3 minutes, then accepted sockets whose JoinRequests it never
+/// A room can refuse upgrades and then accept sockets whose JoinRequests it never
 /// processed. The ping→pong auto-response kept resetting the silence lease —
 /// pongs prove only that Cloudflare is up, never that the room is — and with
 /// `joined_lor` false nothing was ever pushed, so no binary frame arrived to

@@ -36,18 +36,6 @@ const MAX_READ_CHUNKS: usize = 1_000;
 /// The body used for image-only sends.
 pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
 
-/// How attachments ride the prompt: plain local paths appended to the text.
-/// The files are staged on the device
-/// that runs the agent, so the agent can open them with its own tools; the
-/// same text is what persists as the user doc entry.
-pub fn with_attachments(text: &str, paths: &[String]) -> String {
-    if paths.is_empty() {
-        return text.to_string();
-    }
-    let refs: Vec<String> = paths.iter().map(|p| format!("- {p}")).collect();
-    attachment_text(text, &refs)
-}
-
 /// A host-staged attachment and its chat-scoped edge content address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadedAttachment {
@@ -86,7 +74,7 @@ pub struct UserImageAttachment {
     pub id: String,
     pub path: String,
     pub name: String,
-    pub sha256: Option<String>,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +141,7 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
             }
             let sha256 = lines
                 .get(line_index + 1)
-                .and_then(|line| parse_attachment_sha256(line));
+                .and_then(|line| parse_attachment_sha256(line))?;
             Some((path.to_string(), sha256))
         })
         .enumerate()
@@ -722,22 +710,15 @@ pub fn lightbox(
 mod tests {
     use super::*;
 
-    #[test]
-    fn with_attachments_round_trips_through_parse() {
-        let paths = vec!["/data/uploads/ab-cat.png".to_string(), "/x/dog.jpg".into()];
-        let content = with_attachments("look at these", &paths);
-        let parsed = parse_user_message_images(&content);
-        assert_eq!(parsed.text, "look at these");
-        assert_eq!(parsed.attachments.len(), 2);
-        assert_eq!(parsed.attachments[0].path, "/data/uploads/ab-cat.png");
-        assert_eq!(parsed.attachments[0].name, "ab-cat.png");
-        assert_eq!(parsed.attachments[1].name, "dog.jpg");
-        assert_eq!(parsed.attachments[0].id, "0:/data/uploads/ab-cat.png");
-        assert_eq!(parsed.attachments[0].sha256, None);
+    fn uploaded(path: &str) -> UploadedAttachment {
+        UploadedAttachment {
+            path: path.into(),
+            sha256: "0123456789abcdef".repeat(4),
+        }
     }
 
     #[test]
-    fn uploaded_attachments_preserve_edge_hashes() {
+    fn uploaded_attachments_round_trip() {
         let hash = "0123456789abcdef".repeat(4);
         let content = with_uploaded_attachments(
             "look",
@@ -749,12 +730,12 @@ mod tests {
         let parsed = parse_user_message_images(&content);
         assert_eq!(parsed.text, "look");
         assert_eq!(parsed.attachments[0].path, "/data/uploads/cat.png");
-        assert_eq!(parsed.attachments[0].sha256.as_deref(), Some(hash.as_str()));
+        assert_eq!(parsed.attachments[0].sha256, hash);
     }
 
     #[test]
     fn image_only_send_hides_placeholder_body() {
-        let content = with_attachments("", &["/a/b.png".to_string()]);
+        let content = with_uploaded_attachments("", &[uploaded("/a/b.png")]);
         assert!(content.starts_with(ATTACHMENT_ONLY_TEXT));
         let parsed = parse_user_message_images(&content);
         assert_eq!(parsed.text, "");
@@ -763,7 +744,7 @@ mod tests {
 
     #[test]
     fn plain_text_passes_through_unchanged() {
-        assert_eq!(with_attachments("hello", &[]), "hello");
+        assert_eq!(with_uploaded_attachments("hello", &[]), "hello");
         let parsed = parse_user_message_images("hello\n\nno images here");
         assert!(parsed.attachments.is_empty());
         assert_eq!(parsed.text, "hello\n\nno images here");
@@ -772,7 +753,7 @@ mod tests {
     #[test]
     fn marker_is_case_insensitive_and_requires_ref_lines() {
         let parsed = parse_user_message_images(
-            "hi\n\nATTACHED IMAGES (local files — open them to view):\n- /p/q.png",
+            "hi\n\nATTACHED IMAGES (local files — open them to view):\n- /p/q.png\n  SHA-256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         );
         assert_eq!(parsed.attachments.len(), 1);
         // A trailer with no valid `- path` lines is left as plain text.
@@ -785,11 +766,11 @@ mod tests {
 
     #[test]
     fn rail_text_summarizes_image_only_sends() {
-        let one = with_attachments("", &["/a/b.png".to_string()]);
+        let one = with_uploaded_attachments("", &[uploaded("/a/b.png")]);
         assert_eq!(user_message_rail_text(&one), "Attached image");
-        let two = with_attachments("", &["/a/b.png".to_string(), "/c/d.png".into()]);
+        let two = with_uploaded_attachments("", &[uploaded("/a/b.png"), uploaded("/c/d.png")]);
         assert_eq!(user_message_rail_text(&two), "2 attached images");
-        let with_text = with_attachments("fix this", &["/a/b.png".to_string()]);
+        let with_text = with_uploaded_attachments("fix this", &[uploaded("/a/b.png")]);
         assert_eq!(user_message_rail_text(&with_text), "fix this");
         assert_eq!(user_message_rail_text("plain"), "plain");
     }

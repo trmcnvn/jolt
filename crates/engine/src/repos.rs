@@ -681,7 +681,7 @@ impl Repos {
         Ok(names
             .into_iter()
             .map(|name| RepoRef {
-                revision: Some(name.clone()),
+                revision: name.clone(),
                 kind: RepoRefKind::Branch,
                 current: current.as_deref() == Some(name.as_str()),
                 worktree_path: worktrees.get(&name).cloned(),
@@ -712,7 +712,7 @@ impl Repos {
                 (remote.is_empty() && !name.is_empty() && seen.insert(name.to_string())).then(
                     || RepoRef {
                         name: name.to_string(),
-                        revision: Some(name.to_string()),
+                        revision: name.to_string(),
                         kind: RepoRefKind::Bookmark,
                         current: false,
                         worktree_path: None,
@@ -751,11 +751,11 @@ impl Repos {
             let current = canonical == current_root;
             rows.push(RepoRef {
                 name: format!("Working copy · {workspace} · {change_id}"),
-                revision: Some(if current {
+                revision: if current {
                     "@".into()
                 } else {
                     format!("{workspace}@")
-                }),
+                },
                 kind: RepoRefKind::WorkingCopy,
                 current,
                 worktree_path: (!current).then(|| root.to_string()),
@@ -1569,7 +1569,7 @@ mod tests {
         let refs = repos.refs(&root).await.unwrap();
         let current = refs.iter().find(|row| row.current).unwrap();
         assert_eq!(current.kind, RepoRefKind::WorkingCopy);
-        assert_eq!(current.revision.as_deref(), Some("@"));
+        assert_eq!(current.revision, "@");
         assert!(current.name.starts_with("Working copy · default · "));
 
         let workspace = repos.create_worktree(&root, "@").await.unwrap();

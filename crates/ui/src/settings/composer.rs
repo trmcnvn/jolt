@@ -27,7 +27,7 @@ pub struct RememberedModel {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct ComposerDefaults {
     /// Last harness picked on the new-chat canvas.
     pub harness: Option<HarnessId>,

@@ -233,7 +233,7 @@ fn engine_config_from_env() -> jolt_engine::EngineConfig {
             .unwrap_or(27654),
         default_harness: harness_from_env(),
         // WorkOS mode: the signed-in session's org wins; JOLT_ORG_ID (dev
-        // default "dev-org") scopes the workspace room otherwise.
+        // default "dev-org") scopes the registry otherwise.
         org_id: std::env::var("JOLT_ORG_ID").ok(),
         // Real auth against production by default; see
         // `workos_client_id_from_env` for the dev-mode escape hatches.
@@ -260,7 +260,7 @@ fn dirs_data_dir() -> std::path::PathBuf {
 
 /// `jolt sync`: dial the running engine's IPC and print per-room sync state.
 /// The introspection surface every 2026-08 incident was missing — "is this
-/// device's workspace room actually receiving?" as a one-liner.
+/// device's registry and chat rooms actually receiving?" as a one-liner.
 async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
     let client = jolt_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
         .await

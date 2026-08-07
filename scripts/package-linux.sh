@@ -35,6 +35,7 @@ rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/jolt"
 install -m 644 "$ROOT/dist/jolt.desktop" "$STAGE/jolt.desktop"
+install -m 644 "$ROOT/dist/jolt-512.png" "$STAGE/jolt-512.png"
 install -m 644 "$ROOT/dist/jolt.png" "$STAGE/jolt.png"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
@@ -44,6 +45,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/jolt" "$HOME/.local/bin/jolt"
 install -Dm644 "$HERE/jolt.desktop" "$HOME/.local/share/applications/jolt.desktop"
+install -Dm644 "$HERE/jolt-512.png" "$HOME/.local/share/icons/hicolor/512x512/apps/jolt.png"
 install -Dm644 "$HERE/jolt.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/jolt.png"
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$HOME/.local/share/applications" || true

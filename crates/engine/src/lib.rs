@@ -62,15 +62,13 @@ pub use scopes::{AccountScope, ScopeKind, ScopeLayout, ScopeStatus};
 pub use secrets::{HarnessSecrets, SecretsError};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
-pub use terminals::Terminals;
+pub use terminals::{TerminalOutput, Terminals};
 pub use titles::TitleGenerator;
 pub use turn_diffs::TurnDiffStore;
 pub use uploads::{AttachmentChunk, CommittedAttachment, Uploads};
 pub use usage::UsageStore;
 pub use vcs::Vcs;
-pub use workspace_host::{
-    DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
-};
+pub use workspace_host::{DEFAULT_ORG_ID, DEFAULT_USER_ID, WorkspaceHost, WorkspaceHostConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -189,13 +187,14 @@ impl EngineCore {
         user_id: &str,
     ) -> Result<Self, EngineError> {
         let identity_dir = data_dir
-            .join("orgs")
+            .join("scopes")
+            .join("accounts")
             .join(sanitize_path_id(org_id))
             .join(sanitize_path_id(user_id));
         Self::assemble_in_scope(
             data_dir,
             &identity_dir,
-            data_dir,
+            &identity_dir,
             data_dir,
             registry,
             default_harness,
@@ -688,7 +687,7 @@ impl EngineSupervisor {
             return Ok(());
         }
         let (org_id, user_id) = self.account_identity()?;
-        let scope = ScopeLayout::new(&self.config.data_dir).migrate_account(&org_id, &user_id)?;
+        let scope = ScopeLayout::new(&self.config.data_dir).ensure_account(&org_id, &user_id)?;
         let device_id = load_or_create_device_id(&scope.dir)?;
         let edge = Some(
             EdgeConfig::new(self.config.edge_url.clone(), Arc::new(self.auth.clone()))
@@ -1038,7 +1037,7 @@ impl Engine {
         let user_id = auth
             .user_id()
             .ok_or_else(|| anyhow::anyhow!("headless mode requires an account"))?;
-        let scope = ScopeLayout::new(&config.data_dir).migrate_account(&org_id, &user_id)?;
+        let scope = ScopeLayout::new(&config.data_dir).ensure_account(&org_id, &user_id)?;
         let device_id = load_or_create_device_id(&scope.dir)?;
         let edge =
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id);
@@ -1239,7 +1238,7 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Filesystem-safe form of an org/user id (path segments for `orgs/{org}/{user}/`).
+/// Filesystem-safe form of an organization or user ID.
 fn sanitize_path_id(id: &str) -> String {
     id.chars()
         .map(|c| {
@@ -1252,7 +1251,7 @@ fn sanitize_path_id(id: &str) -> String {
         .collect()
 }
 
-/// Stable per-installation device id, persisted at `{data_dir}/device-id`.
+/// Stable per-scope device ID, persisted at `{scope_dir}/device-id`.
 fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
     let path = data_dir.join("device-id");
     match std::fs::read_to_string(&path) {
@@ -1270,9 +1269,9 @@ mod supervisor_tests {
     use super::*;
 
     #[tokio::test]
-    async fn existing_account_is_moved_and_coexists_with_local() {
+    async fn existing_account_coexists_with_local() {
         let dir = tempfile::tempdir().unwrap();
-        let legacy = EngineCore::assemble_with_identity(
+        let existing = EngineCore::assemble_with_identity(
             dir.path(),
             Arc::new(default_registry()),
             HarnessId::Mock,
@@ -1281,9 +1280,9 @@ mod supervisor_tests {
             "user-1",
         )
         .unwrap();
-        let account_device = legacy.device_id.clone();
-        legacy.shutdown().await;
-        drop(legacy);
+        let account_device = existing.device_id.clone();
+        existing.shutdown().await;
+        drop(existing);
         std::fs::write(
             dir.path().join("session.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -1320,7 +1319,6 @@ mod supervisor_tests {
         .expect("Account runtime booted")
         .unwrap();
         assert_eq!(account_local_device["deviceId"], account_device);
-        assert!(!dir.path().join("orgs/org-1/user-1").exists());
         assert!(
             dir.path()
                 .join("scopes/accounts/org-1/user-1/docs.sqlite3")

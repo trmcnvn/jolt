@@ -32,7 +32,6 @@ pub enum GoalPauseSource {
 pub struct Goal {
     pub id: String,
     pub revision: u64,
-    pub control_nonce: String,
     pub objective: String,
     pub status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,10 +314,8 @@ pub struct Repo {
 #[serde(rename_all = "camelCase")]
 pub struct RepoRef {
     pub name: String,
-    /// Backend-specific revision passed back to switch/create operations. The
-    /// display name is used when absent (legacy Git peers).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision: Option<String>,
+    /// Backend-specific revision passed back to switch/create operations.
+    pub revision: String,
     #[serde(default)]
     pub kind: RepoRefKind,
     /// Checked out in the repo's MAIN folder right now.
@@ -509,22 +506,6 @@ pub struct TerminalSession {
     pub cwd: String,
     /// Shell basename (`zsh`, `bash`, …) for the tab label.
     pub shell: String,
-}
-
-/// One `SubscribeTerminal` stream item. `seq` is a per-terminal monotonic counter
-/// used for replay resumption (`afterSeq`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum TerminalEvent {
-    /// Output chunk; `data` is base64 (PTY output is raw bytes, not valid UTF-8).
-    Data { seq: u64, data: String },
-    #[serde(rename_all = "camelCase")]
-    Exit {
-        seq: u64,
-        exit_code: i32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        signal: Option<String>,
-    },
 }
 
 #[cfg(test)]

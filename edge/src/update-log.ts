@@ -10,22 +10,15 @@
  *
  * An update wider than CHUNK_BYTES is stored as consecutive rows, the first
  * with cont=0 and the rest with cont=1; replay reassembles by concatenating
- * each cont=0 row with its cont=1 followers. Rows written before the `cont`
- * column existed read back as cont=0 (ALTER's DEFAULT), i.e. one update per
- * row — exactly what they were.
+ * each cont=0 row with its cont=1 followers.
  */
 import { CHUNK_BYTES } from "./blobs";
 
-/** Create the log table (or add `cont` to a pre-chunking one). */
+/** Create the update-log table. */
 export const ensureUpdateLog = (sql: SqlStorage): void => {
   sql.exec(
     "CREATE TABLE IF NOT EXISTS updates (seq INTEGER PRIMARY KEY AUTOINCREMENT, bytes BLOB NOT NULL, received_at INTEGER NOT NULL, cont INTEGER NOT NULL DEFAULT 0)"
   );
-  try {
-    sql.exec("ALTER TABLE updates ADD COLUMN cont INTEGER NOT NULL DEFAULT 0");
-  } catch {
-    /* column already exists (fresh table above, or already migrated) */
-  }
 };
 
 /** Append one logical update as one or more rows, none above the row cap. */

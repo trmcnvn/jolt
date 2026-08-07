@@ -11,9 +11,9 @@
 //!   codes `host_offline`, `host_closed`, `client_gone`, `client_closed`;
 //! - nudge frames use kind [`NUDGE_KIND`] with payload `{"chatId": …}`.
 //!
-//! The RPC path multiplexes NOTHING new: each distinct client `connId` becomes a virtual
-//! string-frame connection feeding the existing [`serve_connection`] seam, so every RPC
-//! handler works through the relay untouched.
+//! Each distinct client `connId` becomes a virtual [`WireFrame`] connection feeding
+//! the existing [`serve_connection`] seam. JSON control uses `rpc`; binary stream
+//! items use `rpc-bin`, and both remain byte-opaque to the relay.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::{RpcClient, RpcError, RpcService, serve_connection};
+use crate::{RpcClient, RpcError, RpcService, WireFrame, serve_connection};
 
 /// Relay-emitted control frames. MUST byte-match the DO's `RELAY_KIND` (yes, it has a
 /// leading space — clients compare with equality; a mismatch makes host_offline invisible).
@@ -34,6 +34,8 @@ pub const RELAY_KIND: &str = " relay";
 pub const NUDGE_KIND: &str = "nudge";
 /// The RPC stream over the relay: both `s` (stream id) and `k` (kind) are `"rpc"`.
 pub const RPC_KIND: &str = "rpc";
+/// Binary items belonging to the same multiplexed RPC connection.
+pub const RPC_BINARY_KIND: &str = "rpc-bin";
 
 /// Relay error codes (payload `{"error": code}` on [`RELAY_KIND`] frames).
 pub const HOST_OFFLINE: &str = "host_offline";
@@ -322,7 +324,7 @@ fn jitter() -> Duration {
     Duration::from_millis(u64::from(nanos) % 2_000)
 }
 
-/// One per-client virtual connection: `in_tx` feeds the ndjson dispatch loop
+/// One per-client virtual connection: `in_tx` feeds the RPC dispatch loop
 /// ([`serve_connection`]); its replies are pumped back as `{to: connId}` frames.
 ///
 /// Teardown is by channel closure, NOT task abort: dropping `in_tx` ends the dispatch
@@ -330,7 +332,7 @@ fn jitter() -> Duration {
 /// drop and the pump task drains out. Aborting the dispatch loop directly would strand
 /// the request tasks it spawned.
 struct VirtualConn {
-    in_tx: mpsc::Sender<String>,
+    in_tx: mpsc::Sender<WireFrame>,
 }
 
 fn make_virtual_conn(
@@ -338,13 +340,17 @@ fn make_virtual_conn(
     conn_id: String,
     host_out: mpsc::Sender<Vec<u8>>,
 ) -> VirtualConn {
-    let (in_tx, in_rx) = mpsc::channel::<String>(256);
-    let (srv_out_tx, mut srv_out_rx) = mpsc::channel::<String>(256);
+    let (in_tx, in_rx) = mpsc::channel::<WireFrame>(256);
+    let (srv_out_tx, mut srv_out_rx) = mpsc::channel::<WireFrame>(256);
     tokio::spawn(serve_connection(service, srv_out_tx, in_rx));
     tokio::spawn(async move {
-        while let Some(text) = srv_out_rx.recv().await {
-            let header = DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(conn_id.clone());
-            match encode_device_frame(&header, text.as_bytes()) {
+        while let Some(message) = srv_out_rx.recv().await {
+            let (kind, payload) = match &message {
+                WireFrame::Text(text) => (RPC_KIND, text.as_bytes()),
+                WireFrame::Binary(bytes) => (RPC_BINARY_KIND, bytes.as_slice()),
+            };
+            let header = DeviceFrameHeader::new(kind, kind).with_to(conn_id.clone());
+            match encode_device_frame(&header, payload) {
                 Ok(frame) => {
                     if host_out.send(frame).await.is_err() {
                         break; // relay socket gone
@@ -460,7 +466,7 @@ async fn handle_host_frame(
         }
         return;
     }
-    if header.k != RPC_KIND {
+    if header.k != RPC_KIND && header.k != RPC_BINARY_KIND {
         return; // future stream kinds (term, tunnel)
     }
     let Some(from) = header.from else {
@@ -469,8 +475,12 @@ async fn handle_host_frame(
     let conn = conns
         .entry(from.clone())
         .or_insert_with(|| make_virtual_conn(service.clone(), from, out_tx.clone()));
-    let text = String::from_utf8_lossy(&payload).into_owned();
-    if conn.in_tx.send(text).await.is_err() {
+    let message = if header.k == RPC_BINARY_KIND {
+        WireFrame::Binary(payload)
+    } else {
+        WireFrame::Text(String::from_utf8_lossy(&payload).into_owned())
+    };
+    if conn.in_tx.send(message).await.is_err() {
         tracing::warn!("device-room: virtual conn dispatch loop gone");
     }
 }
@@ -479,8 +489,8 @@ async fn handle_host_frame(
 // Client link
 // ---------------------------------------------------------------------------
 
-/// The client end: one WebSocket to a peer device's relay carrying a single RPC stream,
-/// exposed as an ordinary [`RpcClient`]. `host_offline` / `host_closed` relay frames (and
+/// The client end: one WebSocket to a peer device's relay carrying one multiplexed
+/// text/binary RPC connection, exposed as an ordinary [`RpcClient`]. `host_offline` / `host_closed` relay frames (and
 /// socket drops) mark the link down — in-flight calls fail with [`RpcError::Closed`] and
 /// [`LinkCache`] evicts the entry so the next call re-dials.
 pub struct DeviceLink {
@@ -495,8 +505,8 @@ impl DeviceLink {
             .await
             .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
         let (mut sink, mut stream) = ws.split();
-        let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
-        let (in_tx, in_rx) = mpsc::channel::<String>(256);
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(256);
+        let (in_tx, in_rx) = mpsc::channel::<WireFrame>(256);
         let (closed_tx, closed_rx) = watch::channel::<Option<String>>(None);
 
         let pump = tokio::spawn(async move {
@@ -507,9 +517,13 @@ impl DeviceLink {
             let reason = loop {
                 tokio::select! {
                     frame = out_rx.recv() => match frame {
-                        Some(text) => {
-                            let header = DeviceFrameHeader::new(RPC_KIND, RPC_KIND);
-                            let encoded = match encode_device_frame(&header, text.as_bytes()) {
+                        Some(message) => {
+                            let (kind, payload) = match &message {
+                                WireFrame::Text(text) => (RPC_KIND, text.as_bytes()),
+                                WireFrame::Binary(bytes) => (RPC_BINARY_KIND, bytes.as_slice()),
+                            };
+                            let header = DeviceFrameHeader::new(kind, kind);
+                            let encoded = match encode_device_frame(&header, payload) {
                                 Ok(bytes) => bytes,
                                 Err(err) => {
                                     tracing::error!(error = %err, "device-room: frame encode failed");
@@ -538,7 +552,12 @@ impl DeviceLink {
                                 }
                                 Ok((header, payload)) if header.k == RPC_KIND => {
                                     let text = String::from_utf8_lossy(&payload).into_owned();
-                                    if in_tx.send(text).await.is_err() {
+                                    if in_tx.send(WireFrame::Text(text)).await.is_err() {
+                                        break "client dropped".to_string();
+                                    }
+                                }
+                                Ok((header, payload)) if header.k == RPC_BINARY_KIND => {
+                                    if in_tx.send(WireFrame::Binary(payload)).await.is_err() {
                                         break "client dropped".to_string();
                                     }
                                 }

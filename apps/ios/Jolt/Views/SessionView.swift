@@ -42,7 +42,7 @@ struct SessionView: View {
                     }
             } else {
                 VStack(spacing: 12) {
-                    ActivityOrb(size: 32)
+                    ActivitySpinner(size: 32)
                     Text("Opening session…")
                         .font(Theme.sans(12))
                         .foregroundStyle(Theme.textFaint)
@@ -254,7 +254,7 @@ struct SessionView: View {
     }
 
     /// Reserved 24pt status strip (shell.rs render_status_strip) — queued
-    /// offline sends are explicit, Working shows the activity orb + rotating
+    /// offline sends are explicit, Working shows the activity spinner + rotating
     /// flavour word + elapsed, and Errored shows "Run failed". The strip always
     /// reserves its height so the composer never shifts.
     private func statusStrip(chat: Chat, status: SessionStatus?) -> some View {
@@ -268,7 +268,7 @@ struct SessionView: View {
                 } else {
                     switch status {
                     case .working:
-                        ActivityOrb(size: 14)
+                        ActivitySpinner(size: 14)
                         let startedAt = sessionStartedAt(chat: chat)
                         let elapsed = (nowMs() - startedAt) / 1000
                         if sessionRow(chat: chat)?.compacting == true {

@@ -34,6 +34,7 @@ use crate::debug::{PerformanceHud, TogglePerformanceHud};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT};
+use crate::pickers::Pickers;
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
@@ -62,8 +63,10 @@ use crate::transcript::{self, Transcript, TranscriptEvent};
 
 mod spaces;
 mod tabs;
+mod transcript_search;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog, SessionSearchFlow, SpacesMenu};
+use transcript_search::TranscriptSearchFlow;
 
 actions!(
     shell,
@@ -78,7 +81,8 @@ actions!(
         ToggleSidebar,
         ToggleChanges,
         AddSpacePalette,
-        SearchSessionsPalette
+        SearchSessionsPalette,
+        SearchTranscriptPalette
     ]
 );
 
@@ -176,6 +180,14 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
                 ShortcutId::NextTranscriptTurn.default_combo(),
             ),
             NextTranscriptTurn,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.search_transcript,
+                ShortcutId::SearchTranscript.default_combo(),
+            ),
+            SearchTranscriptPalette,
             None,
         ),
         KeyBinding::new(
@@ -698,6 +710,9 @@ pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// Independent copy of the composer's target-space picker for the empty
+    /// new-session canvas. It shares selection state, not the sidebar filter.
+    new_chat_space_picker: Entity<Pickers>,
     status_strip: Entity<SessionStatusStrip>,
     jump_to_bottom: Entity<JumpToBottom>,
     /// External file drag hovering the conversation column — shows the
@@ -745,6 +760,8 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     /// Session-title command center, opened from the sidebar or its hotkey.
     session_search: Option<SessionSearchFlow>,
+    /// Current-session transcript command center, opened with Cmd/Ctrl+F.
+    transcript_search: Option<TranscriptSearchFlow>,
     /// Searchable sidebar space filter, local to this viewport.
     spaces_menu: Option<SpacesMenu>,
     /// Outside-click dismissal guard for the filter trigger.
@@ -786,6 +803,7 @@ pub struct Shell {
     install: jolt_update::InstallKind,
     org: Option<OrgGateUi>,
     mutate_task: Option<Task<()>>,
+    regenerate_title_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
     /// Kept for the failed-gate "Retry" action.
     boot: EngineBootConfig,
@@ -850,6 +868,7 @@ pub struct Shell {
     /// Refreshes Claude and ChatGPT/Codex rate-limit windows in the background.
     _account_usage_task: Task<()>,
     _state_observation: Subscription,
+    _new_chat_space_picker_observation: Subscription,
     _composer_events: Subscription,
     _transcript_events: Subscription,
 }
@@ -869,6 +888,9 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let new_chat_space_picker = cx.new(|cx| Pickers::new(state.clone(), cx));
+        let new_chat_space_picker_observation =
+            cx.observe(&new_chat_space_picker, |_, _, cx| cx.notify());
         let status_strip = cx.new(|_| SessionStatusStrip {
             state: state.clone(),
             composer: composer.clone(),
@@ -992,7 +1014,6 @@ impl Shell {
         // real auth state (display-only — for styling passes).
         let debug_dialog = std::env::var("JOLT_OPEN_DIALOG").ok();
         let debug_gate = match std::env::var("JOLT_FORCE_GATE").ok().as_deref() {
-            Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
             Some("failed") => Some(GatePhase::Failed(
                 "Could not reach the Jolt engine on port 27901".into(),
@@ -1011,6 +1032,7 @@ impl Shell {
             state,
             transcript,
             composer,
+            new_chat_space_picker,
             status_strip,
             jump_to_bottom,
             file_drag_active: false,
@@ -1045,6 +1067,7 @@ impl Shell {
             delete_space_confirm: None,
             add_space: None,
             session_search: None,
+            transcript_search: None,
             spaces_menu: None,
             spaces_menu_dismissed_at: None,
             tab_hover: None,
@@ -1066,6 +1089,7 @@ impl Shell {
             install: jolt_update::detect_install(),
             org: None,
             mutate_task: None,
+            regenerate_title_task: None,
             auth_task: None,
             boot,
             data_dir,
@@ -1097,6 +1121,7 @@ impl Shell {
             _ticker: ticker,
             _account_usage_task: account_usage_task,
             _state_observation: observation,
+            _new_chat_space_picker_observation: new_chat_space_picker_observation,
             _composer_events: composer_events,
             _transcript_events: transcript_events,
         }
@@ -1122,22 +1147,11 @@ impl Shell {
             self.settings
                 .scope_navigation
                 .insert(scope_key(previous).into(), snapshot);
-        } else if self.settings.scope_navigation.is_empty()
-            && (snapshot.last_space_id.is_some()
-                || snapshot
-                    .open_tabs
-                    .as_ref()
-                    .is_some_and(|tabs| !tabs.is_empty()))
-        {
-            // Existing account-only installs have no scope map. If Account won
-            // splash resolution, assign navigation directly; a Local fallback
-            // preserves it as legacy until that account signs in again.
-            let key = if scope == jolt_engine::ScopeKind::Account {
-                "account"
-            } else {
-                "legacy-account"
-            };
-            self.settings.scope_navigation.insert(key.into(), snapshot);
+        } else {
+            self.settings
+                .scope_navigation
+                .entry(scope_key(scope).into())
+                .or_insert(snapshot);
         }
 
         let target = self
@@ -1145,16 +1159,6 @@ impl Shell {
             .scope_navigation
             .get(scope_key(scope))
             .cloned()
-            .or_else(|| {
-                (scope == jolt_engine::ScopeKind::Account)
-                    .then(|| {
-                        self.settings
-                            .scope_navigation
-                            .get("legacy-account")
-                            .cloned()
-                    })
-                    .flatten()
-            })
             .unwrap_or_default();
         self.settings.last_space_id = target.last_space_id;
         self.settings.open_tabs = target.open_tabs;
@@ -1172,6 +1176,7 @@ impl Shell {
         self.archived_page = None;
         self.add_space = None;
         self.session_search = None;
+        self.transcript_search = None;
         self.space_boot_applied = false;
         self.tabs_scrolled_to = None;
         self.schedule_save(cx);
@@ -1764,6 +1769,7 @@ impl Shell {
 
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.route = Route::Settings(section);
+        self.transcript_search = None;
         self.nav.push(NavEntry::Settings(section));
         self.sync_changes_watch(cx);
         self.user_menu_open = false;
@@ -1773,6 +1779,7 @@ impl Shell {
 
     fn open_archived(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Archived;
+        self.transcript_search = None;
         self.nav.push(NavEntry::Archived);
         self.sync_changes_watch(cx);
         self.user_menu_open = false;
@@ -1784,6 +1791,7 @@ impl Shell {
     /// same target resolver: sidebar filter, last active space, first space.
     fn open_new_session(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        self.transcript_search = None;
         self.nav.push(NavEntry::Chat(String::new()));
         self.user_menu_open = false;
         self.chat_menu = None;
@@ -2053,6 +2061,69 @@ impl Shell {
                 cx,
             );
         }
+        cx.notify();
+    }
+
+    fn regenerate_chat_title(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            crate::toast::show(
+                Toast::new(
+                    "regenerate-title-error",
+                    "Regenerate name failed",
+                    ToastKind::Error,
+                )
+                .body("The Jolt engine is not connected."),
+                cx,
+            );
+            return;
+        };
+        let Some(target_device_id) = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.device_id.clone())
+        else {
+            crate::toast::show(
+                Toast::new(
+                    "regenerate-title-error",
+                    "Regenerate name failed",
+                    ToastKind::Error,
+                )
+                .body("The session no longer exists."),
+                cx,
+            );
+            return;
+        };
+        self.regenerate_title_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::REGENERATE_CHAT_TITLE,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "targetDeviceId": target_device_id,
+                    }),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.regenerate_title_task = None;
+                if let Err(error) = result {
+                    crate::toast::show(
+                        Toast::new(
+                            "regenerate-title-error",
+                            "Regenerate name failed",
+                            ToastKind::Error,
+                        )
+                        .body(error.to_string()),
+                        cx,
+                    );
+                }
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
@@ -2612,7 +2683,7 @@ impl Shell {
     }
 
     /// One session row: status rail on the left
-    /// (a live dotted orb while working, a dot otherwise), title +
+    /// (a live text spinner while working, a dot otherwise), title +
     /// relative time on the first line, "folder · device" underneath aligned
     /// to the title. Click selects; right-click opens the context menu.
     #[allow(clippy::too_many_arguments)]
@@ -2631,7 +2702,7 @@ impl Shell {
     ) -> AnyElement {
         // Status is a rail, not a word, and is always present
         // so rows align and state changes read in place. Working animates as a
-        // compact dotted orb; every other status is a dot.
+        // compact text spinner; every other status is a dot.
         let dot_color = spaces::status_dot_color(status, theme);
         let status_rail: AnyElement = if status == jolt_proto::ChatIndicator::Working {
             div()
@@ -2640,7 +2711,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(loaders::activity_orb(
+                .child(loaders::activity_spinner(
                     format!("chat-working-{id}"),
                     theme,
                     16.0,
@@ -3958,6 +4029,7 @@ impl Shell {
 
         if let Some((chat_id, position)) = self.chat_menu.clone() {
             let rename_id = chat_id.clone();
+            let regenerate_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
@@ -3976,6 +4048,19 @@ impl Shell {
                         }))
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
+                )
+                .child(
+                    popover::menu_row(&theme, false, format!("chat-menu-regenerate-{chat_id}"))
+                        .id("chat-menu-regenerate")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.regenerate_chat_title(regenerate_id.clone(), cx)
+                        }))
+                        .child(
+                            icon(icons::REFRESH)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Regenerate name")),
                 )
                 .child(
                     popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
@@ -4062,6 +4147,9 @@ impl Shell {
             overlays.push(overlay);
         }
         if let Some(overlay) = self.render_session_search_overlay(viewport, window, cx) {
+            overlays.push(overlay);
+        }
+        if let Some(overlay) = self.render_transcript_search_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
 
@@ -4174,13 +4262,6 @@ impl Shell {
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
-        let space_label: Option<SharedString> = {
-            let state = self.state.read(cx);
-            state.selected_space_row().map(|space| {
-                let (device, _) = state.space_device_tag(space, Utc::now());
-                SharedString::from(format!("{} {device}", space.display_name()))
-            })
-        };
 
         // Content outlet: selected chat → transcript; nothing selected → the
         // "Send a message to start" canvas with a watermark; no spaces at all
@@ -4239,23 +4320,16 @@ impl Shell {
         } else {
             // New-chat canvas: the dim violet Jolt mark over the centered
             // helper line, naming the space the session will start in.
-            let helper: AnyElement = if let Some(space_label) = space_label {
+            let space_link = self
+                .new_chat_space_picker
+                .update(cx, |picker, cx| picker.render_new_chat_space_link(cx));
+            let helper: AnyElement = if let Some(space_link) = space_link {
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .child("Send a message to start a session in ")
-                    .child(
-                        div()
-                            .id("new-chat-space-selector")
-                            .underline()
-                            .cursor_pointer()
-                            .hover(|style| style.text_color(theme.text_muted.opacity(0.9)))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_spaces_dropdown(window, cx)
-                            }))
-                            .child(space_label),
-                    )
+                    .child(space_link)
                     .child(".")
                     .into_any_element()
             } else {
@@ -4539,95 +4613,36 @@ impl Shell {
 
     fn render_gate_card(&mut self, phase: &GatePhase, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let content: AnyElement = match phase {
-            // Backend unreachable: quiet centered copy (jolt Gate `Failed`),
-            // plus a Retry affordance (the native engine doesn't self-redial).
-            GatePhase::Failed(error) => div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(Theme::SPACE_MD))
-                .child(
-                    div()
-                        .text_size(px(14.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(error.clone())),
-                )
-                .child(
-                    div()
-                        .id("retry-engine")
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(theme.border)
-                        .text_size(px(13.0))
-                        .text_color(theme.text)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.glass_hover()))
-                        .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
-                        .child(SharedString::from("Retry")),
-                )
-                .into_any_element(),
-            // Login card centered on the grid: logo, copy, and a full-width
-            // white Log in button.
-            _ => div()
-                .w(px(360.0))
-                .px(px(32.0))
-                .py(px(40.0))
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.surface_card)
-                .shadow_lg()
-                .flex()
-                .flex_col()
-                .items_center()
-                .text_center()
-                .child(
-                    icon(icons::JOLT_LOGO)
-                        .size(px(36.0))
-                        .text_color(theme.code_text),
-                )
-                .child(
-                    div()
-                        .mt(px(24.0))
-                        .text_size(px(18.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.text)
-                        .child(SharedString::from("Log in to Jolt")),
-                )
-                .child(
-                    div()
-                        .mt(px(6.0))
-                        .mb(px(24.0))
-                        .text_size(px(13.0))
-                        .line_height(px(19.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(
-                            "This opens your browser to finish logging in — you'll come right back.",
-                        )),
-                )
-                .child(
-                    div()
-                        .id("sign-in")
-                        .w_full()
-                        .h(px(36.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.0))
-                        .bg(theme.text)
-                        .text_size(px(14.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.on_solid)
-                        .cursor_pointer()
-                        .hover(|s| s.opacity(0.9))
-                        .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
-                        .child(SharedString::from("Log in")),
-                )
-                .into_any_element(),
+        let GatePhase::Failed(error) = phase else {
+            unreachable!("only failed gates render the failure card");
         };
+        // Backend unreachable: quiet centered copy plus a Retry affordance.
+        let content = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(Theme::SPACE_MD))
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(error.clone())),
+            )
+            .child(
+                div()
+                    .id("retry-engine")
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(px(13.0))
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.glass_hover()))
+                    .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
+                    .child(SharedString::from("Retry")),
+            );
         div()
             .size_full()
             .relative()
@@ -4642,13 +4657,7 @@ impl Shell {
                     .justify_center()
                     // Keyed per phase so every gate swap replays the 0.5s
                     // entrance instead of mutating one animated element.
-                    .child(motion::fade_in(
-                        match phase {
-                            GatePhase::SignIn => "gate-card-signin",
-                            _ => "gate-card-failed",
-                        },
-                        div().child(content),
-                    )),
+                    .child(motion::fade_in("gate-card-failed", div().child(content))),
             )
             .into_any_element()
     }
@@ -4689,7 +4698,7 @@ impl Shell {
             .child(div().mt(px(10.0)).flex().items_center().gap(px(8.0)).when(
                 error.is_none(),
                 |el| {
-                    el.child(loaders::activity_orb(
+                    el.child(loaders::activity_spinner(
                         "account-setup-indicator",
                         &theme,
                         14.0,
@@ -4814,7 +4823,7 @@ impl Render for SessionStatusStrip {
 
         match indicator {
             Indicator::Working if compacting => strip
-                .child(loaders::activity_orb(
+                .child(loaders::activity_spinner(
                     "compacting-indicator",
                     &theme,
                     14.0,
@@ -4832,7 +4841,7 @@ impl Render for SessionStatusStrip {
                 let word =
                     transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
                 strip
-                    .child(loaders::activity_orb(
+                    .child(loaders::activity_spinner(
                         "working-indicator",
                         &theme,
                         14.0,
@@ -4858,7 +4867,7 @@ impl Render for SessionStatusStrip {
                 .child(SharedString::from("Run failed"))
                 .into_any_element(),
             Indicator::None if sending => strip
-                .child(loaders::activity_orb(
+                .child(loaders::activity_spinner(
                     "sending-indicator",
                     &theme,
                     14.0,
@@ -5292,7 +5301,8 @@ impl Render for Shell {
                     || this.rename_space_dialog.is_some()
                     || this.delete_space_confirm.is_some()
                     || this.add_space.is_some()
-                    || this.session_search.is_some();
+                    || this.session_search.is_some()
+                    || this.transcript_search.is_some();
                 if event.keystroke.key == "escape" && this.changes_expanded {
                     this.set_changes_expanded(false, cx);
                     cx.stop_propagation();
@@ -5391,6 +5401,14 @@ impl Render for Shell {
                     cx.notify();
                 } else {
                     this.open_session_search(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SearchTranscriptPalette, _, cx| {
+                if !matches!(this.route, Route::Chat) || this.state.read(cx).selected_chat.is_none()
+                {
+                    cx.propagate();
+                } else if this.transcript_search.is_none() {
+                    this.open_transcript_search(cx);
                 }
             }));
 
@@ -5596,7 +5614,7 @@ impl Render for Shell {
                 let card = self.render_org_gate(cx);
                 root.child(card)
             }
-            phase @ (GatePhase::Failed(_) | GatePhase::SignIn) => {
+            phase @ GatePhase::Failed(_) => {
                 let card = self.render_gate_card(phase, cx);
                 root.child(card)
             }

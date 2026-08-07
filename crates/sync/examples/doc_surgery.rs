@@ -1,9 +1,7 @@
-//! One-off recovery tool (untracked): inspect and repair chat/workspace docs
-//! in a docs.sqlite3 store. Modes:
-//!   dump-workspace    <data_dir>
-//!   inspect-workspace <data_dir> <chat_id>
-//!   inspect-chat      <data_dir> <chat_id>
-//!   cut-chat          <data_dir> <chat_id> <from_index>
+//! One-off recovery tool: inspect and repair chat documents in a docs.sqlite3
+//! store. Modes:
+//!   inspect-chat <data_dir> <chat_id>
+//!   cut-chat     <data_dir> <chat_id> <from_index>
 use jolt_doc::SessionDoc;
 use jolt_sync::DocsStore;
 use loro::{LoroDoc, ToJson};
@@ -25,22 +23,6 @@ fn main() {
     let store = DocsStore::open(data_dir).expect("open store");
 
     match mode {
-        "dump-workspace" => {
-            let doc = load_doc(&store, "workspace2");
-            let value = doc.get_deep_value().to_json_value();
-            println!("{}", serde_json::to_string_pretty(&value).unwrap());
-        }
-        "inspect-workspace" => {
-            let chat_id = args.get(3).expect("chat id");
-            let doc = load_doc(&store, "workspace2");
-            let value = doc.get_deep_value().to_json_value();
-            let row = value
-                .get("chats")
-                .and_then(|c| c.get(chat_id.as_str()))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            println!("{}", serde_json::to_string_pretty(&row).unwrap());
-        }
         "inspect-chat" => {
             let chat_id = args.get(3).expect("chat id");
             let doc = load_doc(&store, chat_id);
@@ -100,29 +82,6 @@ fn main() {
             println!(
                 "cut chat {chat_id}: removed entries [{from}..{len}), {} remain; snapshot saved ({} bytes)",
                 from,
-                bytes.len()
-            );
-        }
-        "set-preview" => {
-            let chat_id = args.get(3).expect("chat id");
-            let preview = args.get(4).expect("preview");
-            let at: i64 = args.get(5).expect("at ms").parse().expect("ms");
-            let doc = load_doc(&store, "workspace2");
-            let chats = doc.get_map("chats");
-            let row = match chats.get(chat_id) {
-                Some(loro::ValueOrContainer::Container(loro::Container::Map(m))) => m,
-                _ => panic!("no chat row {chat_id}"),
-            };
-            row.insert("lastMessagePreview", preview.as_str())
-                .expect("preview");
-            row.insert("lastMessageAt", at).expect("at");
-            doc.commit();
-            let bytes = doc
-                .export(loro::ExportMode::Snapshot)
-                .expect("export workspace");
-            store.save_snapshot("workspace2", &bytes).expect("save");
-            println!(
-                "workspace2 preview updated for {chat_id} ({} bytes)",
                 bytes.len()
             );
         }

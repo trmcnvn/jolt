@@ -979,8 +979,7 @@ async fn run_session(session: Session) {
                             // bad: most commonly the active turn finished
                             // between the UI send and this request. Queue it
                             // for redelivery as the next `turn/start` when the
-                            // expected turn's end arrives (also the safe
-                            // fallback for older Codex without steering).
+                            // expected turn's end arrives.
                             Err(e) => {
                                 tracing::debug!(
                                     target: "jolt_harness::codex",

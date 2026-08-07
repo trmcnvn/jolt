@@ -81,7 +81,7 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | `WatchQueuedPrompts` | stream | no | Pending queued turns from the locally synced chat doc |
 | `WatchTranscriptV2` | stream | yes | Compact whole-session manifest + trailing pages, then sequenced live-page deltas |
 | `GetTranscriptPage` | unary | yes | Fetch one historical page by opaque page ID |
-| `WatchDocMessages` | stream | yes | Compatibility stream for older clients: initial full reset, then entry/text deltas |
+| `SearchTranscript` | unary | yes | Search one transcript and return message/page anchors |
 | `ExtractQuestions` | unary | yes | Extract answerable questions from one completed assistant message |
 | `WatchChatUsage` | stream | yes | Current chat usage from its host ledger |
 | `UsageBreakdown` | unary | yes | 7/30/90-day local usage summary |
@@ -97,6 +97,7 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | `WatchThemes` / `ListThemes` | stream / unary | no | Account-registry copies of installation-level custom theme files |
 | `UpsertThemes` / `DeleteTheme` | unary | no | Reconcile custom theme files without syncing active appearance settings |
 | `Mutate` | unary | no | Create/rename/delete spaces and chats; config, checkout, archive, seen, device updates |
+| `RegenerateChatTitle` | unary | yes | Replace a session name from its first prompt using the host harness's economy model |
 | `ProbeSync` | unary | no | Ask workspace/open chat clients to verify room liveness |
 | `SyncStatus` | unary | no | Per-room push/ack/rejoin/probe/resync diagnostics |
 | `LocalDevice` | unary | no | Identity of the directly connected engine |
@@ -152,10 +153,10 @@ File search roots are resolved from synced chat/space rows and verified against 
 | Method | Reply | Remote target |
 | --- | --- | --- |
 | `OpenTerminal` | unary | yes |
-| `SubscribeTerminal` | stream | yes |
+| `SubscribeTerminalV2` | binary stream | yes |
 | `WriteTerminal`, `ResizeTerminal`, `CloseTerminal` | unary | yes |
 
-Terminal output is base64 raw PTY data with monotonically increasing sequence numbers. `afterSeq` resumes from the bounded replay window.
+`SubscribeTerminalV2` carries versioned binary items with a compact event header, monotonically increasing sequence, and raw PTY bytes without base64. `afterSeq` resumes from the bounded 1 MiB raw-byte replay window.
 
 ### Agent accounts
 
@@ -209,16 +210,13 @@ A `RunRequest` carries prompt, concrete model/reasoning/options, cwd, sandbox, a
 
 A subscription receiver drop sends cancellation to the server. Bounded channels apply backpressure instead of allowing an unbounded slow-consumer queue.
 
-Watch streams generally emit the current value first. `WatchTranscriptV2` opens atomically with a compact manifest and enough trailing pages to cover at least 64 messages, then emits sequenced deltas for the mutable live page. A sequence/page mismatch resubscribes for another tail-sized bootstrap. Historical pages come from `GetTranscriptPage`; opaque IDs and page revisions make cached pages safe across reconnects.
+Watch streams generally emit the current value first. `WatchTranscriptV2` opens atomically with a compact manifest and enough trailing pages to cover at least 64 messages, then emits sequenced deltas for the mutable live page. A sequence/page mismatch resubscribes for another tail-sized bootstrap. Historical pages come from `GetTranscriptPage`; opaque IDs and page revisions make cached pages safe across reconnects. `SearchTranscript` searches the authoritative document on its host and returns page-backed message anchors, so selecting a cold result loads only its containing page.
 
-`WatchDocMessages` remains as a compatibility surface for older clients. It emits a full reset and then compact transcript delta frames.
-
-## Compatibility guidance
+## Contract guidance
 
 - Treat `params` from a process/network boundary as untrusted JSON.
 - Use tagged enums for mutually exclusive payloads.
-- Default additive fields where mixed-version devices need compatibility.
-- Ignore unknown fields where the decoder policy permits it, but reject unknown methods.
+- Reject unknown methods and behavior-changing enum tags.
 - Add a method to the forwardable and stream-method lists explicitly; routing is deny-by-default.
 - Never make a secret-bearing method relay-forwardable.
 

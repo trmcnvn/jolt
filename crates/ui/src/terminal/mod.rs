@@ -8,7 +8,7 @@
 //!   drag-reorder, and the Cmd/Ctrl+` toggle action.
 //!
 //! Method names come from `jolt_rpc::methods` and wire types from
-//! `jolt_proto` (`TerminalSession`, `TerminalEvent`) — the same contract the
+//! `jolt_proto::TerminalSession` plus versioned binary output frames — the same contract the
 //! engine serves.
 
 pub mod emulator;

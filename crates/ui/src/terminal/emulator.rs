@@ -1,7 +1,7 @@
 //! The terminal emulator core: `libghostty_vt` wrapped as a pure state
 //! machine.
 //!
-//! Bytes in ([`Emulator::feed`] — the decoded `SubscribeTerminal` Data frames),
+//! Bytes in ([`Emulator::feed`] — decoded `SubscribeTerminalV2` data frames),
 //! grid snapshots out ([`Emulator::snapshot`]). No PTY I/O, timers, or GPUI:
 //! the panel owns RPC and scheduling, while the view owns paint. Query
 //! responses (DSR/DA/…) are captured through Ghostty's effect callbacks and
@@ -11,6 +11,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use libghostty_vt::fmt::Format;
+use libghostty_vt::mouse::{
+    Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder,
+    EncoderSize as MouseEncoderSize, Event as MouseEvent, Position as MousePosition,
+};
 use libghostty_vt::render::{CellIterator, RowIterator};
 use libghostty_vt::screen::{CellWide, TrackedGridRef};
 use libghostty_vt::selection::{
@@ -119,6 +123,12 @@ enum SelectionKind {
     Line,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseWheelDirection {
+    Up,
+    Down,
+}
+
 /// The emulator: a pure fold of PTY bytes into a renderable grid.
 pub struct Emulator {
     term: Terminal<'static, 'static>,
@@ -126,6 +136,8 @@ pub struct Emulator {
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
     effects: Rc<RefCell<EffectCapture>>,
+    mouse_encoder: MouseEncoder<'static>,
+    mouse_event: MouseEvent<'static>,
     selection_anchor: Option<TrackedGridRef>,
     selection_kind: SelectionKind,
 }
@@ -189,6 +201,9 @@ impl Emulator {
             cell_iterator: CellIterator::new()
                 .expect("libghostty-vt cell iterator should initialize"),
             effects,
+            mouse_encoder: MouseEncoder::new()
+                .expect("libghostty-vt mouse encoder should initialize"),
+            mouse_event: MouseEvent::new().expect("libghostty-vt mouse event should initialize"),
             selection_anchor: None,
             selection_kind: SelectionKind::Cell,
         }
@@ -246,6 +261,51 @@ impl Emulator {
     /// Pastes should be wrapped in `ESC [200~` / `ESC [201~`.
     pub fn bracketed_paste_mode(&self) -> bool {
         self.term.mode(Mode::BRACKETED_PASTE).unwrap_or(false)
+    }
+
+    /// Encode one wheel step for a mouse-aware full-screen program.
+    pub fn mouse_wheel_report(
+        &mut self,
+        direction: MouseWheelDirection,
+        row: usize,
+        col: usize,
+        modifiers: libghostty_vt::key::Mods,
+    ) -> Option<Vec<u8>> {
+        if !self.term.is_mouse_tracking().unwrap_or(false) {
+            return None;
+        }
+
+        let cols = self.cols();
+        let rows = self.rows();
+        self.mouse_encoder
+            .set_options_from_terminal(&self.term)
+            .set_size(MouseEncoderSize {
+                screen_width: u32::try_from(cols).unwrap_or(u32::MAX),
+                screen_height: u32::try_from(rows).unwrap_or(u32::MAX),
+                cell_width: 1,
+                cell_height: 1,
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_right: 0,
+                padding_left: 0,
+            });
+        self.mouse_event
+            .set_action(MouseAction::Press)
+            .set_button(Some(match direction {
+                MouseWheelDirection::Up => MouseButton::Four,
+                MouseWheelDirection::Down => MouseButton::Five,
+            }))
+            .set_mods(modifiers)
+            .set_position(MousePosition {
+                x: col.min(cols.saturating_sub(1)) as f32 + 0.5,
+                y: row.min(rows.saturating_sub(1)) as f32 + 0.5,
+            });
+
+        let mut report = Vec::new();
+        self.mouse_encoder
+            .encode_to_vec(&self.mouse_event, &mut report)
+            .ok()?;
+        (!report.is_empty()).then_some(report)
     }
 
     /// Lines scrolled back into history (0 = pinned to the live bottom).
@@ -736,6 +796,40 @@ mod tests {
         assert!(!e.app_cursor_mode());
         e.feed(b"\x1b[?2004h");
         assert!(e.bracketed_paste_mode());
+    }
+
+    #[test]
+    fn mouse_wheel_reports_follow_tracking_mode_and_position() {
+        let mut e = emu(10, 4);
+        assert_eq!(
+            e.mouse_wheel_report(
+                MouseWheelDirection::Up,
+                1,
+                2,
+                libghostty_vt::key::Mods::empty(),
+            ),
+            None
+        );
+
+        e.feed(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            e.mouse_wheel_report(
+                MouseWheelDirection::Up,
+                1,
+                2,
+                libghostty_vt::key::Mods::empty(),
+            ),
+            Some(b"\x1b[<64;3;2M".to_vec())
+        );
+        assert_eq!(
+            e.mouse_wheel_report(
+                MouseWheelDirection::Down,
+                3,
+                9,
+                libghostty_vt::key::Mods::SHIFT | libghostty_vt::key::Mods::CTRL,
+            ),
+            Some(b"\x1b[<85;10;4M".to_vec())
+        );
     }
 
     #[test]

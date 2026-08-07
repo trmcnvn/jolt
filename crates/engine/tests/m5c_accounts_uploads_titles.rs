@@ -632,6 +632,59 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
 }
 
 #[tokio::test]
+async fn regenerate_chat_title_rpc_replaces_an_existing_title() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let core = assemble_with_mock(
+        &tmp.path().join("data"),
+        vec![
+            AgentEvent::TextDelta {
+                text: "Improve session naming".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        ],
+    );
+    core.workspace
+        .create_space("space-title", &core.device_id, "/tmp", None, false)
+        .expect("create space");
+    core.workspace
+        .create_chat("chat-title", "space-title", None, None)
+        .expect("create chat");
+    core.workspace
+        .rename_chat("chat-title", "Old title")
+        .expect("seed title");
+    core.doc_host
+        .open("chat-title")
+        .expect("open chat")
+        .write_user_message("message-1", "make session names clearer", 1_000)
+        .expect("write prompt");
+
+    let client = jolt_rpc::memory_client(core.rpc_service());
+    client
+        .call(
+            methods::REGENERATE_CHAT_TITLE,
+            serde_json::json!({
+                "chatId": "chat-title",
+                "targetDeviceId": core.device_id,
+            }),
+        )
+        .await
+        .expect("regenerate title");
+
+    let chat = core
+        .workspace
+        .chat("chat-title")
+        .expect("read chat")
+        .expect("chat row");
+    assert_eq!(chat.title.as_deref(), Some("Improve session naming"));
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn rename_worktree_branch_guards_and_collisions() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("repo");

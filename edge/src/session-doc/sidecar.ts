@@ -19,6 +19,7 @@ export interface DiffPageDescriptor {
   readonly noticeCount: number;
   readonly hunkCount: number;
   readonly lineCount: number;
+  readonly splitLineCount: number;
   readonly estimatedBytes: number;
 }
 
@@ -81,6 +82,7 @@ const parsePageDescriptor = (value: unknown): DiffPageDescriptor | undefined => 
   if (!input || typeof input.id !== "string" || typeof input.fileId !== "string") return undefined;
   if (typeof input.firstRow !== "number" || typeof input.rowCount !== "number" || typeof input.estimatedBytes !== "number") return undefined;
   if (typeof input.noticeCount !== "number" || typeof input.hunkCount !== "number" || typeof input.lineCount !== "number") return undefined;
+  if (input.splitLineCount !== undefined && typeof input.splitLineCount !== "number") return undefined;
   return {
     id: input.id,
     fileId: input.fileId,
@@ -89,6 +91,7 @@ const parsePageDescriptor = (value: unknown): DiffPageDescriptor | undefined => 
     noticeCount: input.noticeCount,
     hunkCount: input.hunkCount,
     lineCount: input.lineCount,
+    splitLineCount: input.splitLineCount ?? input.lineCount,
     estimatedBytes: input.estimatedBytes
   };
 };

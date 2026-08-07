@@ -15,7 +15,8 @@
 //!    branch from the title and update the chat's branch row;
 //! 6. `rename_chat` in the workspace doc.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::StreamExt;
 
@@ -41,11 +42,18 @@ struct Inner {
     registry: Arc<HarnessRegistry>,
     repos: Repos,
     usage: UsageStore,
+    auto_generating: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
 pub struct TitleGenerator {
     inner: Arc<Inner>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenerationMode {
+    Untitled,
+    ReplaceCurrent,
 }
 
 impl TitleGenerator {
@@ -61,6 +69,7 @@ impl TitleGenerator {
                 registry,
                 repos,
                 usage,
+                auto_generating: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -68,15 +77,52 @@ impl TitleGenerator {
     /// Fire-and-forget: title `chat_id` if it's still untitled. Called by the run
     /// task after a completed exchange; runs detached so it never delays anything.
     pub fn maybe_generate(&self, chat_id: &str, harness: HarnessId, prompt: &str, cwd: &str) {
+        let mut generating = self
+            .inner
+            .auto_generating
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !generating.insert(chat_id.to_string()) {
+            return;
+        }
+        drop(generating);
+
         let this = self.clone();
         let chat_id = chat_id.to_string();
         let prompt = prompt.to_string();
         let cwd = cwd.to_string();
         tokio::spawn(async move {
-            if let Err(err) = this.generate(&chat_id, harness, &prompt, &cwd).await {
+            let result = this
+                .generate(&chat_id, harness, &prompt, &cwd, GenerationMode::Untitled)
+                .await;
+            this.inner
+                .auto_generating
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&chat_id);
+            if let Err(err) = result {
                 tracing::debug!(chat = %chat_id, error = %err, "chat auto-titling skipped");
             }
         });
+    }
+
+    /// Replace the current title using the same economy-model path as automatic
+    /// titling. A concurrent rename still wins.
+    pub async fn regenerate(
+        &self,
+        chat_id: &str,
+        harness: HarnessId,
+        prompt: &str,
+        cwd: &str,
+    ) -> Result<(), EngineError> {
+        self.generate(
+            chat_id,
+            harness,
+            prompt,
+            cwd,
+            GenerationMode::ReplaceCurrent,
+        )
+        .await
     }
 
     async fn generate(
@@ -85,13 +131,19 @@ impl TitleGenerator {
         harness_id: HarnessId,
         prompt: &str,
         cwd: &str,
+        mode: GenerationMode,
     ) -> Result<(), EngineError> {
         let chat = self
             .inner
             .workspace
             .chat(chat_id)?
             .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
-        if chat.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+        let original_title = chat.title.clone();
+        if mode == GenerationMode::Untitled
+            && original_title
+                .as_deref()
+                .is_some_and(|title| !title.trim().is_empty())
+        {
             return Ok(()); // already named
         }
 
@@ -110,20 +162,16 @@ impl TitleGenerator {
             return Ok(());
         }
 
-        // Re-read after the model call: a user may have named the chat or checked
-        // out another branch while the throwaway generation was live.
+        // Re-read after the model call: a concurrent user rename always wins.
         let latest = self.inner.workspace.chat(chat_id)?.unwrap_or(chat);
-        if latest
-            .title
-            .as_deref()
-            .is_some_and(|t| !t.trim().is_empty())
-        {
+        if latest.title != original_title {
             return Ok(());
         }
 
-        // Rename the worktree branch when the chat still sits on its original
-        // jolt/<name> branch (guards live inside rename_worktree_branch).
-        if let (Some(chat_cwd), Some(branch)) = (&latest.cwd, &latest.branch)
+        // Initial automatic generation may rename an untouched Jolt worktree
+        // branch. Regeneration changes only the requested session name.
+        if mode == GenerationMode::Untitled
+            && let (Some(chat_cwd), Some(branch)) = (&latest.cwd, &latest.branch)
             && branch.starts_with("jolt/")
         {
             match self
@@ -145,7 +193,14 @@ impl TitleGenerator {
         }
 
         self.inner.workspace.rename_chat(chat_id, &title)?;
-        tracing::info!(chat = %chat_id, title = %title, "chat auto-titled");
+        match mode {
+            GenerationMode::Untitled => {
+                tracing::info!(chat = %chat_id, title = %title, "chat auto-titled");
+            }
+            GenerationMode::ReplaceCurrent => {
+                tracing::info!(chat = %chat_id, title = %title, "chat title regenerated");
+            }
+        }
         Ok(())
     }
 

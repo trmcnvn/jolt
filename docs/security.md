@@ -75,7 +75,7 @@ The host's local run journal can retain complete normalized events needed for re
 
 ## Attachments
 
-Composer images are uploaded in chunks to the host engine. The prompt stores host-local file references plus their SHA-256 content addresses, and supported harnesses receive inline image data. Account-scope upload commits wait for the edge mirror; transcript clients can therefore read the authenticated R2 object when the host is offline. Legacy path-only messages remain host-dependent.
+Composer images are uploaded in chunks to the host engine. The prompt stores host-local file references plus their SHA-256 content addresses, and supported harnesses receive inline image data. Account-scope upload commits wait for the edge mirror; transcript clients can therefore read the authenticated R2 object when the host is offline.
 
 The edge attachment store is:
 

@@ -28,4 +28,3 @@ export const AUTH_USER_HEADER = "x-jolt-auth-user";
  * (`ws/{orgId}`). Membership (JWT org claim == orgId) is enforced at the
  * Worker; the SessionRoom DO sees this and skips its per-chat
  * claim-on-first-join ownership discipline for the room. */
-export const ROOM_KIND_HEADER = "x-jolt-room-kind";

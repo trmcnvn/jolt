@@ -4,8 +4,8 @@
 //! See docs/architecture.md and docs/sync.md:
 //! - the doc IS the outbox: commands and user entries commit locally and sync whenever a
 //!   room connection exists; the engine is fully functional with sync disabled;
-//! - on every doc change (local commit or remote import) the handle re-emits the joined
-//!   transcript to watchers, drains pending commands, and schedules a snapshot save;
+//! - on every doc change (local commit or remote import) the handle updates transcript
+//!   projections, drains pending commands, and schedules a snapshot save;
 //! - command drain: evaluate via `evaluate_command` (with the DocsStore processed
 //!   ledger), mark processed BEFORE execute, execute through the sessions engine, then
 //!   write the outcome status back into the doc as the sole outcome writer.
@@ -16,7 +16,7 @@
 //! the host's relay receives it and warm-opens the doc, which drains the queue.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use tokio::sync::{broadcast, watch};
@@ -26,7 +26,7 @@ use jolt_doc::{
     GoalOperation, MessagePart, MessageRole, MessageStatus, QueuedPrompt, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
     TranscriptBootstrap, TranscriptCatalog, TranscriptPage, TranscriptWatchFrame,
-    can_composer_cancel, evaluate_command, join_continuation_entries, queued_prompts,
+    can_composer_cancel, evaluate_command, queued_prompts,
 };
 use jolt_harness::{BashRequest, BashResult};
 use jolt_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
@@ -54,10 +54,8 @@ const RESIDENT_BYTES_PER_SNAPSHOT_BYTE: usize = 6;
 /// Floor per open doc (room socket buffers, tasks) regardless of content size.
 const DOC_RESIDENT_FLOOR_BYTES: usize = 512 * 1024;
 
-/// Docs touched this recently are never evicted. Closes the open→attach race:
-/// `open()` returns a handle, and until the caller's `watch_messages` lands
-/// the doc is unwatched and unpinned — a concurrent eviction would orphan the
-/// watcher on a roomless doc that renders once and never updates again.
+/// Docs touched this recently are never evicted. This closes the open→attach
+/// race before a transcript or command watcher pins the handle.
 const EVICT_MIN_IDLE_MS: i64 = 30_000;
 
 /// Edge connection config. The bearer is a **provider**, never a snapshot:
@@ -188,7 +186,6 @@ pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
     doc: Arc<SessionDoc>,
-    messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
     queue_tx: watch::Sender<Vec<QueuedPrompt>>,
     /// Serializes change-driven drains with explicit session-transition kicks.
     drain_lock: tokio::sync::Mutex<()>,
@@ -197,9 +194,6 @@ pub struct ChatDocHandle {
     /// mutable live page.
     transcript_projection: Mutex<Option<TranscriptProjectionState>>,
     transcript_tx: broadcast::Sender<TranscriptWatchFrame>,
-    /// True when the doc changed while nobody watched: the mirror rebuild is
-    /// deferred to the next `watch_messages` attach instead of paid per commit.
-    mirror_dirty: AtomicBool,
     /// Epoch ms of the last open/watch touch — the LRU eviction key.
     last_access: AtomicI64,
     /// Last known snapshot blob size — the eviction budget estimate's input.
@@ -220,30 +214,6 @@ impl ChatDocHandle {
 
     pub fn doc_arc(&self) -> Arc<SessionDoc> {
         self.doc.clone()
-    }
-
-    /// Joined transcript watch — re-sent on every doc change (WatchDocMessages).
-    ///
-    /// Attach-time refresh: the mirror is only maintained while watched, so a
-    /// doc that changed unwatched materializes here, once, instead of on every
-    /// commit it sat through in the background.
-    pub fn watch_messages(&self) -> watch::Receiver<Vec<SessionMessageEntry>> {
-        self.touch();
-        // Attach is a user signal: verify a quiet room is actually alive
-        // (a doc-wedged DO keeps answering pings while delivering nothing,
-        // and the background probe cadence can be hours out). Coalescing
-        // no-op on a healthy or recently-active room.
-        if let Some(room) = lock(&self.room).as_ref() {
-            room.probe();
-        }
-        // Subscribe BEFORE the dirty check: a commit racing this attach then
-        // sees a live receiver and publishes, instead of re-marking dirty
-        // after our refresh and leaving the new watcher a cleared mirror.
-        let rx = self.messages_tx.subscribe();
-        if self.mirror_dirty.load(Ordering::Acquire) {
-            self.publish_messages();
-        }
-        rx
     }
 
     /// Pending queued turns, projected from the durable command ledger.
@@ -318,6 +288,29 @@ impl ChatDocHandle {
             .expect("projection initialized above")
             .catalog
             .page(&self.doc, page_id)
+    }
+
+    pub fn search_transcript(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<jolt_doc::TranscriptSearchResult>, DocError> {
+        self.touch();
+        let mut projection = lock(&self.transcript_projection);
+        if projection.is_none() {
+            let catalog = TranscriptCatalog::build(&self.doc)?;
+            let live_page = catalog.live_page(&self.doc)?;
+            *projection = Some(TranscriptProjectionState {
+                sequence: 0,
+                catalog,
+                live_page,
+            });
+        }
+        projection
+            .as_ref()
+            .expect("projection initialized above")
+            .catalog
+            .search(&self.doc, query, limit)
     }
 
     fn publish_transcript_if_watched(&self) {
@@ -483,38 +476,7 @@ impl ChatDocHandle {
                 stamped.push((entry.id.clone(), entry.created_at));
             }
         }
-        if !stamped.is_empty() {
-            self.publish_messages();
-        }
         Ok(stamped)
-    }
-
-    fn publish_messages(&self) {
-        self.mirror_dirty.store(false, Ordering::Release);
-        match self.doc.read_entries() {
-            Ok(entries) => {
-                let joined = join_continuation_entries(entries);
-                // send_replace: update the watch even with no subscribers yet, so a
-                // late subscriber's first borrow sees the current transcript.
-                self.messages_tx.send_replace(joined);
-            }
-            Err(err) => {
-                tracing::warn!(chat = %self.chat_id, error = %err, "transcript read failed");
-            }
-        }
-    }
-
-    /// Per-commit publish path: unwatched docs just mark the mirror dirty —
-    /// rebuilding a full transcript nobody reads was a per-tick cost on every
-    /// open doc (and kept a second transcript copy hot).
-    fn publish_messages_if_watched(&self) {
-        if self.messages_tx.receiver_count() == 0 {
-            self.mirror_dirty.store(true, Ordering::Release);
-            // Shrink the stale mirror: watch_messages rebuilds on attach.
-            self.messages_tx.send_replace(Vec::new());
-        } else {
-            self.publish_messages();
-        }
     }
 
     /// Rough resident cost for the LRU budget.
@@ -586,10 +548,6 @@ impl DocHost {
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
-        // The mirror starts dirty and empty: many opens (command queueing,
-        // drains, nudges) never watch the transcript, and the first
-        // watch_messages attach materializes it on demand.
-        let (messages_tx, _) = watch::channel(Vec::new());
         let (queue_tx, _) = watch::channel(Vec::new());
         let (transcript_tx, _) = broadcast::channel(128);
 
@@ -597,12 +555,10 @@ impl DocHost {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
             doc: doc.clone(),
-            messages_tx,
             queue_tx,
             drain_lock: tokio::sync::Mutex::new(()),
             transcript_projection: Mutex::new(None),
             transcript_tx,
-            mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room: Mutex::new(None),
@@ -676,7 +632,7 @@ impl DocHost {
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
     /// resident estimate exceeds `DOC_LRU_BYTE_BUDGET`, close the
     /// least-recently-touched unpinned docs. Pinned (never evicted):
-    /// - watched docs (`messages_tx` has receivers — a UI transcript);
+    /// - watched docs (queue or transcript receivers);
     /// - docs with a live writer (`Arc<SessionDoc>` held outside the handle —
     ///   a run streaming into it);
     /// - host-side docs with pending commands (the executor owes them work).
@@ -727,10 +683,7 @@ impl DocHost {
     }
 
     fn pinned(&self, handle: &Arc<ChatDocHandle>) -> bool {
-        if handle.messages_tx.receiver_count() > 0
-            || handle.queue_tx.receiver_count() > 0
-            || handle.transcript_tx.receiver_count() > 0
-        {
+        if handle.queue_tx.receiver_count() > 0 || handle.transcript_tx.receiver_count() > 0 {
             return true;
         }
         // The handle itself holds one doc ref; more means a live writer.
@@ -1436,7 +1389,6 @@ impl DocHost {
                 }
             }
             if changed {
-                handle.publish_messages_if_watched();
                 handle.publish_transcript_if_watched();
                 self.save_snapshot(&handle);
             }
@@ -1584,8 +1536,7 @@ pub fn respond_input_prompt(
 /// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
 /// Holds only a weak handle so a dropped host tears the task down.
 async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: watch::Receiver<u64>) {
-    // Initial pass: the snapshot may already carry pending commands. The
-    // mirror stays lazy — it materializes on the first watch attach.
+    // Initial pass: the snapshot may already carry pending commands.
     {
         let Some(handle) = weak.upgrade() else { return };
         host.drain_commands(&handle).await;
@@ -1599,7 +1550,6 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                     break; // doc handle (and its change sender) is gone
                 }
                 let Some(handle) = weak.upgrade() else { break };
-                handle.publish_messages_if_watched();
                 handle.publish_transcript_if_watched();
                 handle.publish_queue_if_watched();
                 host.drain_commands(&handle).await;

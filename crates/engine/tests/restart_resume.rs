@@ -309,9 +309,10 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
 async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("data");
-    std::fs::create_dir_all(&dir).unwrap();
+    let scope = dir.join("scopes/accounts/dev-org/dev-user");
+    std::fs::create_dir_all(&scope).unwrap();
     // Pin the device id so the manufactured streaming entry counts as OURS.
-    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+    std::fs::write(scope.join("device-id"), "dev-crash").unwrap();
 
     // Manufacture the on-disk state a kill -9 mid-run leaves behind:
     // - a chat doc snapshot whose assistant entry is still `streaming`;
@@ -319,7 +320,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     //   the only copy of the harness session id (the debounced workspace-row
     //   write never landed).
     {
-        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let store = DocsStore::open(dir.join("scopes/accounts/dev-org/dev-user")).unwrap();
         let doc = SessionDoc::init(CHAT).unwrap();
         doc.push_message(&SessionMessageEntry {
             id: "msg-user-1".into(),
@@ -351,7 +352,8 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
             .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
             .unwrap();
 
-        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        let journal =
+            RunJournal::open(dir.join("scopes/accounts/dev-org/dev-user/journals")).unwrap();
         journal
             .append(
                 CHAT,
@@ -391,7 +393,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[1].status, Some(MessageStatus::Aborted));
     // … and closed the stale journal with a synthetic Done.
-    let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+    let journal = RunJournal::open(dir.join("scopes/accounts/dev-org/dev-user/journals")).unwrap();
     assert!(matches!(
         journal.last_event(CHAT).unwrap(),
         Some((_, AgentEvent::Done { .. }))
@@ -444,7 +446,7 @@ impl Harness for PersistentHarness {
     }
     async fn run(
         &self,
-        request: RunRequest,
+        _request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         *self.runs_started.lock().unwrap() += 1;
@@ -555,8 +557,9 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
 async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("data");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+    let scope = dir.join("scopes/accounts/dev-org/dev-user");
+    std::fs::create_dir_all(&scope).unwrap();
+    std::fs::write(scope.join("device-id"), "dev-crash").unwrap();
 
     // Same manufactured kill -9 state as above, but FRESH: the streaming entry
     // crashed moments ago, inside the 12h revival window.
@@ -565,7 +568,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         .unwrap()
         .as_millis() as i64;
     {
-        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let store = DocsStore::open(dir.join("scopes/accounts/dev-org/dev-user")).unwrap();
         let doc = SessionDoc::init(CHAT).unwrap();
         doc.push_message(&SessionMessageEntry {
             id: "msg-user-1".into(),
@@ -597,7 +600,8 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
             .unwrap();
 
-        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        let journal =
+            RunJournal::open(dir.join("scopes/accounts/dev-org/dev-user/journals")).unwrap();
         journal
             .append(
                 CHAT,

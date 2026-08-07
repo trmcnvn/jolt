@@ -7,13 +7,14 @@
 //! - `ListCommands {harness}` → Jolt's built-in `[AgentCommand]` catalog
 //! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
 //! - `ExtractQuestions {chatId, sourceMessageId}` → extracted prose questions
-//! - `WatchDocMessages {chatId}` → stream of joined `SessionMessageEntry[]`,
 //!   re-emitted on every doc change
 //! - `WatchChats` / `WatchDevices` → streams of the workspace doc's entity rows
 //! - `WatchSessions` → stream of `Session[]`: this engine's live statuses merged with
 //!   remote devices' workspace session rows
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
 //!   setChatArchived, deleteChat, renameDevice, markChatSeen)
+//! - `RegenerateChatTitle {chatId}` → `{ok}` — replace a session name using the
+//!   host harness's economy model
 //! - `LocalDevice` → `{deviceId}` — this engine's identity (never forwarded)
 //! - AuthRpc: `AuthStatus` (stream), `SignIn`/`SignInHeadless` → `{url}`,
 //!   `CompleteSignIn {code}`, `SignOut`, `ListOrgs`, and automatic provisioning
@@ -24,7 +25,6 @@
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffV2` → checkout manifest stream;
 //!   `GetCheckoutDiffPage` → immutable patch page
 //! - Terminals: `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
-//!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
 //!   real multi-account auth in M6.
@@ -75,7 +75,7 @@ use crate::repos::{Repos, home_dir};
 use crate::review_store::ReviewStore;
 use crate::secrets::HarnessSecrets;
 use crate::sessions::SessionsEngine;
-use crate::terminals::Terminals;
+use crate::terminals::{TerminalOutput, Terminals};
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
@@ -93,6 +93,13 @@ struct ChatParams {
 struct TranscriptPageParams {
     chat_id: String,
     page_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchTranscriptParams {
+    chat_id: String,
+    query: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,6 +720,19 @@ impl EngineRpc {
             )));
         };
         let client = links.client(target).await?;
+        if is_binary_stream_method(method) {
+            let rx = match client.subscribe_binary(method, params).await {
+                Ok(rx) => rx,
+                Err(err) => {
+                    links.invalidate(target);
+                    return Err(err);
+                }
+            };
+            let stream = futures::stream::unfold((rx, client), |(mut rx, client)| async move {
+                rx.recv().await.map(|item| (item, (rx, client)))
+            });
+            return Ok(RpcReply::BinaryStream(stream.boxed()));
+        }
         if is_stream_method(method) {
             let rx = match client.subscribe(method, params).await {
                 Ok(rx) => rx,
@@ -923,12 +943,13 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
-            | methods::WATCH_DOC_MESSAGES
             | methods::WATCH_TRANSCRIPT_V2
             | methods::GET_TRANSCRIPT_PAGE
+            | methods::SEARCH_TRANSCRIPT
             | methods::EXTRACT_QUESTIONS
             | methods::WATCH_CHAT_USAGE
             | methods::USAGE_BREAKDOWN
+            | methods::REGENERATE_CHAT_TITLE
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -952,7 +973,7 @@ fn forwardable(method: &str) -> bool {
             | methods::RELEASE_DIFF_DOCUMENT
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
-            | methods::SUBSCRIBE_TERMINAL
+            | methods::SUBSCRIBE_TERMINAL_V2
             | methods::WRITE_TERMINAL
             | methods::RESIZE_TERMINAL
             | methods::CLOSE_TERMINAL
@@ -980,13 +1001,15 @@ fn forwardable(method: &str) -> bool {
 fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
-        methods::WATCH_DOC_MESSAGES
-            | methods::WATCH_TRANSCRIPT_V2
+        methods::WATCH_TRANSCRIPT_V2
             | methods::WATCH_CHAT_USAGE
-            | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFF_V2
             | methods::UPDATE_STATUS
     )
+}
+
+fn is_binary_stream_method(method: &str) -> bool {
+    method == methods::SUBSCRIBE_TERMINAL_V2
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -1061,36 +1084,6 @@ fn diff_stream(
             ) => None,
         }
     })
-    .boxed()
-}
-
-fn doc_messages_stream(
-    rx: watch::Receiver<Vec<jolt_doc::SessionMessageEntry>>,
-) -> BoxStream<'static, serde_json::Value> {
-    use jolt_doc::transcript_delta::{TranscriptFrame, diff_transcript};
-    futures::stream::unfold(
-        (rx, None::<Vec<jolt_doc::SessionMessageEntry>>),
-        |(mut rx, mut prev)| async move {
-            loop {
-                if prev.is_some() {
-                    rx.changed().await.ok()?;
-                }
-                let current: Vec<_> = rx.borrow_and_update().clone();
-                let frame = match prev.as_deref() {
-                    None => TranscriptFrame::reset(&current),
-                    Some(prev) => diff_transcript(prev, &current),
-                };
-                prev = Some(current);
-                // No-op commits (a second watcher attaching, command-only
-                // changes) produce empty deltas — skip the frame entirely.
-                if frame.is_empty_delta() {
-                    continue;
-                }
-                let value = serde_json::to_value(&frame).ok()?;
-                return Some((value, (rx, prev)));
-            }
-        },
-    )
     .boxed()
 }
 
@@ -1237,16 +1230,6 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 Ok(RpcReply::Stream(watch_stream(handle.watch_queue())))
             }
-            methods::WATCH_DOC_MESSAGES => {
-                let p: ChatParams = parse_params(params)?;
-                let handle = self
-                    .doc_host
-                    .open(&p.chat_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                Ok(RpcReply::Stream(doc_messages_stream(
-                    handle.watch_messages(),
-                )))
-            }
             methods::WATCH_TRANSCRIPT_V2 => {
                 let p: ChatParams = parse_params(params)?;
                 let handle = self
@@ -1274,6 +1257,18 @@ impl RpcService for EngineRpc {
                         p.page_id
                     ))),
                 }
+            }
+            methods::SEARCH_TRANSCRIPT => {
+                const RESULT_LIMIT: usize = 100;
+                let p: SearchTranscriptParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let results = handle
+                    .search_transcript(&p.query, RESULT_LIMIT)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&results)
             }
             methods::WATCH_CHAT_USAGE => {
                 let p: ChatParams = parse_params(params)?;
@@ -1479,6 +1474,14 @@ impl RpcService for EngineRpc {
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
                 self.mutate(p)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::REGENERATE_CHAT_TITLE => {
+                let p: ChatParams = parse_params(params)?;
+                self.sessions
+                    .regenerate_title(&p.chat_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::PIN_DIFF_DOCUMENT => {
@@ -1732,18 +1735,36 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&session)
             }
-            methods::SUBSCRIBE_TERMINAL => {
+            methods::SUBSCRIBE_TERMINAL_V2 => {
                 let p: SubscribeTerminalParams = parse_params(params)?;
                 let rx = self
                     .terminals
-                    .subscribe(&p.terminal_id, p.after_seq)
+                    .subscribe_output(&p.terminal_id, p.after_seq)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let stream = futures::stream::unfold(rx, |mut rx| async move {
                     let event = rx.recv().await?;
-                    let value = serde_json::to_value(&event).ok()?;
-                    Some((value, rx))
+                    let encoded = match event {
+                        TerminalOutput::Data { seq, data } => {
+                            jolt_rpc::terminal_wire::encode_data(seq, &data)
+                        }
+                        TerminalOutput::Exit {
+                            seq,
+                            exit_code,
+                            signal,
+                        } => {
+                            jolt_rpc::terminal_wire::encode_exit(seq, exit_code, signal.as_deref())
+                        }
+                        TerminalOutput::ReplayGap {
+                            requested_after,
+                            oldest_available,
+                        } => jolt_rpc::terminal_wire::encode_replay_gap(
+                            requested_after,
+                            oldest_available,
+                        ),
+                    };
+                    Some((encoded, rx))
                 });
-                Ok(RpcReply::Stream(stream.boxed()))
+                Ok(RpcReply::BinaryStream(stream.boxed()))
             }
             methods::WRITE_TERMINAL => {
                 let p: WriteTerminalParams = parse_params(params)?;
@@ -1917,10 +1938,14 @@ mod tests {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::LIST_COMMANDS));
+        assert!(forwardable(methods::SEARCH_TRANSCRIPT));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::GET_CHECKOUT_REVIEW));
+        assert!(forwardable(methods::REGENERATE_CHAT_TITLE));
         assert!(forwardable(methods::GET_TURN_DIFF_PAGE));
         assert!(forwardable(methods::PIN_DIFF_DOCUMENT));
+        assert!(forwardable(methods::SUBSCRIBE_TERMINAL_V2));
+        assert!(is_binary_stream_method(methods::SUBSCRIBE_TERMINAL_V2));
         assert!(!forwardable(methods::GET_REVIEW_DRAFT));
         assert!(local_only(methods::GET_REVIEW_DRAFT));
         assert!(!forwardable(methods::UPSERT_HARNESS_SECRET));

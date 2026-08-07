@@ -117,23 +117,10 @@ struct MobileTranscriptPageDescriptor: Decodable, Hashable {
     var messageCount: Int
     let estimatedBytes: Int
     let previousPageId: String?
-    let nextPageId: String?
-    let live: Bool
-}
-
-struct MobileTranscriptTurnDescriptor: Decodable, Hashable {
-    let messageId: String
-    let ordinal: Int
-    let pageId: String
-    let promptPreview: String
-    let replyPreview: String?
 }
 
 struct MobileTranscriptManifest: Decodable, Hashable {
-    let catalogRevision: String
-    let totalMessages: Int
     var pages: [MobileTranscriptPageDescriptor]
-    let turns: [MobileTranscriptTurnDescriptor]
 }
 
 private struct WireMessagePart: Decodable {

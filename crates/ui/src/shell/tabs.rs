@@ -82,22 +82,6 @@ impl Render for TabGhost {
     }
 }
 
-/// Resolve the legacy per-space visual order while dropping vanished chats and
-/// appending chats created after the last manual reorder.
-pub(super) fn resolve_legacy_order(created: &[String], manual: &[String]) -> Vec<String> {
-    let mut resolved: Vec<String> = manual
-        .iter()
-        .filter(|id| created.contains(id))
-        .cloned()
-        .collect();
-    for id in created {
-        if !resolved.contains(id) {
-            resolved.push(id.clone());
-        }
-    }
-    resolved
-}
-
 /// The neighbor to select after closing `closed`: the next tab, else the
 /// previous, else `None` (last tab → new-session canvas). Pure.
 pub(super) fn next_after_close(order: &[String], closed: &str) -> Option<String> {
@@ -118,11 +102,10 @@ impl Shell {
     /// separately by [`Shell::sync_open_tabs`]; this read-only view just skips
     /// rows that haven't been reconciled yet.
     pub(super) fn open_tab_ids(&self, cx: &App) -> Vec<String> {
-        let Some(open) = self.settings.open_tabs.as_ref() else {
-            return Vec::new();
-        };
         let state = self.state.read(cx);
-        open.iter()
+        self.settings
+            .open_tabs
+            .iter()
             .filter(|id| state.chats.iter().any(|c| &c.id == *id && !c.archived))
             .cloned()
             .collect()
@@ -132,8 +115,6 @@ impl Shell {
     /// every state change (cheap set math), but only judges once the first
     /// chats frame has landed — the pre-sync empty list would prune everything.
     ///
-    /// - Pre-tabs settings file (`open_tabs: None`): seed from the last
-    ///   selected space's sessions, so the upgrade doesn't blank the strip.
     /// - Prune archived/deleted chats (the selected chat is exempt: a
     ///   just-sent new session's row hasn't synced yet).
     /// - Any selected chat becomes a tab (sidebar clicks, boot restore,
@@ -151,52 +132,8 @@ impl Shell {
             )
         };
         let mut changed = false;
-        if self.settings.open_tabs.is_none() {
-            let seed_space = {
-                let state = self.state.read(cx);
-                self.settings
-                    .last_space_id
-                    .clone()
-                    .filter(|id| state.space_row(id).is_some())
-                    .or_else(|| state.selected_space.clone())
-            };
-            let seed = seed_space
-                .as_deref()
-                .map(|space_id| {
-                    let created: Vec<String> = self
-                        .state
-                        .read(cx)
-                        .chats_in_space(space_id)
-                        .iter()
-                        .map(|chat| chat.id.clone())
-                        .collect();
-                    let manual = self
-                        .settings
-                        .tab_order
-                        .get(space_id)
-                        .map(Vec::as_slice)
-                        .unwrap_or_default();
-                    resolve_legacy_order(&created, manual)
-                })
-                .unwrap_or_default();
-            if self.settings.active_tab_id.is_none() {
-                self.settings.active_tab_id = seed_space.as_deref().and_then(|space_id| {
-                    self.state
-                        .read(cx)
-                        .visible_chats()
-                        .find(|chat| chat.space_id.as_deref() == Some(space_id))
-                        .map(|chat| chat.id.clone())
-                });
-            }
-            self.settings.open_tabs = Some(seed);
-            changed = true;
-        }
         let boot_target = {
-            let tabs = self
-                .settings
-                .open_tabs
-                .as_mut()
-                .expect("migration initializes tabs");
+            let tabs = &mut self.settings.open_tabs;
             let before = tabs.len();
             tabs.retain(|id| live.contains(id) || selected.as_deref() == Some(id.as_str()));
             changed |= tabs.len() != before;
@@ -249,9 +186,7 @@ impl Shell {
         let next = (selected.as_deref() == Some(chat_id.as_str()))
             .then(|| next_after_close(&order, &chat_id))
             .flatten();
-        if let Some(tabs) = self.settings.open_tabs.as_mut() {
-            tabs.retain(|id| id != &chat_id);
-        }
+        self.settings.open_tabs.retain(|id| id != &chat_id);
         if selected.as_deref() == Some(chat_id.as_str()) {
             self.settings.active_tab_id = next.clone();
             self.state
@@ -294,7 +229,7 @@ impl Shell {
             self.state
                 .update(cx, |s, cx| s.select_chat(Some(anchor.to_string()), cx));
         }
-        self.settings.open_tabs = Some(kept);
+        self.settings.open_tabs = kept;
         self.settings.active_tab_id = self.state.read(cx).selected_chat.clone();
         self.schedule_save(cx);
         cx.notify();
@@ -303,7 +238,8 @@ impl Shell {
     /// Open a session as a tab (sidebar click): append if absent, focus.
     pub(super) fn open_chat_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
-        let tabs = self.settings.open_tabs.get_or_insert_with(Vec::new);
+        self.transcript_search = None;
+        let tabs = &mut self.settings.open_tabs;
         if !tabs.contains(&chat_id) {
             tabs.push(chat_id.clone());
             self.schedule_save(cx);
@@ -351,12 +287,7 @@ impl Shell {
     /// Remove an archived session from this device's tabs before the synced
     /// registry round-trip lands.
     pub(super) fn remove_archived_tab(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        if self
-            .settings
-            .open_tabs
-            .as_ref()
-            .is_some_and(|tabs| tabs.iter().any(|id| id == chat_id))
-        {
+        if self.settings.open_tabs.iter().any(|id| id == chat_id) {
             self.close_session_tab(chat_id.to_string(), cx);
         }
     }
@@ -396,7 +327,7 @@ impl Shell {
         let mut order = self.open_tab_ids(cx);
         if from < order.len() {
             reorder_tabs(&mut order, from, to);
-            self.settings.open_tabs = Some(order);
+            self.settings.open_tabs = order;
             self.schedule_save(cx);
         }
         self.tab_drag = None;
@@ -529,8 +460,8 @@ impl Shell {
                             )
                             .into_any_element()
                     } else {
-                        // Working animates (the sidebar's miniaturized gradient
-                        // spinner) instead of a static pink dot; every other
+                        // Working animates with the compact text spinner
+                        // instead of a static pink dot; every other
                         // non-idle status stays a dot.
                         let dot = spaces::status_dot_color(status, &theme);
                         div()
@@ -540,7 +471,7 @@ impl Shell {
                             .items_center()
                             .justify_center()
                             .when(status == ChatIndicator::Working, |el| {
-                                el.child(loaders::activity_orb(
+                                el.child(loaders::activity_spinner(
                                     format!("tab-working-{id}"),
                                     &theme,
                                     8.0,
@@ -920,18 +851,10 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_after_close, resolve_legacy_order};
+    use super::next_after_close;
 
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn legacy_order_preserves_manual_rows_and_appends_new_chats() {
-        assert_eq!(
-            resolve_legacy_order(&ids(&["a", "b", "c"]), &ids(&["c", "gone", "a"])),
-            ids(&["c", "a", "b"])
-        );
     }
 
     #[test]

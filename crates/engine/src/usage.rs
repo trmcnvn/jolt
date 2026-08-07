@@ -176,25 +176,6 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS usage_events_recorded_at
              ON usage_events(recorded_at_ms);",
     )?;
-    let has_purpose = {
-        let mut statement = connection.prepare("PRAGMA table_info(usage_events)")?;
-        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-        let mut found = false;
-        for column in columns {
-            if column? == "purpose" {
-                found = true;
-                break;
-            }
-        }
-        found
-    };
-    if !has_purpose {
-        connection.execute(
-            "ALTER TABLE usage_events
-             ADD COLUMN purpose TEXT NOT NULL DEFAULT 'chat'",
-            [],
-        )?;
-    }
     Ok(())
 }
 
@@ -537,51 +518,6 @@ mod tests {
         assert_eq!(breakdown.sessions, 1);
         assert_eq!(breakdown.calls, 2);
         assert_eq!(breakdown.rows[0].total_tokens(), 76);
-    }
-
-    #[test]
-    fn migrates_existing_usage_rows_to_chat_purpose() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("usage.sqlite");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE usage_events (
-                    chat_id TEXT NOT NULL,
-                    journal_seq INTEGER NOT NULL,
-                    device_id TEXT NOT NULL,
-                    harness TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    cwd TEXT NOT NULL,
-                    recorded_at_ms INTEGER NOT NULL,
-                    input_tokens INTEGER NOT NULL,
-                    output_tokens INTEGER NOT NULL,
-                    cache_read_input_tokens INTEGER NOT NULL,
-                    cache_write_input_tokens INTEGER NOT NULL,
-                    cost_usd REAL,
-                    context_tokens INTEGER,
-                    context_window INTEGER,
-                    PRIMARY KEY (chat_id, journal_seq)
-                 );
-                 INSERT INTO usage_events VALUES (
-                    'c1', 1, 'd1', 'pi', 'sonnet', '/repo', 1,
-                    10, 2, 0, 0, NULL, 12, 200000
-                 );",
-            )
-            .unwrap();
-        drop(connection);
-
-        let store = UsageStore::open(&path, "d1".into()).unwrap();
-        let connection = lock(&store.connection);
-        let purpose: String = connection
-            .query_row("SELECT purpose FROM usage_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(purpose, "chat");
-        drop(connection);
-        assert_eq!(
-            store.summary("c1").unwrap().model.as_deref(),
-            Some("sonnet")
-        );
     }
 
     #[test]

@@ -63,7 +63,7 @@ describe("device-room host selection", () => {
   });
 
   it("treats a socket attached before this deploy (no timestamps) as dead", () => {
-    expect(pickLiveHost([{ ws: "legacy", lastSeenAt: 0 }], NOW)).toBeUndefined();
+    expect(pickLiveHost([{ ws: "stale", lastSeenAt: 0 }], NOW)).toBeUndefined();
   });
 
   it("keeps a just-joined host that has not pinged yet", () => {

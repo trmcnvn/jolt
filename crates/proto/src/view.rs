@@ -146,9 +146,6 @@ pub enum GatePhase {
     Loading,
     /// Engine unreachable and embedding failed.
     Failed(String),
-    /// Legacy sign-in gate retained for wire compatibility; local-first desktop
-    /// engines no longer enter it when signed out.
-    SignIn,
     /// Signed in while the hidden Personal organization is being provisioned.
     OrgGate,
     /// Render the shell.
@@ -596,7 +593,7 @@ mod checkout_tests {
     fn plain(name: &str) -> RepoRef {
         RepoRef {
             name: name.into(),
-            revision: None,
+            revision: name.into(),
             kind: crate::RepoRefKind::Branch,
             current: false,
             worktree_path: None,
@@ -606,7 +603,7 @@ mod checkout_tests {
     fn materialized(name: &str, path: &str) -> RepoRef {
         RepoRef {
             name: name.into(),
-            revision: None,
+            revision: name.into(),
             kind: crate::RepoRefKind::Branch,
             current: false,
             worktree_path: Some(path.into()),

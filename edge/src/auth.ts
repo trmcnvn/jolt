@@ -4,9 +4,8 @@
  * token as `?token=` (WS clients cannot always set headers); plain requests
  * use `Authorization: Bearer`.
  *
- * Workspace rooms (`ws/{orgId}`) authorize on the token's WorkOS organization
- * claim (`org_id`, present when the session was refreshed scoped to an org):
- * membership = claim equals the room's orgId.
+ * Registry routes verify that the token's WorkOS organization claim matches
+ * the requested organization; chat rooms additionally enforce ownership.
  */
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { Env } from "./env";
