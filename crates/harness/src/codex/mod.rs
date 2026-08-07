@@ -172,6 +172,9 @@ impl Harness for CodexHarness {
     fn supports_steering(&self) -> bool {
         true
     }
+    fn supports_mcp(&self) -> bool {
+        true
+    }
     /// Native `turn/steer` injects into the active turn; a steer that misses
     /// the turn falls back to a follow-up `turn/start` on the same thread.
     fn steering_mode(&self) -> SteeringMode {
@@ -246,6 +249,19 @@ impl Harness for CodexHarness {
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
         crate::environment::apply(&mut cmd, &environment);
+        if let Some(mcp) = &controls.mcp {
+            cmd.env(crate::MCP_BEARER_TOKEN_ENV, &mcp.bearer_token);
+            cmd.args([
+                "-c",
+                &format!("mcp_servers.{}.url={}", mcp.name, mcp.url),
+                "-c",
+                &format!(
+                    "mcp_servers.{}.bearer_token_env_var=\"{}\"",
+                    mcp.name,
+                    crate::MCP_BEARER_TOKEN_ENV
+                ),
+            ]);
+        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -538,6 +554,7 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         persist_session,
+        mcp: _,
         request_input,
         mut steering,
         bash: _,

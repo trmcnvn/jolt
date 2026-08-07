@@ -14,6 +14,7 @@
 
 pub mod app_menus;
 pub mod appearance;
+pub mod archived;
 pub mod ascii_mark;
 pub mod attachments;
 pub mod changes;

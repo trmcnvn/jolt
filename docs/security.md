@@ -22,6 +22,8 @@ Production traffic uses HTTPS/WSS. Transcript documents are not end-to-end encry
 
 Local engine RPC binds only `127.0.0.1`. It has no additional IPC authentication token, so other processes running as the same machine user—or any process able to reach that loopback port—should be treated as inside the local trust boundary.
 
+The product MCP endpoint is separate from engine RPC. It binds a loopback-only ephemeral port, validates the HTTP host, rejects browser-origin requests, and requires a random bearer credential scoped to one live harness process and chat. Goal and answer tools derive the target chat and live input bridge from that authenticated lease and never accept an arbitrary chat ID. Jolt passes the endpoint and credential through the reserved `JOLT_MCP_URL` and `JOLT_MCP_BEARER_TOKEN` child environment variables where required; they are never persisted, synchronized, relayed, journaled, or logged, and the credential is revoked when the run ends. Pi's bundled bridge captures and removes both variables before harness tools can inherit them.
+
 ## Agent execution
 
 Harness subprocesses inherit the engine user's filesystem and process permissions. Jolt intentionally defaults coding harnesses to unattended full-access operation:
@@ -73,7 +75,7 @@ The host's local run journal can retain complete normalized events needed for re
 
 ## Attachments
 
-Composer images are uploaded in chunks to the host engine. The prompt stores host-local file references, and supported harnesses receive inline image data.
+Composer images are uploaded in chunks to the host engine. The prompt stores host-local file references plus their SHA-256 content addresses, and supported harnesses receive inline image data. Account-scope upload commits wait for the edge mirror; transcript clients can therefore read the authenticated R2 object when the host is offline. Legacy path-only messages remain host-dependent.
 
 The edge attachment store is:
 

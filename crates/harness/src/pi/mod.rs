@@ -3,6 +3,7 @@
 mod normalize;
 mod rpc;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -23,7 +24,10 @@ use jolt_proto::{
 };
 
 use crate::environment::HarnessEnvironment;
-use crate::{BashMessage, BashRequest, BashResult, Harness, HarnessError, RunControls};
+use crate::{
+    BashMessage, BashRequest, BashResult, Harness, HarnessError, MCP_BEARER_TOKEN_ENV, MCP_URL_ENV,
+    RunControls,
+};
 use rpc::{Incoming, RpcClient};
 
 const REASONING_LEVELS: &[ReasoningLevel] = &[
@@ -37,6 +41,17 @@ const REASONING_LEVELS: &[ReasoningLevel] = &[
 const MAX_INLINE_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const PROJECT_TRUST_OPTION: &str = "projectTrust";
 const TOOL_ACCESS_OPTION: &str = "toolAccess";
+const MCP_EXTENSION_SOURCE: &str = include_str!("mcp-extension.mjs");
+
+fn materialize_mcp_extension() -> Result<tempfile::TempPath, std::io::Error> {
+    let mut file = tempfile::Builder::new()
+        .prefix("jolt-pi-mcp-")
+        .suffix(".mjs")
+        .tempfile()?;
+    file.write_all(MCP_EXTENSION_SOURCE.as_bytes())?;
+    file.flush()?;
+    Ok(file.into_temp_path())
+}
 
 pub struct PiHarness {
     executable: Option<PathBuf>,
@@ -103,6 +118,10 @@ impl Harness for PiHarness {
     }
 
     fn supports_steering(&self) -> bool {
+        true
+    }
+
+    fn supports_mcp(&self) -> bool {
         true
     }
 
@@ -494,7 +513,7 @@ struct Session {
 async fn run_session(session: Session) {
     let Session {
         executable,
-        environment,
+        mut environment,
         request,
         controls,
         event_tx,
@@ -503,6 +522,7 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         persist_session,
+        mcp,
         request_input,
         mut steering,
         mut bash,
@@ -540,6 +560,28 @@ async fn run_session(session: Session) {
     };
 
     let mut owned_args = Vec::<String>::new();
+    let mut _mcp_extension = None;
+    if let Some(mcp) = mcp {
+        match materialize_mcp_extension() {
+            Ok(extension) => {
+                owned_args.extend([
+                    "--extension".into(),
+                    extension.to_string_lossy().into_owned(),
+                ]);
+                environment.retain(|(name, _)| name != MCP_URL_ENV && name != MCP_BEARER_TOKEN_ENV);
+                environment.push((MCP_URL_ENV.into(), mcp.url));
+                environment.push((MCP_BEARER_TOKEN_ENV.into(), mcp.bearer_token));
+                _mcp_extension = Some(extension);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "jolt_harness::pi",
+                    %error,
+                    "Jolt MCP extension unavailable; starting Pi without Jolt MCP"
+                );
+            }
+        }
+    }
     if !persist_session {
         owned_args.push("--no-session".into());
     }

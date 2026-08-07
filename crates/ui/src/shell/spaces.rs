@@ -42,6 +42,19 @@ pub(super) struct SessionSearchFlow {
 }
 
 #[derive(Clone)]
+pub(super) struct ActiveChatRow {
+    pub(super) key: String,
+    pub(super) id: String,
+    pub(super) title: SharedString,
+    pub(super) time_ago: SharedString,
+    pub(super) space_name: SharedString,
+    pub(super) branch: Option<SharedString>,
+    pub(super) harness: Option<jolt_proto::HarnessId>,
+    pub(super) status: ChatIndicator,
+    pub(super) selected: bool,
+}
+
+#[derive(Clone)]
 struct SessionSearchRow {
     chat_id: String,
     title: String,
@@ -592,67 +605,50 @@ impl Shell {
     /// The sidebar's Sessions list: every session (idle included) of the
     /// filter space — or all spaces under "All" — attention-sorted. Rows are
     /// keyed for the FLIP resort glide.
-    pub(super) fn render_active_rows(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Vec<(String, f32, AnyElement)> {
+    pub(super) fn active_rows(&self, cx: &App) -> Vec<ActiveChatRow> {
         let now = Utc::now();
-        let filter = self.settings.space_filter.clone();
-        let rows: Vec<(ChatIndicator, jolt_proto::Chat, String, Option<String>)> = {
-            let state = self.state.read(cx);
-            state
-                .overview_chats(now)
-                .into_iter()
-                .filter(|(_, chat)| match &filter {
-                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
-                    None => true,
-                })
-                .map(|(status, chat)| {
-                    let space = state.space_for_chat(chat);
-                    let mut folder = space
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    // Unknown device → no fragment, same as the archived list.
-                    if let Some(device) = state.device_name(&chat.device_id) {
-                        folder = format!("{folder}@{device}");
-                    }
-                    // The branch shows whenever the engine has stamped one —
-                    // main-checkout sessions included, not just worktrees.
-                    let branch = chat
-                        .branch
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|b| !b.is_empty())
-                        .map(str::to_string);
-                    (status, chat.clone(), folder, branch)
-                })
-                .collect()
-        };
-        let selected = self.state.read(cx).selected_chat.clone();
-        rows.into_iter()
-            .map(|(status, chat, folder, branch)| {
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::CHAT_ROW_HEIGHT;
-                let harness = chat.config.as_ref().map(|c| c.harness);
-                let element = self.render_chat_row(
-                    chat.id.clone(),
-                    transcript::single_line(
+        let filter = self.settings.space_filter.as_deref();
+        let state = self.state.read(cx);
+        let selected = state.selected_chat.as_deref();
+        state
+            .overview_chats(now)
+            .into_iter()
+            .filter(|(_, chat)| match filter {
+                Some(space_id) => chat.space_id.as_deref() == Some(space_id),
+                None => true,
+            })
+            .map(|(status, chat)| {
+                let space = state.space_for_chat(chat);
+                let mut folder = space
+                    .map(|space| space.display_name().to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                // Unknown device → no fragment, same as the archived list.
+                if let Some(device) = state.device_name(&chat.device_id) {
+                    folder = format!("{folder}@{device}");
+                }
+                // The branch shows whenever the engine has stamped one —
+                // main-checkout sessions included, not just worktrees.
+                let branch = chat
+                    .branch
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|branch| !branch.is_empty())
+                    .map(SharedString::from);
+                ActiveChatRow {
+                    key: format!("c:{}", chat.id),
+                    id: chat.id.clone(),
+                    title: transcript::single_line(
                         &chat.title.clone().unwrap_or_else(|| "New session".into()),
                     )
                     .into(),
-                    time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
-                    harness,
+                    time_ago: format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
+                        .into(),
+                    space_name: folder.into(),
+                    branch,
+                    harness: chat.config.as_ref().map(|config| config.harness),
                     status,
-                    is_selected,
-                    theme,
-                    cx,
-                );
-                (format!("c:{}", chat.id), height, element)
+                    selected: selected == Some(chat.id.as_str()),
+                }
             })
             .collect()
     }

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use jolt_harness::HarnessError;
 use jolt_harness::environment::HarnessEnvironmentProvider;
+use jolt_harness::{HarnessError, MCP_BEARER_TOKEN_ENV, MCP_URL_ENV};
 use jolt_proto::{HarnessId, HarnessSecret, HarnessSecretsSnapshot};
 use serde::{Deserialize, Serialize};
 
@@ -389,6 +389,11 @@ fn validate_label(label: &str) -> Result<String, SecretsError> {
 
 fn validate_environment_variable(value: &str) -> Result<String, SecretsError> {
     let value = value.trim();
+    if [MCP_BEARER_TOKEN_ENV, MCP_URL_ENV].contains(&value) {
+        return Err(SecretsError::Invalid(format!(
+            "{value} is reserved by Jolt"
+        )));
+    }
     let mut chars = value.chars();
     if !chars
         .next()
@@ -531,6 +536,14 @@ mod tests {
         let snapshot = secrets.delete(&snapshot.secrets[0].id).await.unwrap();
         assert!(snapshot.secrets.is_empty());
         assert!(backend.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_reserved_mcp_environment_variables() {
+        for variable in [MCP_BEARER_TOKEN_ENV, MCP_URL_ENV] {
+            let error = validate_environment_variable(variable).unwrap_err();
+            assert!(error.to_string().contains("reserved by Jolt"));
+        }
     }
 
     #[test]

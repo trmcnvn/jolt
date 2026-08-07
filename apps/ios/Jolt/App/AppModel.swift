@@ -246,10 +246,13 @@ final class AppModel {
         if let demo {
             return effectiveStatus(demo.sessions[chat.id], now: nowMs())
         }
-        if sessionStores[chat.id]?.sendPending() == true {
-            return .working
-        }
+        if sendQueuedForOfflineHost(chat) { return nil }
+        if sessionStores[chat.id]?.sendPending() == true { return .working }
         return effectiveStatus(workspace?.sessions[chat.id], now: nowMs())
+    }
+
+    func sendQueuedForOfflineHost(_ chat: Chat) -> Bool {
+        sessionStores[chat.id]?.hasPendingSends == true && !deviceOnline(chat.deviceId)
     }
 
     func indicator(for chat: Chat) -> ChatIndicator {
@@ -274,18 +277,26 @@ final class AppModel {
 
     func listHarnesses(space: Space) async -> [HarnessInfo] {
         if demo != nil { return HarnessCatalog.harnesses }
-        return await workspace?.listHarnesses(deviceId: space.deviceId) ?? []
+        if !deviceOnline(space.deviceId) { return HarnessCatalog.harnesses }
+        if let loaded = await workspace?.listHarnesses(deviceId: space.deviceId) {
+            return loaded
+        }
+        return deviceOnline(space.deviceId) ? [] : HarnessCatalog.harnesses
     }
 
     /// Live model catalog from the space's owning device (the desktop's
-    /// "catalog source = the device that runs the session" rule). Production
-    /// never substitutes models for a harness the host could not resolve.
+    /// "catalog source = the device that runs the session" rule). Known static
+    /// catalogs keep offline session drafts configurable until the host returns.
     func listModels(space: Space, harness: String) async -> [ModelInfo] {
         if demo != nil {
             try? await Task.sleep(nanoseconds: 100_000_000)
             return HarnessCatalog.models(for: harness)
         }
-        return await workspace?.listModels(deviceId: space.deviceId, harness: harness) ?? []
+        if !deviceOnline(space.deviceId) { return HarnessCatalog.models(for: harness) }
+        if let loaded = await workspace?.listModels(deviceId: space.deviceId, harness: harness) {
+            return loaded
+        }
+        return deviceOnline(space.deviceId) ? [] : HarnessCatalog.models(for: harness)
     }
 
     /// Refs/revisions from the host's active VCS backend.
@@ -377,8 +388,11 @@ final class AppModel {
     }
 
     func uploadAttachment(deviceId: String, chatId: String,
-                          name: String, data: Data) async throws -> String {
-        if demo != nil { return "/tmp/jolt-demo-uploads/\(name)" }
+                          name: String, data: Data) async throws -> UploadedAttachment {
+        if demo != nil {
+            return UploadedAttachment(path: "/tmp/jolt-demo-uploads/\(name)",
+                                      sha256: String(repeating: "0", count: 64))
+        }
         guard let workspace else { throw RelayError.notConnected }
         return try await workspace.uploadAttachment(deviceId: deviceId, chatId: chatId,
                                                     name: name, data: data)

@@ -1253,9 +1253,9 @@ impl DocHost {
                 let workspace = self.workspace().ok_or_else(|| {
                     EngineError::Other("workspace registry is unavailable".into())
                 })?;
-                let current = workspace.chat_goal(chat_id);
-                let next = crate::goals::apply_operation(current, operation)?;
-                workspace.set_chat_goal(chat_id, next.as_ref())?;
+                let next = workspace.mutate_chat_goal(chat_id, |current| {
+                    crate::goals::apply_operation(current, operation)
+                })?;
 
                 if matches!(
                     operation,

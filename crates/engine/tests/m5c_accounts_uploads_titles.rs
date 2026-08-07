@@ -443,10 +443,13 @@ async fn uploads_chunk_commit_readback_and_jail() {
     uploads
         .append("up-1", &chunks[1], Some(1))
         .expect("chunk 1");
-    let path = uploads
+    let committed = uploads
         .commit("up-1", "photo.png", "chat-1")
+        .await
         .expect("commit");
+    let path = committed.path;
     assert!(path.ends_with("up-1-photo.png"), "path: {path}");
+    assert_eq!(committed.sha256.len(), 64);
     assert_eq!(std::fs::read(&path).expect("committed file"), payload);
 
     // Readback: chunked reassembly round-trips.
@@ -472,7 +475,7 @@ async fn uploads_chunk_commit_readback_and_jail() {
         .append("up-2", &chunks[2], Some(2))
         .expect("chunk 2 (hole at 1)");
     assert!(
-        uploads.commit("up-2", "holey.png", "chat-1").is_err(),
+        uploads.commit("up-2", "holey.png", "chat-1").await.is_err(),
         "hole detected"
     );
 
@@ -504,7 +507,12 @@ async fn uploads_chunk_commit_readback_and_jail() {
 
     // Bogus upload ids never become paths.
     assert!(uploads.append("../evil", "aGk=", None).is_err());
-    assert!(uploads.commit("unknown-upload", "x.png", "chat-1").is_err());
+    assert!(
+        uploads
+            .commit("unknown-upload", "x.png", "chat-1")
+            .await
+            .is_err()
+    );
 }
 
 // ---------------------------------------------------------------------------

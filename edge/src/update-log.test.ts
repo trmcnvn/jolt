@@ -55,8 +55,13 @@ const readAll = (fake: FakeSql): Uint8Array[] => [...readUpdateRows(asSql(fake))
 
 /** Byte-identical check that stays fast on multi-MB arrays (vitest's deep
  * equality walks element-by-element and times out). */
-const sameBytes = (a: Uint8Array | undefined, b: Uint8Array): boolean =>
-  a !== undefined && Buffer.from(a.buffer, a.byteOffset, a.byteLength).equals(Buffer.from(b.buffer, b.byteOffset, b.byteLength));
+const sameBytes = (a: Uint8Array | undefined, b: Uint8Array): boolean => {
+  if (a === undefined || a.byteLength !== b.byteLength) return false;
+  for (let index = 0; index < a.byteLength; index++) {
+    if (a[index] !== b[index]) return false;
+  }
+  return true;
+};
 
 describe("update log chunking", () => {
   it("stores a small update as a single non-continuation row", () => {

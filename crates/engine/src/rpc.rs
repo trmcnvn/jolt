@@ -34,7 +34,7 @@
 //!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
 //!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
 //! - Uploads: `UploadChunk {uploadId, data, seq?}`,
-//!   `UploadCommit {uploadId, fileName, chatId}` → `{path}`,
+//!   `UploadCommit {uploadId, fileName, chatId}` → `{path, sha256}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
 //!   done}` (path-jailed to the uploads dir + workspace-known chat cwds).
 //!
@@ -1767,11 +1767,12 @@ impl RpcService for EngineRpc {
             }
             methods::UPLOAD_COMMIT => {
                 let p: UploadCommitParams = parse_params(params)?;
-                let path = self
+                let committed = self
                     .uploads
                     .commit(&p.upload_id, &p.file_name, &p.chat_id)
+                    .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "path": path }))
+                RpcReply::value(&committed)
             }
             methods::READ_ATTACHMENT_CHUNK => {
                 let p: ReadAttachmentChunkParams = parse_params(params)?;

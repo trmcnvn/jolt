@@ -27,6 +27,10 @@ struct SessionView: View {
         return model.spaces.first { $0.id == spaceId }
     }
 
+    private var hostOnline: Bool {
+        chat.map { model.deviceOnline($0.deviceId) } ?? false
+    }
+
     var body: some View {
         Group {
             if let chat, let store = model.sessionStore(for: chat) {
@@ -124,7 +128,7 @@ struct SessionView: View {
                 )
             }
         }
-        .task(id: chatId) {
+        .task(id: "\(chatId)/\(hostOnline)") {
             guard let space = chatSpace else { return }
             let harness = chat?.config?.harness ?? "claude-code"
             catalogs[harness] = await model.listModels(space: space, harness: harness)
@@ -241,39 +245,47 @@ struct SessionView: View {
         model.sessionStatus(for: chat)
     }
 
-    /// Reserved 24pt status strip (shell.rs render_status_strip) — Working
-    /// shows the activity orb + rotating flavour word + elapsed; Errored
-    /// shows "Run failed"; the strip always reserves its height so the
-    /// composer never shifts.
+    /// Reserved 24pt status strip (shell.rs render_status_strip) — queued
+    /// offline sends are explicit, Working shows the activity orb + rotating
+    /// flavour word + elapsed, and Errored shows "Run failed". The strip always
+    /// reserves its height so the composer never shifts.
     private func statusStrip(chat: Chat, status: SessionStatus?) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             HStack(spacing: 6) {
-                switch status {
-                case .working:
-                    ActivityOrb(size: 14)
-                    let startedAt = sessionStartedAt(chat: chat)
-                    let elapsed = (nowMs() - startedAt) / 1000
-                    if sessionRow(chat: chat)?.compacting == true {
-                        Text("Compacting context…")
-                            .font(Theme.sans(12))
-                            .foregroundStyle(Theme.textMuted)
-                    } else {
-                        Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chat.id), elapsedSecs: elapsed))…")
-                            .font(Theme.sans(12))
-                            .foregroundStyle(Theme.textMuted)
-                        Text(Motion.formatElapsed(elapsed))
+                if model.sendQueuedForOfflineHost(chat) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 11, weight: .medium))
+                    Text("Queued · \(model.deviceName(chat.deviceId)) is offline")
+                        .font(Theme.sans(12))
+                } else {
+                    switch status {
+                    case .working:
+                        ActivityOrb(size: 14)
+                        let startedAt = sessionStartedAt(chat: chat)
+                        let elapsed = (nowMs() - startedAt) / 1000
+                        if sessionRow(chat: chat)?.compacting == true {
+                            Text("Compacting context…")
+                                .font(Theme.sans(12))
+                                .foregroundStyle(Theme.textMuted)
+                        } else {
+                            Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chat.id), elapsedSecs: elapsed))…")
+                                .font(Theme.sans(12))
+                                .foregroundStyle(Theme.textMuted)
+                            Text(Motion.formatElapsed(elapsed))
+                                .font(Theme.sans(11))
+                                .foregroundStyle(Theme.textFaint)
+                                .monospacedDigit()
+                        }
+                    case .errored:
+                        Text("Run failed")
                             .font(Theme.sans(11))
-                            .foregroundStyle(Theme.textFaint)
-                            .monospacedDigit()
+                            .foregroundStyle(Theme.danger)
+                    default:
+                        EmptyView()
                     }
-                case .errored:
-                    Text("Run failed")
-                        .font(Theme.sans(11))
-                        .foregroundStyle(Theme.danger)
-                default:
-                    EmptyView()
                 }
             }
+            .foregroundStyle(model.sendQueuedForOfflineHost(chat) ? Theme.warning : Theme.textMuted)
             .frame(height: 24)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.leading, 26)  // aligns with the composer's text start

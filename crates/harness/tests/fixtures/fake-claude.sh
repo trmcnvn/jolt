@@ -38,6 +38,20 @@ case "$first" in
   emit '{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20},"session_id":"sess-1","total_cost_usd":0.01}'
   ;;
 
+*scenario:mcp*)
+  error=""
+  case "$all_args" in *--mcp-config*) ;; *) error="missing --mcp-config" ;; esac
+  case "$all_args" in *'http://127.0.0.1:3210/mcp'*) ;; *) error="missing MCP URL" ;; esac
+  case "$all_args" in *'${JOLT_MCP_BEARER_TOKEN}'*) ;; *) error="missing token placeholder" ;; esac
+  case "$all_args" in *test-token*) error="token leaked into arguments" ;; esac
+  [ "$JOLT_MCP_BEARER_TOKEN" = "test-token" ] || error="missing token environment"
+  if [ -n "$error" ]; then
+    emit "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"errors\":[\"$error\"],\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"session_id\":\"sess-mcp\"}"
+  else
+    emit '{"type":"result","subtype":"success","result":"mcp","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-mcp"}'
+  fi
+  ;;
+
 *scenario:ephemeral*)
   case "$all_args" in
   *--no-session-persistence*)

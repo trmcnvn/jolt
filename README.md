@@ -1,6 +1,6 @@
 # Jolt
 
-Control your coding agents (Claude Code, Codex, Pi) locally without an account, or sign in to use them from any of your devices.
+Jolt is a multi-device ADE for Claude Code, Codex, and Pi. Use it locally without an account, or sign in to control your agents from any of your devices.
 
 The desktop always provides a Local scope that never syncs. When signed in, every device runs a small account engine that keeps your sessions in sync: start an
 agent on one machine, follow and drive it from another. Install the engine as

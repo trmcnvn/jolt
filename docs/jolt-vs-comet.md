@@ -1,6 +1,6 @@
 # How Jolt differs from Comet
 
-Jolt is a fork of [Comet](https://github.com/zeronsh/comet) and retains its core model: local engines run coding-agent CLIs, Loro documents carry durable conversations and commands, Cloudflare Durable Objects synchronize account data, and desktop and iOS apps act as viewports.
+Jolt is an ADE forked from [Comet](https://github.com/zeronsh/comet) and retains its core model: local engines run coding-agent CLIs, Loro documents carry durable conversations and commands, Cloudflare Durable Objects synchronize account data, and desktop and iOS apps act as viewports.
 
 This page lists Jolt's deliberate additions and product changes rather than every inherited feature. The comparison was reviewed against Comet `main` at [`2b0dc843`](https://github.com/zeronsh/comet/commit/2b0dc843d940), the upstream revision available at the time. Features ported from Comet are not presented as Jolt differences.
 

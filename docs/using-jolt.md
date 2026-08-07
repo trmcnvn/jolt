@@ -31,7 +31,7 @@ The owning engine detects whether the folder is under the selected version-contr
 
 A session is one durable conversation attached to a space. Its row records the host device, folder, checkout, harness configuration, title, activity, and seen state. The transcript and command queue live in a separate Loro document. After the first completed exchange, an untitled session is named asynchronously with an economy-tier model; a user rename always wins, and Jolt-created worktree branches can be renamed with the generated title.
 
-The desktop shows an attention-sorted session list and device-local, cross-space tabs. Closing a tab only closes that local viewport; the synced session keeps running and remains in the sidebar. Archiving is an explicit session-row action, and archived sessions can be restored from **Settings → Archived sessions**.
+The desktop shows an attention-sorted session list and device-local, cross-space tabs. Closing a tab only closes that local viewport; the synced session keeps running and remains in the sidebar. Archiving is an explicit session-row action. The searchable **Archived sessions** page opens from the user menu and restores archived sessions across devices.
 
 ## The desktop shell
 
@@ -110,7 +110,9 @@ If upload fails, the files return to the session draft. Attachment values are no
 
 ### Questions from agents
 
-When a harness requests structured input, the composer becomes a paged question panel. Single-choice questions can auto-advance; multi-choice and typed answers require explicit submission. Number keys select visible options. The request remains answerable across transient sync or run-state changes until it is resolved.
+When a harness requests structured input—or an agent calls Jolt's `request_answers` MCP tool—the composer becomes a paged question panel. Single-choice questions can auto-advance; multi-choice and typed answers require explicit submission. Number keys select visible options. The request remains answerable across transient sync or run-state changes until it is resolved, and the answers return directly to the waiting agent tool call.
+
+`/answer` remains available for assistant responses that asked questions only in prose: it extracts those questions and compiles the completed answer pages into the next turn.
 
 ## Transcript and status
 

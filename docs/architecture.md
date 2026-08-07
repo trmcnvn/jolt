@@ -1,6 +1,6 @@
 # Architecture
 
-Jolt is a multi-device controller for local coding-agent CLIs. The engine is the authority for machine-local capabilities; viewports render and control engines through one RPC contract. Cloudflare edge services synchronize durable shared state and relay device-to-device calls.
+Jolt is a multi-device ADE for local coding-agent CLIs. The engine is the authority for machine-local capabilities; viewports render and control engines through one RPC contract. Cloudflare edge services synchronize durable shared state and relay device-to-device calls.
 
 ## Topology
 
@@ -37,6 +37,7 @@ Jolt is a multi-device controller for local coding-agent CLIs. The engine is the
 The Rust engine:
 
 - launches Claude Code, Codex, Pi, and test harness subprocesses;
+- hosts an authenticated loopback MCP endpoint injected into supported live harness processes;
 - owns local authentication, repositories, version-control commands, worktrees/workspaces, terminals, uploads, diffs, and usage;
 - hosts session documents and executes commands only for chats assigned to its device;
 - persists snapshots, command claims, run journals, settings, and identity-scoped telemetry;

@@ -244,7 +244,7 @@ struct TranscriptView: View {
             switch row.kind {
             case .user(let text, let blocks):
                 UserBubble(text: text, blocks: blocks, pending: row.timestamp == nil,
-                           deviceId: store.hostDeviceId ?? "")
+                           deviceId: store.hostDeviceId ?? "", chatId: store.chatId)
 
             case .markdown(let block, let streaming):
                 MarkdownRowView(row: row, block: block, streaming: streaming, veils: veils)
@@ -392,6 +392,7 @@ struct UserBubble: View {
     var pending = false
     /// The chat's host device — where attachment files live (read-back key).
     var deviceId = ""
+    var chatId = ""
 
     var body: some View {
         // Attachment refs ride the message text; split them out and render
@@ -401,7 +402,8 @@ struct UserBubble: View {
         let mentions = projectFileMentions(parsed.text)
         VStack(alignment: .trailing, spacing: 8) {
             if !parsed.attachments.isEmpty, !deviceId.isEmpty {
-                UserAttachmentsStrip(deviceId: deviceId, attachments: parsed.attachments)
+                UserAttachmentsStrip(deviceId: deviceId, chatId: chatId,
+                                     attachments: parsed.attachments)
             }
             if !blocks.isEmpty {
                 VStack(alignment: .leading, spacing: MD.blockGap) {

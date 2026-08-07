@@ -159,6 +159,7 @@ impl ClaudeHarness {
         request: &RunRequest,
         environment: &[(String, String)],
         persist_session: bool,
+        mcp: Option<&crate::McpServerConfig>,
     ) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
@@ -210,6 +211,25 @@ impl ClaudeHarness {
         if !persist_session {
             cmd.arg("--no-session-persistence");
         }
+        if let Some(mcp) = mcp {
+            cmd.env(crate::MCP_BEARER_TOKEN_ENV, &mcp.bearer_token);
+            let mut servers = serde_json::Map::new();
+            servers.insert(
+                mcp.name.clone(),
+                serde_json::json!({
+                    "type": "http",
+                    "url": mcp.url,
+                    "headers": {
+                        "Authorization": format!(
+                            "Bearer ${{{}}}",
+                            crate::MCP_BEARER_TOKEN_ENV
+                        ),
+                    },
+                }),
+            );
+            cmd.arg("--mcp-config");
+            cmd.arg(serde_json::json!({ "mcpServers": servers }).to_string());
+        }
         let mut settings = serde_json::Map::new();
         if option_is_on(&request.model_options, "fastMode") {
             settings.insert("fastMode".into(), Value::Bool(true));
@@ -244,6 +264,9 @@ impl Harness for ClaudeHarness {
         "Claude Code"
     }
     fn supports_steering(&self) -> bool {
+        true
+    }
+    fn supports_mcp(&self) -> bool {
         true
     }
     fn steering_mode(&self) -> SteeringMode {
@@ -339,7 +362,13 @@ impl Harness for ClaudeHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let environment = self.environment.resolve(HarnessId::ClaudeCode).await?;
-        let mut cmd = self.build_command(&exe, &request, &environment, controls.persist_session);
+        let mut cmd = self.build_command(
+            &exe,
+            &request,
+            &environment,
+            controls.persist_session,
+            controls.mcp.as_ref(),
+        );
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -548,6 +577,7 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         persist_session: _,
+        mcp: _,
         request_input,
         mut steering,
         bash: _,

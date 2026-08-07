@@ -10,14 +10,14 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use jolt_doc::{
-    MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
+    GoalOperation, MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
 };
 use jolt_engine::{EngineCore, HarnessRegistry, RunJournal, SteerOutcome};
 use jolt_harness::mock::MockHarness;
-use jolt_harness::{BashRequest, BashResult, Harness, HarnessError, RunControls};
+use jolt_harness::{BashRequest, BashResult, Harness, HarnessError, McpServerConfig, RunControls};
 use jolt_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
+    AgentEvent, DoneStatus, GoalStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SessionStatus, SteeringMode, ToolCall,
 };
 use jolt_sync::DocsStore;
@@ -75,7 +75,271 @@ fn mock_script() -> Vec<AgentEvent> {
     ]
 }
 
-struct EditingHarness;
+struct McpCompletingHarness;
+
+async fn call_mcp_tool(
+    config: &McpServerConfig,
+    id: u64,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, HarnessError> {
+    let response = reqwest::Client::new()
+        .post(&config.url)
+        .bearer_auth(&config.bearer_token)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("MCP-Protocol-Version", "2025-03-26")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }))
+        .send()
+        .await
+        .map_err(|error| HarnessError::Protocol(format!("MCP request failed: {error}")))?;
+    if !response.status().is_success() {
+        return Err(HarnessError::Protocol(format!(
+            "MCP request returned {}",
+            response.status()
+        )));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| HarnessError::Protocol(format!("invalid MCP response: {error}")))
+}
+
+#[async_trait]
+impl Harness for McpCompletingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "MCP completing"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn supports_mcp(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let config = controls
+            .mcp
+            .as_ref()
+            .ok_or_else(|| HarnessError::Protocol("missing Jolt MCP configuration".into()))?;
+        let current = call_mcp_tool(config, 1, "goal_get", serde_json::json!({})).await?;
+        let goal = &current["result"]["structuredContent"];
+        let goal_id = goal["id"]
+            .as_str()
+            .ok_or_else(|| HarnessError::Protocol("goal_get omitted goal id".into()))?;
+        let revision = goal["revision"]
+            .as_u64()
+            .ok_or_else(|| HarnessError::Protocol("goal_get omitted revision".into()))?;
+        let completed = call_mcp_tool(
+            config,
+            2,
+            "goal_complete",
+            serde_json::json!({
+                "goalId": goal_id,
+                "expectedRevision": revision,
+                "summary": "Completed through Jolt MCP"
+            }),
+        )
+        .await?;
+        if completed["result"]["isError"] == true {
+            return Err(HarnessError::Protocol(format!(
+                "goal_complete failed: {}",
+                completed["result"]
+            )));
+        }
+
+        let events = vec![
+            AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock".into(),
+                tools: vec!["goal_complete".into()],
+                cwd: request.cwd,
+                session_id: "mcp-session".into(),
+                assistant_message_id: "mcp-assistant".into(),
+            },
+            AgentEvent::TextDelta {
+                text: "Goal complete.".into(),
+            },
+            AgentEvent::Usage {
+                input_tokens: 11,
+                output_tokens: 7,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                cost_usd: None,
+                context_tokens: None,
+                context_window: None,
+            },
+            done(DoneStatus::Completed),
+        ];
+        Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+    }
+}
+
+struct McpAskingHarness;
+
+#[async_trait]
+impl Harness for McpAskingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "MCP asking"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn supports_mcp(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let config = controls
+            .mcp
+            .ok_or_else(|| HarnessError::Protocol("missing Jolt MCP configuration".into()))?;
+        let started = AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock".into(),
+            tools: vec!["request_answers".into()],
+            cwd: request.cwd,
+            session_id: "mcp-answer-session".into(),
+            assistant_message_id: "mcp-answer-assistant".into(),
+        };
+        let answer = async move {
+            let response = call_mcp_tool(
+                &config,
+                1,
+                "request_answers",
+                serde_json::json!({
+                    "questions": [{
+                        "header": "Decision",
+                        "question": "What should happen next?",
+                        "options": ["Ship", "Document", "Wait"],
+                        "multiSelect": true
+                    }]
+                }),
+            )
+            .await?;
+            if response["result"]["isError"] == true {
+                return Err(HarnessError::Protocol(format!(
+                    "request_answers failed: {}",
+                    response["result"]
+                )));
+            }
+            let labels = response["result"]["structuredContent"]["answers"][0]["labels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(AgentEvent::TextDelta {
+                text: format!("selected {labels}"),
+            })
+        };
+        Ok(futures::stream::once(async move { Ok(started) })
+            .chain(futures::stream::once(answer))
+            .chain(futures::stream::once(async {
+                Ok(done(DoneStatus::Completed))
+            }))
+            .boxed())
+    }
+}
+
+struct McpStartupFailureHarness;
+
+#[async_trait]
+impl Harness for McpStartupFailureHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "MCP startup failure"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn supports_mcp(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        if controls.mcp.is_none() {
+            return Err(HarnessError::Protocol(
+                "missing Jolt MCP configuration".into(),
+            ));
+        }
+        Err(HarnessError::Protocol("startup failed".into()))
+    }
+}
+
+struct EditingHarness {
+    report_file_tool: bool,
+}
 
 #[async_trait]
 impl Harness for EditingHarness {
@@ -113,29 +377,35 @@ impl Harness for EditingHarness {
             "after\n",
         )
         .map_err(HarnessError::Io)?;
-        let events = vec![
-            AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
-                model: "mock".into(),
-                tools: vec![],
-                cwd: request.cwd,
-                session_id: "editing-session".into(),
-                assistant_message_id: "assistant".into(),
-            },
-            AgentEvent::ToolCall {
-                id: "edit".into(),
-                call: ToolCall::EditFile {
-                    path: "changed.txt".into(),
-                    old_string: Some("before\n".into()),
-                    new_string: Some("after\n".into()),
+        let mut events = vec![AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock".into(),
+            tools: vec![],
+            cwd: request.cwd,
+            session_id: "editing-session".into(),
+            assistant_message_id: "assistant".into(),
+        }];
+        if self.report_file_tool {
+            events.extend([
+                AgentEvent::ToolCall {
+                    id: "edit".into(),
+                    call: ToolCall::EditFile {
+                        path: "changed.txt".into(),
+                        old_string: Some("before\n".into()),
+                        new_string: Some("after\n".into()),
+                    },
                 },
-            },
-            AgentEvent::ToolResult {
-                id: "edit".into(),
-                is_error: false,
-            },
-            done(DoneStatus::Completed),
-        ];
+                AgentEvent::ToolResult {
+                    id: "edit".into(),
+                    is_error: false,
+                },
+            ]);
+        } else {
+            events.push(AgentEvent::TextDelta {
+                text: "No files changed.".into(),
+            });
+        }
+        events.push(done(DoneStatus::Completed));
         Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
     }
 }
@@ -679,6 +949,184 @@ fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, 
 }
 
 #[tokio::test]
+async fn mcp_completion_during_harness_startup_is_scoped_and_accounted() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(McpCompletingHarness));
+    core.workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "goal-create",
+        SessionCommandPayload::Goal {
+            operation: GoalOperation::Create {
+                objective: "Complete through MCP".into(),
+                token_budget: Some(100),
+            },
+        },
+    );
+
+    wait_for(
+        || {
+            core.workspace
+                .chat_goal(CHAT)
+                .is_some_and(|goal| goal.status == GoalStatus::Complete && goal.turns == 1)
+        },
+        "MCP goal completion",
+    )
+    .await;
+
+    let goal = core.workspace.chat_goal(CHAT).unwrap();
+    assert_eq!(goal.status, GoalStatus::Complete);
+    assert_eq!(
+        goal.status_message.as_deref(),
+        Some("Completed through Jolt MCP")
+    );
+    assert_eq!(goal.tokens_used, 18);
+    assert_eq!(goal.turns, 1);
+    assert!(goal.elapsed_active_ms > 0);
+    assert_eq!(
+        command_status(&core, "goal-create").map(|status| status.0),
+        Some(SessionCommandStatus::Applied)
+    );
+}
+
+#[tokio::test]
+async fn harness_startup_failure_pauses_and_accounts_the_active_goal() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(McpStartupFailureHarness));
+    core.workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "failing-goal-create",
+        SessionCommandPayload::Goal {
+            operation: GoalOperation::Create {
+                objective: "Encounter startup failure".into(),
+                token_budget: None,
+            },
+        },
+    );
+
+    wait_for(
+        || {
+            core.workspace.chat_goal(CHAT).is_some_and(|goal| {
+                goal.status == GoalStatus::Paused
+                    && goal.pause_source == Some(jolt_proto::GoalPauseSource::System)
+                    && goal.turns == 1
+            })
+        },
+        "failed startup goal accounting",
+    )
+    .await;
+
+    let goal = core.workspace.chat_goal(CHAT).unwrap();
+    assert_eq!(
+        goal.status_message.as_deref(),
+        Some("harness protocol error: startup failed")
+    );
+    assert_eq!(goal.tokens_used, 0);
+    assert!(goal.elapsed_active_ms > 0);
+}
+
+#[tokio::test]
+async fn mcp_request_answers_round_trips_through_the_composer_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(McpAskingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "mcp-answer-run",
+        SessionCommandPayload::Run {
+            request: run_request("ask through Jolt"),
+            message_id: "mcp-answer-user".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .map(|status| status.status)
+                == Some(SessionStatus::AwaitingInput)
+        },
+        "MCP answer UI",
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        MessagePart::Input {
+                            resolved: false,
+                            ..
+                        }
+                    )
+                })
+            })
+        },
+        "MCP input transcript part",
+    )
+    .await;
+    let (request_id, question) = entries(&core)
+        .iter()
+        .find_map(|entry| {
+            entry.parts.iter().find_map(|part| match part {
+                MessagePart::Input {
+                    request_id,
+                    questions,
+                    resolved: false,
+                    ..
+                } => questions
+                    .first()
+                    .map(|question| (request_id.clone(), question.clone())),
+                _ => None,
+            })
+        })
+        .unwrap();
+    assert_eq!(question.header, "Decision");
+    assert_eq!(question.question, "What should happen next?");
+    assert_eq!(question.options, ["Ship", "Document", "Wait"]);
+    assert!(question.multi_select);
+    let question_id = question.id;
+    queue_as_viewer(
+        handle.doc(),
+        "mcp-answer-response",
+        SessionCommandPayload::RespondInput {
+            request_id,
+            answers: vec![jolt_proto::UserInputAnswer {
+                question_id,
+                labels: vec!["Ship".into(), "Document".into()],
+            }],
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.status == Some(MessageStatus::Complete)
+                    && entry.parts.iter().any(
+                        |part| matches!(part, MessagePart::Text { text, .. } if text == "selected Ship, Document"),
+                    )
+            })
+        },
+        "MCP answer tool result",
+    )
+    .await;
+    assert_eq!(
+        command_status(&core, "mcp-answer-response"),
+        Some((SessionCommandStatus::Applied, None))
+    );
+    assert!(entries(&core).iter().any(|entry| {
+        entry
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::Input { resolved: true, .. }))
+    }));
+}
+
+#[tokio::test]
 async fn queued_messages_drain_fifo_as_one_batch_at_the_next_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
@@ -850,7 +1298,12 @@ async fn completed_turn_persists_an_authoritative_filesystem_diff() {
     )
     .unwrap();
 
-    let core = assemble(data.path(), Arc::new(EditingHarness));
+    let core = assemble(
+        data.path(),
+        Arc::new(EditingHarness {
+            report_file_tool: true,
+        }),
+    );
     core.repos.set_vcs(jolt_proto::VcsKind::Git).unwrap();
     core.doc_host.open(CHAT).unwrap();
     let mut request = run_request("edit it");
@@ -902,6 +1355,67 @@ async fn completed_turn_persists_an_authoritative_filesystem_diff() {
     assert!(page.patch.contains("-before"));
     assert!(page.patch.contains("+after"));
     assert!(!page.patch.contains("preexisting.txt"));
+}
+
+#[tokio::test]
+async fn turn_without_a_successful_file_tool_ignores_checkout_changes() {
+    let data = tempfile::tempdir().unwrap();
+    let checkout = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "jolt@example.invalid"]);
+    git(&["config", "user.name", "Jolt Test"]);
+    std::fs::write(checkout.path().join("changed.txt"), "before\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "initial"]);
+
+    let core = assemble(
+        data.path(),
+        Arc::new(EditingHarness {
+            report_file_tool: false,
+        }),
+    );
+    core.repos.set_vcs(jolt_proto::VcsKind::Git).unwrap();
+    core.doc_host.open(CHAT).unwrap();
+    let mut request = run_request("inspect it");
+    request.cwd = checkout.path().to_string_lossy().into_owned();
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, request, Some("user".into()))
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Complete)
+            })
+        },
+        "completed assistant turn",
+    )
+    .await;
+
+    let assistant = entries(&core)
+        .into_iter()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .unwrap();
+    assert!(
+        !assistant
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::Changes { .. }))
+    );
 }
 
 #[tokio::test]
@@ -2739,6 +3253,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
         .await
         .expect("UploadCommit");
     let path = committed["path"].as_str().expect("path").to_string();
+    assert_eq!(committed["sha256"].as_str().expect("sha256").len(), 64);
     assert_eq!(
         std::fs::read(&path).expect("durable upload file"),
         payload,

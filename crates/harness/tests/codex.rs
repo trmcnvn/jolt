@@ -9,7 +9,8 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use jolt_harness::{
-    CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
+    CancellationToken, CodexHarness, Harness, HarnessError, McpServerConfig, RunControls,
+    SteerMessage,
 };
 use jolt_proto::{
     AgentCommandSource, AgentEvent, CommandContext, DoneStatus, HarnessId, ReasoningLevel,
@@ -69,6 +70,7 @@ fn controls(
     let token = CancellationToken::new();
     let controls = RunControls {
         persist_session: true,
+        mcp: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -100,6 +102,26 @@ async fn run_to_end(
     )
     .await
     .expect("run finished in time")
+}
+
+#[tokio::test]
+async fn product_mcp_is_injected_without_bearer_in_arguments() {
+    let harness = harness();
+    assert!(harness.supports_mcp());
+    let (mut controls, _steer, _token) = controls("A");
+    controls.mcp = Some(McpServerConfig {
+        name: "jolt".into(),
+        url: "http://127.0.0.1:3210/mcp".into(),
+        bearer_token: "test-token".into(),
+    });
+    let events = run_to_end(&harness, request("scenario:mcp"), controls).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]
@@ -398,6 +420,7 @@ async fn approvals_round_trip_as_input_requests() {
     let seen = asked.clone();
     let controls = RunControls {
         persist_session: true,
+        mcp: None,
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();

@@ -389,6 +389,7 @@ fn field_mutators_round_trip() {
         control_nonce: "nonce-1".into(),
         objective: "finish it".into(),
         status: GoalStatus::Active,
+        pause_source: None,
         status_message: None,
         token_budget: Some(10_000),
         tokens_used: 500,

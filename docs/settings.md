@@ -14,7 +14,6 @@ Open settings from the user menu or with `Cmd+,` on macOS / `Ctrl+,` elsewhere. 
 | **Appearance** | System/light/dark mode, paired themes, custom colors, and typography | Local viewport setting; custom theme files are installation-level |
 | **Notifications** | In-app toasts versus operating-system notifications | Local viewport setting |
 | **Hotkeys** | Rebindable app commands with conflict detection and reset controls | Local viewport setting |
-| **Archived sessions** | Browse and restore archived chats | Synced chat rows |
 
 Removing a device tombstones its spaces and sessions. Synced R2 backups and attachments are purged asynchronously; folders and other local files on that machine are unaffected. If Jolt later starts there again, it registers as an empty device.
 
@@ -85,7 +84,7 @@ On macOS, the page also includes the native app and window hotkeys:
 | Minimize window | `Cmd+M` |
 | Close window | `Cmd+W` |
 
-`Cmd+W` intentionally serves both Close current tab and Close window. In chat mode it closes only the device-local tab; on an empty new-session canvas it does nothing. In Settings it falls through to the native window action. Archive remains an explicit session context-menu action. Transcript prompt navigation follows the complete message rail, loading historical pages when needed, and works even when the visual rail is hidden on a narrow layout. Developer builds also expose the Performance HUD hotkey (`Mod+Shift+F12`).
+`Cmd+W` intentionally serves both Close current tab and Close window. In a focused terminal pane it closes only the active terminal tab; elsewhere in chat mode it closes only the device-local session tab. On an empty new-session canvas it does nothing. In Settings it falls through to the native window action. Archive remains an explicit session context-menu action. Transcript prompt navigation follows the complete message rail, loading historical pages when needed, and works even when the visual rail is hidden on a narrow layout. Developer builds also expose the Performance HUD hotkey (`Mod+Shift+F12`).
 
 The Hotkeys page groups commands into collapsible Session actions, Tab switching, Navigation & layout, App & window, and Developer sections. Tab switching starts collapsed; the other available sections start expanded. The page records key combinations, detects duplicate assignments, resets one action, or restores defaults.
 
@@ -94,6 +93,7 @@ The Hotkeys page groups commands into collapsible Session actions, Tab switching
 The user menu includes:
 
 - **Settings**
+- **Archived sessions** — search and restore archived chats across devices
 - **Usage breakdown** — 7-, 30-, or 90-day summaries merged from reachable devices
 - **Check for update** or the current update state
 - **Sign out**

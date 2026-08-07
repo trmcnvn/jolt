@@ -12,12 +12,14 @@ model="beta"
 session="pi-session-1"
 wedge=0
 steer_race=0
+extension=""
 all_args="$*"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --provider) provider="$2"; shift 2 ;;
     --model) model="$2"; shift 2 ;;
     --session-id) session="$2"; shift 2 ;;
+    --extension) extension="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -116,6 +118,18 @@ while IFS= read -r line; do
           ;;
         *scenario:environment*)
           [ "$JOLT_TEST_SECRET" = available ] || { fail "$line" prompt 'missing secret environment'; continue; }
+          respond "$line" prompt '{}'
+          emit '{"type":"agent_start"}'
+          emit '{"type":"agent_end","messages":[]}'
+          emit '{"type":"agent_settled"}'
+          ;;
+        *scenario:mcp*)
+          has "$all_args" '--extension' || { fail "$line" prompt 'missing Jolt MCP extension'; continue; }
+          [ -f "$extension" ] || { fail "$line" prompt 'Jolt MCP extension file is unavailable'; continue; }
+          has "$all_args" 'top-secret' && { fail "$line" prompt 'MCP token leaked into arguments'; continue; }
+          [ "$JOLT_MCP_URL" = 'http://127.0.0.1:1234/mcp' ] || { fail "$line" prompt 'missing MCP URL'; continue; }
+          [ "$JOLT_MCP_BEARER_TOKEN" = 'top-secret' ] || { fail "$line" prompt 'missing MCP token'; continue; }
+          [ "$PI_MCP_CONFIG" = 'user-config' ] || { fail "$line" prompt 'overrode user MCP config'; continue; }
           respond "$line" prompt '{}'
           emit '{"type":"agent_start"}'
           emit '{"type":"agent_end","messages":[]}'

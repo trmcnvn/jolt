@@ -39,7 +39,7 @@ Development mode can connect to an edge running with `AUTH_MODE=dev`, where the 
 - Search the host checkout with `@` and send file/directory mentions as cross-platform `jolt-file:` links.
 - Use `/answer`, `/bro`, `!command`, and `!!command` from the composer.
 - Change model, reasoning, and ref for later turns.
-- Archive sessions with a swipe.
+- Archive sessions with a left swipe and delete them with a confirmed right swipe.
 - Use context menus to copy transcript text and code.
 
 The app registers the iPhone as an iOS viewer in the account device list, publishes presence, shows host-device online state, and warns when a run is queued for an offline host.
@@ -50,7 +50,7 @@ The app registers the iPhone as an iOS viewer in the account device list, publis
 | --- | --- |
 | Searchable sidebar space filter and session list | Sessions-first Home screen with a searchable space filter |
 | Device-local horizontal tabs | Native navigation stack; no mobile tab strip |
-| Explicit Archive action | Swipe to archive |
+| Explicit Archive and Delete actions | Swipe left to archive; swipe right to delete with confirmation |
 | Harness/model popover | Model and effort sheets |
 | Global New Session canvas + space picker | Global New Session route + searchable space sheet |
 | Add-space palette | Device tabs and remote folder browser |

@@ -704,6 +704,27 @@ impl AppState {
         })
     }
 
+    fn pending_send_host_device_id(&self, chat_id: &str) -> Option<&str> {
+        if let Some(chat) = self.chats.iter().find(|chat| chat.id == chat_id) {
+            return Some(&chat.device_id);
+        }
+        if self.selected_chat.as_deref() != Some(chat_id) {
+            return None;
+        }
+        self.selected_space_row()
+            .map(|space| space.device_id.as_str())
+    }
+
+    /// Host name while an unacknowledged send is waiting on an offline device.
+    /// Unlike the Working overlay, this does not expire: the durable command is
+    /// still queued until the host returns or the matching transcript entry lands.
+    pub fn queued_send_offline_host_name(&self, chat_id: &str, now: DateTime<Utc>) -> Option<&str> {
+        self.pending_sends.get(chat_id)?;
+        let device_id = self.pending_send_host_device_id(chat_id)?;
+        (!self.device_online(device_id, now))
+            .then(|| self.device_name(device_id).unwrap_or("Unknown device"))
+    }
+
     fn ack_pending_send_from_transcript(&mut self) {
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(pending) = self.pending_sends.get(chat_id)
@@ -805,10 +826,13 @@ impl AppState {
         self.selected_space_row().is_some_and(|s| s.git_detected)
     }
 
-    /// Full display status for a chat (tab dots, Active list). A queued send
-    /// reads as Working until its host acknowledges it.
+    /// Full display status for a chat (tab dots, Active list). A pending send
+    /// reads as Working only while its host is reachable; offline sends remain
+    /// queued without impersonating active work.
     pub fn display_status_for(&self, chat: &Chat, now: DateTime<Utc>) -> ChatIndicator {
-        if self.send_pending(&chat.id, now) {
+        if self.queued_send_offline_host_name(&chat.id, now).is_none()
+            && self.send_pending(&chat.id, now)
+        {
             return ChatIndicator::Working;
         }
         display_status(chat, self.session_for(&chat.id), now)
@@ -837,7 +861,9 @@ impl AppState {
 
     /// Staleness-checked status dot for a chat row.
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
-        if self.send_pending(chat_id, now) {
+        if self.queued_send_offline_host_name(chat_id, now).is_none()
+            && self.send_pending(chat_id, now)
+        {
             return Indicator::Working;
         }
         effective_indicator(self.session_for(chat_id), now)
@@ -2149,6 +2175,47 @@ mod tests {
             ChatIndicator::Completed
         );
         assert_eq!(state.indicator_for("c", expired), Indicator::None);
+    }
+
+    #[test]
+    fn pending_send_to_offline_host_stays_queued_instead_of_working() {
+        let now = Utc::now();
+        let unseen = chat("c", 0, Some(10));
+        let mut state = AppState::new();
+        state.apply_chats(vec![unseen.clone()]);
+        state.devices = vec![Device {
+            id: "dev".into(),
+            name: "MacBook".into(),
+            platform: "macos".into(),
+            last_seen_at: Some(now - TimeDelta::minutes(2)),
+            created_at: None,
+            version: None,
+        }];
+        state.begin_pending_send("c", "m1", now);
+
+        assert_eq!(
+            state.queued_send_offline_host_name("c", now),
+            Some("MacBook")
+        );
+        assert_eq!(
+            state.display_status_for(&unseen, now),
+            ChatIndicator::Completed
+        );
+        assert_eq!(state.indicator_for("c", now), Indicator::None);
+        let expired = now + TimeDelta::milliseconds(PENDING_SEND_TTL_MS + 1);
+        assert_eq!(
+            state.queued_send_offline_host_name("c", expired),
+            Some("MacBook")
+        );
+        assert_eq!(state.indicator_for("c", expired), Indicator::None);
+
+        state.devices[0].last_seen_at = Some(now);
+        assert_eq!(state.queued_send_offline_host_name("c", now), None);
+        assert_eq!(
+            state.display_status_for(&unseen, now),
+            ChatIndicator::Working
+        );
+        assert_eq!(state.indicator_for("c", now), Indicator::Working);
     }
 
     #[test]

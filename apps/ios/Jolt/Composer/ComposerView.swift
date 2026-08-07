@@ -362,16 +362,17 @@ struct ComposerView: View {
         Task { @MainActor in
             defer { uploading = false }
             do {
-                var paths: [String] = []
+                var uploads: [UploadedAttachment] = []
                 for att in staged {
-                    let path = try await store.uploadAttachment(name: att.name, data: att.data)
+                    let upload = try await store.uploadAttachment(name: att.name, data: att.data)
                     // Seed the cache so our own bubble renders from local
                     // bytes instead of a round-trip.
-                    AttachmentImageCache.shared.seed(deviceId: chat.deviceId, path: path,
+                    AttachmentImageCache.shared.seed(deviceId: chat.deviceId, path: upload.path,
                                                      name: att.name, data: att.data)
-                    paths.append(path)
+                    uploads.append(upload)
                 }
-                deliver(content: withAttachments(text: encodedPrompt, paths: paths), paths: paths)
+                deliver(content: withAttachments(text: encodedPrompt, uploads: uploads),
+                        paths: uploads.map(\.path))
                 attachments = []
                 clearDraft()
             } catch {

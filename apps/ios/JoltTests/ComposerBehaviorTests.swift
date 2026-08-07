@@ -25,6 +25,20 @@ final class ComposerBehaviorTests: XCTestCase {
         XCTAssertEqual(pastedProviders.count, 1)
     }
 
+    func testAttachmentTransportPreservesEdgeHash() {
+        let hash = String(repeating: "0123456789abcdef", count: 4)
+        let content = withAttachments(
+            text: "Look",
+            uploads: [UploadedAttachment(path: "/uploads/cat.png", sha256: hash)]
+        )
+        let parsed = parseUserMessageImages(content)
+
+        XCTAssertEqual(parsed.text, "Look")
+        XCTAssertEqual(parsed.attachments.count, 1)
+        XCTAssertEqual(parsed.attachments[0].path, "/uploads/cat.png")
+        XCTAssertEqual(parsed.attachments[0].sha256, hash)
+    }
+
     func testShellCommandPrefixes() {
         XCTAssertEqual(parseShellCommand("! cargo test"),
                        ShellCommand(command: "cargo test", excludeFromContext: false))

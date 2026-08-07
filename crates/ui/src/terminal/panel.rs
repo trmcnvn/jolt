@@ -4,8 +4,8 @@
 //! (emulators — and their server-side PTYs — survive navigation; detach is not
 //! close). Tab bar supports pointer drag-reorder with 150 ms sliding
 //! transforms, middle-click close, and a "+" new-tab button. While the pane is
-//! focused, Cmd/Ctrl+T opens a tab and Cmd/Ctrl+Shift+W closes the active tab;
-//! Cmd/Ctrl+` toggles the panel (the shell owns the height animation and
+//! focused, Cmd/Ctrl+T opens a tab and Cmd/Ctrl+W or Cmd/Ctrl+Shift+W closes
+//! the active tab; Cmd/Ctrl+` toggles the panel (the shell owns the height animation and
 //! persistence).
 //!
 //! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
@@ -29,6 +29,7 @@ use jolt_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
+use crate::shell::CloseCurrentTab;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
@@ -47,6 +48,7 @@ actions!(terminal, [ToggleTerminal, NewTerminalTab, CloseTerminalTab]);
 #[derive(Debug, Clone)]
 pub enum TerminalPanelEvent {
     ChatEmptied(String),
+    ToggleExpanded,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +250,7 @@ pub struct TerminalPanel {
     chats: HashMap<String, ChatTabs>,
     /// Shell-driven visibility gate: no RPC happens while closed (lazy).
     open: bool,
+    expanded_view: bool,
     tab_seq: u64,
     drag: Option<DragState>,
     last_selected: Option<String>,
@@ -267,6 +270,7 @@ impl TerminalPanel {
             launch_command,
             chats: HashMap::new(),
             open: false,
+            expanded_view: false,
             tab_seq: 0,
             drag: None,
             last_selected: None,
@@ -295,6 +299,13 @@ impl TerminalPanel {
             self.ensure_tab(cx);
         }
         cx.notify();
+    }
+
+    pub fn set_expanded_view(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if self.expanded_view != expanded {
+            self.expanded_view = expanded;
+            cx.notify();
+        }
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
@@ -1218,8 +1229,38 @@ impl TerminalPanel {
                             .text_color(theme.text_muted.opacity(0.6)),
                     ),
             )
-            // Collapse chevron pinned right ("Hide terminal" ⌘`).
+            // Panel controls pinned right.
             .child(div().flex_1())
+            .child(
+                div()
+                    .id("toggle-expanded-terminal")
+                    .size(px(28.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        "term-expand",
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.05),
+                    ))
+                    .on_hover(motion::hover_listener("term-expand"))
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(TerminalPanelEvent::ToggleExpanded);
+                    }))
+                    .child(
+                        crate::icons::icon(if self.expanded_view {
+                            crate::icons::RESTORE
+                        } else {
+                            crate::icons::MAXIMIZE
+                        })
+                        .size(px(15.0))
+                        .text_color(theme.text_muted.opacity(0.55)),
+                    ),
+            )
+            // Collapse chevron ("Hide terminal" ⌘`).
             .child(
                 div()
                     .id("terminal-collapse")
@@ -1291,6 +1332,9 @@ impl Render for TerminalPanel {
                         this.open_selected_tab(cx);
                     }))
                     .on_action(cx.listener(|this, _: &CloseTerminalTab, window, cx| {
+                        this.close_active_tab(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &CloseCurrentTab, window, cx| {
                         this.close_active_tab(window, cx);
                     }))
                     .on_key_down(cx.listener(Self::on_key_down))

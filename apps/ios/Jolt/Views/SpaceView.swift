@@ -1,5 +1,5 @@
 // Space detail remains a filtered mobile deep link. Sessions use native
-// navigation, swipe-to-archive stays explicit, and "+" starts in this space.
+// navigation, explicit swipe actions, and "+" starts in this space.
 
 import SwiftUI
 
@@ -7,6 +7,14 @@ struct SpaceView: View {
     @Environment(AppModel.self) private var model
     let spaceId: String
     @Binding var path: [Route]
+    @State private var sessionToDelete: Chat?
+
+    private var deleteConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { sessionToDelete != nil },
+            set: { if !$0 { sessionToDelete = nil } }
+        )
+    }
 
     private var space: Space? {
         model.spaces.first { $0.id == spaceId }
@@ -28,6 +36,16 @@ struct SpaceView: View {
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    Button {
+                        sessionToDelete = chat
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                    // The confirmation button owns the destructive role. Giving
+                    // it to this trigger makes List optimistically remove the row.
+                    .tint(Theme.danger)
+                }
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button {
                         model.archive(chatId: chat.id)
@@ -43,6 +61,19 @@ struct SpaceView: View {
         .scrollContentBackground(.hidden)
         .scrollEdgeEffectStyle(.soft, for: .top)
         .background(Theme.surface.ignoresSafeArea())
+        .confirmationDialog(
+            "Delete session?",
+            isPresented: deleteConfirmationPresented,
+            titleVisibility: .visible,
+            presenting: sessionToDelete
+        ) { chat in
+            Button("Delete", role: .destructive) {
+                model.deleteChat(chat.id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { chat in
+            Text("“\(chat.displayTitle)” will be permanently deleted. This can’t be undone.")
+        }
         .navigationTitle(space?.displayName ?? "Space")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

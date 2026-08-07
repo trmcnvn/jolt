@@ -3589,6 +3589,10 @@ pub enum MessageHistoryDirection {
     Newer,
 }
 
+fn can_navigate_message_history(current: Option<usize>, composer_text: &str) -> bool {
+    current.is_some() || composer_text.is_empty()
+}
+
 fn message_history_position(
     current: Option<usize>,
     message_count: usize,
@@ -4374,7 +4378,11 @@ impl Composer {
         direction: MessageHistoryDirection,
         cx: &mut Context<Self>,
     ) {
-        if self.wizard.is_some() || self.extracted_answers.is_some() {
+        let can_navigate_history = {
+            let input = self.input.read(cx);
+            can_navigate_message_history(self.message_history_position, input.text())
+        };
+        if self.wizard.is_some() || self.extracted_answers.is_some() || !can_navigate_history {
             let direction = match direction {
                 MessageHistoryDirection::Older => -1.0,
                 MessageHistoryDirection::Newer => 1.0,
@@ -5867,7 +5875,7 @@ impl Composer {
                 // prompt text (`with_attachments`, the persisted transport)
                 // and the paths onto the Run request (inline image blocks).
                 let mut content = text.clone();
-                let mut attachment_paths: Vec<String> = Vec::new();
+                let mut uploaded_attachments = Vec::new();
                 if !staged.is_empty() {
                     for att in &staged {
                         match attachments::upload_attachment(
@@ -5879,7 +5887,7 @@ impl Composer {
                         )
                         .await
                         {
-                            Ok(path) => attachment_paths.push(path),
+                            Ok(upload) => uploaded_attachments.push(upload),
                             Err(err) => {
                                 tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
                                 return Err(
@@ -5892,13 +5900,23 @@ impl Composer {
                     // Seed the transcript cache from local bytes so the sent
                     // bubble's thumbnails never round-trip.
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
-                    for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
+                    for (upload, att) in uploaded_attachments.iter().zip(&staged) {
+                        attachments::seed_attachment(
+                            &seed_device,
+                            &upload.path,
+                            &att.name,
+                            att.image.clone(),
+                        );
                         if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                            attachments::seed_attachment(
+                                &device_id,
+                                &upload.path,
+                                &att.name,
+                                att.image.clone(),
+                            );
                         }
                     }
-                    content = attachments::with_attachments(&text, &attachment_paths);
+                    content = attachments::with_uploaded_attachments(&text, &uploaded_attachments);
                     if !queue_cmd {
                         // Refresh the echo in place with the attachment refs
                         // (same id, same clock — the bubble grows its thumbnails
@@ -5927,6 +5945,10 @@ impl Composer {
                     }
                 }
 
+                let attachment_paths = uploaded_attachments
+                    .into_iter()
+                    .map(|upload| upload.path)
+                    .collect();
                 let command = if let Some(shell) = &shell {
                     SessionCommandPayload::Bash {
                         command: shell.command.clone(),
@@ -7721,6 +7743,16 @@ mod tests {
             range,
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn message_history_starts_only_from_an_empty_composer() {
+        assert!(can_navigate_message_history(None, ""));
+        assert!(!can_navigate_message_history(None, "unsent text"));
+        assert!(
+            can_navigate_message_history(Some(0), "recalled prompt"),
+            "an untouched recalled prompt remains in history navigation"
+        );
     }
 
     #[test]

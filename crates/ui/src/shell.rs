@@ -18,13 +18,15 @@ use chrono::Utc;
 use gpui::{
     AnyElement, App, Context, Empty, Entity, FocusHandle, Focusable as _, IntoElement, KeyBinding,
     Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString,
-    Subscription, Task, Window, WindowControlArea, actions, div, prelude::*, px,
+    Subscription, Task, UniformListScrollHandle, Window, WindowControlArea, actions, div,
+    prelude::*, px, uniform_list,
 };
 
 use gpui_tokio::Tokio;
 use jolt_proto::{HarnessId, UsageBreakdown, UsageBreakdownRow, UsageDay};
 use jolt_rpc::methods;
 
+use crate::archived::ArchivedPage;
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 #[cfg(any(debug_assertions, feature = "debug-ui"))]
@@ -36,7 +38,6 @@ use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
-use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::hotkeys::{HotkeysEvent, HotkeysPage};
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
@@ -289,11 +290,10 @@ pub enum SettingsSection {
     Appearance,
     Notifications,
     Hotkeys,
-    Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
         SettingsSection::Secrets,
@@ -302,7 +302,6 @@ impl SettingsSection {
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Hotkeys,
-        SettingsSection::Archived,
     ];
 
     /// Label shared by the settings sidebar and header.
@@ -316,7 +315,6 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Hotkeys => "Hotkeys",
-            SettingsSection::Archived => "Archived sessions",
         }
     }
 }
@@ -325,6 +323,7 @@ impl SettingsSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Chat,
+    Archived,
     Settings(SettingsSection),
 }
 
@@ -379,6 +378,7 @@ impl SessionPanels {
 pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
+    Archived,
     Settings(SettingsSection),
 }
 
@@ -685,22 +685,34 @@ fn harness_label(harness: HarnessId) -> &'static str {
     }
 }
 
+struct SessionStatusStrip {
+    state: Entity<AppState>,
+    composer: Entity<Composer>,
+}
+
+struct JumpToBottom {
+    transcript: Entity<Transcript>,
+}
+
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    status_strip: Entity<SessionStatusStrip>,
+    jump_to_bottom: Entity<JumpToBottom>,
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
     file_drag_active: bool,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
+    terminal_expanded: bool,
     changes: Option<Entity<Changes>>,
     changes_expanded: bool,
     changes_sub: Option<Subscription>,
     #[cfg(any(debug_assertions, feature = "debug-ui"))]
     performance_hud: Option<Entity<PerformanceHud>>,
-    /// Chat outlet vs settings pages.
+    /// Chat outlet vs secondary app pages.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
@@ -750,7 +762,7 @@ pub struct Shell {
     /// selection change, not every frame (which would fight manual scrolling).
     tabs_scrolled_to: Option<String>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
-    sidebar_scroll: gpui::ScrollHandle,
+    sidebar_scroll: UniformListScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
     /// Last scope whose navigation snapshot is loaded into `settings`.
@@ -825,7 +837,7 @@ pub struct Shell {
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
-    /// Focus target for settings pages, which otherwise have no consistently
+    /// Focus target for secondary pages, which otherwise have no consistently
     /// focusable child to receive route-level keyboard events.
     settings_focus: FocusHandle,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
@@ -857,6 +869,13 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let status_strip = cx.new(|_| SessionStatusStrip {
+            state: state.clone(),
+            composer: composer.clone(),
+        });
+        let jump_to_bottom = cx.new(|_| JumpToBottom {
+            transcript: transcript.clone(),
+        });
         let transcript_events = cx.subscribe(
             &transcript,
             |this: &mut Shell, _, event: &TranscriptEvent, cx| match event {
@@ -935,9 +954,9 @@ impl Shell {
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable hotkeys from the persisted keymap.
         apply_keymap(cx, &settings.keymap);
-        // Dev/testing knob: `JOLT_OPEN_ROUTE=settings[/<section>]` boots
-        // straight into a settings section — these pages have no deep link and
-        // synthetic input can't reach them on headless compositors.
+        // Dev/testing knob: `JOLT_OPEN_ROUTE=archived|settings[/<section>]`
+        // boots straight into a secondary page — these pages have no deep link
+        // and synthetic input can't reach them on headless compositors.
         let route = match std::env::var("JOLT_OPEN_ROUTE").ok().as_deref() {
             Some("settings") | Some("settings/devices") => {
                 Route::Settings(SettingsSection::Devices)
@@ -951,7 +970,7 @@ impl Shell {
             Some("settings/hotkeys" | "settings/shortcuts") => {
                 Route::Settings(SettingsSection::Hotkeys)
             }
-            Some("settings/archived") => Route::Settings(SettingsSection::Archived),
+            Some("archived" | "settings/archived") => Route::Archived,
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -975,6 +994,7 @@ impl Shell {
         };
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
+            Route::Archived => NavEntry::Archived,
             Route::Settings(section) => NavEntry::Settings(section),
         });
         #[cfg(any(debug_assertions, feature = "debug-ui"))]
@@ -984,8 +1004,11 @@ impl Shell {
             state,
             transcript,
             composer,
+            status_strip,
+            jump_to_bottom,
             file_drag_active: false,
             terminal: None,
+            terminal_expanded: false,
             changes: None,
             changes_expanded: false,
             changes_sub: None,
@@ -1022,7 +1045,7 @@ impl Shell {
             tab_drag: None,
             tabs_scroll: gpui::ScrollHandle::new(),
             tabs_scrolled_to: None,
-            sidebar_scroll: gpui::ScrollHandle::new(),
+            sidebar_scroll: UniformListScrollHandle::new(),
             space_boot_applied: false,
             observed_scope: None,
             usage_warning_levels: std::collections::HashMap::new(),
@@ -1134,6 +1157,7 @@ impl Shell {
         // Scope-bound views own standing RPC streams; recreate them against the
         // newly routed runtime while leaving both engine runtimes alive.
         self.terminal = None;
+        self.terminal_expanded = false;
         self.changes = None;
         self.changes_expanded = false;
         self.changes_sub = None;
@@ -1224,6 +1248,7 @@ impl Shell {
             self.right_tween = None;
             self.terminal_tween = None;
             self.set_changes_expanded(false, cx);
+            self.set_terminal_expanded(false, cx);
             let panels = self.panels.get(&self.panel_key(cx));
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
@@ -1438,6 +1463,9 @@ impl Shell {
     }
 
     fn set_changes_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if expanded {
+            self.set_terminal_expanded(false, cx);
+        }
         if self.changes_expanded == expanded {
             return;
         }
@@ -1490,8 +1518,11 @@ impl Shell {
         changes
     }
     fn sync_changes_watch(&mut self, cx: &mut Context<Self>) {
-        let visible =
-            matches!(self.route, Route::Chat) && self.panels.get(&self.panel_key(cx)).changes_open;
+        let on_chat = matches!(self.route, Route::Chat);
+        if !on_chat {
+            self.set_terminal_expanded(false, cx);
+        }
+        let visible = on_chat && self.panels.get(&self.panel_key(cx)).changes_open;
         if visible {
             self.changes_pane(cx).update(cx, Changes::ensure_watch);
         } else if let Some(changes) = self.changes.clone() {
@@ -1506,16 +1537,36 @@ impl Shell {
         }
         let command = self.settings.terminal_command.clone();
         let terminal = cx.new(|cx| TerminalPanel::new(self.state.clone(), command, cx));
+        terminal.update(cx, |terminal, cx| {
+            terminal.set_expanded_view(self.terminal_expanded, cx)
+        });
         self.terminal_panel_sub = Some(cx.subscribe(
             &terminal,
             |this: &mut Shell, _, event: &TerminalPanelEvent, cx| match event {
                 TerminalPanelEvent::ChatEmptied(chat_id) => {
                     this.close_terminal_for_exited_chat(chat_id, cx);
                 }
+                TerminalPanelEvent::ToggleExpanded => {
+                    this.set_terminal_expanded(!this.terminal_expanded, cx);
+                }
             },
         ));
         self.terminal = Some(terminal.clone());
         terminal
+    }
+
+    fn set_terminal_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if expanded {
+            self.set_changes_expanded(false, cx);
+        }
+        if self.terminal_expanded == expanded {
+            return;
+        }
+        self.terminal_expanded = expanded;
+        if let Some(terminal) = self.terminal.clone() {
+            terminal.update(cx, |terminal, cx| terminal.set_expanded_view(expanded, cx));
+        }
+        cx.notify();
     }
 
     fn terminal_target(&self, cx: &App) -> f32 {
@@ -1533,6 +1584,7 @@ impl Shell {
             return;
         }
         if let Some(from) = from {
+            self.set_terminal_expanded(false, cx);
             self.terminal_tween = Some(WidthTween::new(from, 0.0));
             self.schedule_terminal_tween_cleanup(cx);
             cx.notify();
@@ -1559,6 +1611,9 @@ impl Shell {
         let key = self.panel_key(cx);
         let open = self.panels.toggle_terminal(&key);
         self.terminal_tween = Some(WidthTween::new(from, self.terminal_target(cx)));
+        if !open {
+            self.set_terminal_expanded(false, cx);
+        }
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
@@ -1695,6 +1750,15 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_archived(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Archived;
+        self.nav.push(NavEntry::Archived);
+        self.sync_changes_watch(cx);
+        self.user_menu_open = false;
+        self.chat_menu = None;
+        cx.notify();
+    }
+
     /// Open the unmaterialized new-session tab. Every entry point shares the
     /// same target resolver: sidebar filter, last active space, first space.
     fn open_new_session(&mut self, cx: &mut Context<Self>) {
@@ -1722,7 +1786,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn close_settings(&mut self, cx: &mut Context<Self>) {
+    fn close_secondary_page(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         self.sync_changes_watch(cx);
@@ -1754,6 +1818,9 @@ impl Shell {
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
                 }
+            }
+            NavEntry::Archived => {
+                self.route = Route::Archived;
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
@@ -1887,16 +1954,18 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Archived => {
-                if self.archived_page.is_none() {
-                    let state = self.state.clone();
-                    self.archived_page = Some(cx.new(|cx| ArchivedPage::new(state, cx)));
-                }
-                match &self.archived_page {
-                    Some(page) => page.clone().into_any_element(),
-                    None => Empty.into_any_element(),
-                }
-            }
+        }
+    }
+
+    /// Lazily create the standalone archived-sessions page.
+    fn archived_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.archived_page.is_none() {
+            let state = self.state.clone();
+            self.archived_page = Some(cx.new(|cx| ArchivedPage::new(state, cx)));
+        }
+        match &self.archived_page {
+            Some(page) => page.clone().into_any_element(),
+            None => Empty.into_any_element(),
         }
     }
 
@@ -1973,6 +2042,12 @@ impl Shell {
             serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": true }),
             cx,
         );
+        cx.notify();
+    }
+
+    fn confirm_delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        self.delete_confirm = Some(chat_id);
         cx.notify();
     }
 
@@ -2216,13 +2291,13 @@ impl Shell {
         cluster + CLUSTER_BUTTONS_WIDTH + 10.0
     }
 
-    /// The unified window titlebar: chat → the session tab strip; settings →
-    /// the section label. Full-width on the glass shell; the traffic lights
-    /// and control cluster overlay its left end.
+    /// The unified window titlebar: chat shows the session tab strip;
+    /// secondary pages keep the strip clear. Full-width on the glass shell;
+    /// the traffic lights and control cluster overlay its left end.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_tab_strip(cx),
-            Route::Settings(_) => {
+            Route::Archived | Route::Settings(_) => {
                 let inner = div()
                     .size_full()
                     .flex()
@@ -2393,7 +2468,7 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            Route::Chat | Route::Archived => self.render_chat_sidebar(&theme, cx),
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -2423,7 +2498,6 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Hotkeys => icons::KEYBOARD,
-            SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
@@ -2502,7 +2576,7 @@ impl Shell {
                         .text_color(theme.text_muted)
                         .cursor_pointer()
                         .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_secondary_page(cx)))
                         .child(
                             // Use the AltArrowLeft chevron, not the straight
                             // history arrow.
@@ -2566,6 +2640,9 @@ impl Shell {
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
         let menu_id = id.clone();
+        let archive_id = id.clone();
+        let delete_id = id.clone();
+        let group: SharedString = format!("chat-row-group-{id}").into();
         // Both the hover wash and title brighten over the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
         let rest_bg = if selected {
@@ -2581,6 +2658,8 @@ impl Shell {
         let rest_text = if selected { text } else { text.opacity(0.8) };
         div()
             .id(SharedString::from(format!("chat-{id}")))
+            .group(group.clone())
+            .relative()
             .flex()
             .flex_col()
             .gap(px(2.0))
@@ -2623,12 +2702,98 @@ impl Shell {
                             .text_color(subline)
                             .child(space_name),
                     )
+                    // The fixed trailing slot keeps metadata from reflowing
+                    // when hover swaps the timestamp for row actions.
                     .child(
                         div()
+                            .w(px(40.0))
+                            .h(px(14.0))
                             .flex_none()
-                            .text_size(px(11.0))
-                            .text_color(subline)
-                            .child(time_ago),
+                            .relative()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .text_size(px(11.0))
+                                    .text_color(subline)
+                                    .opacity(1.0)
+                                    .group_hover(group.clone(), |style| style.opacity(0.0))
+                                    .child(time_ago),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(-2.0))
+                                    .right_0()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(2.0))
+                                    .opacity(0.0)
+                                    .group_hover(group.clone(), |style| style.opacity(1.0))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("chat-archive-{id}")))
+                                            .size(px(18.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(5.0))
+                                            .text_color(theme.text_muted)
+                                            .cursor_pointer()
+                                            .hover(|style| {
+                                                style
+                                                    .bg(crate::theme::wash(0.14))
+                                                    .text_color(theme.text)
+                                            })
+                                            .tooltip(|_, cx| {
+                                                cx.new(|_| {
+                                                    SessionActionTooltip("Archive session".into())
+                                                })
+                                                .into()
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.archive_chat(archive_id.clone(), cx);
+                                            }))
+                                            .child(
+                                                icon(icons::ARCHIVE_MINIMALISTIC)
+                                                    .size(px(12.0))
+                                                    .text_color(theme.text_muted),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("chat-delete-{id}")))
+                                            .size(px(18.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(5.0))
+                                            .text_color(theme.text_muted)
+                                            .cursor_pointer()
+                                            .hover(|style| {
+                                                style
+                                                    .bg(theme.danger.opacity(0.12))
+                                                    .text_color(theme.danger)
+                                            })
+                                            .tooltip(|_, cx| {
+                                                cx.new(|_| {
+                                                    SessionActionTooltip("Delete session".into())
+                                                })
+                                                .into()
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.confirm_delete_chat(delete_id.clone(), cx);
+                                            }))
+                                            .child(
+                                                icon(icons::TRASH_BIN_MINIMALISTIC)
+                                                    .size(px(12.0))
+                                                    .text_color(theme.danger),
+                                            ),
+                                    ),
+                            ),
                     ),
             )
             // Line 2: the session title, aligned under the folder icon
@@ -2687,8 +2852,9 @@ impl Shell {
     /// Which sidebar-list edges have hidden overflow (offset from the LAST
     /// frame — the invisible one-frame lag every fade here rides).
     pub(super) fn sidebar_fade_zones(&self) -> (bool, bool) {
-        let scrolled = -f32::from(self.sidebar_scroll.offset().y);
-        let max_scroll = f32::from(self.sidebar_scroll.max_offset().y);
+        let scroll = self.sidebar_scroll.0.borrow();
+        let scrolled = -f32::from(scroll.base_handle.offset().y);
+        let max_scroll = f32::from(scroll.base_handle.max_offset().y);
         (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
@@ -2697,10 +2863,11 @@ impl Shell {
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let user = self.state.read(cx).auth_user().cloned();
 
-        // Keyed rows: (stable key, estimated height, element) — the key + height
-        // list drives the §1.6 resort FLIP diff below (attention-bucket
-        // promotions glide; cleared rows just go).
-        let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+        // Keep only compact row data here. The uniform list below asks for the
+        // visible range, so a large session history no longer rebuilds and lays
+        // out every offscreen row on each composer or transcript frame. In the
+        // 100-session release typing fixture this holds p50 draw at 1.9ms.
+        let rows = self.active_rows(cx);
 
         // When the order of a live list changes due to activity or grouping,
         // surviving rows glide from their old y to the new one. Layout is at the new
@@ -2708,19 +2875,22 @@ impl Shell {
         // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
         // disappear immediately. First fill and chat switches that do not
         // reorder never animate.
-        let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
+        let order: Vec<(String, f32)> = rows
+            .iter()
+            .map(|row| (row.key.clone(), CHAT_ROW_HEIGHT))
+            .collect();
         if self.sidebar_prev_order != order {
             if !self.sidebar_prev_order.is_empty() {
                 let offsets = resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
                 let prev_keys: std::collections::HashSet<&str> = self
                     .sidebar_prev_order
                     .iter()
-                    .map(|(k, _)| k.as_str())
+                    .map(|(key, _)| key.as_str())
                     .collect();
                 let new_keys: std::collections::HashSet<String> = order
                     .iter()
-                    .filter(|(k, _)| !prev_keys.contains(k.as_str()))
-                    .map(|(k, _)| k.clone())
+                    .filter(|(key, _)| !prev_keys.contains(key.as_str()))
+                    .map(|(key, _)| key.clone())
                     .collect();
                 if !offsets.is_empty() || !new_keys.is_empty() {
                     self.resort_epoch += 1;
@@ -2730,26 +2900,59 @@ impl Shell {
             }
             self.sidebar_prev_order = order;
         }
+
+        let row_count = rows.len();
         let epoch = self.resort_epoch;
-        let list_items: Vec<AnyElement> = keyed
-            .into_iter()
-            .map(|(key, _, element)| {
-                if let Some(dy) = self.sidebar_resort.get(&key).copied() {
-                    let id = SharedString::from(format!("resort-{epoch}-{key}"));
-                    div()
-                        .child(element)
-                        .with_animation(id, RESORT.animation(), move |el, t| {
-                            el.relative().top(px(dy * (1.0 - t)))
+        let theme_for_rows = theme.clone();
+        let shell = cx.weak_entity();
+        let sessions = uniform_list("sidebar-sessions", row_count, move |range, _, cx| {
+            shell
+                .update(cx, |this, cx| {
+                    range
+                        .filter_map(|index| rows.get(index))
+                        .map(|row| {
+                            let element = this.render_chat_row(
+                                row.id.clone(),
+                                row.title.clone(),
+                                row.time_ago.clone(),
+                                row.space_name.clone(),
+                                row.branch.clone(),
+                                row.harness,
+                                row.status,
+                                row.selected,
+                                &theme_for_rows,
+                                cx,
+                            );
+                            let element = if let Some(dy) =
+                                this.sidebar_resort.get(&row.key).copied()
+                            {
+                                let id = SharedString::from(format!("resort-{epoch}-{}", row.key));
+                                div()
+                                    .child(element)
+                                    .with_animation(id, RESORT.animation(), move |el, t| {
+                                        el.relative().top(px(dy * (1.0 - t)))
+                                    })
+                                    .into_any_element()
+                            } else if this.sidebar_new_keys.contains(&row.key) {
+                                let id = SharedString::from(format!("row-in-{epoch}-{}", row.key));
+                                motion::fade_quick(id, div().child(element)).into_any_element()
+                            } else {
+                                element
+                            };
+                            div()
+                                .h(px(CHAT_ROW_HEIGHT + SIDEBAR_LIST_GAP))
+                                .pb(px(SIDEBAR_LIST_GAP))
+                                .child(element)
+                                .into_any_element()
                         })
-                        .into_any_element()
-                } else if self.sidebar_new_keys.contains(&key) {
-                    let id = SharedString::from(format!("row-in-{epoch}-{key}"));
-                    motion::fade_quick(id, div().child(element)).into_any_element()
-                } else {
-                    element
-                }
-            })
-            .collect();
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .track_scroll(&self.sidebar_scroll)
+        .w_full()
+        .flex_1()
+        .min_h_0();
 
         // Overflow edge fades for the lists scroll region — the tab strip's
         // idiom, vertical (offset from the LAST frame; the lag is invisible).
@@ -2800,8 +3003,6 @@ impl Shell {
                         div()
                             .id("sidebar-lists")
                             .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.sidebar_scroll)
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
@@ -2842,14 +3043,8 @@ impl Shell {
                                             ),
                                     ),
                             )
-                            .child(if !list_items.is_empty() {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .pb(px(Theme::SPACE_SM))
-                                    .children(list_items)
-                                    .into_any_element()
+                            .child(if row_count > 0 {
+                                sessions.into_any_element()
                             } else {
                                 div()
                                     .px(px(Theme::SPACE_SM))
@@ -3058,7 +3253,7 @@ impl Shell {
         }
     }
 
-    /// User menu: account identity, settings, and sign out.
+    /// User menu: account identity, app pages, updates, and scope actions.
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
@@ -3227,6 +3422,17 @@ impl Shell {
                                 .text_color(theme.text_muted),
                         )
                         .child(SharedString::from("Settings")),
+                )
+                .child(
+                    popover::menu_row(theme, false, "user-menu-archived")
+                        .id("user-menu-archived")
+                        .on_click(cx.listener(|this, _, _, cx| this.open_archived(cx)))
+                        .child(
+                            icon(icons::ARCHIVE_MINIMALISTIC)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Archived sessions")),
                 )
                 .child(
                     popover::menu_row(theme, false, "user-menu-usage-breakdown")
@@ -3752,9 +3958,7 @@ impl Shell {
                         .id("chat-menu-delete")
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.chat_menu = None;
-                            this.delete_confirm = Some(delete_id.clone());
-                            cx.notify();
+                            this.confirm_delete_chat(delete_id.clone(), cx)
                         }))
                         .child(
                             icon(icons::TRASH_BIN_MINIMALISTIC)
@@ -3911,10 +4115,14 @@ impl Shell {
         let theme_bg = theme.bg;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
 
-        // Settings route: just the section outlet — the section label lives in
-        // the unified window titlebar now (render_title_bar).
-        if let Route::Settings(section) = self.route {
-            let outlet = self.settings_outlet(section, cx);
+        // Secondary routes show only their page outlet; chat-scoped composer,
+        // transcript, terminal, and Changes chrome remain mounted on Chat.
+        let secondary_outlet = match self.route {
+            Route::Archived => Some(self.archived_outlet(cx)),
+            Route::Settings(section) => Some(self.settings_outlet(section, cx)),
+            Route::Chat => None,
+        };
+        if let Some(outlet) = secondary_outlet {
             return div()
                 .flex_1()
                 .min_w_0()
@@ -4028,7 +4236,7 @@ impl Shell {
                 .into_any_element()
         };
 
-        let status = self.render_status_strip(cx);
+        let status = self.status_strip.clone();
         // File dropzone over the ENTIRE conversation column (transcript +
         // composer, not just the pill): dragging OS files anywhere across the
         // chat area shows the "Drop images to attach" veil; a drop stages the
@@ -4081,7 +4289,7 @@ impl Shell {
                                 gpui::linear_color_stop(theme_bg.opacity(0.0), 1.0),
                             )),
                     )
-                    .children(self.render_jump_to_bottom(cx)),
+                    .child(self.jump_to_bottom.clone()),
             )
             // Reserved status strip (h-6) — the WorkingIndicator lives here so
             // the composer below never shifts. Both live INSIDE the
@@ -4104,72 +4312,6 @@ impl Shell {
                 )
             })
             .into_any_element()
-    }
-
-    /// The "↓ Scroll to bottom" pill (round-9 §3): a LABELED rounded-full
-    /// chip — down-arrow glyph + 13px label on a near-opaque raised surface
-    /// with a hairline — horizontally centered over the transcript column and
-    /// floating a small gap above the composer. It hangs 14px below the
-    /// conversation region (through the reserved h-6 status strip, whose
-    /// content is left-aligned) so its bottom edge sits ~10px above the pill.
-    /// Shown past the transcript's 320px threshold; 180ms fade + 2px rise in.
-    fn render_jump_to_bottom(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.transcript.read(cx).jump_button_shown() {
-            return None;
-        }
-        let theme = Theme::of(cx);
-        Some(
-            div()
-                .absolute()
-                .bottom(px(-14.0))
-                .left_0()
-                .right(px(10.0))
-                .flex()
-                .justify_center()
-                .child(motion::dialog_in(
-                    "jump-to-bottom",
-                    div()
-                        .id("jump-to-bottom-btn")
-                        .h(px(30.0))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_md()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .pl(px(11.0))
-                        .pr(px(13.0))
-                        .cursor_pointer()
-                        // Hover must BRIGHTEN the opaque pill, never replace it
-                        // with a translucent wash (a 10%-alpha bg here made the
-                        // pill go see-through on hover — user-reported), and it
-                        // fades over the CSS transition-colors 150ms, not snaps.
-                        .bg(motion::hover_blend(
-                            "jump-pill",
-                            theme.surface_raised,
-                            theme.surface_raised_hover,
-                        ))
-                        .on_hover(motion::hover_listener("jump-pill"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.transcript
-                                .update(cx, |transcript, cx| transcript.jump_to_bottom(cx));
-                        }))
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from("↓")),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .text_color(theme.text)
-                                .child(SharedString::from("Scroll to bottom")),
-                        ),
-                ))
-                .into_any_element(),
-        )
     }
 
     /// Terminal panel dock at the main-column bottom: a 5px height-drag handle
@@ -4243,114 +4385,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Working indicator strip: dotted orb + rotating flavour word (7s,
-    /// seeded per chat) + elapsed, staleness-gated via [`Indicator`]; falls back
-    /// to a "Sending…" bridge and then the engine mode line.
-    fn render_status_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let now = Utc::now();
-        let state = self.state.read(cx);
-
-        // Aligned with the composer column: centered, same max width, small
-        // inner gutter.
-        let strip = div()
-            .h(px(Theme::STATUS_STRIP_HEIGHT))
-            .flex_none()
-            .w_full()
-            .max_w(px(768.0))
-            .mx_auto()
-            .flex()
-            .items_center()
-            .gap(px(Theme::SPACE_SM))
-            .px(px(Theme::SPACE_LG + 8.0))
-            .text_size(px(11.0));
-
-        let Some(chat_id) = state.selected_chat.clone() else {
-            return strip.into_any_element();
-        };
-        let indicator = state.indicator_for(&chat_id, now);
-        let compacting = state
-            .session_for(&chat_id)
-            .is_some_and(|session| session.compacting);
-        let elapsed_secs = state
-            .session_for(&chat_id)
-            .and_then(|s| s.started_at)
-            .map(|t| now.signed_duration_since(t).num_seconds())
-            .unwrap_or(0);
-        let composer = self.composer.read(cx);
-        let sending = composer.is_sending();
-        // Keep the reserved strip empty when the composer already owns the
-        // active workflow's progress feedback.
-        if composer.has_inline_progress() {
-            return strip.into_any_element();
-        }
-
-        match indicator {
-            Indicator::Working if compacting => strip
-                .child(loaders::activity_orb(
-                    "compacting-indicator",
-                    &theme,
-                    14.0,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Compacting context…")),
-                )
-                .into_any_element(),
-            Indicator::Working => {
-                let word =
-                    transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
-                strip
-                    .child(loaders::activity_orb(
-                        "working-indicator",
-                        &theme,
-                        14.0,
-                        cx.entity_id(),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(format!("{word}…"))),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(transcript::format_elapsed(elapsed_secs))),
-                    )
-                    .into_any_element()
-            }
-            // No label: the QuestionPanel right below IS the awaiting-input
-            // surface — a strip caption above it was redundant (user request).
-            Indicator::AwaitingInput => strip.into_any_element(),
-            Indicator::Errored => strip
-                .text_color(theme.danger)
-                .child(SharedString::from("Run failed"))
-                .into_any_element(),
-            Indicator::None if sending => strip
-                .child(loaders::activity_orb(
-                    "sending-indicator",
-                    &theme,
-                    14.0,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Sending…")),
-                )
-                .into_any_element(),
-            Indicator::None => strip.into_any_element(),
-        }
-    }
-
     fn render_expanded_changes(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let changes = self.changes_pane(cx);
@@ -4367,6 +4401,25 @@ impl Shell {
             .bg(theme.bg)
             .overflow_hidden()
             .child(changes)
+            .into_any_element()
+    }
+
+    fn render_expanded_terminal(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let terminal = self.terminal_panel(cx);
+        terminal.update(cx, |terminal, cx| terminal.set_open(true, cx));
+        div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .mx(px(8.0))
+            .mb(px(8.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.bg)
+            .overflow_hidden()
+            .child(terminal)
             .into_any_element()
     }
 
@@ -4654,6 +4707,176 @@ impl Shell {
     }
 }
 
+/// Isolated from the shell so composer keystrokes invalidate this tiny strip,
+/// not the sidebar and the rest of the window chrome.
+impl Render for SessionStatusStrip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        let now = Utc::now();
+        let state = self.state.read(cx);
+
+        let strip = div()
+            .h(px(Theme::STATUS_STRIP_HEIGHT))
+            .flex_none()
+            .w_full()
+            .max_w(px(768.0))
+            .mx_auto()
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
+            .px(px(Theme::SPACE_LG + 8.0))
+            .text_size(px(11.0));
+
+        let Some(chat_id) = state.selected_chat.clone() else {
+            return strip.into_any_element();
+        };
+        let indicator = state.indicator_for(&chat_id, now);
+        let queued_host = state
+            .queued_send_offline_host_name(&chat_id, now)
+            .map(str::to_owned);
+        let compacting = state
+            .session_for(&chat_id)
+            .is_some_and(|session| session.compacting);
+        let elapsed_secs = state
+            .session_for(&chat_id)
+            .and_then(|session| session.started_at)
+            .map(|started| now.signed_duration_since(started).num_seconds())
+            .unwrap_or(0);
+        let composer = self.composer.read(cx);
+        let sending = composer.is_sending();
+        if composer.has_inline_progress() {
+            return strip.into_any_element();
+        }
+        if let Some(host) = queued_host {
+            return strip
+                .text_color(theme.warning)
+                .child(div().size(px(6.0)).rounded_full().bg(theme.warning))
+                .child(SharedString::from(format!("Queued · {host} is offline")))
+                .into_any_element();
+        }
+
+        match indicator {
+            Indicator::Working if compacting => strip
+                .child(loaders::activity_orb(
+                    "compacting-indicator",
+                    &theme,
+                    14.0,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Compacting context…")),
+                )
+                .into_any_element(),
+            Indicator::Working => {
+                let word =
+                    transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
+                strip
+                    .child(loaders::activity_orb(
+                        "working-indicator",
+                        &theme,
+                        14.0,
+                        cx.entity_id(),
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(format!("{word}…"))),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(transcript::format_elapsed(elapsed_secs))),
+                    )
+                    .into_any_element()
+            }
+            Indicator::AwaitingInput => strip.into_any_element(),
+            Indicator::Errored => strip
+                .text_color(theme.danger)
+                .child(SharedString::from("Run failed"))
+                .into_any_element(),
+            Indicator::None if sending => strip
+                .child(loaders::activity_orb(
+                    "sending-indicator",
+                    &theme,
+                    14.0,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Sending…")),
+                )
+                .into_any_element(),
+            Indicator::None => strip.into_any_element(),
+        }
+    }
+}
+
+/// Isolated from the shell so wheel/touch frames only redraw the transcript
+/// and this tiny overlay rather than rebuilding every session row.
+impl Render for JumpToBottom {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.transcript.read(cx).jump_button_shown() {
+            return Empty.into_any_element();
+        }
+        let theme = Theme::of(cx);
+        div()
+            .absolute()
+            .bottom(px(-14.0))
+            .left_0()
+            .right(px(10.0))
+            .flex()
+            .justify_center()
+            .child(motion::dialog_in(
+                "jump-to-bottom",
+                div()
+                    .id("jump-to-bottom-btn")
+                    .h(px(30.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_md()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .pl(px(11.0))
+                    .pr(px(13.0))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        "jump-pill",
+                        theme.surface_raised,
+                        theme.surface_raised_hover,
+                    ))
+                    .on_hover(motion::hover_listener("jump-pill"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.transcript
+                            .update(cx, |transcript, cx| transcript.jump_to_bottom(cx));
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("↓")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text)
+                            .child(SharedString::from("Scroll to bottom")),
+                    ),
+            ))
+            .into_any_element()
+    }
+}
+
 /// The sign-in gate's faint grid backdrop (jolt styles.css `.bg-grid`):
 /// 44px hairlines at white 3.5%, with the radial mask approximated by edge
 /// gradients back into the page background (gpui has no mask-image).
@@ -4740,6 +4963,24 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
                 )),
         )
         .into_any_element()
+}
+
+struct SessionActionTooltip(SharedString);
+
+impl Render for SessionActionTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            .child(self.0.clone())
+    }
 }
 
 /// A 24px icon button for the titlebar strip.
@@ -4953,20 +5194,22 @@ impl Render for Shell {
                 Some(
                     cx.on_focus_lost(window, |this: &mut Shell, window, cx| match this.route {
                         Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
-                        Route::Settings(_) => window.focus(&this.settings_focus, cx),
+                        Route::Archived | Route::Settings(_) => {
+                            window.focus(&this.settings_focus, cx)
+                        }
                     }),
                 );
         }
         if matches!(gate, GatePhase::Ready) && window.focused(cx).is_none() {
             match self.route {
                 Route::Chat => window.focus(&self.composer.focus_handle(cx), cx),
-                Route::Settings(_) => window.focus(&self.settings_focus, cx),
+                Route::Archived | Route::Settings(_) => window.focus(&self.settings_focus, cx),
             }
         }
 
         let root = div()
             .id("shell-root")
-            .when(matches!(self.route, Route::Settings(_)), |root| {
+            .when(!matches!(self.route, Route::Chat), |root| {
                 root.track_focus(&self.settings_focus)
             })
             .relative()
@@ -4998,6 +5241,11 @@ impl Render for Shell {
                     cx.stop_propagation();
                     return;
                 }
+                if event.keystroke.key == "escape" && this.terminal_expanded {
+                    this.set_terminal_expanded(false, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key == "escape"
                     && matches!(this.route, Route::Chat)
                     && this.state.read(cx).selected_chat.is_none()
@@ -5011,12 +5259,12 @@ impl Render for Shell {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && matches!(this.route, Route::Settings(_)) {
-                    this.close_settings(cx);
+                if event.keystroke.key == "escape" && !matches!(this.route, Route::Chat) {
+                    this.close_secondary_page(cx);
                 }
             }))
-            // Panel hotkeys are chat-scoped chrome and no-op in Settings;
-            // the terminal panel only mounts on session routes. The sidebar
+            // Panel hotkeys are chat-scoped chrome and no-op on secondary
+            // pages; the terminal panel only mounts on session routes. The sidebar
             // toggle stays live everywhere.
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 if matches!(this.route, Route::Chat) {
@@ -5035,7 +5283,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &CloseCurrentTab, _, cx| {
                 if matches!(this.route, Route::Chat) {
                     // On an empty new-session canvas Cmd-W is deliberately a
-                    // no-op; in Settings it propagates to Close Window.
+                    // no-op; on secondary pages it propagates to Close Window.
                     this.close_current_tab(cx);
                 } else {
                     cx.propagate();
@@ -5147,7 +5395,9 @@ impl Render for Shell {
                 // titlebar remains available for navigation.
                 let on_chat = matches!(self.route, Route::Chat);
                 let expanded_changes = on_chat && self.changes_expanded && self.right_pane_open(cx);
-                let sidebar = if expanded_changes {
+                let expanded_terminal = on_chat && self.terminal_expanded && self.terminal_open(cx);
+                let expanded_panel = expanded_changes || expanded_terminal;
+                let sidebar = if expanded_panel {
                     Empty.into_any_element()
                 } else {
                     self.render_sidebar(cx)
@@ -5158,15 +5408,15 @@ impl Render for Shell {
                     |shell, _| shell.settings.sidebar_width = SIDEBAR_DEFAULT,
                     cx,
                 );
-                let main = if expanded_changes {
+                let main = if expanded_panel {
                     Empty.into_any_element()
                 } else {
                     self.render_main(cx)
                 };
-                // The Changes pane is chat-scoped chrome, so the Settings route
-                // never renders it. The per-session open flags stay
+                // The Changes pane is chat-scoped chrome, so secondary routes
+                // never render it. The per-session open flags stay
                 // intact for the return trip.
-                let right: AnyElement = if on_chat && !expanded_changes {
+                let right: AnyElement = if on_chat && !expanded_panel {
                     self.render_right_pane(cx)
                 } else {
                     Empty.into_any_element()
@@ -5241,7 +5491,7 @@ impl Render for Shell {
                 // through the titlebar, down to the bottom edge). Its width
                 // rides the same tween as the sidebar, so the tone melts away
                 // with the collapse instead of vanishing in a frame.
-                let sidebar_now = if expanded_changes {
+                let sidebar_now = if expanded_panel {
                     0.0
                 } else {
                     self.eval_tween(self.sidebar_tween, self.sidebar_target())
@@ -5259,6 +5509,8 @@ impl Render for Shell {
                     .border_color(border_color);
                 let body: AnyElement = if expanded_changes {
                     self.render_expanded_changes(cx)
+                } else if expanded_terminal {
+                    self.render_expanded_terminal(cx)
                 } else {
                     div()
                         .flex_1()

@@ -19,6 +19,14 @@ pub enum GoalStatus {
     Complete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GoalPauseSource {
+    User,
+    Agent,
+    System,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Goal {
@@ -27,6 +35,8 @@ pub struct Goal {
     pub control_nonce: String,
     pub objective: String,
     pub status: GoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_source: Option<GoalPauseSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -65,11 +65,25 @@ pub struct BashMessage {
     pub response: oneshot::Sender<Result<BashResult, HarnessError>>,
 }
 
+/// Ephemeral configuration for Jolt's product-owned MCP server.
+#[derive(Clone)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub url: String,
+    pub bearer_token: String,
+}
+
+/// Environment variables reserved for the product-owned MCP connection.
+pub const MCP_BEARER_TOKEN_ENV: &str = "JOLT_MCP_BEARER_TOKEN";
+pub const MCP_URL_ENV: &str = "JOLT_MCP_URL";
+
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
     /// Whether the harness should retain this run in its native session store.
     /// Disable only for internal one-shot work such as title generation.
     pub persist_session: bool,
+    /// Product-owned MCP configuration scoped to this live harness process.
+    pub mcp: Option<McpServerConfig>,
     /// The run sends questions and awaits answers (blocks the agent, mirrors jolt).
     pub request_input: Box<
         dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
@@ -90,6 +104,10 @@ pub trait Harness: Send + Sync {
     fn id(&self) -> HarnessId;
     fn display_name(&self) -> &str;
     fn supports_steering(&self) -> bool;
+    /// Whether this harness accepts additive Streamable HTTP MCP configuration.
+    fn supports_mcp(&self) -> bool {
+        false
+    }
     /// Whether shell execution is native and records included output in the
     /// harness session. Other harnesses use Jolt's local fallback.
     fn supports_native_bash(&self) -> bool {

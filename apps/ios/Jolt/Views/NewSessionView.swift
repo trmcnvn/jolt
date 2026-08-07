@@ -50,6 +50,10 @@ struct NewSessionView: View {
         model.spaces.first { $0.id == selectedSpaceId }
     }
 
+    private var hostOnline: Bool {
+        space.map { model.deviceOnline($0.deviceId) } ?? false
+    }
+
     private var models: [ModelInfo] {
         catalogs[harness] ?? []
     }
@@ -142,7 +146,7 @@ struct NewSessionView: View {
                 pickCheckout(kind)
             }
         }
-        .task(id: selectedSpaceId) {
+        .task(id: "\(selectedSpaceId)/\(hostOnline)") {
             guard let space else { return }
             let requestedSpace = space.id
             let loadedHarnesses = await model.listHarnesses(space: space)
@@ -163,7 +167,7 @@ struct NewSessionView: View {
                 }
             }
         }
-        .task(id: "\(selectedSpaceId)/\(harness)") {
+        .task(id: "\(selectedSpaceId)/\(harness)/\(hostOnline)") {
             // Live model catalog from the device that will run the session.
             guard let space else { return }
             let requestedSpace = space.id
@@ -479,22 +483,23 @@ struct NewSessionView: View {
                     return
                 }
                 createdChatId = chatId
-                var attachmentPaths: [String] = []
+                var uploadedAttachments: [UploadedAttachment] = []
                 for attachment in staged {
                     let uploaded = try await model.uploadAttachment(deviceId: space.deviceId,
                                                                     chatId: chatId,
                                                                     name: attachment.name,
                                                                     data: attachment.data)
-                    AttachmentImageCache.shared.seed(deviceId: space.deviceId, path: uploaded,
+                    AttachmentImageCache.shared.seed(deviceId: space.deviceId, path: uploaded.path,
                                                      name: attachment.name, data: attachment.data)
-                    attachmentPaths.append(uploaded)
+                    uploadedAttachments.append(uploaded)
                 }
+                let attachmentPaths = uploadedAttachments.map(\.path)
                 if let shell {
                     store.sendBash(command: shell.command,
                                    excludeFromContext: shell.excludeFromContext,
                                    chat: chat)
                 } else {
-                    let content = withAttachments(text: encodedPrompt, paths: attachmentPaths)
+                    let content = withAttachments(text: encodedPrompt, uploads: uploadedAttachments)
                     store.sendRun(prompt: content, chat: chat, attachments: attachmentPaths)
                 }
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()

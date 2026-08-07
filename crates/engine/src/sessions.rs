@@ -37,11 +37,12 @@ use jolt_harness::{
     BashMessage, BashRequest, BashResult, CancellationToken, Harness, RunControls, SteerMessage,
 };
 use jolt_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, ToolCall,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
+use crate::mcp::{McpHost, McpLease};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
 use crate::usage::{UsageContext, UsageStore};
@@ -64,6 +65,51 @@ pub enum SteerOutcome {
 }
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+
+fn begin_input_request(
+    pending: &PendingInputs,
+    engine_tx: &mpsc::UnboundedSender<AgentEvent>,
+    questions: Vec<UserInputQuestion>,
+) -> (String, oneshot::Receiver<Vec<UserInputAnswer>>) {
+    let (tx, rx) = oneshot::channel();
+    let request_id = new_id();
+    lock(pending).insert(request_id.clone(), tx);
+    let _ = engine_tx.send(AgentEvent::InputRequested {
+        request_id: request_id.clone(),
+        questions,
+    });
+    (request_id, rx)
+}
+
+struct PendingInputGuard {
+    pending: PendingInputs,
+    engine_tx: mpsc::UnboundedSender<AgentEvent>,
+    request_id: String,
+}
+
+impl PendingInputGuard {
+    fn new(
+        pending: PendingInputs,
+        engine_tx: mpsc::UnboundedSender<AgentEvent>,
+        request_id: String,
+    ) -> Self {
+        Self {
+            pending,
+            engine_tx,
+            request_id,
+        }
+    }
+}
+
+impl Drop for PendingInputGuard {
+    fn drop(&mut self) {
+        if lock(&self.pending).remove(&self.request_id).is_some() {
+            let _ = self.engine_tx.send(AgentEvent::InputResolved {
+                request_id: self.request_id.clone(),
+            });
+        }
+    }
+}
 
 const CONTINUE_AFTER_COMPACTION_PROMPT: &str = "Compaction has just completed, but the session stopped before work resumed. Resume the existing task rather than waiting for another user prompt.\n\nBefore continuing:\n\n1. Reconstruct the original goal, user constraints, decisions made, files changed, commands and tests run, unresolved issues, and intended next action from the compacted conversation.\n2. Reconcile that context with the current repository state. Treat the worktree as authoritative for file state and the conversation as authoritative for user intent.\n3. Briefly state the context you recovered.\n4. Immediately perform the next unfinished step. Do not stop after the recap or ask the user to repeat context unless it is genuinely unavailable or ambiguous.";
 
@@ -124,6 +170,7 @@ struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
+    mcp: McpHost,
     usage: UsageStore,
     usage_contexts: Mutex<HashMap<String, UsageContext>>,
     doc_host: OnceLock<DocHost>,
@@ -172,6 +219,7 @@ impl SessionsEngine {
                 device_id,
                 journal,
                 registry,
+                mcp: McpHost::new(),
                 usage,
                 usage_contexts: Mutex::new(HashMap::new()),
                 doc_host: OnceLock::new(),
@@ -506,31 +554,66 @@ impl SessionsEngine {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        let answer_requester: crate::mcp::McpAnswerRequester = {
+            let pending = pending_inputs.clone();
+            let engine_tx = engine_tx.clone();
+            Arc::new(move |questions, cancellation| {
+                let (request_id, mut answers) =
+                    begin_input_request(&pending, &engine_tx, questions);
+                let guard = PendingInputGuard::new(pending.clone(), engine_tx.clone(), request_id);
+                Box::pin(async move {
+                    let result = tokio::select! {
+                        result = &mut answers => result.ok(),
+                        () = cancellation.cancelled() => None,
+                    };
+                    drop(guard);
+                    result
+                })
+            })
+        };
+        let mcp_lease = if harness.supports_mcp() {
+            match self
+                .inner
+                .mcp
+                .lease(
+                    chat_id.to_string(),
+                    self.inner.workspace().cloned(),
+                    Some(answer_requester),
+                )
+                .await
+            {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    tracing::warn!(
+                        harness = ?harness_id,
+                        %error,
+                        "MCP listener unavailable; starting run without Jolt MCP"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let compaction_follow_up = Arc::new(CompactionFollowUp::default());
         let pending_external_turns = Arc::new(AtomicUsize::new(0));
         let turn_diff_baselines = Arc::new(Mutex::new(VecDeque::new()));
         let initial_turn_diff_baseline =
             self.capture_turn_diff_baseline(chat_id, &request.cwd).await;
 
-        // Input bridge: the harness asks questions; we mint the request id, park the
-        // resolver for `respond_input`, and surface the event through the run pipeline.
+        // Native harness questions and Jolt's MCP answer tool share one pending-input
+        // registry, event stream, durable response command, and composer UI.
         let request_input = {
             let pending = pending_inputs.clone();
             let engine_tx = engine_tx.clone();
             Box::new(move |questions: Vec<UserInputQuestion>| {
-                let (tx, rx) = oneshot::channel();
-                let request_id = new_id();
-                lock(&pending).insert(request_id.clone(), tx);
-                let _ = engine_tx.send(AgentEvent::InputRequested {
-                    request_id,
-                    questions,
-                });
-                rx
+                begin_input_request(&pending, &engine_tx, questions).1
             })
         };
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
             persist_session: true,
+            mcp: mcp_lease.as_ref().map(McpLease::config),
             request_input,
             steering: steer_rx,
             bash: bash_rx,
@@ -577,6 +660,7 @@ impl SessionsEngine {
             request,
             handle.doc_arc(),
             controls,
+            mcp_lease,
             engine_rx,
             cancel_rx,
             compaction_follow_up,
@@ -930,6 +1014,7 @@ impl SessionsEngine {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
         }
+        self.inner.mcp.shutdown().await;
     }
 
     fn is_live(&self, chat_id: &str, run_id: &str) -> bool {
@@ -1361,6 +1446,22 @@ async fn capture_turn_diff_baseline(
     }
 }
 
+fn has_successful_file_mutation(parts: &[MessagePart]) -> bool {
+    parts.iter().any(|part| {
+        matches!(
+            part,
+            MessagePart::Tool {
+                call: ToolCall::WriteFile { .. }
+                    | ToolCall::EditFile { .. }
+                    | ToolCall::ApplyPatch { .. },
+                is_error: false,
+                resolved: true,
+                ..
+            }
+        )
+    })
+}
+
 async fn append_turn_diff(
     inner: &Inner,
     chat_id: &str,
@@ -1372,6 +1473,12 @@ async fn append_turn_diff(
     let (Some(store), Some(baseline)) = (inner.turn_diffs.get(), baseline) else {
         return;
     };
+    // A checkout can host several concurrent sessions. Its baseline delta is
+    // only evidence of this turn's work when this turn reported a successful
+    // file mutation; otherwise another session's edits would be attributed here.
+    if !has_successful_file_mutation(folded) {
+        return;
+    }
     match store
         .finalize(chat_id, assistant_message_id, Path::new(cwd), baseline)
         .await
@@ -1407,6 +1514,7 @@ async fn drive_run(
     request: RunRequest,
     doc: Arc<SessionDoc>,
     controls: RunControls,
+    mcp_lease: Option<McpLease>,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     compaction_follow_up: Arc<CompactionFollowUp>,
@@ -1420,6 +1528,15 @@ async fn drive_run(
     let harness_id = harness.id();
     let user_prompt = resume_state.turn_prompt.clone();
     let run_cwd = request.cwd.clone();
+    // Capture the goal before starting the harness. A fast client can call a
+    // Jolt MCP goal tool during harness startup, before `run` returns its event
+    // stream; that turn must still be charged to the goal active at dispatch.
+    let mut goal_turn_started = tokio::time::Instant::now();
+    let mut goal_turn_id = inner
+        .workspace()
+        .and_then(|workspace| workspace.chat_goal(&chat_id))
+        .filter(|goal| goal.status == jolt_proto::GoalStatus::Active)
+        .map(|goal| goal.id);
     // Kept whole for the failed-resume retry (fresh session, same user entry).
     // Option so the retry branch (inside the event loop) can take ownership.
     let mut retry_request = Some(RunRequest {
@@ -1430,6 +1547,21 @@ async fn drive_run(
         Ok(stream) => stream,
         Err(err) => {
             let message = err.to_string();
+            let goal_signal = mcp_lease.as_ref().and_then(McpLease::take_goal_signal);
+            finish_goal_turn(
+                &inner,
+                &chat_id,
+                goal_turn_id.as_deref(),
+                DoneStatus::Errored,
+                Some(&message),
+                goal_signal,
+                None,
+                0,
+                goal_turn_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
             inner.publish(
                 &chat_id,
                 &AgentEvent::Error {
@@ -1485,7 +1617,6 @@ async fn drive_run(
     const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
-    let mut goal_turn_started = tokio::time::Instant::now();
     let mut goal_turn_tokens = 0u64;
     let mut goal_turn_error: Option<String> = None;
 
@@ -1576,6 +1707,12 @@ async fn drive_run(
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
         if idle_since.take().is_some() {
+            goal_turn_started = tokio::time::Instant::now();
+            goal_turn_id = inner
+                .workspace()
+                .and_then(|workspace| workspace.chat_goal(&chat_id))
+                .filter(|goal| goal.status == jolt_proto::GoalStatus::Active)
+                .map(|goal| goal.id);
             pending_external_turns
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                     pending.checked_sub(1)
@@ -1761,11 +1898,14 @@ async fn drive_run(
 
         if let AgentEvent::Done { status, error, .. } = &event {
             let goal_control = take_goal_control(&mut folded);
+            let goal_signal = mcp_lease.as_ref().and_then(McpLease::take_goal_signal);
             let goal_after_turn = finish_goal_turn(
                 &inner,
                 &chat_id,
+                goal_turn_id.as_deref(),
                 *status,
                 error.as_deref().or(goal_turn_error.as_deref()),
+                goal_signal,
                 goal_control,
                 goal_turn_tokens,
                 goal_turn_started
@@ -1776,6 +1916,7 @@ async fn drive_run(
             goal_turn_tokens = 0;
             goal_turn_started = tokio::time::Instant::now();
             goal_turn_error = None;
+            goal_turn_id = None;
             let message_status = match status {
                 DoneStatus::Interrupted => MessageStatus::Aborted,
                 DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
@@ -1956,94 +2097,231 @@ fn take_goal_control(parts: &mut [MessagePart]) -> Option<crate::goals::GoalCont
     result
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "goal finalization combines one turn's terminal event, control signal, and usage"
+)]
 fn finish_goal_turn(
     inner: &Inner,
     chat_id: &str,
+    started_goal_id: Option<&str>,
     done: DoneStatus,
     error: Option<&str>,
+    signal: Option<crate::mcp::McpGoalSignal>,
     control: Option<crate::goals::GoalControl>,
     tokens: u64,
     elapsed_ms: u64,
 ) -> Option<jolt_proto::Goal> {
-    let workspace = inner.workspace()?;
-    let mut goal = workspace.chat_goal(chat_id)?;
-    if goal.status != jolt_proto::GoalStatus::Active {
-        return Some(goal);
-    }
+    finish_goal_turn_in_workspace(
+        inner.workspace()?,
+        chat_id,
+        started_goal_id,
+        done,
+        error,
+        signal,
+        control,
+        tokens,
+        elapsed_ms,
+    )
+}
 
-    goal.tokens_used = goal.tokens_used.saturating_add(tokens);
-    goal.elapsed_active_ms = goal.elapsed_active_ms.saturating_add(elapsed_ms.max(1));
-    goal.turns = goal.turns.saturating_add(1);
-    goal.updated_at_ms = now_ms();
-
-    if done == DoneStatus::Interrupted {
-        goal.status = jolt_proto::GoalStatus::Paused;
-        goal.status_message = Some("Goal turn interrupted".into());
-    } else if done == DoneStatus::Errored || error.is_some() {
-        let message = error.unwrap_or("Harness turn failed");
-        goal.status = if message.to_ascii_lowercase().contains("rate")
-            || message.to_ascii_lowercase().contains("quota")
-            || message.to_ascii_lowercase().contains("usage")
-        {
-            jolt_proto::GoalStatus::UsageLimited
-        } else {
-            jolt_proto::GoalStatus::Paused
+#[allow(
+    clippy::too_many_arguments,
+    reason = "workspace seam preserves the complete goal-turn finalization input for tests"
+)]
+fn finish_goal_turn_in_workspace(
+    workspace: &crate::workspace_host::WorkspaceHost,
+    chat_id: &str,
+    started_goal_id: Option<&str>,
+    done: DoneStatus,
+    error: Option<&str>,
+    signal: Option<crate::mcp::McpGoalSignal>,
+    control: Option<crate::goals::GoalControl>,
+    tokens: u64,
+    elapsed_ms: u64,
+) -> Option<jolt_proto::Goal> {
+    match workspace.mutate_chat_goal(chat_id, |current| {
+        let Some(mut goal) = current else {
+            return Ok(None);
         };
-        goal.status_message = Some(message.to_string());
-    } else {
-        let control = control.filter(|control| control.matches(&goal));
-        match control {
-            Some(control)
-                if control.outcome == crate::goals::GoalOutcome::Complete
-                    && !control.summary.trim().is_empty() =>
-            {
-                goal.status = jolt_proto::GoalStatus::Complete;
-                goal.status_message = Some(control.summary);
-                goal.blocker_key = None;
-                goal.blocker_streak = 0;
-            }
-            Some(control) if control.outcome == crate::goals::GoalOutcome::Blocked => {
-                let key = control.blocker_key.filter(|key| !key.trim().is_empty());
-                if key.is_some() && key == goal.blocker_key {
-                    goal.blocker_streak = goal.blocker_streak.saturating_add(1);
+        if started_goal_id != Some(goal.id.as_str()) {
+            return Ok(Some(goal));
+        }
+
+        goal.tokens_used = goal.tokens_used.saturating_add(tokens);
+        goal.elapsed_active_ms = goal.elapsed_active_ms.saturating_add(elapsed_ms.max(1));
+        goal.turns = goal.turns.saturating_add(1);
+        goal.updated_at_ms = now_ms();
+
+        if goal.status == jolt_proto::GoalStatus::Active {
+            if done == DoneStatus::Interrupted {
+                goal.status = jolt_proto::GoalStatus::Paused;
+                goal.pause_source = Some(jolt_proto::GoalPauseSource::System);
+                goal.status_message = Some("Goal turn interrupted".into());
+            } else if done == DoneStatus::Errored || error.is_some() {
+                let message = error.unwrap_or("Harness turn failed");
+                goal.status = if message.to_ascii_lowercase().contains("rate")
+                    || message.to_ascii_lowercase().contains("quota")
+                    || message.to_ascii_lowercase().contains("usage")
+                {
+                    jolt_proto::GoalStatus::UsageLimited
                 } else {
-                    goal.blocker_key = key;
-                    goal.blocker_streak = 1;
+                    jolt_proto::GoalStatus::Paused
+                };
+                goal.pause_source = (goal.status == jolt_proto::GoalStatus::Paused)
+                    .then_some(jolt_proto::GoalPauseSource::System);
+                goal.status_message = Some(message.to_string());
+            } else if let Some(crate::mcp::McpGoalSignal::Blocked {
+                goal_id,
+                expected_revision,
+                blocker_key,
+                summary,
+            }) = signal.filter(|signal| match signal {
+                crate::mcp::McpGoalSignal::Blocked {
+                    goal_id,
+                    expected_revision,
+                    ..
+                } => goal_id == &goal.id && *expected_revision == goal.revision,
+            }) {
+                debug_assert_eq!(goal_id, goal.id);
+                debug_assert_eq!(expected_revision, goal.revision);
+                apply_goal_blocker(&mut goal, Some(blocker_key), summary);
+            } else {
+                let control = control.filter(|control| control.matches(&goal));
+                match control {
+                    Some(control)
+                        if control.outcome == crate::goals::GoalOutcome::Complete
+                            && !control.summary.trim().is_empty() =>
+                    {
+                        goal.status = jolt_proto::GoalStatus::Complete;
+                        goal.pause_source = None;
+                        goal.status_message = Some(control.summary);
+                        goal.blocker_key = None;
+                        goal.blocker_streak = 0;
+                    }
+                    Some(control) if control.outcome == crate::goals::GoalOutcome::Blocked => {
+                        let key = control.blocker_key.filter(|key| !key.trim().is_empty());
+                        apply_goal_blocker(&mut goal, key, control.summary);
+                    }
+                    _ => {
+                        goal.blocker_key = None;
+                        goal.blocker_streak = 0;
+                    }
                 }
-                if goal.blocker_key.is_some() && goal.blocker_streak >= 3 {
-                    goal.status = jolt_proto::GoalStatus::Blocked;
-                    goal.status_message =
-                        (!control.summary.trim().is_empty()).then_some(control.summary);
-                }
-            }
-            _ => {
-                goal.blocker_key = None;
-                goal.blocker_streak = 0;
             }
         }
-    }
 
-    if goal.status == jolt_proto::GoalStatus::Active
-        && goal
-            .token_budget
-            .is_some_and(|budget| goal.tokens_used >= budget)
-    {
-        goal.status = jolt_proto::GoalStatus::BudgetLimited;
-        goal.status_message = Some("Token budget reached".into());
+        if goal.status == jolt_proto::GoalStatus::Active
+            && goal
+                .token_budget
+                .is_some_and(|budget| goal.tokens_used >= budget)
+        {
+            goal.status = jolt_proto::GoalStatus::BudgetLimited;
+            goal.pause_source = None;
+            goal.status_message = Some("Token budget reached".into());
+        }
+        if goal.status == jolt_proto::GoalStatus::Active {
+            goal.control_nonce = new_id();
+        }
+        goal.revision = goal.revision.saturating_add(1);
+        Ok(Some(goal))
+    }) {
+        Ok(goal) => goal,
+        Err(error) => {
+            tracing::warn!(chat = %chat_id, %error, "goal state write failed");
+            workspace.chat_goal(chat_id)
+        }
     }
-    if goal.status == jolt_proto::GoalStatus::Active {
-        goal.control_nonce = new_id();
+}
+
+fn apply_goal_blocker(goal: &mut jolt_proto::Goal, key: Option<String>, summary: String) {
+    if key.is_some() && key == goal.blocker_key {
+        goal.blocker_streak = goal.blocker_streak.saturating_add(1);
+    } else {
+        goal.blocker_key = key;
+        goal.blocker_streak = 1;
     }
-    goal.revision = goal.revision.saturating_add(1);
-    if let Err(error) = workspace.set_chat_goal(chat_id, Some(&goal)) {
-        tracing::warn!(chat = %chat_id, %error, "goal state write failed");
+    if !summary.trim().is_empty() {
+        goal.status_message = Some(summary);
     }
-    Some(goal)
+    if goal.blocker_key.is_some() && goal.blocker_streak >= 3 {
+        goal.status = jolt_proto::GoalStatus::Blocked;
+        goal.pause_source = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_host::WorkspaceHostConfig;
+
+    fn goal_workspace() -> (tempfile::TempDir, crate::workspace_host::WorkspaceHost) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(jolt_sync::DocsStore::open(dir.path()).unwrap());
+        let workspace = crate::workspace_host::WorkspaceHost::open(
+            store,
+            WorkspaceHostConfig {
+                device_id: "device-1".into(),
+                device_name: "Test".into(),
+                platform: "test".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_space("space-1", "device-1", "/tmp", None, false)
+            .unwrap();
+        workspace
+            .create_chat("chat-1", "space-1", None, None)
+            .unwrap();
+        (dir, workspace)
+    }
+
+    fn active_goal(workspace: &crate::workspace_host::WorkspaceHost) -> jolt_proto::Goal {
+        let goal = crate::goals::apply_operation(
+            None,
+            &jolt_doc::GoalOperation::Create {
+                objective: "Finish the work".into(),
+                token_budget: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        workspace.set_chat_goal("chat-1", Some(&goal)).unwrap();
+        goal
+    }
+
+    #[tokio::test]
+    async fn dropped_mcp_answer_request_resolves_the_input_ui() {
+        let pending: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let (request_id, answers) = begin_input_request(
+            &pending,
+            &engine_tx,
+            vec![UserInputQuestion {
+                id: "question-1".into(),
+                header: "Question".into(),
+                question: "Continue?".into(),
+                options: vec!["Yes".into(), "No".into()],
+                multi_select: false,
+            }],
+        );
+        assert!(matches!(
+            engine_rx.recv().await,
+            Some(AgentEvent::InputRequested { .. })
+        ));
+
+        let guard = PendingInputGuard::new(pending.clone(), engine_tx, request_id.clone());
+        drop(guard);
+        assert!(lock(&pending).is_empty());
+        assert!(answers.await.is_err());
+        assert!(matches!(
+            engine_rx.recv().await,
+            Some(AgentEvent::InputResolved { request_id: resolved }) if resolved == request_id
+        ));
+    }
 
     #[test]
     fn compaction_follow_up_survives_only_until_user_or_agent_activity() {
@@ -2064,5 +2342,78 @@ mod tests {
         follow_up.observe_agent_event(&AgentEvent::CompactionFinished);
         follow_up.cancel_for_user_message();
         assert!(!follow_up.take_on_shutdown());
+    }
+
+    #[tokio::test]
+    async fn direct_completion_keeps_terminal_status_and_accounts_the_turn() {
+        let (_dir, workspace) = goal_workspace();
+        let goal = active_goal(&workspace);
+        let completed = workspace
+            .mutate_chat_goal("chat-1", |current| {
+                crate::goals::apply_agent_action(
+                    current,
+                    &goal.id,
+                    goal.revision,
+                    crate::goals::AgentGoalAction::Complete {
+                        summary: "Verified every requirement".into(),
+                    },
+                )
+                .map(Some)
+            })
+            .unwrap()
+            .unwrap();
+
+        let finished = finish_goal_turn_in_workspace(
+            &workspace,
+            "chat-1",
+            Some(&goal.id),
+            DoneStatus::Completed,
+            None,
+            None,
+            None,
+            42,
+            100,
+        )
+        .unwrap();
+        assert_eq!(finished.status, jolt_proto::GoalStatus::Complete);
+        assert_eq!(finished.status_message, completed.status_message);
+        assert_eq!(finished.tokens_used, 42);
+        assert_eq!(finished.elapsed_active_ms, 100);
+        assert_eq!(finished.turns, 1);
+    }
+
+    #[tokio::test]
+    async fn blocker_reports_require_three_distinct_goal_turns() {
+        let (_dir, workspace) = goal_workspace();
+        let goal = active_goal(&workspace);
+        for expected_streak in 1..=3 {
+            let current = workspace.chat_goal("chat-1").unwrap();
+            let finished = finish_goal_turn_in_workspace(
+                &workspace,
+                "chat-1",
+                Some(&goal.id),
+                DoneStatus::Completed,
+                None,
+                Some(crate::mcp::McpGoalSignal::Blocked {
+                    goal_id: current.id.clone(),
+                    expected_revision: current.revision,
+                    blocker_key: "waiting-for-review".into(),
+                    summary: "Waiting for review".into(),
+                }),
+                None,
+                1,
+                1,
+            )
+            .unwrap();
+            assert_eq!(finished.blocker_streak, expected_streak);
+            assert_eq!(
+                finished.status,
+                if expected_streak == 3 {
+                    jolt_proto::GoalStatus::Blocked
+                } else {
+                    jolt_proto::GoalStatus::Active
+                }
+            );
+        }
     }
 }

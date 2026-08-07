@@ -78,9 +78,9 @@ final class SessionStore {
         return relay
     }
 
-    /// Chunked upload of one staged image to the host device; returns the
-    /// durable absolute path on that device (what the refs trailer carries).
-    func uploadAttachment(name: String, data: Data) async throws -> String {
+    /// Chunked upload of one staged image to the host device; returns its
+    /// durable host path and chat-scoped edge content address.
+    func uploadAttachment(name: String, data: Data) async throws -> UploadedAttachment {
         try await uploadAttachmentChunked(relay: relayToHost(), chatId: chatId,
                                           name: name, data: data)
     }
@@ -333,6 +333,8 @@ final class SessionStore {
         guard let pendingSendOverlay else { return false }
         return now - pendingSendOverlay.startedAt <= pendingSendOverlayTtlMs
     }
+
+    var hasPendingSends: Bool { !pendingSends.isEmpty }
 
     var liveEntry: MessageEntry? {
         entries.last(where: { $0.status == .streaming })

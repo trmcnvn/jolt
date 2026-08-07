@@ -5,6 +5,7 @@
 # start/resume, then a scenario picked from the turn/start prompt text. Driven
 # by crates/harness/tests/codex.rs.
 
+all_args="$*"
 emit() { printf '%s\n' "$1"; }
 rid() { printf '%s' "$1" | sed 's/.*"id":\([0-9]*\).*/\1/'; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
@@ -53,6 +54,20 @@ read -r turnline || exit 1
 tid=$(rid "$turnline")
 
 case "$turnline" in
+
+*scenario:mcp*)
+  error=""
+  case "$all_args" in *'mcp_servers.jolt.url=http://127.0.0.1:3210/mcp'*) ;; *) error="missing MCP URL" ;; esac
+  case "$all_args" in *'mcp_servers.jolt.bearer_token_env_var="JOLT_MCP_BEARER_TOKEN"'*) ;; *) error="missing token environment config" ;; esac
+  case "$all_args" in *test-token*) error="token leaked into arguments" ;; esac
+  [ "$JOLT_MCP_BEARER_TOKEN" = "test-token" ] || error="missing token environment"
+  if [ -n "$error" ]; then
+    fail_turn "$tid" "$error"
+  else
+    emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-mcp\"}}}"
+    emit '{"method":"turn/completed","params":{"turn":{"id":"t-mcp"}}}'
+  fi
+  ;;
 
 *scenario:happy*)
   # Verify the turn/start + thread/start params the harness must send.

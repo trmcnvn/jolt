@@ -9,6 +9,7 @@
 // back out to render thumbnails. RunRequest.attachments additionally carries
 // the paths so a harness can inline the bytes.
 
+import CryptoKit
 import Photos
 import PhotosUI
 import SwiftUI
@@ -19,8 +20,25 @@ import UniformTypeIdentifiers
 /// The body used for image-only sends.
 let attachmentOnlyText = "See the attached image(s)."
 
-/// Append plain local paths to the text; files are staged on the device that
-/// runs the agent.
+/// A host-staged attachment and its chat-scoped edge content address.
+struct UploadedAttachment: Hashable {
+    let path: String
+    let sha256: String
+}
+
+/// Append host-local paths plus immutable edge addresses to the text. The
+/// harness receives the paths separately; the metadata lets transcript clients
+/// recover images from R2 while the host is offline.
+func withAttachments(text: String, uploads: [UploadedAttachment]) -> String {
+    guard !uploads.isEmpty else { return text }
+    let body = text.isEmpty ? attachmentOnlyText : text
+    let refs = uploads.map { "- \($0.path)\n  SHA-256: \($0.sha256)" }
+        .joined(separator: "\n")
+    return "\(body)\n\nAttached images (local files — open them to view):\n\(refs)"
+}
+
+/// Legacy path-only transport retained for old call sites and compatibility
+/// tests. New uploads should always use the content-addressed overload above.
 func withAttachments(text: String, paths: [String]) -> String {
     guard !paths.isEmpty else { return text }
     let body = text.isEmpty ? attachmentOnlyText : text
@@ -33,6 +51,7 @@ struct UserImageAttachment: Identifiable, Hashable {
     let id: String
     let path: String
     let name: String
+    let sha256: String?
 }
 
 struct ParsedUserMessage {
@@ -62,13 +81,20 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
     guard let markerIx else {
         return ParsedUserMessage(text: content, attachments: [])
     }
-    let attachments = lines[(markerIx + 1)...].compactMap { line -> String? in
+    let refs = Array(lines[(markerIx + 1)...])
+    let parsedRefs = refs.enumerated().compactMap { offset, line -> (String, String?)? in
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard trimmed.hasPrefix("- ") else { return nil }
         let path = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
-        return path.isEmpty ? nil : path
-    }.enumerated().map { ix, path in
-        UserImageAttachment(id: "\(ix):\(path)", path: path, name: nameFromPath(path))
+        guard !path.isEmpty else { return nil }
+        let sha256 = refs.indices.contains(offset + 1)
+            ? parseAttachmentSHA256(refs[offset + 1])
+            : nil
+        return (path, sha256)
+    }
+    let attachments = parsedRefs.enumerated().map { index, ref in
+        UserImageAttachment(id: "\(index):\(ref.0)", path: ref.0,
+                            name: nameFromPath(ref.0), sha256: ref.1)
     }
     guard !attachments.isEmpty else {
         return ParsedUserMessage(text: content, attachments: [])
@@ -77,6 +103,17 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
         .trimmingCharacters(in: .whitespacesAndNewlines)
     return ParsedUserMessage(text: body == attachmentOnlyText ? "" : body,
                              attachments: attachments)
+}
+
+private func parseAttachmentSHA256(_ line: String) -> String? {
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+    guard trimmed.lowercased().hasPrefix("sha-256:") else { return nil }
+    let hash = String(trimmed.dropFirst("sha-256:".count)).trimmingCharacters(in: .whitespaces)
+        .lowercased()
+    guard hash.count == 64,
+          hash.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "0123456789abcdef").contains($0) })
+    else { return nil }
+    return hash
 }
 
 // MARK: - Staging
@@ -188,11 +225,14 @@ private func pastedImageData(from provider: NSItemProvider) async -> Data? {
 /// Chunked upload straight to the host device's relay room: base64 the bytes,
 /// `UploadChunk {uploadId, seq, data}` per 60k-char slice (positional `seq`
 /// makes retries idempotent), then `UploadCommit {uploadId, fileName, chatId}`
-/// → the durable absolute path on the host.
+/// → the durable host path and edge content address.
 func uploadAttachmentChunked(relay: DeviceRelayClient, chatId: String,
-                             name: String, data: Data) async throws -> String {
+                             name: String, data: Data) async throws -> UploadedAttachment {
     struct OkReply: Decodable { var ok: Bool? }
-    struct CommitReply: Decodable { var path: String }
+    struct CommitReply: Decodable {
+        var path: String
+        var sha256: String?
+    }
 
     let b64 = data.base64EncodedString()
     let uploadId = UUID().uuidString.lowercased()
@@ -217,20 +257,21 @@ func uploadAttachmentChunked(relay: DeviceRelayClient, chatId: String,
         start = end
         seq += 1
     }
-    // Commit outlasts the engine's assemble + best-effort edge mirror.
+    // Commit outlasts assembly plus the required account-scope edge mirror.
     let reply: CommitReply = try await relay.call(
         method: "UploadCommit",
         params: ["uploadId": uploadId, "fileName": name, "chatId": chatId],
         timeoutSeconds: 150)
-    return reply.path
+    let localHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    return UploadedAttachment(path: reply.path, sha256: reply.sha256 ?? localHash)
 }
 
 // MARK: - Transcript image cache (attachments.rs image cache)
 
-/// Decoded transcript images keyed by `(deviceId, path)`, loaded over the
-/// owning device's relay in 45KB base64 chunks, seeded locally after a send
-/// so own bubbles never round-trip. Bounded by an encoded-byte LRU budget;
-/// failed loads retry on the 2s→15s ladder.
+/// Decoded transcript images keyed by `(deviceId, path)`. Content-addressed
+/// refs load from authenticated R2 first and fall back to the owning device's
+/// 45KB relay chunks; legacy path-only refs remain host-dependent. The cache is
+/// seeded after sends and bounded by an encoded-byte LRU budget.
 @MainActor
 @Observable
 final class AttachmentImageCache {
@@ -285,8 +326,8 @@ final class AttachmentImageCache {
 
     /// Kick a load if this source isn't already loaded/loading (errored
     /// sources retry only after their backoff).
-    func load(deviceId: String, path: String) {
-        let key = Key(deviceId: deviceId, path: path)
+    func load(deviceId: String, chatId: String, attachment: UserImageAttachment) {
+        let key = Key(deviceId: deviceId, path: attachment.path)
         let attempts: Int
         switch entries[key] {
         case .loaded, .loading:
@@ -305,7 +346,13 @@ final class AttachmentImageCache {
             return client
         }()
         Task { @MainActor [weak self] in
-            let loaded = await Self.readImage(relay: relay, path: path)
+            let edgeLoaded = await Self.readEdgeImage(config: config, chatId: chatId,
+                                                      attachment: attachment)
+            let loaded = if let edgeLoaded {
+                edgeLoaded
+            } else {
+                await Self.readHostImage(relay: relay, path: attachment.path)
+            }
             guard let self else { return }
             if let loaded {
                 self.store(key: key, name: loaded.name, image: loaded.image, bytes: loaded.bytes)
@@ -345,9 +392,27 @@ final class AttachmentImageCache {
         min(Double(2 << min(max(attempts - 1, 0), 3)), 15)
     }
 
+    /// Authenticated content-addressed read that remains available while the
+    /// session's host is offline.
+    private static func readEdgeImage(config: AppConfig, chatId: String,
+                                      attachment: UserImageAttachment)
+        async -> (name: String, image: UIImage, bytes: Int)? {
+        guard let sha256 = attachment.sha256,
+              let token = await config.currentToken() else { return nil }
+        let url = config.edgeURL.appending(path: "attachments/\(chatId)/\(sha256)")
+        var request = URLRequest(url: url, timeoutInterval: 20)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              http.statusCode == 200,
+              data.count <= 32 * 1024 * 1024,
+              let image = UIImage(data: data) else { return nil }
+        return (attachment.name, image, data.count)
+    }
+
     /// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded,
     /// with a stuck-offset guard).
-    private static func readImage(relay: DeviceRelayClient, path: String)
+    private static func readHostImage(relay: DeviceRelayClient, path: String)
         async -> (name: String, image: UIImage, bytes: Int)? {
         struct Chunk: Decodable {
             var name: String
@@ -429,13 +494,15 @@ struct AttachmentStripView: View {
 
 struct UserAttachmentsStrip: View {
     let deviceId: String
+    let chatId: String
     let attachments: [UserImageAttachment]
 
     var body: some View {
         HStack(spacing: 8) {
             Spacer(minLength: 0)
-            ForEach(attachments) { att in
-                AttachmentThumbView(deviceId: deviceId, path: att.path)
+            ForEach(attachments) { attachment in
+                AttachmentThumbView(deviceId: deviceId, chatId: chatId,
+                                    attachment: attachment)
             }
         }
         // Fixed height: load-state flips never shift the transcript.
@@ -447,14 +514,15 @@ struct UserAttachmentsStrip: View {
 
 struct AttachmentThumbView: View {
     let deviceId: String
-    let path: String
+    let chatId: String
+    let attachment: UserImageAttachment
 
     private let cache = AttachmentImageCache.shared
     @State private var preview: AttachmentPreview?
 
     var body: some View {
         Group {
-            switch cache.snapshot(deviceId: deviceId, path: path) {
+            switch cache.snapshot(deviceId: deviceId, path: attachment.path) {
             case .loaded(let name, let image):
                 Button {
                     preview = AttachmentPreview(name: name, image: image)
@@ -474,7 +542,7 @@ struct AttachmentThumbView: View {
             case .error:
                 // Tap retries once the backoff ladder allows it.
                 Button {
-                    cache.load(deviceId: deviceId, path: path)
+                    cache.load(deviceId: deviceId, chatId: chatId, attachment: attachment)
                 } label: {
                     Image(systemName: "photo.badge.exclamationmark")
                         .font(.system(size: 16))
@@ -487,8 +555,8 @@ struct AttachmentThumbView: View {
         .background(whiteAlpha(0.035))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(whiteAlpha(0.11), lineWidth: 1))
-        .task(id: "\(deviceId)|\(path)") {
-            cache.load(deviceId: deviceId, path: path)
+        .task(id: "\(deviceId)|\(attachment.path)") {
+            cache.load(deviceId: deviceId, chatId: chatId, attachment: attachment)
         }
         .fullScreenCover(item: $preview) { AttachmentLightbox(preview: $0) }
     }

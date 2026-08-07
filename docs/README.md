@@ -1,6 +1,6 @@
 # Jolt documentation
 
-Jolt is a native, multi-device controller for Claude Code, Codex, and Pi. Every computer runs an engine that owns its local agent processes and working folders. Desktop and iOS clients are viewports that can follow and control those engines from anywhere.
+Jolt is a native, multi-device ADE for Claude Code, Codex, and Pi. Every computer runs an engine that owns its local agent processes and working folders. Desktop and iOS clients are viewports that can follow and control those engines from anywhere.
 
 ## Start here
 

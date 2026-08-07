@@ -376,6 +376,20 @@ fn row_splice(old: &[ChangeRow], new: &[ChangeRow]) -> Option<(Range<usize>, usi
     Some((prefix..old.len() - suffix, new.len() - prefix - suffix))
 }
 
+fn sticky_header_row(
+    header_rows: &[usize],
+    top_item: usize,
+    top_item_is_scrolled: bool,
+) -> Option<usize> {
+    let insertion = header_rows.partition_point(|&row| row <= top_item);
+    let header = header_rows.get(insertion.checked_sub(1)?)?;
+    (*header < top_item || top_item_is_scrolled).then_some(*header)
+}
+
+fn sticky_header_push_offset(next_header_top: Option<f32>) -> f32 {
+    next_header_top.map_or(0.0, |top| (top - FILE_HEADER_HEIGHT).min(0.0))
+}
+
 #[derive(Clone)]
 enum DiffSource {
     Checkout {
@@ -512,6 +526,7 @@ pub struct Changes {
     horizontal_scrolls: HashMap<String, ScrollHandle>,
     file_columns: HashMap<String, usize>,
     rows: Vec<ChangeRow>,
+    file_header_rows: Vec<usize>,
     list: ListState,
     _observe: Subscription,
 }
@@ -549,6 +564,7 @@ impl Changes {
             horizontal_scrolls: HashMap::new(),
             file_columns: HashMap::new(),
             rows: Vec::new(),
+            file_header_rows: Vec::new(),
             list,
             _observe: observe,
         }
@@ -642,6 +658,9 @@ impl Changes {
     }
 
     fn handle_scroll(&mut self, _event: &ListScrollEvent, cx: &mut Context<Self>) {
+        // The virtual list repaints its rows while scrolling, but the sticky
+        // header is a sibling overlay and therefore needs an entity repaint.
+        cx.notify();
         let weak = cx.weak_entity();
         cx.defer(move |cx| {
             weak.update(cx, |changes, cx| {
@@ -949,10 +968,12 @@ impl Changes {
 
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
+        let mut file_header_rows = Vec::new();
         let mut file_columns = HashMap::new();
         if let Some(manifest) = &self.manifest {
             for (file_index, file) in manifest.files.iter().enumerate() {
                 self.horizontal_scrolls.entry(file.id.clone()).or_default();
+                file_header_rows.push(rows.len());
                 rows.push(ChangeRow {
                     id: format!("file:{}", file.id),
                     version: hash64(&[&file.id, &manifest.catalog_revision]),
@@ -1032,6 +1053,7 @@ impl Changes {
         }
         self.file_columns = file_columns;
         self.rows = rows;
+        self.file_header_rows = file_header_rows;
     }
 
     fn trim_highlights(&mut self, keep: &str) {
@@ -1191,7 +1213,7 @@ impl Changes {
         };
         let row_id = row.id.clone();
         match row.kind {
-            ChangeRowKind::FileHeader { file } => self.render_file_header(index, file, cx),
+            ChangeRowKind::FileHeader { file } => self.render_file_header(index, file, false, cx),
             ChangeRowKind::PagePlaceholder { file, page_id } => {
                 self.render_placeholder(file, page_id, cx)
             }
@@ -1283,9 +1305,10 @@ impl Changes {
     }
 
     fn render_file_header(
-        &mut self,
+        &self,
         index: usize,
         file_index: usize,
+        sticky: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -1300,7 +1323,11 @@ impl Changes {
         let expanded = self.expanded.contains(&file.id);
         let click_file = file.clone();
         div()
-            .id(SharedString::from(format!("file-hdr-{index}")))
+            .id(SharedString::from(if sticky {
+                format!("sticky-file-hdr-{index}")
+            } else {
+                format!("file-hdr-{index}")
+            }))
             .w_full()
             .h(px(FILE_HEADER_HEIGHT))
             .flex()
@@ -1355,6 +1382,45 @@ impl Changes {
                     .child(SharedString::from(format!("−{}", file.deletions))),
             )
             .into_any_element()
+    }
+
+    fn render_sticky_header(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let scroll_top = self.list.logical_scroll_top();
+        let header_row = sticky_header_row(
+            &self.file_header_rows,
+            scroll_top.item_ix,
+            scroll_top.offset_in_item > px(0.0),
+        )?;
+        let ChangeRowKind::FileHeader { file } = self.rows.get(header_row)?.kind else {
+            return None;
+        };
+
+        let next_header_top = self
+            .file_header_rows
+            .iter()
+            .copied()
+            .find(|&row| row > header_row)
+            .and_then(|row| {
+                let bounds = self.list.bounds_for_item(row)?;
+                let viewport = self.list.viewport_bounds();
+                Some(f32::from(bounds.origin.y - viewport.origin.y))
+            });
+        let top_offset = px(sticky_header_push_offset(next_header_top));
+        let theme = Theme::of(cx).clone();
+
+        Some(
+            div()
+                .absolute()
+                .top(top_offset)
+                .left_0()
+                .w_full()
+                // The regular header uses a translucent wash. Give its overlay
+                // an opaque base so diff rows never show through while pinned.
+                .bg(theme.bg)
+                .shadow_sm()
+                .child(self.render_file_header(header_row, file, true, cx))
+                .into_any_element(),
+        )
     }
 
     fn render_placeholder(
@@ -1519,6 +1585,7 @@ impl Render for Changes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let error = self.error.clone();
+        let sticky_header = self.render_sticky_header(cx);
         let showing_turn = matches!(self.source, Some(DiffSource::Turn { .. }));
         let content: AnyElement = match self.manifest.as_ref() {
             None if self.state.read(cx).selected_chat_row().is_some() => div()
@@ -1631,9 +1698,17 @@ impl Render for Changes {
                             ),
                     )
                     .child(
-                        list(self.list.clone(), cx.processor(Self::render_row))
+                        div()
+                            .relative()
                             .flex_1()
-                            .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(
+                                list(self.list.clone(), cx.processor(Self::render_row))
+                                    .size_full()
+                                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+                            )
+                            .when_some(sticky_header, |element, header| element.child(header)),
                     )
                     .into_any_element()
             }
@@ -1700,5 +1775,24 @@ mod tests {
         let old = [row("a"), row("b"), row("c")];
         let new = [row("a"), row("x"), row("c")];
         assert_eq!(row_splice(&old, &new), Some((1..2, 1)));
+    }
+
+    #[test]
+    fn sticky_header_tracks_the_file_above_the_viewport() {
+        let headers = [0, 5, 9];
+        assert_eq!(sticky_header_row(&headers, 0, false), None);
+        assert_eq!(sticky_header_row(&headers, 0, true), Some(0));
+        assert_eq!(sticky_header_row(&headers, 4, false), Some(0));
+        assert_eq!(sticky_header_row(&headers, 5, false), None);
+        assert_eq!(sticky_header_row(&headers, 8, false), Some(5));
+    }
+
+    #[test]
+    fn next_file_pushes_the_sticky_header_away() {
+        assert_eq!(sticky_header_push_offset(None), 0.0);
+        assert_eq!(sticky_header_push_offset(Some(50.0)), 0.0);
+        assert_eq!(sticky_header_push_offset(Some(FILE_HEADER_HEIGHT)), 0.0);
+        assert_eq!(sticky_header_push_offset(Some(20.0)), -16.0);
+        assert_eq!(sticky_header_push_offset(Some(0.0)), -FILE_HEADER_HEIGHT);
     }
 }

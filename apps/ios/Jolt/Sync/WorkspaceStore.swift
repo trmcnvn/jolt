@@ -409,7 +409,7 @@ final class WorkspaceStore {
 
     /// Upload an attachment into the chat's edge-scoped artifact prefix.
     func uploadAttachment(deviceId: String, chatId: String,
-                          name: String, data: Data) async throws -> String {
+                          name: String, data: Data) async throws -> UploadedAttachment {
         try await uploadAttachmentChunked(relay: relay(for: deviceId), chatId: chatId,
                                           name: name, data: data)
     }

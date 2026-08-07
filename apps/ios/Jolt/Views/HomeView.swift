@@ -16,6 +16,14 @@ struct HomeView: View {
     @State private var path: [Route] = []
     @State private var showNewSpace = false
     @State private var showSpaceFilter = false
+    @State private var sessionToDelete: Chat?
+
+    private var deleteConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { sessionToDelete != nil },
+            set: { if !$0 { sessionToDelete = nil } }
+        )
+    }
 
     private var spaceFilter: String? {
         storedSpaceFilter.isEmpty ? nil : storedSpaceFilter
@@ -44,6 +52,19 @@ struct HomeView: View {
             .scrollContentBackground(.hidden)
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(Theme.surface.ignoresSafeArea())
+            .confirmationDialog(
+                "Delete session?",
+                isPresented: deleteConfirmationPresented,
+                titleVisibility: .visible,
+                presenting: sessionToDelete
+            ) { chat in
+                Button("Delete", role: .destructive) {
+                    model.deleteChat(chat.id)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { chat in
+                Text("“\(chat.displayTitle)” will be permanently deleted. This can’t be undone.")
+            }
             .navigationTitle("Jolt")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(removing: .title)
@@ -178,6 +199,16 @@ struct HomeView: View {
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    Button {
+                        sessionToDelete = chat
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                    // The confirmation button owns the destructive role. Giving
+                    // it to this trigger makes List optimistically remove the row.
+                    .tint(Theme.danger)
+                }
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button {
                         model.archive(chatId: chat.id)

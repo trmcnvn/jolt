@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use jolt_harness::environment::{HarnessEnvironment, HarnessEnvironmentProvider};
 use jolt_harness::{
-    BashMessage, BashRequest, CancellationToken, Harness, HarnessError, PiHarness, RunControls,
-    SteerMessage,
+    BashMessage, BashRequest, CancellationToken, Harness, HarnessError, McpServerConfig, PiHarness,
+    RunControls, SteerMessage,
 };
 use jolt_proto::{
     AgentCommandSource, AgentEvent, CommandContext, DoneStatus, HarnessId, ReasoningLevel,
@@ -32,6 +32,11 @@ fn harness() -> PiHarness {
     PiHarness::new().with_executable(fixture_path())
 }
 
+#[test]
+fn product_mcp_is_supported_through_bundled_extension() {
+    assert!(harness().supports_mcp());
+}
+
 struct TestEnvironment;
 
 #[async_trait]
@@ -39,6 +44,16 @@ impl HarnessEnvironmentProvider for TestEnvironment {
     async fn environment(&self, harness: HarnessId) -> Result<Vec<(String, String)>, HarnessError> {
         assert_eq!(harness, HarnessId::Pi);
         Ok(vec![("JOLT_TEST_SECRET".into(), "available".into())])
+    }
+}
+
+struct McpEnvironment;
+
+#[async_trait]
+impl HarnessEnvironmentProvider for McpEnvironment {
+    async fn environment(&self, harness: HarnessId) -> Result<Vec<(String, String)>, HarnessError> {
+        assert_eq!(harness, HarnessId::Pi);
+        Ok(vec![("PI_MCP_CONFIG".into(), "user-config".into())])
     }
 }
 
@@ -61,6 +76,7 @@ fn controls(answer: &'static str) -> (RunControls, mpsc::Sender<SteerMessage>, C
     let interrupt = CancellationToken::new();
     let controls = RunControls {
         persist_session: true,
+        mcp: None,
         request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
             let (tx, rx) = oneshot::channel();
             let answers = questions
@@ -167,6 +183,7 @@ async fn warm_pi_session_executes_bash_through_its_control_mailbox() {
     let interrupt = CancellationToken::new();
     let controls = RunControls {
         persist_session: true,
+        mcp: None,
         request_input: Box::new(|_| oneshot::channel().1),
         steering: steer_rx,
         bash: bash_rx,
@@ -462,6 +479,31 @@ async fn interrupt_sends_abort_and_settles_interrupted() {
         AgentEvent::Done {
             status: DoneStatus::Interrupted,
             error: None,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn product_mcp_is_injected_additively_without_argument_credentials() {
+    let (mut controls, _steer, _interrupt) = controls("Yes");
+    controls.mcp = Some(McpServerConfig {
+        name: "jolt".into(),
+        url: "http://127.0.0.1:1234/mcp".into(),
+        bearer_token: "top-secret".into(),
+    });
+    let environment = HarnessEnvironment::default();
+    environment.set_provider(Arc::new(McpEnvironment));
+    let mut stream = harness()
+        .with_environment(environment)
+        .run(request("scenario:mcp"), controls)
+        .await
+        .unwrap();
+    let events = until_done(&mut stream).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
             ..
         }
     )));

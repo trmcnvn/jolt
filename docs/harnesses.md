@@ -12,6 +12,12 @@ A Jolt harness adapts an installed coding-agent CLI into one normalized stream o
 
 All three support resume, interrupt escalation, normalized usage, images where the CLI supports them, and structured input bridging.
 
+## Product MCP
+
+For each live Claude Code, Codex, or Pi process, Jolt additively injects a product-owned Streamable HTTP MCP server named `jolt`. The identity-scoped engine starts the loopback listener lazily on an ephemeral port and issues a chat-scoped bearer credential that is revoked when the run ends. The server exposes goal lifecycle tools and `request_answers`, but no prompts, resources, or general-purpose coding tools; it does not replace harness-native coding tools.
+
+Claude receives the server through `--mcp-config`; Codex receives per-process `mcp_servers.jolt` configuration. Because Pi has no native MCP client, Jolt explicitly loads its bundled bridge extension for the live process. The bridge is independent of project trust and does not install packages or change Pi settings. Existing user and project extensions and MCP servers remain available.
+
 ## Executable discovery
 
 Jolt first uses the current process `PATH`, then supplements it with a login-shell PATH snapshot and common Node-version-manager locations. This is important for apps launched from Finder, Dock, launchd, or systemd, which often receive a minimal environment.
@@ -81,7 +87,9 @@ The harness-native session ID is updated after successful runs. Resume is scoped
 
 When compaction finishes, Jolt arms a hidden continuation. Any subsequent user or agent message cancels it; if the harness instead settles without resuming, Jolt sends the continuation into the same live session. This guard uses the normalized compaction lifecycle and therefore applies equally to Claude Code, Codex, and Pi.
 
-Jolt goals use the same harness-neutral layer. The engine prepends an active-goal contract without adding it to the visible user message, accounts normalized usage, removes the model's trailing goal-control envelope from the transcript, and schedules hidden continuation turns until the goal completes, blocks, pauses, errors, or reaches its budget. No harness-specific goal command or extension is required. Jolt pauses locally hosted active goals after an engine restart rather than silently restarting autonomous work.
+Jolt goals use the same harness-neutral layer. The engine prepends an active-goal contract without adding it to the visible user message, accounts normalized usage, and schedules hidden continuation turns until the goal completes, blocks, pauses, errors, or reaches its budget. Agents read and mutate only their chat's goal through the `goal_get`, `goal_update`, `goal_complete`, `goal_report_blocked`, `goal_pause`, and `goal_resume` MCP tools. Objective, budget, creation, editing, and clearing remain user-owned through `/goal`; agents cannot resume user- or system-paused goals. A private trailing control envelope remains only as fail-open compatibility when MCP is unavailable and is removed from the transcript. Jolt pauses locally hosted active goals after an engine restart rather than silently restarting autonomous work.
+
+Agents can call `request_answers` with typed, single-choice, or multi-choice questions. The tool emits the same normalized input lifecycle as native harness questions, opens Jolt's paged composer UI, waits for the durable `respondInput` command, and returns the selected or typed labels to the calling agent. `/answer` remains the user-invoked extraction flow for questions already emitted in assistant prose.
 
 ## Harness secrets
 
@@ -108,5 +116,6 @@ See [Security and data](security.md) for the complete trust boundary.
 - Codex adapter: `crates/harness/src/codex/`
 - Pi adapter: `crates/harness/src/pi/`
 - Harness registry: `crates/engine/src/registry.rs`
+- Product MCP host: `crates/engine/src/mcp.rs`
 - Environment injection: `crates/harness/src/environment.rs`
 - Secure secret storage: `crates/engine/src/secrets.rs`

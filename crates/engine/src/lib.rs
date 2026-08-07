@@ -21,6 +21,7 @@ pub mod diff_sync;
 pub mod doc_host;
 mod goals;
 pub mod instance_lock;
+mod mcp;
 mod model_selection;
 mod question_extraction;
 pub mod registry;
@@ -60,7 +61,7 @@ pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use turn_diffs::TurnDiffStore;
-pub use uploads::{AttachmentChunk, Uploads};
+pub use uploads::{AttachmentChunk, CommittedAttachment, Uploads};
 pub use usage::UsageStore;
 pub use vcs::Vcs;
 pub use workspace_host::{

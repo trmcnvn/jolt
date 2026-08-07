@@ -721,6 +721,21 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_goal(chat_id, goal))?)
     }
 
+    pub(crate) fn mutate_chat_goal(
+        &self,
+        chat_id: &str,
+        mutation: impl FnOnce(Option<jolt_proto::Goal>) -> Result<Option<jolt_proto::Goal>, EngineError>,
+    ) -> Result<Option<jolt_proto::Goal>, EngineError> {
+        self.mutate(|doc| {
+            let current = doc.chat(chat_id)?.and_then(|chat| chat.goal);
+            let next = mutation(current)?;
+            if !doc.set_chat_goal(chat_id, next.as_ref())? {
+                return Err(EngineError::Other("session has no chat row".into()));
+            }
+            Ok(next)
+        })
+    }
+
     pub fn chat_goal(&self, chat_id: &str) -> Option<jolt_proto::Goal> {
         self.read(|doc| doc.chat(chat_id))
             .ok()
@@ -744,6 +759,7 @@ impl WorkspaceHost {
         for (chat_id, mut goal) in goals {
             goal.revision = goal.revision.saturating_add(1);
             goal.status = jolt_proto::GoalStatus::Paused;
+            goal.pause_source = Some(jolt_proto::GoalPauseSource::System);
             goal.status_message = Some("Paused after Jolt restarted".into());
             goal.updated_at_ms = now_ms();
             self.set_chat_goal(&chat_id, Some(&goal))?;

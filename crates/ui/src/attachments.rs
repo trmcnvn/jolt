@@ -45,6 +45,30 @@ pub fn with_attachments(text: &str, paths: &[String]) -> String {
         return text.to_string();
     }
     let refs: Vec<String> = paths.iter().map(|p| format!("- {p}")).collect();
+    attachment_text(text, &refs)
+}
+
+/// A host-staged attachment and its chat-scoped edge content address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedAttachment {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// Persist host paths with content addresses so other clients can read the R2
+/// mirror while the host is offline.
+pub fn with_uploaded_attachments(text: &str, uploads: &[UploadedAttachment]) -> String {
+    if uploads.is_empty() {
+        return text.to_string();
+    }
+    let refs: Vec<String> = uploads
+        .iter()
+        .map(|upload| format!("- {}\n  SHA-256: {}", upload.path, upload.sha256))
+        .collect();
+    attachment_text(text, &refs)
+}
+
+fn attachment_text(text: &str, refs: &[String]) -> String {
     let body = if text.is_empty() {
         ATTACHMENT_ONLY_TEXT
     } else {
@@ -62,6 +86,7 @@ pub struct UserImageAttachment {
     pub id: String,
     pub path: String,
     pub name: String,
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,17 +142,26 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
         };
     };
     let body = content[..body_end].trim_end();
-    let attachments: Vec<UserImageAttachment> = content[refs_start..]
-        .lines()
-        .filter_map(|line| {
+    let lines: Vec<&str> = content[refs_start..].lines().collect();
+    let attachments: Vec<UserImageAttachment> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
             let path = line.trim_start().strip_prefix("- ")?.trim();
-            (!path.is_empty()).then(|| path.to_string())
+            if path.is_empty() {
+                return None;
+            }
+            let sha256 = lines
+                .get(line_index + 1)
+                .and_then(|line| parse_attachment_sha256(line));
+            Some((path.to_string(), sha256))
         })
         .enumerate()
-        .map(|(index, path)| UserImageAttachment {
+        .map(|(index, (path, sha256))| UserImageAttachment {
             id: format!("{index}:{path}"),
             name: name_from_path(&path),
             path,
+            sha256,
         })
         .collect();
     if attachments.is_empty() {
@@ -144,6 +178,15 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
         },
         attachments,
     }
+}
+
+fn parse_attachment_sha256(line: &str) -> Option<String> {
+    let (label, hash) = line.trim().split_once(':')?;
+    if !label.eq_ignore_ascii_case("sha-256") {
+        return None;
+    }
+    let hash = hash.trim().to_ascii_lowercase();
+    (hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hash)
 }
 
 /// Text shown by the rail/sidebar for a user message, using attachment counts
@@ -286,15 +329,15 @@ async fn call_with_timeout(
 
 /// Chunked upload: base64 the bytes, `UploadChunk{uploadId,seq,data}` per 60KB
 /// slice (positional `seq` makes the cheap retry idempotent), then
-/// `UploadCommit{uploadId,fileName,chatId}` → the durable absolute path on the
-/// target device. Errors return the raw cause (the composer shows friendly copy).
+/// `UploadCommit{uploadId,fileName,chatId}` → the durable host path and edge
+/// content address. Errors return the raw cause (the composer shows friendly copy).
 pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
     chat_id: &str,
     attachment: &StagedAttachment,
-) -> Result<String, String> {
+) -> Result<UploadedAttachment, String> {
     let b64 = crate::simd_base64::encode(attachment.bytes());
     let upload_id = uuid::Uuid::new_v4().to_string();
     let mut start = 0usize;
@@ -354,11 +397,18 @@ pub async fn upload_attachment(
         COMMIT_TIMEOUT,
     )
     .await?;
-    reply
+    let path = reply
         .get("path")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "upload commit returned no path".to_string())
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "upload commit returned no path".to_string())?;
+    let sha256 = reply
+        .get("sha256")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "upload commit returned no content hash".to_string())?;
+    Ok(UploadedAttachment {
+        path: path.to_string(),
+        sha256: sha256.to_string(),
+    })
 }
 
 /// A transcript image read back from the owning device.
@@ -683,6 +733,23 @@ mod tests {
         assert_eq!(parsed.attachments[0].name, "ab-cat.png");
         assert_eq!(parsed.attachments[1].name, "dog.jpg");
         assert_eq!(parsed.attachments[0].id, "0:/data/uploads/ab-cat.png");
+        assert_eq!(parsed.attachments[0].sha256, None);
+    }
+
+    #[test]
+    fn uploaded_attachments_preserve_edge_hashes() {
+        let hash = "0123456789abcdef".repeat(4);
+        let content = with_uploaded_attachments(
+            "look",
+            &[UploadedAttachment {
+                path: "/data/uploads/cat.png".into(),
+                sha256: hash.clone(),
+            }],
+        );
+        let parsed = parse_user_message_images(&content);
+        assert_eq!(parsed.text, "look");
+        assert_eq!(parsed.attachments[0].path, "/data/uploads/cat.png");
+        assert_eq!(parsed.attachments[0].sha256.as_deref(), Some(hash.as_str()));
     }
 
     #[test]
