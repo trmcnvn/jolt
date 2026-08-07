@@ -23,7 +23,7 @@
 //! inside the 70px band; own-send re-engages with the same glide.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, ClipboardItem, Context, Entity, EventEmitter, ListAlignment, ListScrollEvent,
-    ListState, ObjectFit, SharedString, StyledImage as _, Subscription, Task, Window, div, img,
-    list, prelude::*, px,
+    ListState, ObjectFit, Pixels, SharedString, StyledImage as _, Subscription, Task, Window, div,
+    img, list, prelude::*, px,
 };
 
 use jolt_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
@@ -81,6 +81,8 @@ const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
+const CHANGE_TREE_INDENT: f32 = 16.0;
+const CHANGE_TREE_ROW_HEIGHT: f32 = 28.0;
 
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
@@ -302,6 +304,89 @@ fn is_file_mutation(call: &ToolCall) -> bool {
         call,
         ToolCall::WriteFile { .. } | ToolCall::EditFile { .. } | ToolCall::ApplyPatch { .. }
     )
+}
+
+#[derive(Default)]
+struct ChangeTreeNode {
+    directories: BTreeMap<String, ChangeTreeNode>,
+    files: Vec<(String, usize)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChangeTreeRow {
+    Directory {
+        path: String,
+        name: String,
+        depth: usize,
+        collapsed: bool,
+    },
+    File {
+        file_index: usize,
+        name: String,
+        depth: usize,
+    },
+}
+
+fn change_tree_rows(
+    files: &[jolt_proto::DiffFileDescriptor],
+    collapsed_paths: Option<&HashSet<String>>,
+) -> Vec<ChangeTreeRow> {
+    let mut root = ChangeTreeNode::default();
+    for (file_index, file) in files.iter().enumerate() {
+        let mut components: Vec<_> = file
+            .path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect();
+        let Some(name) = components.pop() else {
+            continue;
+        };
+        let mut node = &mut root;
+        for component in components {
+            node = node.directories.entry(component.to_string()).or_default();
+        }
+        node.files.push((name.to_string(), file_index));
+    }
+
+    fn flatten(
+        node: &mut ChangeTreeNode,
+        parent: &str,
+        depth: usize,
+        collapsed_paths: Option<&HashSet<String>>,
+        rows: &mut Vec<ChangeTreeRow>,
+    ) {
+        for (name, child) in &mut node.directories {
+            let path = if parent.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent}/{name}")
+            };
+            let collapsed = collapsed_paths.is_some_and(|paths| paths.contains(&path));
+            rows.push(ChangeTreeRow::Directory {
+                path: path.clone(),
+                name: name.clone(),
+                depth,
+                collapsed,
+            });
+            if !collapsed {
+                flatten(child, &path, depth + 1, collapsed_paths, rows);
+            }
+        }
+        node.files.sort_by(|(left, _), (right, _)| left.cmp(right));
+        rows.extend(
+            node.files
+                .iter()
+                .map(|(name, file_index)| ChangeTreeRow::File {
+                    file_index: *file_index,
+                    name: name.clone(),
+                    depth,
+                }),
+        );
+    }
+
+    let mut rows = Vec::new();
+    flatten(&mut root, "", 0, collapsed_paths, &mut rows);
+    rows
 }
 
 fn tool_fingerprint(tools: &[ToolItem], active: bool) -> u64 {
@@ -1387,15 +1472,34 @@ pub enum TranscriptEvent {
     },
 }
 
+#[derive(Clone)]
+struct SavedScrollPosition {
+    row_id: SharedString,
+    entry_id: SharedString,
+    page_id: Option<String>,
+    row_index: usize,
+    offset_in_item: Pixels,
+    show_jump_button: bool,
+    last_scroll_distance: f32,
+}
+
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
     chat_id: Option<String>,
+    /// Device-local viewport anchors keyed by chat. Stable row ids preserve
+    /// the same reading position even when rows are inserted while away.
+    scroll_positions: HashMap<String, SavedScrollPosition>,
+    pending_scroll_restore: Option<SavedScrollPosition>,
+    page_by_entry: HashMap<String, String>,
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
     folds: HashMap<SharedString, FoldState>,
+    /// Collapsed directory paths within expanded assistant-turn diff trees.
+    /// Absence means fully expanded; state is device-local and per diff row.
+    collapsed_change_paths: HashMap<SharedString, HashSet<String>>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -1478,10 +1582,14 @@ impl Transcript {
             list,
             rows: Vec::new(),
             chat_id: None,
+            scroll_positions: HashMap::new(),
+            pending_scroll_restore: None,
+            page_by_entry: HashMap::new(),
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
             folds: HashMap::new(),
+            collapsed_change_paths: HashMap::new(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -1546,8 +1654,91 @@ impl Transcript {
 
     /// Replace the transcript's scroll animation task (rail click / jump).
     pub(crate) fn set_scroll_task(&mut self, task: Task<()>) {
+        self.pending_scroll_restore = None;
         self.pinned = false;
         self.scroll_anim = Some(task);
+    }
+
+    fn save_scroll_position(&mut self) {
+        let Some(chat_id) = self.chat_id.as_ref() else {
+            return;
+        };
+        // If the destination page is still loading, retain the original exact
+        // anchor rather than replacing it with the temporary placeholder.
+        if self.pending_scroll_restore.is_some() {
+            return;
+        }
+        if self.pinned {
+            self.scroll_positions.remove(chat_id);
+            return;
+        }
+        let offset = self.list.logical_scroll_top();
+        let Some(row) = self.rows.get(offset.item_ix) else {
+            self.scroll_positions.remove(chat_id);
+            return;
+        };
+        self.scroll_positions.insert(
+            chat_id.clone(),
+            SavedScrollPosition {
+                row_id: row.id.clone(),
+                entry_id: row.entry_id.clone(),
+                page_id: self.page_by_entry.get(row.entry_id.as_ref()).cloned(),
+                row_index: offset.item_ix,
+                offset_in_item: offset.offset_in_item,
+                show_jump_button: self.show_jump_button,
+                last_scroll_distance: self.last_scroll_distance,
+            },
+        );
+    }
+
+    fn restore_scroll_position(&mut self) {
+        let Some(saved) = self.pending_scroll_restore.clone() else {
+            return;
+        };
+        let exact = self.rows.iter().position(|row| row.id == saved.row_id);
+        let same_entry = || {
+            self.rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.entry_id == saved.entry_id)
+                .min_by_key(|(index, _)| index.abs_diff(saved.row_index))
+                .map(|(index, _)| index)
+        };
+        if let Some(item_ix) = exact.or_else(same_entry) {
+            self.list.scroll_to(gpui::ListOffset {
+                item_ix,
+                offset_in_item: saved.offset_in_item,
+            });
+            self.pending_scroll_restore = None;
+        } else if let Some(item_ix) = saved.page_id.as_deref().and_then(|page_id| {
+            self.rows.iter().position(|row| {
+                matches!(
+                    &row.kind,
+                    RowKind::HistoryPlaceholder { page_id: row_page, .. }
+                        if row_page.as_ref() == page_id
+                )
+            })
+        }) {
+            // Put the cold page in view so its existing render hook loads it;
+            // keep the exact anchor pending for the page-replacement frame.
+            self.list.scroll_to(gpui::ListOffset {
+                item_ix,
+                offset_in_item: px(0.0),
+            });
+        } else if !self.rows.is_empty() {
+            // The anchor was deleted while this chat was away. Preserve the
+            // nearest surviving logical position instead of resetting.
+            self.list.scroll_to(gpui::ListOffset {
+                item_ix: saved.row_index.min(self.rows.len() - 1),
+                offset_in_item: saved.offset_in_item,
+            });
+            self.pending_scroll_restore = None;
+        } else {
+            return;
+        }
+        self.pinned = false;
+        self.show_jump_button = saved.show_jump_button;
+        self.last_scroll_distance = saved.last_scroll_distance;
     }
 
     pub(crate) fn distance_from_bottom(&self) -> f32 {
@@ -1573,6 +1764,9 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
+                // Any direct manipulation supersedes an async page-backed
+                // restoration; the user's gesture always wins.
+                this.pending_scroll_restore = None;
                 let top = this.list.logical_scroll_top().item_ix;
                 if let Some(Row {
                     kind: RowKind::HistoryPlaceholder { page_id, .. },
@@ -1649,6 +1843,7 @@ impl Transcript {
     /// [`GLIDE_MAX_VIEWPORTS`] of the end first (mugen `springToBottom`);
     /// reduced motion snaps.
     fn engage_pin(&mut self, cx: &mut Context<Self>) {
+        self.pending_scroll_restore = None;
         self.pinned = true;
         self.show_jump_button = false;
         if motion::reduced_motion(cx) {
@@ -1756,23 +1951,44 @@ impl Transcript {
 
         let attached = selected != self.chat_id;
         if attached {
-            self.chat_id = selected;
+            self.save_scroll_position();
+            self.chat_id = selected.clone();
+            self.pending_scroll_restore = selected
+                .as_ref()
+                .and_then(|chat_id| self.scroll_positions.get(chat_id).cloned());
             self.rows.clear();
             self.row_cache.clear();
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
+            self.collapsed_change_paths.clear();
             self.veils.clear();
+            self.page_by_entry.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
             self.list.reset(0);
-            self.pinned = true;
+            self.pinned = self.pending_scroll_restore.is_none();
             self.spring.reset();
             self.spring_last_tick = None;
             self.spring_settled_at = None;
             self.spring_kick = false;
-            self.show_jump_button = false;
+            if let Some(saved) = &self.pending_scroll_restore {
+                self.show_jump_button = saved.show_jump_button;
+                self.last_scroll_distance = saved.last_scroll_distance;
+            } else {
+                self.show_jump_button = false;
+                self.last_scroll_distance = 0.0;
+            }
         }
+
+        self.page_by_entry = pages
+            .iter()
+            .flat_map(|page| {
+                page.messages
+                    .iter()
+                    .map(move |entry| (entry.id.clone(), page.id.clone()))
+            })
+            .collect();
 
         let mut new_rows: Vec<Row> = Vec::new();
         if let Some(manifest) = &manifest {
@@ -1884,6 +2100,7 @@ impl Transcript {
             }
         }
         self.rows = new_rows;
+        self.restore_scroll_position();
         if self.pinned {
             if motion::reduced_motion(cx) || was_empty {
                 // First fill (chat open) lands at the bottom instantly
@@ -1936,6 +2153,19 @@ impl Transcript {
     fn toggle_changes(&mut self, row_id: SharedString) {
         let entry = self.folds.entry(row_id.clone()).or_default();
         entry.open = Some(!entry.open.unwrap_or(false));
+        if let Some(index) = self.rows.iter().position(|row| row.id == row_id) {
+            self.list.remeasure_items(index..index + 1);
+        }
+    }
+
+    fn toggle_change_path(&mut self, row_id: SharedString, path: String) {
+        let collapsed = self
+            .collapsed_change_paths
+            .entry(row_id.clone())
+            .or_default();
+        if !collapsed.remove(&path) {
+            collapsed.insert(path);
+        }
         if let Some(index) = self.rows.iter().position(|row| row.id == row_id) {
             self.list.remeasure_items(index..index + 1);
         }
@@ -2630,54 +2860,127 @@ impl Transcript {
             );
 
         let files = open.then(|| {
+            let rows = change_tree_rows(&diff.files, self.collapsed_change_paths.get(row_id));
             div()
                 .pt(px(2.0))
                 .pb(px(4.0))
                 .flex()
                 .flex_col()
-                .children(diff.files.iter().map(|file| {
-                    let open_diff = diff.clone();
-                    let path = file.path.clone();
-                    div()
-                        .id(SharedString::from(format!("{row_id}-file-{}", file.id)))
-                        .h(px(28.0))
-                        .px(px(8.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted)
-                        .hover(|style| style.bg(crate::theme::ink(0.04)).text_color(theme.text))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(TranscriptEvent::OpenTurnDiff {
-                                diff: (*open_diff).clone(),
-                                file_path: Some(path.clone()),
-                            });
-                        }))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .font_family(theme.font_mono.clone())
-                                .child(file.path.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_family(theme.font_mono.clone())
-                                .text_color(theme.diff_add)
-                                .child(SharedString::from(format!("+{}", file.additions))),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_family(theme.font_mono.clone())
-                                .text_color(theme.diff_del)
-                                .child(SharedString::from(format!("−{}", file.deletions))),
-                        )
+                .children(rows.into_iter().map(|entry| match entry {
+                    ChangeTreeRow::Directory {
+                        path,
+                        name,
+                        depth,
+                        collapsed,
+                    } => {
+                        let toggle_row = row_id.clone();
+                        let toggle_path = path.clone();
+                        div()
+                            .id(SharedString::from(format!("{row_id}-dir-{path}")))
+                            .h(px(CHANGE_TREE_ROW_HEIGHT))
+                            .pl(px(6.0 + depth as f32 * CHANGE_TREE_INDENT))
+                            .pr(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .hover(|style| style.bg(crate::theme::ink(0.04)).text_color(theme.text))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_change_path(toggle_row.clone(), toggle_path.clone());
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .size(px(14.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(9.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .child(SharedString::from(if collapsed {
+                                        "▸"
+                                    } else {
+                                        "▾"
+                                    })),
+                            )
+                            .child(
+                                crate::icons::icon(crate::icons::FOLDER)
+                                    .size(px(14.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .font_family(theme.font_mono.clone())
+                                    .child(name),
+                            )
+                            .into_any_element()
+                    }
+                    ChangeTreeRow::File {
+                        file_index,
+                        name,
+                        depth,
+                    } => {
+                        let file = &diff.files[file_index];
+                        let open_diff = diff.clone();
+                        let path = file.path.clone();
+                        div()
+                            .id(SharedString::from(format!("{row_id}-file-{}", file.id)))
+                            .h(px(CHANGE_TREE_ROW_HEIGHT))
+                            .pl(px(6.0 + depth as f32 * CHANGE_TREE_INDENT))
+                            .pr(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .hover(|style| style.bg(crate::theme::ink(0.04)).text_color(theme.text))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(TranscriptEvent::OpenTurnDiff {
+                                    diff: (*open_diff).clone(),
+                                    file_path: Some(path.clone()),
+                                });
+                            }))
+                            .child(div().size(px(14.0)).flex_none())
+                            .child(
+                                crate::icons::icon(crate::icons::DOCUMENT)
+                                    .size(px(14.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .font_family(theme.font_mono.clone())
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_color(theme.diff_add)
+                                    .child(SharedString::from(format!("+{}", file.additions))),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_color(theme.diff_del)
+                                    .child(SharedString::from(format!("−{}", file.deletions))),
+                            )
+                            .into_any_element()
+                    }
                 }))
         });
 
@@ -3433,6 +3736,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn change_tree_groups_paths_and_hides_collapsed_descendants() {
+        let mut files = turn_diff().files;
+        let mut main = files[0].clone();
+        main.id = "main".into();
+        main.path = "src/bin/main.rs".into();
+        let mut readme = files[0].clone();
+        readme.id = "readme".into();
+        readme.path = "README.md".into();
+        files.extend([main, readme]);
+
+        assert_eq!(
+            change_tree_rows(&files, None),
+            vec![
+                ChangeTreeRow::Directory {
+                    path: "src".into(),
+                    name: "src".into(),
+                    depth: 0,
+                    collapsed: false,
+                },
+                ChangeTreeRow::Directory {
+                    path: "src/bin".into(),
+                    name: "bin".into(),
+                    depth: 1,
+                    collapsed: false,
+                },
+                ChangeTreeRow::File {
+                    file_index: 1,
+                    name: "main.rs".into(),
+                    depth: 2,
+                },
+                ChangeTreeRow::File {
+                    file_index: 0,
+                    name: "lib.rs".into(),
+                    depth: 1,
+                },
+                ChangeTreeRow::File {
+                    file_index: 2,
+                    name: "README.md".into(),
+                    depth: 0,
+                },
+            ]
+        );
+
+        let collapsed = HashSet::from(["src".to_string()]);
+        assert_eq!(
+            change_tree_rows(&files, Some(&collapsed)),
+            vec![
+                ChangeTreeRow::Directory {
+                    path: "src".into(),
+                    name: "src".into(),
+                    depth: 0,
+                    collapsed: true,
+                },
+                ChangeTreeRow::File {
+                    file_index: 2,
+                    name: "README.md".into(),
+                    depth: 0,
+                },
+            ]
+        );
+    }
+
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
 
     #[test]
@@ -3890,7 +4256,10 @@ mod tests {
             ("Search", "foo in src".to_string())
         );
         assert_eq!(
-            tool_chip_content(&ToolCall::ApplyPatch { path: None }),
+            tool_chip_content(&ToolCall::ApplyPatch {
+                path: None,
+                paths: Vec::new(),
+            }),
             ("Patch", "workspace".to_string())
         );
         assert_eq!(

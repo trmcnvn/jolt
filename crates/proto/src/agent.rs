@@ -161,6 +161,9 @@ pub enum ToolCall {
     ApplyPatch {
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        /// Every affected path when a patch tool reports multiple files.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
     },
     Search {
         pattern: String,
@@ -359,6 +362,19 @@ mod tests {
                     path: "src/lib.rs".into(),
                     offset: None,
                     limit: None,
+                },
+            }
+        );
+
+        let old_patch =
+            r#"{"type":"toolCall","id":"p1","call":{"kind":"applyPatch","path":"src/lib.rs"}}"#;
+        assert_eq!(
+            serde_json::from_str::<AgentEvent>(old_patch).unwrap(),
+            AgentEvent::ToolCall {
+                id: "p1".into(),
+                call: ToolCall::ApplyPatch {
+                    path: Some("src/lib.rs".into()),
+                    paths: Vec::new(),
                 },
             }
         );

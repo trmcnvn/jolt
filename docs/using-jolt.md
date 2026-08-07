@@ -132,7 +132,7 @@ Live status is freshness-gated so a crashed engine cannot leave a permanent Work
 
 Terminal tabs are PTYs on the host device. Detaching or hiding the panel does not close the shell. Output has a bounded replay window so a viewport can reconnect and continue from a sequence number. Drag to select cells, double-click words, or triple-click lines; copy with `Cmd+C` on macOS or `Ctrl+Shift+C` elsewhere.
 
-The Changes pane shows the latest bounded working-copy diff for the checkout. It supports per-file folding, additions/deletions, syntax highlighting, binary markers, and a partial-snapshot notice when the patch reaches its size cap.
+The Changes pane shows the latest bounded working-copy diff for the checkout. It supports per-file folding, additions/deletions, syntax highlighting, binary markers, and a partial-snapshot notice when the patch reaches its size cap. Click a textual diff line to add pending review feedback; Shift-click another line in the same file to extend the range. Comments auto-save only on this device. Once annotation begins, the reviewed revision remains fixed and a newer working copy is reported without moving existing anchors. **Send feedback** groups every pending comment into one ordinary user message while preserving text and attachments already staged in the composer.
 
 Completed assistant turns that changed files also show a collapsed `N changed files +A −D` card in the transcript. Expanding it lists files; on desktop, selecting a file or **Open diff** opens that immutable turn delta in the Changes pane. iOS shows the summary and file list without diff opening. Successful edit/write chips are replaced by the card, while failed mutation chips remain visible.
 

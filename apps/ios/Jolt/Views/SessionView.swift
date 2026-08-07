@@ -18,6 +18,7 @@ struct SessionView: View {
     /// The view's own width, the only reliable basis for capping the principal
     /// toolbar item (its container proposes an unbounded width).
     @State private var viewWidth: CGFloat = 0
+    @State private var viewHeight: CGFloat = 0
 
 
     private var chat: Chat? { model.chat(id: chatId) }
@@ -35,7 +36,10 @@ struct SessionView: View {
         Group {
             if let chat, let store = model.sessionStore(for: chat) {
                 content(chat: chat, store: store)
-                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
+                    .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+                        viewWidth = size.width
+                        viewHeight = size.height
+                    }
             } else {
                 VStack(spacing: 12) {
                     ActivityOrb(size: 32)
@@ -208,7 +212,11 @@ struct SessionView: View {
                         .allowsHitTesting(false)
                     Group {
                         if let request = store.openInputRequest {
-                            QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
+                            QuestionPanel(
+                                requestId: request.requestId,
+                                questions: request.questions,
+                                maxHeight: viewHeight > 0 ? viewHeight * 0.7 : 520
+                            ) { requestId, answers in
                                 store.respondInput(requestId: requestId, answers: answers)
                             }
                         } else {

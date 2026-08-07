@@ -835,14 +835,14 @@ impl Shell {
             // selected space has git.
             .child(header_icon_button(
                 "toggle-terminal",
-                icons::SIDEBAR_MINIMALISTIC_BOTTOM,
+                icons::TERMINAL,
                 &theme,
                 cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
             ))
             .when(git, |el| {
                 el.child(header_icon_button(
                     "toggle-changes",
-                    icons::SIDEBAR_MINIMALISTIC,
+                    icons::GIT_BRANCH,
                     &theme,
                     cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                 ))

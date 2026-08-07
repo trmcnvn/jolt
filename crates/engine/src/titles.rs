@@ -29,6 +29,7 @@ use crate::EngineError;
 use crate::model_selection::cheap_model_id;
 use crate::registry::HarnessRegistry;
 use crate::repos::Repos;
+use crate::usage::{UsageCapture, UsagePurpose, UsageStore};
 use crate::workspace_host::WorkspaceHost;
 
 /// Throwaway title runs are cheap but still cross a process boundary — retry a
@@ -39,6 +40,7 @@ struct Inner {
     workspace: WorkspaceHost,
     registry: Arc<HarnessRegistry>,
     repos: Repos,
+    usage: UsageStore,
 }
 
 #[derive(Clone)]
@@ -47,12 +49,18 @@ pub struct TitleGenerator {
 }
 
 impl TitleGenerator {
-    pub fn new(workspace: WorkspaceHost, registry: Arc<HarnessRegistry>, repos: Repos) -> Self {
+    pub fn new(
+        workspace: WorkspaceHost,
+        registry: Arc<HarnessRegistry>,
+        repos: Repos,
+        usage: UsageStore,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 workspace,
                 registry,
                 repos,
+                usage,
             }),
         }
     }
@@ -87,7 +95,7 @@ impl TitleGenerator {
             return Ok(()); // already named
         }
 
-        let generated = self.run_title_model(harness_id, prompt, cwd).await;
+        let generated = self.run_title_model(chat_id, harness_id, prompt, cwd).await;
         // Fallback so a chat is always named even if the model run produced nothing.
         let fallback: String = prompt
             .split_whitespace()
@@ -144,6 +152,7 @@ impl TitleGenerator {
     /// One-shot titling run: collect TextDeltas until Done; retries on failure.
     async fn run_title_model(
         &self,
+        chat_id: &str,
         harness_id: HarnessId,
         prompt: &str,
         cwd: &str,
@@ -181,7 +190,21 @@ impl TitleGenerator {
                 attachments: Vec::new(),
                 resume: None,
             };
-            match collect_text(harness.as_ref(), request).await {
+            let mut usage = UsageCapture::new(
+                self.inner.usage.clone(),
+                chat_id,
+                UsagePurpose::TitleGeneration,
+                harness_id,
+                cheap.as_deref(),
+                cwd,
+            );
+            match collect_text(harness.as_ref(), request, |event| {
+                if let Err(error) = usage.observe(event) {
+                    tracing::error!(chat = %chat_id, %error, "title usage ledger write failed");
+                }
+            })
+            .await
+            {
                 Ok(raw) => {
                     let candidate = clean_title(&raw);
                     if !candidate.is_empty() {
@@ -217,6 +240,7 @@ fn clean_title(raw: &str) -> String {
 pub(crate) async fn collect_text(
     harness: &dyn jolt_harness::Harness,
     request: RunRequest,
+    mut observe: impl FnMut(&AgentEvent),
 ) -> Result<String, EngineError> {
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
     let controls = RunControls {
@@ -234,7 +258,9 @@ pub(crate) async fn collect_text(
     let mut stream = harness.run(request, controls).await?;
     let mut text = String::new();
     while let Some(event) = stream.next().await {
-        match event? {
+        let event = event?;
+        observe(&event);
+        match event {
             AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
             AgentEvent::Error { message } => {
                 return Err(EngineError::Other(format!("titling run error: {message}")));
@@ -263,5 +289,64 @@ mod tests {
         assert_eq!(clean_title("\"Fix Login Flow\"\nextra"), "Fix Login Flow");
         assert_eq!(clean_title("# Add Dark Mode  "), "Add Dark Mode");
         assert_eq!(clean_title("   "), "");
+    }
+
+    #[tokio::test]
+    async fn title_collection_records_reported_usage() {
+        use jolt_harness::mock::MockHarness;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = UsageStore::open(&dir.path().join("usage.sqlite"), "d1".into()).unwrap();
+        let harness = MockHarness {
+            script: vec![
+                AgentEvent::Usage {
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    cache_read_input_tokens: 3,
+                    cache_write_input_tokens: 0,
+                    cost_usd: Some(0.01),
+                    context_tokens: Some(11),
+                    context_window: Some(200_000),
+                },
+                AgentEvent::TextDelta {
+                    text: "Track internal usage".into(),
+                },
+                AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            ],
+        };
+        let request = RunRequest {
+            prompt: "title this".into(),
+            model: Some("haiku".into()),
+            reasoning: Some(ReasoningLevel::Minimal),
+            model_options: serde_json::Map::new(),
+            cwd: "/repo".into(),
+            sandbox: SandboxLevel::ReadOnly,
+            auto_approve: true,
+            attachments: Vec::new(),
+            resume: None,
+        };
+        let mut usage = UsageCapture::new(
+            store.clone(),
+            "c1",
+            UsagePurpose::TitleGeneration,
+            HarnessId::Mock,
+            Some("haiku"),
+            "/repo",
+        );
+        let title = collect_text(&harness, request, |event| usage.observe(event).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(title, "Track internal usage");
+        let summary = store.summary("c1").unwrap();
+        assert_eq!(summary.calls, 1);
+        assert_eq!(summary.total_tokens(), 13);
+        assert_eq!(summary.model, None);
+        assert_eq!(store.breakdown(30).unwrap().rows[0].model, "haiku");
     }
 }

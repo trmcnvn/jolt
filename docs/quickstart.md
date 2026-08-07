@@ -6,7 +6,7 @@ This page gets a computer running Jolt and starts a first agent session.
 
 ### Linux daemon
 
-The installer places a managed binary under `~/.jolt/app`, installs a systemd user service, and exposes `jolt` on your path:
+The installer places a managed binary under `~/.jolt/app`, adds a desktop launcher, installs a systemd user service, and exposes `jolt` on your path:
 
 ```bash
 curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh

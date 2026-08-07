@@ -308,17 +308,13 @@ struct SpaceFilterSheet: View {
                         .foregroundStyle(Theme.textMuted.opacity(0.6))
                         .lineLimit(1)
                 }
+                SheetSelectionIndicator(selected: isSelected)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(SheetRowButtonStyle())
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-        .listRowBackground(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(isSelected ? Theme.elementActive : Color.clear)
-                .padding(.horizontal, 20)
-        )
+        .buttonStyle(SheetRowButtonStyle(selected: isSelected))
+        .listRowBackground(Color.clear)
     }
 }
 

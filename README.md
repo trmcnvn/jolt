@@ -63,8 +63,6 @@ live under `~/.jolt/workspaces` (`JOLT_WORKSPACES_DIR` overrides the root).
 
 Jolt is a fork of [Comet](https://github.com/zeronsh/comet). A huge shoutout
 to the Comet project and its contributors for the foundation they created.
-See [how Jolt differs from Comet](docs/jolt-vs-comet.md) for the current
-product and architecture changes.
 
 ---
 

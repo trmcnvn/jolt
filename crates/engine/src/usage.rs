@@ -19,6 +19,75 @@ pub(crate) struct UsageContext {
     pub cwd: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsagePurpose {
+    Chat,
+    TitleGeneration,
+    QuestionExtraction,
+}
+
+impl UsagePurpose {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::TitleGeneration => "title-generation",
+            Self::QuestionExtraction => "question-extraction",
+        }
+    }
+}
+
+pub(crate) struct UsageCapture {
+    store: UsageStore,
+    chat_id: String,
+    purpose: UsagePurpose,
+    context: UsageContext,
+}
+
+impl UsageCapture {
+    pub(crate) fn new(
+        store: UsageStore,
+        chat_id: &str,
+        purpose: UsagePurpose,
+        harness: HarnessId,
+        model: Option<&str>,
+        cwd: &str,
+    ) -> Self {
+        Self {
+            store,
+            chat_id: chat_id.to_string(),
+            purpose,
+            context: UsageContext {
+                harness,
+                model: model.unwrap_or_default().to_string(),
+                cwd: cwd.to_string(),
+            },
+        }
+    }
+
+    pub(crate) fn observe(&mut self, event: &AgentEvent) -> rusqlite::Result<()> {
+        match event {
+            AgentEvent::SessionStarted {
+                harness,
+                model,
+                cwd,
+                ..
+            } => {
+                self.context = UsageContext {
+                    harness: *harness,
+                    model: model.clone(),
+                    cwd: cwd.clone(),
+                };
+                Ok(())
+            }
+            AgentEvent::Usage { .. } => {
+                self.store
+                    .record_internal(&self.chat_id, self.purpose, &self.context, event)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RawUsage {
     chat_id: String,
@@ -83,31 +152,109 @@ fn add_cost(total: &mut Option<f64>, value: Option<f64>) {
     }
 }
 
+fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE IF NOT EXISTS usage_events (
+             chat_id TEXT NOT NULL,
+             journal_seq INTEGER NOT NULL,
+             device_id TEXT NOT NULL,
+             harness TEXT NOT NULL,
+             model TEXT NOT NULL,
+             cwd TEXT NOT NULL,
+             purpose TEXT NOT NULL DEFAULT 'chat',
+             recorded_at_ms INTEGER NOT NULL,
+             input_tokens INTEGER NOT NULL,
+             output_tokens INTEGER NOT NULL,
+             cache_read_input_tokens INTEGER NOT NULL,
+             cache_write_input_tokens INTEGER NOT NULL,
+             cost_usd REAL,
+             context_tokens INTEGER,
+             context_window INTEGER,
+             PRIMARY KEY (chat_id, journal_seq)
+         );
+         CREATE INDEX IF NOT EXISTS usage_events_recorded_at
+             ON usage_events(recorded_at_ms);",
+    )?;
+    let has_purpose = {
+        let mut statement = connection.prepare("PRAGMA table_info(usage_events)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for column in columns {
+            if column? == "purpose" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_purpose {
+        connection.execute(
+            "ALTER TABLE usage_events
+             ADD COLUMN purpose TEXT NOT NULL DEFAULT 'chat'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_schema(path: &Path) -> rusqlite::Result<()> {
+    initialize_schema(&Connection::open(path)?)
+}
+
+fn insert_usage_event(
+    connection: &Connection,
+    device_id: &str,
+    chat_id: &str,
+    journal_seq: i64,
+    purpose: UsagePurpose,
+    context: &UsageContext,
+    event: &AgentEvent,
+) -> rusqlite::Result<()> {
+    let AgentEvent::Usage {
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_write_input_tokens,
+        cost_usd,
+        context_tokens,
+        context_window,
+    } = event
+    else {
+        return Ok(());
+    };
+    connection.execute(
+        "INSERT OR IGNORE INTO usage_events (
+            chat_id, journal_seq, device_id, harness, model, cwd, purpose,
+            recorded_at_ms, input_tokens, output_tokens,
+            cache_read_input_tokens, cache_write_input_tokens, cost_usd,
+            context_tokens, context_window
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            chat_id,
+            journal_seq,
+            device_id,
+            harness_key(context.harness),
+            context.model,
+            context.cwd,
+            purpose.key(),
+            Utc::now().timestamp_millis(),
+            sql_u64(*input_tokens),
+            sql_u64(*output_tokens),
+            sql_u64(*cache_read_input_tokens),
+            sql_u64(*cache_write_input_tokens),
+            cost_usd,
+            context_tokens.map(sql_u64),
+            context_window.map(sql_u64),
+        ],
+    )?;
+    Ok(())
+}
+
 impl UsageStore {
     pub fn open(path: &Path, device_id: String) -> rusqlite::Result<Self> {
         let connection = Connection::open(path)?;
-        connection.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS usage_events (
-                 chat_id TEXT NOT NULL,
-                 journal_seq INTEGER NOT NULL,
-                 device_id TEXT NOT NULL,
-                 harness TEXT NOT NULL,
-                 model TEXT NOT NULL,
-                 cwd TEXT NOT NULL,
-                 recorded_at_ms INTEGER NOT NULL,
-                 input_tokens INTEGER NOT NULL,
-                 output_tokens INTEGER NOT NULL,
-                 cache_read_input_tokens INTEGER NOT NULL,
-                 cache_write_input_tokens INTEGER NOT NULL,
-                 cost_usd REAL,
-                 context_tokens INTEGER,
-                 context_window INTEGER,
-                 PRIMARY KEY (chat_id, journal_seq)
-             );
-             CREATE INDEX IF NOT EXISTS usage_events_recorded_at
-                 ON usage_events(recorded_at_ms);",
-        )?;
+        initialize_schema(&connection)?;
         Ok(Self {
             device_id,
             connection: std::sync::Arc::new(Mutex::new(connection)),
@@ -122,46 +269,53 @@ impl UsageStore {
         context: &UsageContext,
         event: &AgentEvent,
     ) -> rusqlite::Result<()> {
-        let AgentEvent::Usage {
-            input_tokens,
-            output_tokens,
-            cache_read_input_tokens,
-            cache_write_input_tokens,
-            cost_usd,
-            context_tokens,
-            context_window,
-        } = event
-        else {
-            return Ok(());
-        };
-        let recorded_at_ms = Utc::now().timestamp_millis();
         {
             let connection = lock(&self.connection);
-            connection.execute(
-                "INSERT OR IGNORE INTO usage_events (
-                    chat_id, journal_seq, device_id, harness, model, cwd,
-                    recorded_at_ms, input_tokens, output_tokens,
-                    cache_read_input_tokens, cache_write_input_tokens, cost_usd,
-                    context_tokens, context_window
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
-                    chat_id,
-                    sql_u64(journal_seq),
-                    self.device_id,
-                    harness_key(context.harness),
-                    context.model,
-                    context.cwd,
-                    recorded_at_ms,
-                    sql_u64(*input_tokens),
-                    sql_u64(*output_tokens),
-                    sql_u64(*cache_read_input_tokens),
-                    sql_u64(*cache_write_input_tokens),
-                    cost_usd,
-                    context_tokens.map(sql_u64),
-                    context_window.map(sql_u64),
-                ],
+            insert_usage_event(
+                &connection,
+                &self.device_id,
+                chat_id,
+                sql_u64(journal_seq),
+                UsagePurpose::Chat,
+                context,
+                event,
             )?;
         }
+        self.refresh_summary(chat_id)
+    }
+
+    fn record_internal(
+        &self,
+        chat_id: &str,
+        purpose: UsagePurpose,
+        context: &UsageContext,
+        event: &AgentEvent,
+    ) -> rusqlite::Result<()> {
+        if !matches!(event, AgentEvent::Usage { .. }) {
+            return Ok(());
+        }
+        {
+            let connection = lock(&self.connection);
+            let journal_seq = connection.query_row(
+                "SELECT COALESCE(MIN(journal_seq), 0) - 1
+                 FROM usage_events WHERE chat_id = ?1",
+                [chat_id],
+                |row| row.get(0),
+            )?;
+            insert_usage_event(
+                &connection,
+                &self.device_id,
+                chat_id,
+                journal_seq,
+                purpose,
+                context,
+                event,
+            )?;
+        }
+        self.refresh_summary(chat_id)
+    }
+
+    fn refresh_summary(&self, chat_id: &str) -> rusqlite::Result<()> {
         let summary = self.summary(chat_id)?;
         if let Some(tx) = lock(&self.watches).get(chat_id) {
             tx.send_replace(summary);
@@ -209,7 +363,8 @@ impl UsageStore {
         if let Some((harness, model)) = connection
             .query_row(
                 "SELECT harness, model FROM usage_events
-                 WHERE chat_id = ?1 ORDER BY recorded_at_ms DESC, journal_seq DESC LIMIT 1",
+                 WHERE chat_id = ?1 AND purpose = 'chat'
+                 ORDER BY recorded_at_ms DESC, journal_seq DESC LIMIT 1",
                 [chat_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -221,7 +376,7 @@ impl UsageStore {
         if let Some((context_tokens, context_window)) = connection
             .query_row(
                 "SELECT context_tokens, context_window FROM usage_events
-                 WHERE chat_id = ?1 AND context_tokens IS NOT NULL
+                 WHERE chat_id = ?1 AND purpose = 'chat' AND context_tokens IS NOT NULL
                  ORDER BY recorded_at_ms DESC, journal_seq DESC LIMIT 1",
                 [chat_id],
                 |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
@@ -382,5 +537,106 @@ mod tests {
         assert_eq!(breakdown.sessions, 1);
         assert_eq!(breakdown.calls, 2);
         assert_eq!(breakdown.rows[0].total_tokens(), 76);
+    }
+
+    #[test]
+    fn migrates_existing_usage_rows_to_chat_purpose() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("usage.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_events (
+                    chat_id TEXT NOT NULL,
+                    journal_seq INTEGER NOT NULL,
+                    device_id TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    recorded_at_ms INTEGER NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    cache_read_input_tokens INTEGER NOT NULL,
+                    cache_write_input_tokens INTEGER NOT NULL,
+                    cost_usd REAL,
+                    context_tokens INTEGER,
+                    context_window INTEGER,
+                    PRIMARY KEY (chat_id, journal_seq)
+                 );
+                 INSERT INTO usage_events VALUES (
+                    'c1', 1, 'd1', 'pi', 'sonnet', '/repo', 1,
+                    10, 2, 0, 0, NULL, 12, 200000
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = UsageStore::open(&path, "d1".into()).unwrap();
+        let connection = lock(&store.connection);
+        let purpose: String = connection
+            .query_row("SELECT purpose FROM usage_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(purpose, "chat");
+        drop(connection);
+        assert_eq!(
+            store.summary("c1").unwrap().model.as_deref(),
+            Some("sonnet")
+        );
+    }
+
+    #[test]
+    fn internal_usage_counts_without_replacing_active_chat_context() {
+        let dir = tempdir().unwrap();
+        let store = UsageStore::open(&dir.path().join("usage.sqlite"), "d1".into()).unwrap();
+        let chat_context = UsageContext {
+            harness: HarnessId::ClaudeCode,
+            model: "sonnet".into(),
+            cwd: "/repo".into(),
+        };
+        store
+            .record("c1", 1, &chat_context, &usage(100, 20, 120))
+            .unwrap();
+
+        let mut capture = UsageCapture::new(
+            store.clone(),
+            "c1",
+            UsagePurpose::TitleGeneration,
+            HarnessId::ClaudeCode,
+            Some("haiku"),
+            "/repo",
+        );
+        capture
+            .observe(&AgentEvent::SessionStarted {
+                harness: HarnessId::ClaudeCode,
+                model: "haiku".into(),
+                tools: Vec::new(),
+                cwd: "/repo".into(),
+                session_id: "title-run".into(),
+                assistant_message_id: "assistant".into(),
+            })
+            .unwrap();
+        capture.observe(&usage(10, 2, 12)).unwrap();
+
+        let summary = store.summary("c1").unwrap();
+        assert_eq!(summary.calls, 2);
+        assert_eq!(summary.input_tokens, 110);
+        assert_eq!(summary.model.as_deref(), Some("sonnet"));
+        assert_eq!(summary.context_tokens, Some(120));
+
+        let connection = lock(&store.connection);
+        let internal = connection
+            .query_row(
+                "SELECT purpose, journal_seq FROM usage_events WHERE purpose != 'chat'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(internal.0, "title-generation");
+        assert!(internal.1 <= 0);
+        drop(connection);
+
+        let breakdown = store.breakdown(30).unwrap();
+        assert_eq!(breakdown.calls, 2);
+        assert_eq!(breakdown.rows.len(), 2);
     }
 }

@@ -19,13 +19,16 @@ pub mod auth;
 pub mod diff_projection;
 pub mod diff_sync;
 pub mod doc_host;
+mod forge_reviews;
 mod goals;
 pub mod instance_lock;
 mod mcp;
 mod model_selection;
+mod pinned_diffs;
 mod question_extraction;
 pub mod registry;
 pub mod repos;
+pub mod review_store;
 pub mod rpc;
 pub mod run_journal;
 pub mod scopes;
@@ -52,6 +55,7 @@ pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
+pub use review_store::ReviewStore;
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
 pub use scopes::{AccountScope, ScopeKind, ScopeLayout, ScopeStatus};
@@ -143,6 +147,7 @@ pub struct EngineCore {
     pub repos: Repos,
     pub terminals: Terminals,
     pub diff_sync: CheckoutDiffSync,
+    pub review_store: ReviewStore,
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
@@ -257,7 +262,8 @@ impl EngineCore {
         let usage = UsageStore::open(&identity_dir.join("usage.sqlite"), device_id.clone())
             .map_err(|error| EngineError::Other(format!("usage store: {error}")))?;
         let repos = Repos::new(data_dir, &device_id);
-        let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone(), usage);
+        let sessions =
+            SessionsEngine::new(device_id.clone(), journal, registry.clone(), usage.clone());
         sessions.set_turn_diffs(TurnDiffStore::new(
             identity_dir.join("turn-diffs"),
             repos.clone(),
@@ -302,8 +308,17 @@ impl EngineCore {
             workspace.clone(),
             registry.clone(),
             repos.clone(),
+            usage,
         ));
-        let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
+        let diff_sync = CheckoutDiffSync::start(
+            repos.clone(),
+            workspace.clone(),
+            &device_id,
+            edge,
+            identity_dir.join("pinned-diffs"),
+        );
+        let review_store = ReviewStore::open(&identity_dir.join("review-drafts.sqlite"))
+            .map_err(|error| EngineError::Other(format!("review store: {error}")))?;
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {
             sessions,
@@ -313,6 +328,7 @@ impl EngineCore {
             repos,
             terminals,
             diff_sync,
+            review_store,
             spaces_sync,
             uploads,
             agent_accounts,
@@ -431,6 +447,7 @@ impl EngineCore {
             self.repos.clone(),
             self.terminals.clone(),
             self.diff_sync.clone(),
+            self.review_store.clone(),
             self.spaces_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),

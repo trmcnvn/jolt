@@ -170,13 +170,17 @@ See [Architecture](architecture.md) for ownership boundaries and [Synchronizatio
 
 ## Common change paths
 
+### Change mobile behavior
+
+Treat iOS and Android as two native implementations of one mobile product. Follow the [mobile feature parity policy](mobile-parity.md): user-facing capabilities and shared protocol behavior change in both apps together; single-platform work is limited to implementation-only fixes and maintenance.
+
 ### Add or change an RPC
 
 1. Define or reuse wire types in `crates/proto`.
 2. Add the method constant in `crates/rpc/src/lib.rs`.
 3. Parse and dispatch it in `crates/engine/src/rpc.rs`.
 4. Explicitly decide whether it is relay-forwardable, stream-valued, or local-only.
-5. Update desktop/iOS clients and tests.
+5. Update affected desktop and mobile clients and tests; mobile capability changes must cover both iOS and Android.
 6. Update [RPC](rpc.md).
 
 ### Change workspace rows

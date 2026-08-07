@@ -11,8 +11,8 @@
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.jolt/app/<ver>` + `current` symlink — the curl|sh
 //!   installer): download the headless tarball into a new versioned dir, flip
-//!   the symlink, restart the service. Same flow the installer script performs,
-//!   natively.
+//!   the symlink, refresh Linux desktop integration, and restart the service.
+//!   Same flow the installer script performs, natively.
 //! - **MacApp** (running out of `Jolt.app`): download the app tarball, swap the
 //!   bundle directory, relaunch. Driven by the UI.
 //! - **Unmanaged** (source builds, hand-copied binaries): report only.
@@ -34,7 +34,7 @@ pub const fn current_version() -> &'static str {
 }
 
 /// Background check cadence.
-const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 /// Retry sooner after a failed check (offline boot, transient edge error).
 const CHECK_RETRY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// First check waits out engine boot (room joins, doc re-sync).
@@ -199,6 +199,187 @@ fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
         }
     }
     InstallKind::Unmanaged
+}
+
+// ---------------------------------------------------------------------------
+// Linux desktop integration
+// ---------------------------------------------------------------------------
+
+/// Reconcile a managed Linux install's desktop entry and icon from the active
+/// version. Running this at process startup makes the first boot after an
+/// update repair installs created before desktop integration was supported.
+pub fn refresh_linux_desktop_integration() -> anyhow::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let InstallKind::Managed { app_root } = detect_install() else {
+            return Ok(());
+        };
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .context("HOME is not set")?;
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        let (applications_dir, desktop_changed) =
+            install_linux_desktop_integration(&app_root, &data_home)?;
+        if desktop_changed {
+            match std::process::Command::new("update-desktop-database")
+                .arg(&applications_dir)
+                .status()
+            {
+                Ok(status) if !status.success() => tracing::debug!(
+                    %status,
+                    "update-desktop-database failed after refreshing Jolt launcher"
+                ),
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => tracing::debug!(
+                    error = %err,
+                    "could not refresh desktop database after installing Jolt launcher"
+                ),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn install_linux_desktop_integration(
+    app_root: &Path,
+    data_home: &Path,
+) -> anyhow::Result<(PathBuf, bool)> {
+    let current = app_root.join("current");
+    let executable = current.join("jolt");
+    if !executable.is_file() {
+        bail!("{} is not a managed Jolt executable", executable.display());
+    }
+    let template_path = current.join("jolt.desktop");
+    let template = std::fs::read_to_string(&template_path)
+        .with_context(|| format!("reading {}", template_path.display()))?;
+    let desktop = render_desktop_entry(&template, &executable)?;
+
+    let icon_path = current.join("jolt.png");
+    let icon =
+        std::fs::read(&icon_path).with_context(|| format!("reading {}", icon_path.display()))?;
+    let applications_dir = data_home.join("applications");
+    let icon_dir = data_home.join("icons/hicolor/1024x1024/apps");
+    std::fs::create_dir_all(&applications_dir)
+        .with_context(|| format!("creating {}", applications_dir.display()))?;
+    std::fs::create_dir_all(&icon_dir)
+        .with_context(|| format!("creating {}", icon_dir.display()))?;
+    atomic_write_if_changed(&icon_dir.join("jolt.png"), &icon)?;
+    let desktop_changed =
+        atomic_write_if_changed(&applications_dir.join("jolt.desktop"), desktop.as_bytes())?;
+    Ok((applications_dir, desktop_changed))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn render_desktop_entry(template: &str, executable: &Path) -> anyhow::Result<String> {
+    let executable = executable.to_str().with_context(|| {
+        format!(
+            "desktop executable path is not UTF-8: {}",
+            executable.display()
+        )
+    })?;
+    if executable.contains(['\n', '\r']) {
+        bail!("desktop executable path contains a line break");
+    }
+    let exec = quote_desktop_exec(executable);
+    let try_exec = escape_desktop_string(executable);
+    let mut saw_exec = false;
+    let mut saw_try_exec = false;
+    let mut output = String::with_capacity(template.len() + executable.len() * 2);
+    for line in template.lines() {
+        if line.starts_with("Exec=") {
+            output.push_str("Exec=");
+            output.push_str(&exec);
+            saw_exec = true;
+        } else if line.starts_with("TryExec=") {
+            output.push_str("TryExec=");
+            output.push_str(&try_exec);
+            saw_try_exec = true;
+        } else {
+            output.push_str(line);
+        }
+        output.push('\n');
+    }
+    if !saw_exec || !saw_try_exec {
+        bail!("jolt.desktop is missing Exec or TryExec");
+    }
+    Ok(output)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn quote_desktop_exec(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for ch in value.chars() {
+        match ch {
+            '%' => output.push_str("%%"),
+            '\\' | '"' | '`' | '$' => {
+                output.push('\\');
+                output.push(ch);
+            }
+            _ => output.push(ch),
+        }
+    }
+    output.push('"');
+    output
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn escape_desktop_string(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn atomic_write_if_changed(path: &Path, contents: &[u8]) -> anyhow::Result<bool> {
+    match std::fs::read(path) {
+        Ok(existing) if existing == contents => return Ok(false),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("{} has no file name", path.display()))?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{file_name}.{}", std::process::id()));
+    let result = (|| {
+        std::fs::write(&temporary, contents)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("setting permissions on {}", temporary.display()))?;
+        }
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("installing {}", path.display()))?;
+        Ok(true)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +691,7 @@ fn auto_update_enabled() -> bool {
 /// to its live-run and open-terminal registries. `None` = no gate.
 pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Background release checker: polls `{edge}/releases` on a 6h cadence and
+/// Background release checker: polls `{edge}/releases` on a 2h cadence and
 /// publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
 /// stream). Managed installs with `JOLT_AUTO_UPDATE` set stage + apply + service
 /// restart on their own — but only in a quiet window: while `quiescent` reports
@@ -772,6 +953,69 @@ mod tests {
         );
         let bare: Manifest = serde_json::from_str(r#"{"version":"0.1.1"}"#).unwrap();
         assert!(bare.files.is_empty());
+    }
+
+    #[test]
+    fn desktop_entry_uses_the_managed_executable() {
+        let executable = Path::new("/home/a b/$cash/%bin/`jolt`\\x");
+        let rendered = render_desktop_entry(
+            "[Desktop Entry]\nExec=jolt\nTryExec=jolt\nIcon=jolt\n",
+            executable,
+        )
+        .unwrap();
+        assert!(
+            rendered.contains(r#"Exec="/home/a b/\$cash/%%bin/\`jolt\`\\x""#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"TryExec=/home/a b/$cash/%bin/`jolt`\\x"#),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn managed_desktop_assets_install_under_xdg_data_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("app");
+        let current = app_root.join("current");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("jolt"), b"binary").unwrap();
+        std::fs::write(
+            current.join("jolt.desktop"),
+            b"[Desktop Entry]\nExec=jolt\nTryExec=jolt\nIcon=jolt\n",
+        )
+        .unwrap();
+        std::fs::write(current.join("jolt.png"), b"icon").unwrap();
+        let data_home = tmp.path().join("xdg-data");
+
+        let (applications, changed) =
+            install_linux_desktop_integration(&app_root, &data_home).unwrap();
+
+        assert!(changed);
+        assert_eq!(applications, data_home.join("applications"));
+        let desktop = std::fs::read_to_string(applications.join("jolt.desktop")).unwrap();
+        assert!(desktop.contains(&format!("Exec=\"{}\"", current.join("jolt").display())));
+        assert_eq!(
+            std::fs::read(data_home.join("icons/hicolor/1024x1024/apps/jolt.png")).unwrap(),
+            b"icon"
+        );
+        assert!(
+            !install_linux_desktop_integration(&app_root, &data_home)
+                .unwrap()
+                .1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(applications.join("jolt.desktop"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
     }
 
     #[cfg(unix)]

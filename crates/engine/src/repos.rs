@@ -321,6 +321,69 @@ impl Repos {
         Ok(format!("Working copy · {id}"))
     }
 
+    /// Branches/bookmarks that can identify the current checkout to a remote
+    /// code-review provider. JJ working copies inherit the nearest bookmarked
+    /// ancestor because the mutable `@` commit itself is normally unbookmarked.
+    pub(crate) async fn review_references(&self, path: &Path) -> Result<Vec<String>, EngineError> {
+        let output = match self.vcs_kind() {
+            Some(VcsKind::Git) => {
+                let branch = self.current_branch(path).await?;
+                return Ok((branch != "HEAD").then_some(branch).into_iter().collect());
+            }
+            Some(VcsKind::Jujutsu) => {
+                self.jj(
+                    &[
+                        "log",
+                        "-r",
+                        "latest(ancestors(@) & bookmarks())",
+                        "--no-graph",
+                        "-T",
+                        "bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
+                    ],
+                    Some(path),
+                    true,
+                )
+                .await?
+            }
+            None => {
+                return Err(EngineError::Other(
+                    "No supported VCS executable found".into(),
+                ));
+            }
+        };
+        let mut seen = HashSet::new();
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && seen.insert((*name).to_string()))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Fetch remote URLs from the active VCS without assigning meaning to the
+    /// hosting service. Forge adapters decide which URLs they understand.
+    pub(crate) async fn remote_urls(&self, path: &Path) -> Result<Vec<String>, EngineError> {
+        let output = match self.vcs_kind() {
+            Some(VcsKind::Git) => self.git(&["remote", "-v"], Some(path)).await?,
+            Some(VcsKind::Jujutsu) => {
+                self.jj(&["git", "remote", "list"], Some(path), true)
+                    .await?
+            }
+            None => {
+                return Err(EngineError::Other(
+                    "No supported VCS executable found".into(),
+                ));
+            }
+        };
+        let mut seen = HashSet::new();
+        Ok(output
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .filter(|url| seen.insert((*url).to_string()))
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Canonical identity shared by every chat using this exact working copy.
     pub async fn checkout_identity(&self, path: &Path) -> Result<CheckoutIdentity, EngineError> {
         let (root, metadata_dir) = match self.vcs_kind() {
@@ -687,7 +750,7 @@ impl Repos {
             let canonical = std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
             let current = canonical == current_root;
             rows.push(RepoRef {
-                name: format!("Working copy · {change_id}"),
+                name: format!("Working copy · {workspace} · {change_id}"),
                 revision: Some(if current {
                     "@".into()
                 } else {
@@ -1456,6 +1519,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_review_context_uses_current_branch_and_dedupes_remote_urls() {
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let repo = repos.create("review-context").await.unwrap();
+        let root = PathBuf::from(repo.path);
+        repos
+            .git(
+                &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+                Some(&root),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(repos.review_references(&root).await.unwrap(), ["main"]);
+        assert_eq!(
+            repos.remote_urls(&root).await.unwrap(),
+            ["git@github.com:owner/repo.git"]
+        );
+    }
+
+    #[tokio::test]
     async fn jujutsu_repo_working_copy_and_workspace_round_trip() {
         let data = tempfile::tempdir().unwrap();
         let repos = Repos::with_roots(
@@ -1485,10 +1570,21 @@ mod tests {
         let current = refs.iter().find(|row| row.current).unwrap();
         assert_eq!(current.kind, RepoRefKind::WorkingCopy);
         assert_eq!(current.revision.as_deref(), Some("@"));
+        assert!(current.name.starts_with("Working copy · default · "));
 
         let workspace = repos.create_worktree(&root, "@").await.unwrap();
         assert!(Path::new(&workspace.path).join(".jj").is_dir());
         assert!(workspace.branch.starts_with("Working copy · "));
+        let refs = repos.refs(&root).await.unwrap();
+        let workspace_ref = refs
+            .iter()
+            .find(|row| row.worktree_path.as_deref() == Some(workspace.path.as_str()))
+            .unwrap();
+        assert!(
+            workspace_ref
+                .name
+                .starts_with(&format!("Working copy · {} · ", workspace.name))
+        );
         repos
             .delete_worktree(&root, Path::new(&workspace.path))
             .await

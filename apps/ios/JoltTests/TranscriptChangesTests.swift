@@ -39,6 +39,32 @@ final class TranscriptChangesTests: XCTestCase {
         XCTAssertEqual(diff.deletions, 3)
     }
 
+    func testTurnDiffTreeGroupsPathsAndHidesCollapsedDescendants() {
+        let files = [
+            TurnDiffFileSummary(id: "lib", path: "src/lib.rs", additions: 2, deletions: 1),
+            TurnDiffFileSummary(id: "main", path: "src/bin/main.rs", additions: 4, deletions: 0),
+            TurnDiffFileSummary(id: "readme", path: "README.md", additions: 1, deletions: 1),
+        ]
+
+        XCTAssertEqual(
+            TurnDiffTree.rows(files: files, collapsedPaths: []),
+            [
+                .directory(path: "src", name: "src", depth: 0, collapsed: false),
+                .directory(path: "src/bin", name: "bin", depth: 1, collapsed: false),
+                .file(summary: files[1], name: "main.rs", depth: 2),
+                .file(summary: files[0], name: "lib.rs", depth: 1),
+                .file(summary: files[2], name: "README.md", depth: 0),
+            ]
+        )
+        XCTAssertEqual(
+            TurnDiffTree.rows(files: files, collapsedPaths: ["src"]),
+            [
+                .directory(path: "src", name: "src", depth: 0, collapsed: true),
+                .file(summary: files[2], name: "README.md", depth: 0),
+            ]
+        )
+    }
+
     func testChangesRowReplacesSuccessfulMutationChips() {
         let diff = TurnDiffSummary(
             catalogRevision: "catalog-1",

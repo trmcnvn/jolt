@@ -31,6 +31,7 @@ struct TranscriptView: View {
 
     @State private var veils = VeilStore()
     @State private var folds: [String: Bool] = [:]
+    @State private var collapsedChangePaths: [String: Set<String>] = [:]
     /// One-shot guard for the first non-empty projection.
     @State private var hydrated = false
     /// Gates the reveal: false until the transcript has landed at the bottom.
@@ -263,11 +264,23 @@ struct TranscriptView: View {
                 ErrorChipView(message: message)
 
             case .changes(let diff):
-                TurnChangesView(diff: diff, open: folds[row.id] ?? false) {
-                    withAnimation(reduceMotion ? nil : Motion.resize) {
-                        folds[row.id] = !(folds[row.id] ?? false)
+                TurnChangesView(
+                    diff: diff,
+                    open: folds[row.id] ?? false,
+                    collapsedPaths: collapsedChangePaths[row.id] ?? [],
+                    toggle: {
+                        withAnimation(reduceMotion ? nil : Motion.resize) {
+                            folds[row.id] = !(folds[row.id] ?? false)
+                        }
+                    },
+                    togglePath: { path in
+                        withAnimation(reduceMotion ? nil : Motion.resize) {
+                            var collapsed = collapsedChangePaths[row.id] ?? []
+                            if collapsed.remove(path) == nil { collapsed.insert(path) }
+                            collapsedChangePaths[row.id] = collapsed
+                        }
                     }
-                }
+                )
             }
         }
         .padding(.top, row.topGap)
@@ -483,10 +496,73 @@ struct MarkdownRowView: View {
 
 // MARK: - Immutable turn changes
 
+enum TurnDiffTreeRow: Equatable, Identifiable {
+    case directory(path: String, name: String, depth: Int, collapsed: Bool)
+    case file(summary: TurnDiffFileSummary, name: String, depth: Int)
+
+    var id: String {
+        switch self {
+        case .directory(let path, _, _, _): "directory:\(path)"
+        case .file(let summary, _, _): "file:\(summary.id)"
+        }
+    }
+}
+
+enum TurnDiffTree {
+    private final class Node {
+        var directories: [String: Node] = [:]
+        var files: [(name: String, summary: TurnDiffFileSummary)] = []
+    }
+
+    static func rows(files: [TurnDiffFileSummary],
+                     collapsedPaths: Set<String>) -> [TurnDiffTreeRow] {
+        let root = Node()
+        for file in files {
+            let components = file.path.split(separator: "/").map(String.init)
+            guard let name = components.last else { continue }
+            var node = root
+            for component in components.dropLast() {
+                if let child = node.directories[component] {
+                    node = child
+                } else {
+                    let child = Node()
+                    node.directories[component] = child
+                    node = child
+                }
+            }
+            node.files.append((name, file))
+        }
+
+        var rows: [TurnDiffTreeRow] = []
+        func flatten(_ node: Node, parent: String, depth: Int) {
+            for name in node.directories.keys.sorted() {
+                guard let child = node.directories[name] else { continue }
+                let path = parent.isEmpty ? name : "\(parent)/\(name)"
+                let collapsed = collapsedPaths.contains(path)
+                rows.append(.directory(path: path, name: name,
+                                       depth: depth, collapsed: collapsed))
+                if !collapsed {
+                    flatten(child, parent: path, depth: depth + 1)
+                }
+            }
+            for file in node.files.sorted(by: {
+                if $0.name == $1.name { return $0.summary.path < $1.summary.path }
+                return $0.name < $1.name
+            }) {
+                rows.append(.file(summary: file.summary, name: file.name, depth: depth))
+            }
+        }
+        flatten(root, parent: "", depth: 0)
+        return rows
+    }
+}
+
 struct TurnChangesView: View {
     let diff: TurnDiffSummary
     let open: Bool
+    let collapsedPaths: Set<String>
     let toggle: () -> Void
+    let togglePath: (String) -> Void
 
     private var title: String {
         let count = diff.files.count
@@ -524,23 +600,62 @@ struct TurnChangesView: View {
 
             if open {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(diff.files) { file in
-                        HStack(spacing: 8) {
-                            Text(file.path)
-                                .font(Theme.mono(11))
-                                .foregroundStyle(Theme.textMuted)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer(minLength: 0)
-                            Text("+\(file.additions)")
-                                .font(Theme.mono(11))
-                                .foregroundStyle(Theme.statusCompleted)
-                            Text("−\(file.deletions)")
-                                .font(Theme.mono(11))
-                                .foregroundStyle(Theme.danger)
+                    ForEach(TurnDiffTree.rows(files: diff.files,
+                                              collapsedPaths: collapsedPaths)) { row in
+                        switch row {
+                        case .directory(let path, let name, let depth, let collapsed):
+                            Button { togglePath(path) } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 8, weight: .semibold))
+                                        .foregroundStyle(Theme.textMuted.opacity(0.7))
+                                        .rotationEffect(.degrees(collapsed ? 0 : 90))
+                                        .frame(width: 14, height: 14)
+                                    Image(systemName: "folder")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(Theme.textMuted)
+                                        .frame(width: 14, height: 14)
+                                    Text(name)
+                                        .font(Theme.mono(11))
+                                        .foregroundStyle(Theme.textMuted)
+                                        .lineLimit(1)
+                                    Spacer(minLength: 0)
+                                }
+                                .frame(height: 28)
+                                .padding(.leading, 6 + CGFloat(depth) * 16)
+                                .padding(.trailing, 8)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(PressWashButtonStyle(cornerRadius: 6))
+                            .accessibilityLabel("\(name) folder")
+                            .accessibilityValue(collapsed ? "Collapsed" : "Expanded")
+
+                        case .file(let file, let name, let depth):
+                            HStack(spacing: 5) {
+                                Color.clear.frame(width: 14, height: 14)
+                                Image(systemName: "doc.text")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Theme.textMuted)
+                                    .frame(width: 14, height: 14)
+                                Text(name)
+                                    .font(Theme.mono(11))
+                                    .foregroundStyle(Theme.textMuted)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer(minLength: 0)
+                                Text("+\(file.additions)")
+                                    .font(Theme.mono(11))
+                                    .foregroundStyle(Theme.statusCompleted)
+                                Text("−\(file.deletions)")
+                                    .font(Theme.mono(11))
+                                    .foregroundStyle(Theme.danger)
+                            }
+                            .frame(height: 28)
+                            .padding(.leading, 6 + CGFloat(depth) * 16)
+                            .padding(.trailing, 8)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("\(file.path), \(file.additions) additions, \(file.deletions) deletions")
                         }
-                        .frame(height: 28)
-                        .padding(.horizontal, 8)
                     }
                 }
                 .padding(.top, 2)

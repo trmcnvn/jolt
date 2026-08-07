@@ -131,14 +131,19 @@ These methods are local IPC only. DeviceRoom relay traffic is permanently routed
 | --- | --- | --- |
 | `ListRepos`, `AddRepo`, `CloneRepo`, `CreateRepo` | unary | yes |
 | `ListBranches`, `ListRefs`, `SwitchRef` | unary | yes |
+| `GetCheckoutReview` | unary | yes |
 | `ListFolders`, `SearchFiles` | unary | yes |
 | `CreateWorktree`, `DeleteWorktree` | unary | yes |
 | `VcsSettings`, `SetVcsBackend` | unary | yes |
 | `WatchCheckoutDiffV2` | stream | yes |
 | `GetCheckoutDiffPage` | unary | yes |
 | `GetTurnDiffPage` | unary | yes |
+| `PinDiffDocument`, `ReleaseDiffDocument` | unary | yes |
+| `GetReviewDraft`, `PutReviewDraft`, `DeleteReviewDraft` | unary | no (direct device only) |
 
-`WatchCheckoutDiffV2` is checkout-specific by `chatId`. It opens with an atomic compact manifest; later frames replace only that manifest. Expanded file bodies load as immutable, SHA-256-addressed raw-patch pages through `GetCheckoutDiffPage`. Sequence or catalog mismatch causes a fresh bootstrap. `GetTurnDiffPage` loads an immutable page captured for one assistant transcript entry, addressed by chat, assistant message, catalog revision, and page ID.
+`WatchCheckoutDiffV2` is checkout-specific by `chatId`. It opens with an atomic compact manifest; later frames replace only that manifest. Expanded file bodies load as immutable, SHA-256-addressed raw-patch pages through `GetCheckoutDiffPage`. Sequence or catalog mismatch causes a fresh bootstrap. `GetTurnDiffPage` loads an immutable page captured for one assistant transcript entry, addressed by chat, assistant message, catalog revision, and page ID. `PinDiffDocument` durably retains a working-copy revision while a review draft references it; release removes that lease. Review-draft RPCs persist typed, pending annotations only in the directly connected device's SQLite store and reject relay access.
+
+`GetCheckoutReview` resolves a chat checkout on its host and returns the open provider-neutral code review when a supported forge adapter can authenticate. The initial GitHub adapter uses that device's authenticated `gh` CLI. Unsupported forges, unavailable provider tooling, missing authentication, and no matching review all return no review.
 
 File search roots are resolved from synced chat/space rows and verified against the owning repository checkout before walking. Results contain paths only, never file contents.
 

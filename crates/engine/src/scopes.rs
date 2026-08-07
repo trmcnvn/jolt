@@ -390,7 +390,12 @@ fn merge_usage(
     if !source.exists() {
         return Ok(());
     }
-    let target = rusqlite::Connection::open(target_dir.join("usage.sqlite"))
+    crate::usage::ensure_schema(&source)
+        .map_err(|error| EngineError::Other(format!("migrate Local usage: {error}")))?;
+    let target_path = target_dir.join("usage.sqlite");
+    crate::usage::ensure_schema(&target_path)
+        .map_err(|error| EngineError::Other(format!("migrate Account usage: {error}")))?;
+    let target = rusqlite::Connection::open(target_path)
         .map_err(|error| EngineError::Other(format!("open Account usage: {error}")))?;
     target
         .execute(
@@ -401,10 +406,10 @@ fn merge_usage(
     target
         .execute(
             "INSERT OR IGNORE INTO usage_events (
-                chat_id, journal_seq, device_id, harness, model, cwd, recorded_at_ms,
+                chat_id, journal_seq, device_id, harness, model, cwd, purpose, recorded_at_ms,
                 input_tokens, output_tokens, cache_read_input_tokens,
                 cache_write_input_tokens, cost_usd, context_tokens, context_window
-             ) SELECT chat_id, journal_seq, ?1, harness, model, cwd, recorded_at_ms,
+             ) SELECT chat_id, journal_seq, ?1, harness, model, cwd, purpose, recorded_at_ms,
                 input_tokens, output_tokens, cache_read_input_tokens,
                 cache_write_input_tokens, cost_usd, context_tokens, context_window
              FROM local_usage.usage_events",

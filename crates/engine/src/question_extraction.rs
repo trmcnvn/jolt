@@ -10,6 +10,7 @@ use crate::EngineError;
 use crate::model_selection::cheap_model_id;
 use crate::registry::HarnessRegistry;
 use crate::titles::collect_text;
+use crate::usage::{UsageCapture, UsagePurpose, UsageStore};
 
 const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_QUESTIONS: usize = 24;
@@ -47,6 +48,8 @@ struct ExtractionEnvelope {
 /// Run a read-only throwaway harness turn and parse its structured result.
 pub(crate) async fn extract_questions(
     registry: &Arc<HarnessRegistry>,
+    usage_store: UsageStore,
+    chat_id: &str,
     harness_id: HarnessId,
     configured_model: Option<&str>,
     cwd: &str,
@@ -63,7 +66,7 @@ pub(crate) async fn extract_questions(
     let prompt = format!("{EXTRACTION_PROMPT}{assistant_text}\n</assistant-response>");
     let request = RunRequest {
         prompt,
-        model,
+        model: model.clone(),
         reasoning: Some(ReasoningLevel::Minimal),
         model_options,
         cwd: cwd.to_string(),
@@ -72,9 +75,24 @@ pub(crate) async fn extract_questions(
         resume: None,
         attachments: Vec::new(),
     };
-    let raw = tokio::time::timeout(EXTRACTION_TIMEOUT, collect_text(harness.as_ref(), request))
-        .await
-        .map_err(|_| EngineError::Other("question extraction timed out".into()))??;
+    let mut usage = UsageCapture::new(
+        usage_store,
+        chat_id,
+        UsagePurpose::QuestionExtraction,
+        harness_id,
+        model.as_deref(),
+        cwd,
+    );
+    let raw = tokio::time::timeout(
+        EXTRACTION_TIMEOUT,
+        collect_text(harness.as_ref(), request, |event| {
+            if let Err(error) = usage.observe(event) {
+                tracing::error!(chat = %chat_id, %error, "question extraction usage ledger write failed");
+            }
+        }),
+    )
+    .await
+    .map_err(|_| EngineError::Other("question extraction timed out".into()))??;
     parse_extraction(&raw)
         .ok_or_else(|| EngineError::Other("question extraction returned invalid JSON".into()))
 }
@@ -146,6 +164,15 @@ mod tests {
                         r#"{"questions":[{"question":"Pick one?","context":"Choose carefully."}]}"#
                             .into(),
                 },
+                AgentEvent::Usage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    cache_read_input_tokens: 4,
+                    cache_write_input_tokens: 0,
+                    cost_usd: Some(0.02),
+                    context_tokens: Some(16),
+                    context_window: Some(200_000),
+                },
                 AgentEvent::Done {
                     status: DoneStatus::Completed,
                     result: None,
@@ -154,8 +181,12 @@ mod tests {
                 },
             ],
         }));
+        let dir = tempfile::tempdir().unwrap();
+        let usage = UsageStore::open(&dir.path().join("usage.sqlite"), "d1".into()).unwrap();
         let questions = extract_questions(
             &registry,
+            usage.clone(),
+            "chat-1",
             HarnessId::Mock,
             Some("mock-1"),
             ".",
@@ -170,6 +201,16 @@ mod tests {
                 context: Some("Choose carefully.".into()),
             }]
         );
+        let summary = usage.summary("chat-1").unwrap();
+        assert_eq!(summary.calls, 1);
+        assert_eq!(summary.input_tokens, 12);
+        assert_eq!(
+            summary.model, None,
+            "internal use is not the active chat model"
+        );
+        let breakdown = usage.breakdown(30).unwrap();
+        assert_eq!(breakdown.calls, 1);
+        assert_eq!(breakdown.rows[0].model, "mock-1");
     }
 
     #[test]

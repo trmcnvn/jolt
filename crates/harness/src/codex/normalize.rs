@@ -117,8 +117,12 @@ fn file_change_call(changes: &[(String, String)]) -> ToolCall {
         },
         [(path, _)] => ToolCall::ApplyPatch {
             path: Some(path.clone()),
+            paths: Vec::new(),
         },
-        _ => ToolCall::ApplyPatch { path: None },
+        _ => ToolCall::ApplyPatch {
+            path: None,
+            paths: changes.iter().map(|(path, _)| path.clone()).collect(),
+        },
     }
 }
 
@@ -344,7 +348,10 @@ mod tests {
             multi,
             vec![AgentEvent::ToolCall {
                 id: "f3".into(),
-                call: ToolCall::ApplyPatch { path: None },
+                call: ToolCall::ApplyPatch {
+                    path: None,
+                    paths: vec!["/a".into(), "/b".into()],
+                },
             }]
         );
     }

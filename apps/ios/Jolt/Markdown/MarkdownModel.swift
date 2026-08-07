@@ -77,7 +77,8 @@ enum MarkdownParser {
     /// Parse a complete markdown source into top-level blocks.
     static func parse(_ source: String) -> [TopBlock] {
         let nested = normalizeNestedMarkdownFences(source)
-        let document = Document(parsing: normalizeMathSource(nested))
+        let quoted = normalizeTripleBlockquotes(nested)
+        let document = Document(parsing: normalizeMathSource(quoted))
         return document.children.compactMap { child in
             guard let block = convertBlock(child) else { return nil }
             let line = child.range?.lowerBound.line ?? 1
@@ -121,6 +122,41 @@ enum MarkdownParser {
                 wrapper = (fence.marker, fence.count, 0)
             }
             return line
+        }.joined(separator: "\n")
+    }
+
+    /// Treat the common `>>> quote` shorthand as one quote block instead of
+    /// three nested block quotes. Character-for-character replacement keeps
+    /// incremental parser line anchors stable.
+    private static func normalizeTripleBlockquotes(_ source: String) -> String {
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+        var fence: (marker: Character, count: Int)?
+        return lines.map { raw -> String in
+            let line = String(raw)
+            if let active = fence {
+                if let candidate = parsedFenceLine(line),
+                   candidate.marker == active.marker,
+                   candidate.count >= active.count,
+                   candidate.rest.allSatisfy(\.isWhitespace) {
+                    fence = nil
+                }
+                return line
+            }
+            if let opening = parsedFenceLine(line) {
+                fence = (opening.marker, opening.count)
+                return line
+            }
+
+            var chars = Array(line)
+            let indent = chars.prefix { $0 == " " }.count
+            guard indent <= 3, chars.count >= indent + 3,
+                  chars[indent] == ">", chars[indent + 1] == ">", chars[indent + 2] == ">",
+                  chars.count == indent + 3 || chars[indent + 3].isWhitespace else {
+                return line
+            }
+            chars[indent + 1] = " "
+            chars[indent + 2] = " "
+            return String(chars)
         }.joined(separator: "\n")
     }
 
@@ -247,7 +283,106 @@ enum MarkdownParser {
                 merged.append(run)
             }
         }
-        return merged
+        return linkifyBareWebURLs(merged)
+    }
+
+    /// Split bare HTTP(S) URLs out of ordinary prose runs while preserving
+    /// every existing style flag. Explicit Markdown links and code/math remain
+    /// unchanged.
+    private static func linkifyBareWebURLs(_ runs: [InlineRun]) -> [InlineRun] {
+        var linked: [InlineRun] = []
+        for run in runs {
+            guard run.style.link == nil, !run.style.code, run.style.math == nil else {
+                linked.append(run)
+                continue
+            }
+
+            let text = run.text
+            var plainStart = text.startIndex
+            var searchFrom = text.startIndex
+            var found = false
+            while let start = nextWebURLStart(in: text, from: searchFrom) {
+                searchFrom = text.index(after: start)
+                if start > text.startIndex {
+                    let previous = text[text.index(before: start)]
+                    if previous.isLetter || previous.isNumber || previous == "_" { continue }
+                }
+
+                var scannedEnd = start
+                while scannedEnd < text.endIndex {
+                    let character = text[scannedEnd]
+                    if character.isWhitespace || bareURLDelimiters.contains(character) { break }
+                    scannedEnd = text.index(after: scannedEnd)
+                }
+                let candidate = String(text[start..<scannedEnd])
+                let destination = trimmedBareURL(candidate)
+                guard isWebURL(destination) else { continue }
+                let end = text.index(start, offsetBy: destination.count)
+
+                if plainStart < start {
+                    linked.append(InlineRun(text: String(text[plainStart..<start]), style: run.style))
+                }
+                var linkStyle = run.style
+                linkStyle.link = destination
+                linked.append(InlineRun(text: destination, style: linkStyle))
+                plainStart = end
+                searchFrom = end
+                found = true
+            }
+
+            if found {
+                if plainStart < text.endIndex {
+                    linked.append(InlineRun(text: String(text[plainStart...]), style: run.style))
+                }
+            } else {
+                linked.append(run)
+            }
+        }
+        return linked
+    }
+
+    private static let bareURLDelimiters: Set<Character> = [
+        "<", ">", "\"", "'", "`", "\\", "“", "”", "‘", "’",
+    ]
+
+    private static func nextWebURLStart(in text: String,
+                                        from: String.Index) -> String.Index? {
+        let range = from..<text.endIndex
+        return ["http://", "https://"]
+            .compactMap { text.range(of: $0, range: range)?.lowerBound }
+            .min()
+    }
+
+    private static func trimmedBareURL(_ candidate: String) -> String {
+        var result = candidate
+        while !result.isEmpty {
+            while let last = result.last, ".,;:!?…".contains(last) {
+                result.removeLast()
+            }
+            guard let close = result.last else { break }
+            let open: Character
+            switch close {
+            case ")": open = "("
+            case "]": open = "["
+            case "}": open = "{"
+            default: return result
+            }
+            guard result.filter({ $0 == close }).count > result.filter({ $0 == open }).count else {
+                return result
+            }
+            result.removeLast()
+        }
+        return result
+    }
+
+    private static func isWebURL(_ candidate: String) -> Bool {
+        guard let components = URLComponents(string: candidate),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host, !host.isEmpty else {
+            return false
+        }
+        return true
     }
 
     /// Convert standalone display delimiters to `math` fences (same line

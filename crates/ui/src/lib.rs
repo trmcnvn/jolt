@@ -30,6 +30,7 @@ pub mod motion;
 pub mod pickers;
 pub mod popover;
 pub mod rail;
+pub mod review;
 pub mod settings;
 pub mod shell;
 mod simd_base64;

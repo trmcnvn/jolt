@@ -9,8 +9,9 @@ Jolt is a native, multi-device ADE for Claude Code, Codex, and Pi. Every compute
 - [Agent harnesses](harnesses.md) — Claude Code, Codex, Pi, model discovery, trust, and harness secrets.
 - [CLI and headless engines](cli.md) — login, daemon management, updates, and sync diagnostics.
 - [Settings](settings.md) — every desktop settings page, hotkeys, notifications, and local persistence.
+- [Mobile feature parity](mobile-parity.md) — required shared capabilities and paired iOS/Android workflow.
 - [Jolt for iOS](ios.md) — build and use the native mobile viewport.
-- [Jolt and Comet](jolt-vs-comet.md) — deliberate product, workflow, and architecture differences from upstream.
+- [Android implementation plan](android.md) — proposed Kotlin stack, structure, protocol work, risks, and delivery phases.
 
 ## Internals
 

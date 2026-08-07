@@ -22,8 +22,8 @@ use gpui::{
 
 use jolt_engine::registry::HarnessDescriptor;
 use jolt_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
-    UsageSummary,
+    ChatConfig, CheckoutReview, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef,
+    SandboxLevel, Space, UsageSummary,
 };
 use jolt_rpc::methods;
 
@@ -270,6 +270,15 @@ enum ContextPressure {
     Danger,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewLookup {
+    chat_id: String,
+    cwd: String,
+    branch: Option<String>,
+    activity_at: Option<i64>,
+    device_id: String,
+}
+
 fn context_pressure(usage: Option<&UsageSummary>) -> ContextPressure {
     match usage.and_then(UsageSummary::context_fraction) {
         Some(fraction) if fraction >= 0.9 => ContextPressure::Danger,
@@ -406,6 +415,10 @@ pub struct Pickers {
     /// Own slot: the refs load runs concurrently with the eager
     /// harness/model loads — sharing `load_task` would abort one mid-flight.
     refs_task: Option<Task<()>>,
+    checkout_review: Option<CheckoutReview>,
+    review_lookup: Option<ReviewLookup>,
+    review_loaded: bool,
+    review_task: Option<Task<()>>,
     /// In-flight mid-session `SwitchRef` (the ref being switched to).
     switching: Option<String>,
     switch_task: Option<Task<()>>,
@@ -455,6 +468,7 @@ impl Pickers {
                 this.config.reasoning = None;
                 this.config.model_options.clear();
                 this.switch_error = None;
+                this.invalidate_checkout_review();
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
@@ -516,6 +530,10 @@ impl Pickers {
             boot_focus_pending: open.is_some(),
             load_task: None,
             refs_task: None,
+            checkout_review: None,
+            review_lookup: None,
+            review_loaded: false,
+            review_task: None,
             switching: None,
             switch_task: None,
             switch_error: None,
@@ -773,7 +791,10 @@ impl Pickers {
             // Force: the checkout state moves under us (a send mints a
             // worktree+branch, terminals switch refs) — every open
             // revalidates, keeping stale rows visible until fresh ones land.
-            PickerKind::Branch | PickerKind::Checkout => self.ensure_refs(true, cx),
+            PickerKind::Branch | PickerKind::Checkout => {
+                self.ensure_refs(true, cx);
+                self.ensure_checkout_review(true, cx);
+            }
             PickerKind::HarnessModel | PickerKind::Traits => {
                 self.ensure_harnesses(cx);
                 if let Some(harness) = self.effective_harness(cx) {
@@ -886,6 +907,77 @@ impl Pickers {
             .ok();
         })
         .detach();
+    }
+
+    fn invalidate_checkout_review(&mut self) {
+        self.checkout_review = None;
+        self.review_lookup = None;
+        self.review_loaded = false;
+        self.review_task = None;
+    }
+
+    fn selected_review_lookup(&self, cx: &App) -> Option<ReviewLookup> {
+        let chat = self.state.read(cx).selected_chat_row()?;
+        Some(ReviewLookup {
+            chat_id: chat.id.clone(),
+            cwd: chat.cwd.clone()?,
+            branch: chat.branch.clone(),
+            activity_at: chat.last_message_at.map(|at| at.timestamp_millis()),
+            device_id: chat.device_id.clone(),
+        })
+    }
+
+    /// Resolve the selected session checkout's open provider review on its host
+    /// device. Failures are intentionally silent: unavailable/unsupported forge
+    /// tooling is absence, not a broken composer state.
+    fn ensure_checkout_review(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(lookup) = self.selected_review_lookup(cx) else {
+            self.invalidate_checkout_review();
+            return;
+        };
+        if self.review_lookup.as_ref() != Some(&lookup) {
+            self.invalidate_checkout_review();
+            self.review_lookup = Some(lookup.clone());
+        } else if !force && (self.review_loaded || self.review_task.is_some()) {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "chatId".into(),
+            serde_json::Value::String(lookup.chat_id.clone()),
+        );
+        if local.as_deref() != Some(lookup.device_id.as_str()) {
+            params.insert(
+                "targetDeviceId".into(),
+                serde_json::Value::String(lookup.device_id.clone()),
+            );
+        }
+        self.review_loaded = false;
+        self.review_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::GET_CHECKOUT_REVIEW,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |pickers, cx| {
+                if pickers.review_lookup.as_ref() != Some(&lookup) {
+                    return;
+                }
+                pickers.checkout_review = result
+                    .ok()
+                    .and_then(|value| serde_json::from_value::<Option<CheckoutReview>>(value).ok())
+                    .flatten();
+                pickers.review_loaded = true;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// ListRefs for the selected SPACE's folder — targeted at the space's
@@ -1133,8 +1225,11 @@ impl Pickers {
                 match result {
                     Ok(_) => {
                         pickers.open = None;
-                        // Checkout state changed — refresh tags/current.
+                        // Checkout state changed — refresh tags/current and its
+                        // provider review association.
                         pickers.ensure_refs(true, cx);
+                        pickers.invalidate_checkout_review();
+                        pickers.ensure_checkout_review(true, cx);
                     }
                     Err(err) => pickers.switch_error = Some(err.to_string()),
                 }
@@ -1814,6 +1909,33 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
+    fn checkout_review_indicator(&self, theme: &Theme) -> Option<gpui::Stateful<gpui::Div>> {
+        let review = self.checkout_review.as_ref()?;
+        let number = review.number;
+        let url = review.url.clone();
+        Some(
+            div()
+                .id(("checkout-review", number))
+                .h(px(20.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .px(px(4.0))
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.success)
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.72))
+                .on_click(move |_, _, cx| cx.open_url(&url))
+                .child(
+                    crate::icons::icon(crate::icons::GIT_PULL_REQUEST)
+                        .size(px(12.0))
+                        .text_color(theme.success),
+                )
+                .child(format!("#{number}")),
+        )
+    }
+
     fn usage_indicator(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let usage = self.state.read(cx).selected_usage.clone();
         let color = match context_pressure(usage.as_ref()) {
@@ -1884,8 +2006,14 @@ impl Pickers {
         let new_chat = session.is_none();
 
         // Refs feed both modes (draft labels, mid-session switch list) —
-        // eager + idempotent.
+        // eager + idempotent. Existing sessions also resolve their host-side
+        // forge review association.
         self.ensure_refs(false, cx);
+        if session.is_some() {
+            self.ensure_checkout_review(false, cx);
+        } else {
+            self.invalidate_checkout_review();
+        }
 
         // Symmetric: the container's 8px gap sits above the toolbar; bleeding
         // 8 of the container's 16px bottom padding (mb -8) leaves 8 below —
@@ -1930,6 +2058,14 @@ impl Pickers {
         );
         let ref_side =
             attach_overlay_end(ref_chip, &mut overlay, PickerKind::Branch, "branch-popover");
+        let ref_side = div()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .when_some(self.checkout_review_indicator(&theme), |element, review| {
+                element.child(review)
+            })
+            .child(ref_side);
 
         if let Some(chat) = &session {
             // The checkout KIND is fixed at creation (harness resume is

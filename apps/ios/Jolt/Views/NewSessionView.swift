@@ -917,6 +917,8 @@ struct ModelPickerSheet: View {
                     ProgressView()
                         .controlSize(.small)
                         .tint(Theme.textMuted)
+                } else {
+                    SheetSelectionIndicator(selected: selected)
                 }
             }
             .padding(.horizontal, 16)
@@ -1055,6 +1057,8 @@ struct RefPickerSheet: View {
                     ProgressView()
                         .controlSize(.small)
                         .tint(Theme.textMuted)
+                } else {
+                    SheetSelectionIndicator(selected: ref.id == selected)
                 }
             }
             .padding(.horizontal, 16)
@@ -1151,6 +1155,7 @@ struct CheckoutPickerSheet: View {
                         .foregroundStyle(Theme.textMuted)
                 }
                 Spacer(minLength: 8)
+                SheetSelectionIndicator(selected: rowKind == kind)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 11)

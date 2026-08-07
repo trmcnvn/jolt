@@ -7,22 +7,16 @@
   "compatibility_date": "2026-07-01",
   "account_id": "2cd5db709b9369660ed7f1d52527c933",
   "workers_dev": true,
-  // Public hostname on the trmcnvn.dev zone, plus the install surface carved out
-  // of the (old) landing host: path routes beat the landing worker's custom
-  // domain, so `curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh` now
-  // installs jolt while the rest of jolt.trmcnvn.dev is untouched.
+  // Public edge hostname plus the clean install hostname. Both custom domains
+  // terminate at this worker, which serves the installer and release artifacts.
   "routes": [
     {
       "pattern": "edge.jolt.trmcnvn.dev",
       "custom_domain": true
     },
     {
-      "pattern": "jolt.trmcnvn.dev/install.sh",
-      "zone_name": "trmcnvn.dev"
-    },
-    {
-      "pattern": "jolt.trmcnvn.dev/releases/*",
-      "zone_name": "trmcnvn.dev"
+      "pattern": "jolt.trmcnvn.dev",
+      "custom_domain": true
     }
   ],
   // Serve src/install.sh as a string (the /install.sh route).

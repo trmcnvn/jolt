@@ -887,9 +887,16 @@ impl Shell {
         // Own-send re-engages the stick-to-bottom pin with a smooth scroll.
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_: &mut Shell, _, event: &ComposerEvent, cx| match event {
+            move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::Sent { .. } => {
                     transcript.update(cx, |t, cx| t.on_own_send(cx));
+                }
+                ComposerEvent::GeneratedReviewFinished { review_id, error } => {
+                    if let Some(changes) = this.changes.clone() {
+                        changes.update(cx, |changes, cx| {
+                            changes.review_submission_finished(review_id, error.as_deref(), cx);
+                        });
+                    }
                 }
             }
         });
@@ -1511,6 +1518,20 @@ impl Shell {
             |this: &mut Shell, _, event: &ChangesEvent, cx| match event {
                 ChangesEvent::ToggleExpanded => {
                     this.set_changes_expanded(!this.changes_expanded, cx)
+                }
+                ChangesEvent::SubmitReview {
+                    review_id,
+                    chat_id,
+                    message,
+                } => {
+                    this.composer.update(cx, |composer, cx| {
+                        composer.submit_generated_review(
+                            review_id.clone(),
+                            chat_id.clone(),
+                            message.clone(),
+                            cx,
+                        );
+                    });
                 }
             },
         ));
@@ -3390,6 +3411,7 @@ impl Shell {
                         .into_any_element(),
                 );
             }
+            let update_ready = matches!(&self.update_flow, UpdateFlow::Ready(_));
             let menu = popover::popover_card(theme)
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -3446,19 +3468,35 @@ impl Shell {
                         .child(SharedString::from("Usage breakdown")),
                 )
                 .child(
-                    popover::menu_row(theme, self.update_checking, "user-menu-check-update")
-                        .id("user-menu-check-update")
-                        .on_click(cx.listener(|this, _, _, cx| this.check_for_update(cx)))
-                        .child(
-                            icon(icons::REFRESH)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from(if self.update_checking {
-                            "Checking for updates…"
+                    popover::menu_row(
+                        theme,
+                        self.update_checking && !update_ready,
+                        "user-menu-check-update",
+                    )
+                    .id("user-menu-check-update")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if matches!(&this.update_flow, UpdateFlow::Ready(_)) {
+                            this.apply_ready_update(cx);
                         } else {
-                            "Check for update"
-                        })),
+                            this.check_for_update(cx);
+                        }
+                    }))
+                    .child(
+                        icon(if update_ready {
+                            icons::RESTART
+                        } else {
+                            icons::REFRESH
+                        })
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
+                    )
+                    .child(SharedString::from(if update_ready {
+                        "Restart to update"
+                    } else if self.update_checking {
+                        "Checking for updates…"
+                    } else {
+                        "Check for update"
+                    })),
                 )
                 .child(popover::menu_separator())
                 .children(scope_rows)
@@ -4136,13 +4174,13 @@ impl Shell {
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
-        let space_name: SharedString = self
-            .state
-            .read(cx)
-            .selected_space_row()
-            .map(|s| s.display_name().to_string())
-            .unwrap_or_default()
-            .into();
+        let space_label: Option<SharedString> = {
+            let state = self.state.read(cx);
+            state.selected_space_row().map(|space| {
+                let (device, _) = state.space_device_tag(space, Utc::now());
+                SharedString::from(format!("{} {device}", space.display_name()))
+            })
+        };
 
         // Content outlet: selected chat → transcript; nothing selected → the
         // "Send a message to start" canvas with a watermark; no spaces at all
@@ -4201,10 +4239,29 @@ impl Shell {
         } else {
             // New-chat canvas: the dim violet Jolt mark over the centered
             // helper line, naming the space the session will start in.
-            let helper: SharedString = if space_name.is_empty() {
-                "Send a message to start a new session.".into()
+            let helper: AnyElement = if let Some(space_label) = space_label {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child("Send a message to start a session in ")
+                    .child(
+                        div()
+                            .id("new-chat-space-selector")
+                            .underline()
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(theme.text_muted.opacity(0.9)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_spaces_dropdown(window, cx)
+                            }))
+                            .child(space_label),
+                    )
+                    .child(".")
+                    .into_any_element()
             } else {
-                format!("Send a message to start a session in {space_name}.").into()
+                div()
+                    .child("Send a message to start a new session.")
+                    .into_any_element()
             };
             div()
                 .size_full()

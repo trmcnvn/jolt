@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::EngineError;
 use crate::diff_projection::DiffProjection;
-use crate::diff_sync::{TurnDiffBaseline, capture_turn_diff, capture_turn_diff_baseline};
+use crate::diff_sync::{TurnDiffBaseline, capture_scoped_turn_diff, capture_turn_diff_baseline};
 use crate::repos::Repos;
 
 #[derive(Clone)]
@@ -43,8 +43,9 @@ impl TurnDiffStore {
         assistant_message_id: &str,
         cwd: &Path,
         baseline: &TurnDiffBaseline,
+        paths: &[String],
     ) -> Result<Option<TurnDiffManifest>, EngineError> {
-        let snapshot = capture_turn_diff(&self.repos, cwd, baseline).await?;
+        let snapshot = capture_scoped_turn_diff(&self.repos, cwd, baseline, paths).await?;
         if snapshot.files.is_empty() {
             return Ok(None);
         }
@@ -216,7 +217,7 @@ mod tests {
         let baseline = store.capture_baseline(&repo).await.unwrap();
         std::fs::write(repo.join("file.txt"), "after\n").unwrap();
         let manifest = store
-            .finalize("chat", "assistant", &repo, &baseline)
+            .finalize("chat", "assistant", &repo, &baseline, &[])
             .await
             .unwrap()
             .unwrap();

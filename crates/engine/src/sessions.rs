@@ -305,6 +305,10 @@ impl SessionsEngine {
         self.inner.usage.breakdown(days)
     }
 
+    pub(crate) fn usage_store(&self) -> UsageStore {
+        self.inner.usage.clone()
+    }
+
     /// Any run currently working or blocked on input — the auto-updater's
     /// "don't restart from under a session" gate.
     pub fn any_active(&self) -> bool {
@@ -1446,20 +1450,46 @@ async fn capture_turn_diff_baseline(
     }
 }
 
-fn has_successful_file_mutation(parts: &[MessagePart]) -> bool {
-    parts.iter().any(|part| {
-        matches!(
-            part,
-            MessagePart::Tool {
-                call: ToolCall::WriteFile { .. }
-                    | ToolCall::EditFile { .. }
-                    | ToolCall::ApplyPatch { .. },
-                is_error: false,
-                resolved: true,
-                ..
+#[derive(Debug, PartialEq, Eq)]
+enum TurnMutationScope {
+    None,
+    Paths(Vec<String>),
+}
+
+fn successful_file_mutations(parts: &[MessagePart]) -> TurnMutationScope {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for part in parts {
+        let MessagePart::Tool {
+            call,
+            is_error: false,
+            resolved: true,
+            ..
+        } = part
+        else {
+            continue;
+        };
+        let mutation_paths = match call {
+            ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
+                std::slice::from_ref(path)
             }
-        )
-    })
+            ToolCall::ApplyPatch {
+                path: Some(path), ..
+            } => std::slice::from_ref(path),
+            ToolCall::ApplyPatch { path: None, paths } => paths,
+            _ => continue,
+        };
+        for path in mutation_paths {
+            if !path.trim().is_empty() && seen.insert(path.as_str()) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    if paths.is_empty() {
+        TurnMutationScope::None
+    } else {
+        TurnMutationScope::Paths(paths)
+    }
 }
 
 async fn append_turn_diff(
@@ -1473,14 +1503,21 @@ async fn append_turn_diff(
     let (Some(store), Some(baseline)) = (inner.turn_diffs.get(), baseline) else {
         return;
     };
-    // A checkout can host several concurrent sessions. Its baseline delta is
-    // only evidence of this turn's work when this turn reported a successful
-    // file mutation; otherwise another session's edits would be attributed here.
-    if !has_successful_file_mutation(folded) {
+    // A checkout can host several concurrent sessions. Restrict the baseline
+    // delta to paths this turn explicitly mutated so edits from other sessions
+    // are not attributed here. A pathless mutation report cannot safely claim
+    // any checkout-wide change and therefore produces no diff card by itself.
+    let TurnMutationScope::Paths(paths) = successful_file_mutations(folded) else {
         return;
-    }
+    };
     match store
-        .finalize(chat_id, assistant_message_id, Path::new(cwd), baseline)
+        .finalize(
+            chat_id,
+            assistant_message_id,
+            Path::new(cwd),
+            baseline,
+            &paths,
+        )
         .await
     {
         Ok(Some(diff)) => folded.push(MessagePart::Changes {
@@ -2277,6 +2314,77 @@ mod tests {
             .create_chat("chat-1", "space-1", None, None)
             .unwrap();
         (dir, workspace)
+    }
+
+    fn tool_part(call: ToolCall, is_error: bool) -> MessagePart {
+        MessagePart::Tool {
+            id: "tool".into(),
+            call,
+            is_error,
+            resolved: true,
+        }
+    }
+
+    #[test]
+    fn turn_mutation_scope_contains_only_successful_explicit_paths() {
+        let parts = vec![
+            tool_part(
+                ToolCall::EditFile {
+                    path: "src/session.rs".into(),
+                    old_string: None,
+                    new_string: None,
+                },
+                false,
+            ),
+            tool_part(
+                ToolCall::WriteFile {
+                    path: "src/session.rs".into(),
+                    content: None,
+                },
+                false,
+            ),
+            tool_part(
+                ToolCall::EditFile {
+                    path: "src/failed.rs".into(),
+                    old_string: None,
+                    new_string: None,
+                },
+                true,
+            ),
+        ];
+
+        assert_eq!(
+            successful_file_mutations(&parts),
+            TurnMutationScope::Paths(vec!["src/session.rs".into()])
+        );
+    }
+
+    #[test]
+    fn multi_file_patch_preserves_every_reported_path() {
+        assert_eq!(
+            successful_file_mutations(&[tool_part(
+                ToolCall::ApplyPatch {
+                    path: None,
+                    paths: vec!["src/one.rs".into(), "src/two.rs".into()],
+                },
+                false,
+            )]),
+            TurnMutationScope::Paths(vec!["src/one.rs".into(), "src/two.rs".into()])
+        );
+    }
+
+    #[test]
+    fn pathless_patch_does_not_claim_checkout_changes() {
+        assert_eq!(
+            successful_file_mutations(&[tool_part(
+                ToolCall::ApplyPatch {
+                    path: None,
+                    paths: Vec::new(),
+                },
+                false,
+            )]),
+            TurnMutationScope::None
+        );
     }
 
     fn active_goal(workspace: &crate::workspace_host::WorkspaceHost) -> jolt_proto::Goal {

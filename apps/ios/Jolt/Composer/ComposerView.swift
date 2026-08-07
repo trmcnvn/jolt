@@ -842,11 +842,14 @@ struct ExtractedAnswerPanel: View {
 struct QuestionPanel: View {
     let requestId: String
     let questions: [UserInputQuestion]
+    let maxHeight: CGFloat
     let respond: (String, [UserInputAnswer]) -> Void
 
     @State private var page = 0
     @State private var picked: [String: Set<String>] = [:]  // questionId → labels
     @State private var typed: [String: String] = [:]
+    @State private var panelIdealHeight: CGFloat = 320
+    @State private var optionsIdealHeight: CGFloat = 160
     @State private var autoAdvanceTask: Task<Void, Never>?
 
     var body: some View {
@@ -861,28 +864,97 @@ struct QuestionPanel: View {
     }
 
     private func panel(for question: UserInputQuestion) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(question.header.uppercased())
-                    .font(Theme.sans(10.5, weight: .medium))
-                    .kerning(1)
-                    .foregroundStyle(Theme.textMuted.opacity(0.6))
-                Spacer()
-                if questions.count > 1 {
-                    Text("\(page + 1)/\(questions.count)")
-                        .font(Theme.sans(10))
-                        .foregroundStyle(Theme.textMuted)
-                        .padding(.horizontal, 6)
-                        .frame(height: 20)
-                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 6))
-                }
+        VStack(alignment: .leading, spacing: 0) {
+            panelHeader(for: question)
+                .layoutPriority(1)
+            ScrollView {
+                questionPrompt(for: question)
             }
-
-            Text(question.question)
-                .font(Theme.sans(15, weight: .medium))
-                .foregroundStyle(Theme.text)
+            .id("question-prompt-\(question.id)")
+            .frame(minHeight: 0)
+            .layoutPriority(-1)
+            .scrollBounceBehavior(.basedOnSize)
+            if !question.options.isEmpty {
+                ScrollView {
+                    selectionChoices(for: question)
+                }
+                .id("question-options-\(question.id)")
+                .frame(height: min(optionsIdealHeight, min(240, maxHeight * 0.45)))
+                .layoutPriority(1)
+                .scrollBounceBehavior(.basedOnSize)
+            }
+            customAnswer(for: question)
                 .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(1)
+            panelFooter(for: question)
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(1)
+        }
+        .frame(height: min(panelIdealHeight, maxHeight))
+        .background {
+            // Measure the card's compact layout outside the ScrollViews. The
+            // visible card stays compact until its question reaches the screen
+            // cap; choices and answer controls remain pinned below it.
+            VStack(alignment: .leading, spacing: 0) {
+                panelHeader(for: question)
+                questionPrompt(for: question)
+                if !question.options.isEmpty {
+                    selectionChoices(for: question)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                            optionsIdealHeight = $0
+                        }
+                }
+                customAnswer(for: question)
+                panelFooter(for: question)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .hidden()
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                panelIdealHeight = $0
+            }
+        }
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26))
+        .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+        .padding(.horizontal, 12)
+        .transition(.opacity)
+    }
 
+    private func panelHeader(for question: UserInputQuestion) -> some View {
+        HStack {
+            Text(question.header.uppercased())
+                .font(Theme.sans(10.5, weight: .medium))
+                .kerning(1)
+                .foregroundStyle(Theme.textMuted.opacity(0.6))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer()
+            if questions.count > 1 {
+                Text("\(page + 1)/\(questions.count)")
+                    .font(Theme.sans(10))
+                    .foregroundStyle(Theme.textMuted)
+                    .padding(.horizontal, 6)
+                    .frame(height: 20)
+                    .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 6))
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
+    }
+
+    private func questionPrompt(for question: UserInputQuestion) -> some View {
+        Text(question.question)
+            .font(Theme.sans(15, weight: .medium))
+            .foregroundStyle(Theme.text)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+    }
+
+    private func selectionChoices(for question: UserInputQuestion) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
             if question.multiSelect == true {
                 Text("Select one or more options.")
                     .font(Theme.sans(12))
@@ -894,44 +966,51 @@ struct QuestionPanel: View {
                     optionRow(question: question, ix: ix, option: option)
                 }
             }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+    }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Rectangle().fill(whiteAlpha(0.06)).frame(height: 1)
-                TextField("Or type your own answer", text: Binding(
-                    get: { typed[question.id] ?? "" },
-                    set: { typed[question.id] = $0 }
-                ))
-                .font(Theme.sans(13))
-                .foregroundStyle(Theme.text)
-                .padding(.top, 6)
-            }
+    private func customAnswer(for question: UserInputQuestion) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Rectangle().fill(whiteAlpha(0.06)).frame(height: 1)
+            TextField("Or type your own answer", text: Binding(
+                get: { typed[question.id] ?? "" },
+                set: { typed[question.id] = $0 }
+            ))
+            .font(Theme.sans(13))
+            .foregroundStyle(Theme.text)
+            .padding(.top, 6)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 12)
+    }
 
-            HStack {
-                if page > 0 {
-                    Button("Back") {
-                        page -= 1
-                    }
-                    .font(Theme.sans(13, weight: .medium))
-                    .foregroundStyle(Theme.textMuted)
-                }
-                Spacer()
-                Button(page < questions.count - 1 ? "Next" : "Submit") {
-                    advance()
+    private func panelFooter(for question: UserInputQuestion) -> some View {
+        HStack {
+            if page > 0 {
+                Button("Back") {
+                    page -= 1
                 }
                 .font(Theme.sans(13, weight: .medium))
-                .foregroundStyle(Theme.bg)
-                .padding(.horizontal, 16)
-                .frame(height: 34)
-                .background(Theme.text, in: Capsule())
-                .opacity(canAdvance(question) ? 1 : 0.4)
-                .disabled(!canAdvance(question))
+                .foregroundStyle(Theme.textMuted)
             }
+            Spacer()
+            Button(page < questions.count - 1 ? "Next" : "Submit") {
+                advance()
+            }
+            .font(Theme.sans(13, weight: .medium))
+            .foregroundStyle(Theme.bg)
+            .padding(.horizontal, 16)
+            .frame(height: 34)
+            .background(Theme.text, in: Capsule())
+            .opacity(canAdvance(question) ? 1 : 0.4)
+            .disabled(!canAdvance(question))
         }
-        .padding(16)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26))
-        .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
-        .padding(.horizontal, 12)
-        .transition(.opacity)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 16)
     }
 
     private func optionRow(question: UserInputQuestion, ix: Int, option: String) -> some View {

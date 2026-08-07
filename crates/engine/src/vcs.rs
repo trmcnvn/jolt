@@ -220,6 +220,11 @@ fn resolve_executable(kind: VcsKind) -> Option<PathBuf> {
         VcsKind::Git => ("git", "JOLT_GIT_EXECUTABLE"),
         VcsKind::Jujutsu => ("jj", "JOLT_JJ_EXECUTABLE"),
     };
+    resolve_auxiliary_executable(name, override_name)
+}
+
+/// Resolve a companion CLI with the same GUI-safe PATH policy as Git/JJ.
+pub(crate) fn resolve_auxiliary_executable(name: &str, override_name: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(override_name).filter(|value| !value.is_empty()) {
         let path = PathBuf::from(path);
         return executable_file(&path).then_some(path);

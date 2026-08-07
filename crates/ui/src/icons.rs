@@ -74,9 +74,10 @@ icon_assets![
     (LIST, "list"),
     (FOLDER_WITH_FILES, "folder-with-files"),
     (FOLDER, "folder"),
-    // Hand-drawn git-branch glyph in the Solar Linear style (like the
-    // terminal/plus/return ports) — the set has no branch icon.
+    // Hand-drawn Git glyphs in the Solar Linear style (like the
+    // terminal/plus/return ports) — the set has no branch/review icons.
     (GIT_BRANCH, "git-branch"),
+    (GIT_PULL_REQUEST, "git-pull-request"),
     (SIDEBAR_MINIMALISTIC, "sidebar-minimalistic"),
     // Rotated variant: the terminal toggle shows the panel line on the bottom;
     // gpui divs have no transform at the pinned rev, so the rotation is baked

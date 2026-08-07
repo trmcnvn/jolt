@@ -35,7 +35,7 @@ struct SheetSeparator: View {
     }
 }
 
-/// Selectable row: title + optional subtitle, with a desktop-style wash when selected.
+/// Selectable row: title + optional subtitle, with a compact trailing selection mark.
 struct SheetSelectRow: View {
     let title: String
     var subtitle: String?
@@ -64,6 +64,7 @@ struct SheetSelectRow: View {
                     }
                 }
                 Spacer(minLength: 8)
+                SheetSelectionIndicator(selected: selected)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
@@ -71,6 +72,20 @@ struct SheetSelectRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(SheetRowButtonStyle(selected: selected))
+    }
+}
+
+/// Native trailing checkmark for a selected item in an iOS choice list.
+struct SheetSelectionIndicator: View {
+    let selected: Bool
+
+    var body: some View {
+        Image(systemName: "checkmark")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.tint)
+            .frame(width: 20)
+            .opacity(selected ? 1 : 0)
+            .accessibilityHidden(true)
     }
 }
 
@@ -129,15 +144,14 @@ struct SheetLabel: View {
     }
 }
 
-/// Full-width row feedback: persistent selection wash plus a brief press wash.
+/// Brief full-width press feedback; persistent selection is shown by the row itself.
 struct SheetRowButtonStyle: ButtonStyle {
     var selected = false
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(selected ? Theme.elementActive :
-                            (configuration.isPressed ? Theme.elementHover : Color.clear),
+            .background(configuration.isPressed ? Theme.elementHover : Color.clear,
                         in: RoundedRectangle(cornerRadius: 8))
             .accessibilityAddTraits(selected ? .isSelected : [])
     }

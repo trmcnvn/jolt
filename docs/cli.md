@@ -75,7 +75,7 @@ For the macOS LaunchAgent, the default service log is `~/.jolt/daemon.log`.
 
 Jolt polls the edge release manifest every six hours after startup. The UI reports available versions and can update a packaged macOS app or a managed remote device.
 
-Managed Linux installs use versioned directories under `~/.jolt/app/<version>` and an atomic `current` symlink. Downloads are verified against the release manifest's SHA-256 when present.
+Managed Linux installs use versioned directories under `~/.jolt/app/<version>` and an atomic `current` symlink. Downloads are verified against the release manifest's SHA-256 when present. On startup, the active version refreshes its desktop launcher and icon, including for installations created before desktop integration was available.
 
 Set `JOLT_AUTO_UPDATE=1` for a managed headless daemon to stage and apply updates automatically. Jolt waits for no active runs and no open terminals before swapping the binary and restarting the service.
 

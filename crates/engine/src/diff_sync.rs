@@ -34,6 +34,7 @@ use jolt_proto::{
 use crate::EngineError;
 use crate::diff_projection::DiffProjection;
 use crate::doc_host::EdgeConfig;
+use crate::pinned_diffs::PinnedDiffStore;
 use crate::repos::{CheckoutIdentity, Repos};
 use crate::vcs::compose_command_path;
 use crate::workspace_host::WorkspaceHost;
@@ -122,6 +123,7 @@ struct DiffSyncInner {
     device_id: String,
     edge: Option<EdgeConfig>,
     http: reqwest::Client,
+    pinned: PinnedDiffStore,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
     chat_entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
 }
@@ -143,6 +145,7 @@ impl CheckoutDiffSync {
         workspace: WorkspaceHost,
         device_id: &str,
         edge: Option<EdgeConfig>,
+        pinned_root: PathBuf,
     ) -> Self {
         let sync = Self {
             inner: Arc::new(DiffSyncInner {
@@ -151,6 +154,7 @@ impl CheckoutDiffSync {
                 device_id: device_id.to_string(),
                 edge,
                 http: reqwest::Client::new(),
+                pinned: PinnedDiffStore::new(pinned_root),
                 entries: Mutex::new(HashMap::new()),
                 chat_entries: Mutex::new(HashMap::new()),
             }),
@@ -214,6 +218,9 @@ impl CheckoutDiffSync {
             return Ok(None);
         };
         if projection.manifest.catalog_revision != catalog_revision {
+            if let Some(page) = self.inner.pinned.page(catalog_revision, page_id)? {
+                return Ok(Some(page));
+            }
             return Err(EngineError::Other("stale diff catalog revision".into()));
         }
         let page = projection.page(page_id);
@@ -226,6 +233,32 @@ impl CheckoutDiffSync {
             );
         }
         Ok(page)
+    }
+
+    pub async fn pin_diff(
+        &self,
+        chat_id: &str,
+        catalog_revision: &str,
+        review_id: &str,
+    ) -> Result<(), EngineError> {
+        let entry = self.ensure_entry_for_chat(chat_id).await?;
+        let projection = lock(&entry.projection)
+            .clone()
+            .ok_or_else(|| EngineError::Other("diff projection unavailable".into()))?;
+        if projection.manifest.catalog_revision != catalog_revision {
+            return Err(EngineError::Other(
+                "diff revision is no longer available".into(),
+            ));
+        }
+        self.inner.pinned.pin(&projection, review_id).await
+    }
+
+    pub async fn release_diff(
+        &self,
+        catalog_revision: &str,
+        review_id: &str,
+    ) -> Result<(), EngineError> {
+        self.inner.pinned.release(catalog_revision, review_id).await
     }
 
     fn entry_for_chat(&self, chat_id: &str) -> Option<Arc<CheckoutEntry>> {
@@ -1007,14 +1040,26 @@ pub async fn capture_turn_diff(
     root: &Path,
     baseline: &TurnDiffBaseline,
 ) -> Result<DiffSnapshot, EngineError> {
+    capture_scoped_turn_diff(repos, root, baseline, &[]).await
+}
+
+/// Capture a turn diff restricted to paths explicitly mutated by that turn.
+/// An empty path list preserves the checkout-wide behavior for callers that
+/// cannot provide reliable mutation paths.
+pub(crate) async fn capture_scoped_turn_diff(
+    repos: &Repos,
+    root: &Path,
+    baseline: &TurnDiffBaseline,
+    paths: &[String],
+) -> Result<DiffSnapshot, EngineError> {
     if repos.vcs_kind() != Some(baseline.vcs) {
         return Err(EngineError::Other(
             "checkout VCS changed while capturing turn diff".into(),
         ));
     }
     match baseline.vcs {
-        VcsKind::Git => capture_git_turn_diff(repos, root, &baseline.revision).await,
-        VcsKind::Jujutsu => capture_jj_turn_diff(repos, root, &baseline.revision).await,
+        VcsKind::Git => capture_git_turn_diff(repos, root, &baseline.revision, paths).await,
+        VcsKind::Jujutsu => capture_jj_turn_diff(repos, root, &baseline.revision, paths).await,
     }
 }
 
@@ -1033,16 +1078,20 @@ async fn capture_git_worktree_tree(repos: &Repos, root: &Path) -> Result<String,
     Ok(tree)
 }
 
+fn scoped_diff_args<'a>(mut args: Vec<&'a str>, paths: &'a [String]) -> Vec<&'a str> {
+    args.extend(paths.iter().map(String::as_str));
+    args
+}
+
 async fn capture_git_turn_diff(
     repos: &Repos,
     root: &Path,
     baseline: &str,
+    paths: &[String],
 ) -> Result<DiffSnapshot, EngineError> {
     let target = capture_git_worktree_tree(repos, root).await?;
-    let names = capture_command(
-        repos,
-        root,
-        &[
+    let names_args = scoped_diff_args(
+        vec![
             "diff",
             "--name-status",
             "-z",
@@ -1051,13 +1100,11 @@ async fn capture_git_turn_diff(
             &target,
             "--",
         ],
-        2 * 1024 * 1024,
-    )
-    .await?;
-    let nums = capture_command(
-        repos,
-        root,
-        &[
+        paths,
+    );
+    let names = capture_command(repos, root, &names_args, 2 * 1024 * 1024).await?;
+    let nums_args = scoped_diff_args(
+        vec![
             "diff",
             "--numstat",
             "-z",
@@ -1066,13 +1113,11 @@ async fn capture_git_turn_diff(
             &target,
             "--",
         ],
-        2 * 1024 * 1024,
-    )
-    .await?;
-    let captured = capture_command(
-        repos,
-        root,
-        &[
+        paths,
+    );
+    let nums = capture_command(repos, root, &nums_args, 2 * 1024 * 1024).await?;
+    let patch_args = scoped_diff_args(
+        vec![
             "diff",
             "--no-ext-diff",
             "--no-color",
@@ -1082,9 +1127,9 @@ async fn capture_git_turn_diff(
             &target,
             "--",
         ],
-        MAX_PATCH_BYTES,
-    )
-    .await?;
+        paths,
+    );
+    let captured = capture_command(repos, root, &patch_args, MAX_PATCH_BYTES).await?;
     let mut patch = String::from_utf8_lossy(&captured.stdout).to_string();
     let truncated = captured.truncated || names.truncated || nums.truncated;
     if captured.truncated {
@@ -1106,6 +1151,7 @@ async fn capture_jj_turn_diff(
     repos: &Repos,
     root: &Path,
     baseline: &str,
+    paths: &[String],
 ) -> Result<DiffSnapshot, EngineError> {
     // This first command snapshots the current working copy before either diff
     // command reads it.
@@ -1126,10 +1172,8 @@ async fn capture_jj_turn_diff(
     )
     .await?;
     let target = String::from_utf8_lossy(&target.stdout).trim().to_string();
-    let listed = capture_command(
-        repos,
-        root,
-        &[
+    let listed_args = scoped_diff_args(
+        vec![
             "--no-pager",
             "--color=never",
             "--ignore-working-copy",
@@ -1140,14 +1184,13 @@ async fn capture_jj_turn_diff(
             &target,
             "-T",
             "status ++ \"\\t\" ++ source.path() ++ \"\\t\" ++ target.path() ++ \"\\n\"",
+            "--",
         ],
-        2 * 1024 * 1024,
-    )
-    .await?;
-    let captured = capture_command(
-        repos,
-        root,
-        &[
+        paths,
+    );
+    let listed = capture_command(repos, root, &listed_args, 2 * 1024 * 1024).await?;
+    let patch_args = scoped_diff_args(
+        vec![
             "--no-pager",
             "--color=never",
             "--ignore-working-copy",
@@ -1159,10 +1202,11 @@ async fn capture_jj_turn_diff(
             "--git",
             "--context",
             "3",
+            "--",
         ],
-        MAX_PATCH_BYTES,
-    )
-    .await?;
+        paths,
+    );
+    let captured = capture_command(repos, root, &patch_args, MAX_PATCH_BYTES).await?;
     let mut patch = String::from_utf8_lossy(&captured.stdout).to_string();
     let truncated = captured.truncated || listed.truncated;
     if captured.truncated {
@@ -1534,7 +1578,7 @@ mod turn_diff_tests {
     use std::collections::HashSet;
     use std::process::Command;
 
-    use super::{capture_turn_diff, capture_turn_diff_baseline};
+    use super::{capture_scoped_turn_diff, capture_turn_diff, capture_turn_diff_baseline};
     use crate::repos::Repos;
 
     fn git(root: &std::path::Path, args: &[&str]) -> String {
@@ -1588,6 +1632,36 @@ mod turn_diff_tests {
         assert_eq!(paths, HashSet::from(["tracked.txt", "new.txt"]));
         assert!(!snapshot.patch.contains("untouched-before.txt"));
         assert!(!snapshot.patch.contains("staged.txt"));
+    }
+
+    #[tokio::test]
+    async fn scoped_turn_diff_excludes_concurrent_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "jolt@example.invalid"]);
+        git(&root, &["config", "user.name", "Jolt Test"]);
+        std::fs::write(root.join("session.txt"), "before\n").unwrap();
+        std::fs::write(root.join("other.txt"), "before\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "initial"]);
+
+        let repos =
+            Repos::with_worktrees_root(temp.path(), "device", temp.path().join("worktrees"));
+        let baseline = capture_turn_diff_baseline(&repos, &root).await.unwrap();
+        std::fs::write(root.join("session.txt"), "session change\n").unwrap();
+        std::fs::write(root.join("other.txt"), "concurrent change\n").unwrap();
+
+        let snapshot =
+            capture_scoped_turn_diff(&repos, &root, &baseline, &["session.txt".to_string()])
+                .await
+                .unwrap();
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].path, "session.txt");
+        assert!(snapshot.patch.contains("session change"));
+        assert!(!snapshot.patch.contains("other.txt"));
     }
 }
 

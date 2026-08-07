@@ -98,6 +98,8 @@ pub mod methods {
     pub const CREATE_REPO: &str = "CreateRepo";
     pub const LIST_BRANCHES: &str = "ListBranches";
     pub const LIST_REFS: &str = "ListRefs";
+    /// Open provider-neutral PR/MR associated with a chat's concrete checkout.
+    pub const GET_CHECKOUT_REVIEW: &str = "GetCheckoutReview";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
@@ -119,6 +121,13 @@ pub mod methods {
     pub const GET_CHECKOUT_DIFF_PAGE: &str = "GetCheckoutDiffPage";
     /// Fetch one immutable page captured for an assistant transcript entry.
     pub const GET_TURN_DIFF_PAGE: &str = "GetTurnDiffPage";
+    /// Retain/release one working-copy revision while a local review draft exists.
+    pub const PIN_DIFF_DOCUMENT: &str = "PinDiffDocument";
+    pub const RELEASE_DIFF_DOCUMENT: &str = "ReleaseDiffDocument";
+    // Pending review drafts are private to the directly connected viewing device.
+    pub const GET_REVIEW_DRAFT: &str = "GetReviewDraft";
+    pub const PUT_REVIEW_DRAFT: &str = "PutReviewDraft";
+    pub const DELETE_REVIEW_DRAFT: &str = "DeleteReviewDraft";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";

@@ -153,6 +153,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Err(err) = jolt_update::refresh_linux_desktop_integration() {
+        tracing::warn!(error = %err, "could not refresh Linux desktop integration");
+    }
+
     match cli.command {
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;

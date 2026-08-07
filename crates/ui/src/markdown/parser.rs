@@ -197,6 +197,36 @@ fn normalize_nested_markdown_fences(source: &str) -> String {
     String::from_utf8(normalized).expect("same-byte ASCII fence replacement")
 }
 
+/// Treat the common `>>> quote` shorthand as one quote block instead of
+/// three nested block quotes. Replacing the extra markers with spaces keeps
+/// source byte ranges stable for incremental parsing.
+fn normalize_triple_blockquotes(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let protected = code_protected_bytes(source);
+    let mut normalized = bytes.to_vec();
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        let line_end = bytes[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |offset| line_start + offset);
+        let line = &bytes[line_start..line_end];
+        let indent = line.iter().take_while(|byte| **byte == b' ').count();
+        let marker = line_start + indent;
+        if indent <= 3
+            && line.get(indent..indent + 3) == Some(b">>>")
+            && !protected[marker]
+            && line
+                .get(indent + 3)
+                .is_none_or(|byte| byte.is_ascii_whitespace())
+        {
+            normalized[marker + 1..marker + 3].fill(b' ');
+        }
+        line_start = (line_end + usize::from(line_end < bytes.len())).min(bytes.len());
+    }
+    String::from_utf8(normalized).expect("same-byte ASCII blockquote replacement")
+}
+
 fn normalize_tex_delimiters(source: &str) -> String {
     let bytes = source.as_bytes();
     let protected = code_protected_bytes(source);
@@ -408,7 +438,8 @@ fn decode_inline_math(text: &str) -> Result<(MathKind, String), String> {
 /// Parse a whole source into a [`BlockTree`].
 pub fn parse_full(source: &str) -> BlockTree {
     let fenced = normalize_nested_markdown_fences(source);
-    let normalized = normalize_tex_delimiters(&fenced);
+    let quoted = normalize_triple_blockquotes(&fenced);
+    let normalized = normalize_tex_delimiters(&quoted);
     let events: Vec<(Event, Range<usize>)> = Parser::new_ext(&normalized, options())
         .into_offset_iter()
         .collect();
@@ -743,21 +774,138 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
 /// Merge adjacent identically-styled runs (keeps run counts small and makes the
 /// tree canonical for equality tests).
 fn merge_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
-    let mut out: Vec<InlineRun> = Vec::with_capacity(runs.len());
+    let mut merged: Vec<InlineRun> = Vec::with_capacity(runs.len());
     for run in runs {
-        match out.last_mut() {
+        match merged.last_mut() {
             Some(last) if last.style == run.style && run.style.math.is_none() => {
                 last.text.push_str(&run.text)
             }
-            _ => out.push(run),
+            _ => merged.push(run),
         }
     }
-    for run in &mut out {
+    for run in &mut merged {
         if run.style.math.is_none() {
             run.text = restore_tex_delimiters(&run.text);
         }
     }
-    out
+    linkify_bare_web_urls(merged)
+}
+
+/// Split bare HTTP(S) URLs out of ordinary prose runs. Markdown links already
+/// carry a destination and code/math must remain literal; all other style flags
+/// are retained on the split URL run.
+fn linkify_bare_web_urls(runs: Vec<InlineRun>) -> Vec<InlineRun> {
+    let mut linked = Vec::with_capacity(runs.len());
+    for InlineRun { text, style } in runs {
+        if style.link.is_some() || style.code || style.math.is_some() {
+            linked.push(InlineRun { text, style });
+            continue;
+        }
+
+        let mut plain_start = 0;
+        let mut search_from = 0;
+        let mut found = false;
+        while let Some(start) = next_web_url_start(&text, search_from) {
+            search_from = start + 1;
+            if text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+            {
+                continue;
+            }
+
+            let scanned_end = text[start..]
+                .char_indices()
+                .find_map(|(offset, ch)| {
+                    (ch.is_whitespace()
+                        || ch.is_control()
+                        || matches!(
+                            ch,
+                            '<' | '>' | '"' | '\'' | '`' | '\\' | '“' | '”' | '‘' | '’'
+                        ))
+                    .then_some(start + offset)
+                })
+                .unwrap_or(text.len());
+            let end = start + trimmed_bare_url_len(&text[start..scanned_end]);
+            let destination = &text[start..end];
+            if !is_web_url(destination) {
+                continue;
+            }
+
+            if plain_start < start {
+                linked.push(InlineRun {
+                    text: text[plain_start..start].to_owned(),
+                    style: style.clone(),
+                });
+            }
+            let mut link_style = style.clone();
+            link_style.link = Some(destination.to_owned());
+            linked.push(InlineRun {
+                text: destination.to_owned(),
+                style: link_style,
+            });
+            plain_start = end;
+            search_from = end;
+            found = true;
+        }
+
+        if found {
+            if plain_start < text.len() {
+                linked.push(InlineRun {
+                    text: text[plain_start..].to_owned(),
+                    style,
+                });
+            }
+        } else {
+            linked.push(InlineRun { text, style });
+        }
+    }
+    linked
+}
+
+fn next_web_url_start(text: &str, from: usize) -> Option<usize> {
+    let suffix = &text[from..];
+    let http = suffix.find("http://");
+    let https = suffix.find("https://");
+    match (http, https) {
+        (Some(http), Some(https)) => Some(from + http.min(https)),
+        (Some(offset), None) | (None, Some(offset)) => Some(from + offset),
+        (None, None) => None,
+    }
+}
+
+fn trimmed_bare_url_len(candidate: &str) -> usize {
+    let mut end = candidate.len();
+    loop {
+        while let Some(ch) = candidate[..end].chars().next_back()
+            && matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '…')
+        {
+            end -= ch.len_utf8();
+        }
+        let Some(close) = candidate[..end].chars().next_back() else {
+            return 0;
+        };
+        let open = match close {
+            ')' => '(',
+            ']' => '[',
+            '}' => '{',
+            _ => break,
+        };
+        let body = &candidate[..end];
+        if body.matches(close).count() <= body.matches(open).count() {
+            break;
+        }
+        end -= close.len_utf8();
+    }
+    end
+}
+
+fn is_web_url(candidate: &str) -> bool {
+    url::Url::parse(candidate).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some_and(|host| !host.is_empty())
+    })
 }
 
 fn heading_level(level: HeadingLevel) -> u8 {
@@ -984,6 +1132,7 @@ mod tests {
         "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nafter code\n",
         "intro\n\n```\nunclosed fence streaming",
         "> quoted line\n> more quote\n>\n> - a list in a quote\n\nplain\n",
+        ">>> single quote block\n",
         "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\ndone\n",
         "setext candidate\n===\n\nnext para\n---\n",
         "***\n\ntext between rules\n\n---\n",
@@ -1102,6 +1251,34 @@ mod tests {
     }
 
     #[test]
+    fn triple_marker_produces_one_blockquote() {
+        let tree = parse_full(">>> quoted\n");
+        let Block::BlockQuote { children } = &tree.blocks[0].block else {
+            panic!("expected blockquote");
+        };
+        assert_eq!(children.len(), 1);
+        let Block::Paragraph { runs } = &children[0] else {
+            panic!("expected quoted paragraph");
+        };
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            "quoted"
+        );
+
+        let nested = parse_full(">> nested\n");
+        let Block::BlockQuote { children } = &nested.blocks[0].block else {
+            panic!("expected outer blockquote");
+        };
+        assert!(matches!(children.as_slice(), [Block::BlockQuote { .. }]));
+
+        let fenced = parse_full("```text\n>>> literal\n```\n");
+        let Block::CodeBlock { code, .. } = &fenced.blocks[0].block else {
+            panic!("expected code block");
+        };
+        assert_eq!(code, ">>> literal");
+    }
+
+    #[test]
     fn nested_lists_and_tight_items() {
         let tree = parse_full("- a\n  - a1\n  - a2\n- b\n");
         let Block::List {
@@ -1159,6 +1336,75 @@ mod tests {
             .expect("link run");
         assert_eq!(link.text, "zed");
         assert_eq!(link.style.link.as_deref(), Some("https://zed.dev"));
+    }
+
+    #[test]
+    fn bare_web_urls_carry_their_own_destination() {
+        let source =
+            "PR: https://github.com/jolt-dev/jolt/pull/7290. See (https://example.com/a_(b)).";
+        let tree = parse_full(source);
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected paragraph")
+        };
+        let links: Vec<_> = runs
+            .iter()
+            .filter_map(|run| {
+                run.style
+                    .link
+                    .as_deref()
+                    .map(|destination| (run.text.as_str(), destination))
+            })
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                (
+                    "https://github.com/jolt-dev/jolt/pull/7290",
+                    "https://github.com/jolt-dev/jolt/pull/7290"
+                ),
+                ("https://example.com/a_(b)", "https://example.com/a_(b)"),
+            ]
+        );
+        assert_eq!(flat(&tree.blocks[0].block), source);
+    }
+
+    #[test]
+    fn bare_web_urls_respect_markdown_boundaries() {
+        let tree = parse_full(
+            "xhttps://not-a-link.test `https://code.test` [docs](https://explicit.test) **https://bold.test** https://",
+        );
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected paragraph")
+        };
+        let links: Vec<_> = runs
+            .iter()
+            .filter_map(|run| {
+                run.style
+                    .link
+                    .as_deref()
+                    .map(|destination| (run.text.as_str(), destination, run.style.bold))
+            })
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                ("docs", "https://explicit.test", false),
+                ("https://bold.test", "https://bold.test", true),
+            ]
+        );
+        assert!(
+            runs.iter()
+                .any(|run| run.style.code && run.text == "https://code.test")
+        );
+    }
+
+    #[test]
+    fn bare_web_urls_match_incremental_parse() {
+        let source = "Created https://github.com/jolt-dev/jolt/pull/7290, then continued.";
+        let full = parse_full(source);
+        for chunk in [1, 3, 8] {
+            assert_eq!(stream(chunk, source).tree(), &full, "chunk {chunk}");
+        }
     }
 
     #[test]

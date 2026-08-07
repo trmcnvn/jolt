@@ -152,6 +152,7 @@ pub const AUTO_ADVANCE_MS: u64 = 220;
 /// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
 pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 
+const WIZARD_OPTIONS_MAX_HEIGHT: f32 = 280.0;
 const COMMAND_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const COMMAND_CACHE_FAILURE_RETRY: Duration = Duration::from_secs(15);
 const COMMAND_CACHE_CAPACITY: usize = 16;
@@ -470,6 +471,18 @@ enum SendIntent {
     Run,
     Steer,
     Queue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubmissionOrigin {
+    Editor,
+    GeneratedReview { review_id: String },
+}
+
+impl SubmissionOrigin {
+    fn uses_editor_state(&self) -> bool {
+        matches!(self, Self::Editor)
+    }
 }
 
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
@@ -3409,6 +3422,11 @@ impl Render for ComposerInput {
 pub enum ComposerEvent {
     /// A prompt was sent (optimistically) — re-engage the transcript pin.
     Sent { chat_id: String },
+    /// A generated review message reached (or failed at) the durable command RPC.
+    GeneratedReviewFinished {
+        review_id: String,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3745,6 +3763,7 @@ pub struct Composer {
     bro_runs: HashMap<String, BroRun>,
     wizard_focus: FocusHandle,
     wizard_scroll: gpui::ScrollHandle,
+    wizard_options_scroll: gpui::ScrollHandle,
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
@@ -3859,6 +3878,7 @@ impl Composer {
             bro_runs: HashMap::new(),
             wizard_focus: cx.focus_handle(),
             wizard_scroll: gpui::ScrollHandle::new(),
+            wizard_options_scroll: gpui::ScrollHandle::new(),
             answered_requests: HashSet::new(),
             advance_task: None,
             send_task: None,
@@ -5120,7 +5140,7 @@ impl Composer {
         match outcome {
             Some(Ok(message)) => {
                 self.close_extracted_answers(cx);
-                self.send(message, SendIntent::Run, cx);
+                self.send(message, SendIntent::Run, SubmissionOrigin::Editor, cx);
             }
             Some(Err(next)) => {
                 self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
@@ -5262,6 +5282,8 @@ impl Composer {
                     self.reset_mention(None, cx);
                     self.wizard = Some(Wizard::new(request_id, questions));
                     self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
+                    self.wizard_options_scroll
+                        .set_offset(point(px(0.0), px(0.0)));
                     self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
                     self.input.update(cx, |input, cx| {
@@ -5575,8 +5597,10 @@ impl Composer {
                 self.drafts.remove(&self.current_key);
                 self.start_bro(cx);
             }
-            SendButtonMode::Send => self.send(text, SendIntent::Run, cx),
-            SendButtonMode::Steer => self.send(text, SendIntent::Steer, cx),
+            SendButtonMode::Send => self.send(text, SendIntent::Run, SubmissionOrigin::Editor, cx),
+            SendButtonMode::Steer => {
+                self.send(text, SendIntent::Steer, SubmissionOrigin::Editor, cx)
+            }
         }
     }
 
@@ -5593,7 +5617,43 @@ impl Composer {
         if text.is_empty() && self.staged().is_empty() {
             return;
         }
-        self.send(text, SendIntent::Queue, cx);
+        self.send(text, SendIntent::Queue, SubmissionOrigin::Editor, cx);
+    }
+
+    /// Submit generated review feedback through the ordinary user-message path
+    /// without reading or mutating the visible composer draft or attachments.
+    pub fn submit_generated_review(
+        &mut self,
+        review_id: String,
+        chat_id: String,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
+            cx.emit(ComposerEvent::GeneratedReviewFinished {
+                review_id,
+                error: Some("The reviewed chat is no longer selected".into()),
+            });
+            return;
+        }
+        if self.state.read(cx).engine().is_none() {
+            cx.emit(ComposerEvent::GeneratedReviewFinished {
+                review_id,
+                error: Some("Engine not connected".into()),
+            });
+            return;
+        }
+        let intent = if self.run_live(cx) {
+            SendIntent::Steer
+        } else {
+            SendIntent::Run
+        };
+        self.send(
+            text,
+            intent,
+            SubmissionOrigin::GeneratedReview { review_id },
+            cx,
+        );
     }
 
     /// Queue a Run, Steer, or deferred-turn doc command. Agent prompts get an
@@ -5601,7 +5661,13 @@ impl Composer {
     /// New chats thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, intent: SendIntent, cx: &mut Context<Self>) {
+    fn send(
+        &mut self,
+        text: String,
+        intent: SendIntent,
+        origin: SubmissionOrigin,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
@@ -5633,6 +5699,11 @@ impl Composer {
             return;
         }
         let is_shell = shell.is_some();
+        let editor_submission = origin.uses_editor_state();
+        let generated_review_id = match &origin {
+            SubmissionOrigin::Editor => None,
+            SubmissionOrigin::GeneratedReview { review_id } => Some(review_id.clone()),
+        };
         let steer_cmd = intent == SendIntent::Steer && !is_new && !is_shell;
         let queue_cmd = intent == SendIntent::Queue && !is_new && !is_shell;
         let existing_cwd = self
@@ -5684,14 +5755,14 @@ impl Composer {
         // Snapshot and clear now: the strip empties the instant you hit send;
         // a failure hands the files
         // back into the chat's stash.
-        let staged = if is_shell {
+        let staged = if is_shell || !editor_submission {
             Vec::new()
         } else {
             self.attachments
                 .remove(&self.current_key)
                 .unwrap_or_default()
         };
-        if !is_shell {
+        if !is_shell && editor_submission {
             self.preview = None;
         }
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -5761,8 +5832,10 @@ impl Composer {
             .detach();
         }
 
-        self.input.update(cx, |input, cx| input.set_text("", cx));
-        self.drafts.remove(&self.current_key);
+        if editor_submission {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.drafts.remove(&self.current_key);
+        }
         self.failure = None;
         self.sending = true;
         self.sync_default_placeholder(cx);
@@ -5771,7 +5844,7 @@ impl Composer {
         });
         cx.notify();
 
-        let restore_text = text.clone();
+        let restore_text = editor_submission.then(|| text.clone());
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
         let queue_send_lock = self.queue_send_lock.clone();
@@ -6003,6 +6076,7 @@ impl Composer {
             this.update(cx, |composer, cx| {
                 composer.sending = false;
                 composer.sync_default_placeholder(cx);
+                let generated_error = result.as_ref().err().cloned();
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
                     // draft, staged files back in the chat's stash.
@@ -6012,7 +6086,11 @@ impl Composer {
                         s.end_pending_send(&err_chat_id, &err_message_id);
                         cx.notify();
                     });
-                    composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    if let Some(restore_text) = restore_text {
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_text(restore_text, cx));
+                    }
                     if !staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back.
@@ -6024,6 +6102,12 @@ impl Composer {
                         );
                         *slot = merged;
                     }
+                }
+                if let Some(review_id) = generated_review_id {
+                    cx.emit(ComposerEvent::GeneratedReviewFinished {
+                        review_id,
+                        error: generated_error,
+                    });
                 }
                 cx.notify();
             })
@@ -6185,6 +6269,8 @@ impl Composer {
             Ok(answers) => self.wizard_finish(answers, cx),
             Err((next, has_pick)) => {
                 self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
+                self.wizard_options_scroll
+                    .set_offset(point(px(0.0), px(0.0)));
                 self.input.update(cx, |input, cx| {
                     input.set_text(next, cx);
                     input.set_placeholder(
@@ -6214,6 +6300,8 @@ impl Composer {
         };
         self.advance_task = None;
         self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.wizard_options_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         self.input.update(cx, |input, cx| {
             input.set_text(previous, cx);
             input.set_placeholder(
@@ -6552,6 +6640,7 @@ impl Composer {
         let last = page + 1 >= wizard.questions.len();
         let typed_empty = self.input.read(cx).is_empty();
         let can_advance = wizard.page_has_pick() || !typed_empty;
+        let has_options = !question.options.is_empty();
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists;
@@ -6685,7 +6774,7 @@ impl Composer {
                     .track_scroll(&self.wizard_scroll)
                     .px(px(16.0))
                     .pt(px(6.0))
-                    .pb(px(12.0))
+                    .pb(px(if has_options { 0.0 } else { 12.0 }))
                     .flex()
                     .flex_col()
                     .child(
@@ -6695,27 +6784,42 @@ impl Composer {
                             .font_weight(gpui::FontWeight::NORMAL)
                             .text_color(theme.text)
                             .child(SharedString::from(question.question.clone())),
-                    )
-                    .when(question.multi_select, |el| {
-                        el.child(
-                            div()
-                                .mt(px(4.0))
-                                .text_size(px(12.0))
-                                .text_color(theme.text_muted.opacity(0.65))
-                                .child(SharedString::from("Select one or more options.")),
-                        )
-                    })
-                    .child(
-                        div()
-                            .mt(px(12.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.0))
-                            .children(options),
                     ),
             )
-            // The custom answer and actions stay reachable while a long
-            // prompt or option list scrolls above them.
+            // Choices stay pinned with the answer controls while only a long
+            // question scrolls. Exceptionally large choice sets get their own
+            // bounded scroll region instead of growing the panel off-screen.
+            .when(has_options, |panel| {
+                panel.child(
+                    div()
+                        .id("question-panel-options")
+                        .flex_none()
+                        .max_h(px(WIZARD_OPTIONS_MAX_HEIGHT))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.wizard_options_scroll)
+                        .px(px(16.0))
+                        .pb(px(12.0))
+                        .when(question.multi_select, |el| {
+                            el.child(
+                                div()
+                                    .mt(px(4.0))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted.opacity(0.65))
+                                    .child(SharedString::from("Select one or more options.")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .mt(px(12.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .children(options),
+                        ),
+                )
+            })
+            // Choices, the custom answer, and actions stay reachable while a
+            // long prompt scrolls above them.
             .child(
                 div()
                     .flex_none()
@@ -8614,6 +8718,17 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Steer);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+    }
+
+    #[test]
+    fn generated_reviews_do_not_consume_editor_state() {
+        assert!(SubmissionOrigin::Editor.uses_editor_state());
+        assert!(
+            !SubmissionOrigin::GeneratedReview {
+                review_id: "review".into()
+            }
+            .uses_editor_state()
+        );
     }
 
     #[test]

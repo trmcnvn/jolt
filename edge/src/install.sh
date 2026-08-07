@@ -4,9 +4,9 @@
 #   curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh
 #
 # Installs the self-contained native binary (no runtime deps) to
-# ~/.jolt/app, puts `jolt` on PATH, and — once you've signed in —
-# runs it as a systemd user service that survives reboots. Re-running
-# upgrades in place; ~/.jolt state is preserved.
+# ~/.jolt/app, puts `jolt` on PATH, adds a desktop launcher, and — once you've
+# signed in — runs it as a systemd user service that survives reboots.
+# Re-running upgrades in place; ~/.jolt state is preserved.
 #
 # The binary ships with production endpoints baked in: no JOLT_EDGE_URL or
 # client-id configuration needed. Overrides (if any) go in ~/.jolt/env.
@@ -45,12 +45,14 @@ file="jolt-$ver-$plat-$arch.tar.gz"
 data_root="$HOME/.jolt"
 app_root="$data_root/app"
 dest="$app_root/$ver"
+tmp=""
+desktop_tmp=""
+trap '[ -z "$tmp" ] || rm -rf "$tmp"; [ -z "$desktop_tmp" ] || rm -f "$desktop_tmp"' EXIT
 
 if [ -x "$dest/jolt" ]; then
   echo "jolt $ver already downloaded — relinking."
 else
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
   echo "downloading jolt $ver ($plat-$arch)…"
   curl -fSL --progress-bar "$BASE/releases/$file" -o "$tmp/$file"
   mkdir -p "$dest"
@@ -60,6 +62,40 @@ fi
 ln -sfn "$dest" "$app_root/current"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$app_root/current/jolt" "$HOME/.local/bin/jolt"
+
+# --- desktop integration -----------------------------------------------------
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+applications_dir="$data_home/applications"
+icon_dir="$data_home/icons/hicolor/1024x1024/apps"
+mkdir -p "$applications_dir" "$icon_dir"
+install -m 644 "$dest/jolt.png" "$icon_dir/jolt.png"
+
+# Desktop launchers do not reliably inherit ~/.local/bin in PATH. Point the
+# entry at the managed `current` symlink so upgrades remain atomic.
+desktop_tmp="$applications_dir/.jolt.desktop.$$"
+JOLT_DESKTOP_EXEC="$app_root/current/jolt" awk '
+function quote_exec(value, out, i, ch) {
+  out = "\""
+  for (i = 1; i <= length(value); i++) {
+    ch = substr(value, i, 1)
+    if (ch == "%") {
+      out = out "%%"
+      continue
+    }
+    if (ch == "\\" || ch == "\"" || ch == "`" || ch == "$") out = out "\\"
+    out = out ch
+  }
+  return out "\""
+}
+/^Exec=/ { print "Exec=" quote_exec(ENVIRON["JOLT_DESKTOP_EXEC"]); next }
+/^TryExec=/ { print "TryExec=" ENVIRON["JOLT_DESKTOP_EXEC"]; next }
+{ print }
+' "$dest/jolt.desktop" >"$desktop_tmp"
+chmod 644 "$desktop_tmp"
+mv -f "$desktop_tmp" "$applications_dir/jolt.desktop"
+desktop_tmp=""
+command -v update-desktop-database >/dev/null 2>&1 \
+  && update-desktop-database "$applications_dir" || true
 
 # --- service -----------------------------------------------------------------
 # Auth is decoupled from the daemon: `jolt login` persists the session and a

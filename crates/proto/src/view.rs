@@ -344,9 +344,16 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
         }
         ToolCall::WriteFile { path, .. } => ("Write", path.clone()),
         ToolCall::EditFile { path, .. } => ("Edit", path.clone()),
-        ToolCall::ApplyPatch { path } => {
-            ("Patch", path.clone().unwrap_or_else(|| "workspace".into()))
-        }
+        ToolCall::ApplyPatch { path, paths } => (
+            "Patch",
+            path.clone().unwrap_or_else(|| {
+                if paths.is_empty() {
+                    "workspace".into()
+                } else {
+                    plural(paths.len(), "file", "files")
+                }
+            }),
+        ),
         ToolCall::Search { pattern, path } => (
             "Search",
             match path {
@@ -402,10 +409,21 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
                     edited.push(path);
                 }
             }
-            ToolCall::ApplyPatch { path } => {
-                let p = path.as_deref().unwrap_or("patch");
-                if !edited.contains(&p) {
-                    edited.push(p);
+            ToolCall::ApplyPatch { path, paths } => {
+                if let Some(path) = path.as_deref() {
+                    if !edited.contains(&path) {
+                        edited.push(path);
+                    }
+                } else if paths.is_empty() {
+                    if !edited.contains(&"patch") {
+                        edited.push("patch");
+                    }
+                } else {
+                    for path in paths {
+                        if !edited.contains(&path.as_str()) {
+                            edited.push(path);
+                        }
+                    }
                 }
             }
             ToolCall::ReadFile { .. } => reads += 1,

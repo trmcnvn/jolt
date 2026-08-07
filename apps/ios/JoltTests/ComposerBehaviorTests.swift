@@ -114,6 +114,67 @@ final class ComposerBehaviorTests: XCTestCase {
         XCTAssertEqual(code, "print(\"ok\")")
     }
 
+    func testMarkdownAutoLinksBareWebURLs() {
+        let source = "PR: https://github.com/jolt-dev/jolt/pull/7290. See (https://example.com/a_(b))."
+        let blocks = MarkdownParser.parse(source)
+        guard case .paragraph(let runs) = blocks.first?.block else {
+            return XCTFail("Expected paragraph")
+        }
+        let links = runs.compactMap { run in
+            run.style.link.map { (run.text, $0) }
+        }
+        XCTAssertEqual(links.count, 2)
+        XCTAssertEqual(links[0].0, "https://github.com/jolt-dev/jolt/pull/7290")
+        XCTAssertEqual(links[0].1, links[0].0)
+        XCTAssertEqual(links[1].0, "https://example.com/a_(b)")
+        XCTAssertEqual(links[1].1, links[1].0)
+        XCTAssertEqual(runs.map(\.text).joined(), source)
+    }
+
+    func testMarkdownAutoLinksRespectMarkdownBoundaries() {
+        let blocks = MarkdownParser.parse(
+            "xhttps://not-a-link.test `https://code.test` [docs](https://explicit.test) **https://bold.test** https://"
+        )
+        guard case .paragraph(let runs) = blocks.first?.block else {
+            return XCTFail("Expected paragraph")
+        }
+        let links = runs.compactMap { run in
+            run.style.link.map { (run.text, $0, run.style.bold) }
+        }
+        XCTAssertEqual(links.count, 2)
+        XCTAssertEqual(links[0].0, "docs")
+        XCTAssertEqual(links[0].1, "https://explicit.test")
+        XCTAssertFalse(links[0].2)
+        XCTAssertEqual(links[1].0, "https://bold.test")
+        XCTAssertEqual(links[1].1, "https://bold.test")
+        XCTAssertTrue(links[1].2)
+        XCTAssertTrue(runs.contains { $0.style.code && $0.text == "https://code.test" })
+    }
+
+    func testTripleMarkerProducesOneBlockquote() {
+        let blocks = MarkdownParser.parse(">>> quoted\n")
+        guard case .blockquote(let children) = blocks.first?.block else {
+            return XCTFail("Expected blockquote")
+        }
+        XCTAssertEqual(children.count, 1)
+        guard case .paragraph(let runs) = children.first else {
+            return XCTFail("Expected quoted paragraph")
+        }
+        XCTAssertEqual(runs.map(\.text).joined(), "quoted")
+
+        let nested = MarkdownParser.parse(">> nested\n")
+        guard case .blockquote(let outer) = nested.first?.block,
+              case .blockquote = outer.first else {
+            return XCTFail("Expected two-marker quote to remain nested")
+        }
+
+        let fenced = MarkdownParser.parse("```text\n>>> literal\n```\n")
+        guard case .codeBlock(_, let code) = fenced.first?.block else {
+            return XCTFail("Expected code block")
+        }
+        XCTAssertEqual(code, ">>> literal")
+    }
+
     func testMarkdownParsesDollarAndTexMath() {
         let blocks = MarkdownParser.parse(
             #"Euler $e^{i\pi}+1=0$ and \(x^2\). Then $$\sum_i i$$."#

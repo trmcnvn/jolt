@@ -72,6 +72,7 @@ use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
+use crate::review_store::ReviewStore;
 use crate::secrets::HarnessSecrets;
 use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
@@ -109,6 +110,33 @@ struct TurnDiffPageParams {
     assistant_message_id: String,
     catalog_revision: String,
     page_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewKeyParams {
+    review_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PutReviewDraftParams {
+    draft: jolt_proto::ReviewDraft,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PinDiffParams {
+    chat_id: String,
+    catalog_revision: String,
+    review_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseDiffParams {
+    catalog_revision: String,
+    review_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,7 +269,10 @@ fn tool_file_path(call: &ToolCall) -> Option<&str> {
         ToolCall::ReadFile { path, .. }
         | ToolCall::WriteFile { path, .. }
         | ToolCall::EditFile { path, .. } => Some(path),
-        ToolCall::ApplyPatch { path } | ToolCall::Search { path, .. } => path.as_deref(),
+        ToolCall::ApplyPatch { path, paths } => path
+            .as_deref()
+            .or_else(|| paths.first().map(String::as_str)),
+        ToolCall::Search { path, .. } => path.as_deref(),
         ToolCall::Exec { .. }
         | ToolCall::Glob { .. }
         | ToolCall::WebFetch { .. }
@@ -472,6 +503,7 @@ pub struct EngineRpc {
     repos: Repos,
     terminals: Terminals,
     diff_sync: CheckoutDiffSync,
+    review_store: ReviewStore,
     spaces_sync: crate::SpacesSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
@@ -491,6 +523,7 @@ impl EngineRpc {
         repos: Repos,
         terminals: Terminals,
         diff_sync: CheckoutDiffSync,
+        review_store: ReviewStore,
         spaces_sync: crate::SpacesSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
@@ -504,6 +537,7 @@ impl EngineRpc {
             repos,
             terminals,
             diff_sync,
+            review_store,
             spaces_sync,
             uploads,
             agent_accounts,
@@ -838,7 +872,10 @@ impl EngineRpc {
 fn local_only(method: &str) -> bool {
     matches!(
         method,
-        methods::LIST_HARNESS_SECRETS
+        methods::GET_REVIEW_DRAFT
+            | methods::PUT_REVIEW_DRAFT
+            | methods::DELETE_REVIEW_DRAFT
+            | methods::LIST_HARNESS_SECRETS
             | methods::UPSERT_HARNESS_SECRET
             | methods::DELETE_HARNESS_SECRET
             | methods::WATCH_THEMES
@@ -899,6 +936,7 @@ fn forwardable(method: &str) -> bool {
             | methods::CREATE_REPO
             | methods::LIST_BRANCHES
             | methods::LIST_REFS
+            | methods::GET_CHECKOUT_REVIEW
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
             | methods::SEARCH_FILES
@@ -910,6 +948,8 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFF_V2
             | methods::GET_CHECKOUT_DIFF_PAGE
             | methods::GET_TURN_DIFF_PAGE
+            | methods::PIN_DIFF_DOCUMENT
+            | methods::RELEASE_DIFF_DOCUMENT
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
             | methods::SUBSCRIBE_TERMINAL
@@ -1326,6 +1366,8 @@ impl RpcService for EngineRpc {
                     .unwrap_or(".");
                 let questions = crate::question_extraction::extract_questions(
                     &self.registry,
+                    self.sessions.usage_store(),
+                    &p.chat_id,
                     harness,
                     model,
                     cwd,
@@ -1437,6 +1479,44 @@ impl RpcService for EngineRpc {
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
                 self.mutate(p)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::PIN_DIFF_DOCUMENT => {
+                let p: PinDiffParams = parse_params(params)?;
+                self.diff_sync
+                    .pin_diff(&p.chat_id, &p.catalog_revision, &p.review_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::RELEASE_DIFF_DOCUMENT => {
+                let p: ReleaseDiffParams = parse_params(params)?;
+                self.diff_sync
+                    .release_diff(&p.catalog_revision, &p.review_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::GET_REVIEW_DRAFT => {
+                let p: ReviewKeyParams = parse_params(params)?;
+                let draft = self
+                    .review_store
+                    .get(&p.review_key)
+                    .map_err(|error| RpcError::Failed(format!("review draft read: {error}")))?;
+                RpcReply::value(&draft)
+            }
+            methods::PUT_REVIEW_DRAFT => {
+                let p: PutReviewDraftParams = parse_params(params)?;
+                self.review_store
+                    .put(&p.draft)
+                    .map_err(|error| RpcError::Failed(format!("review draft write: {error}")))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::DELETE_REVIEW_DRAFT => {
+                let p: ReviewKeyParams = parse_params(params)?;
+                self.review_store
+                    .delete(&p.review_key)
+                    .map_err(|error| RpcError::Failed(format!("review draft delete: {error}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFF_V2 => {
@@ -1555,6 +1635,23 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&refs)
+            }
+            methods::GET_CHECKOUT_REVIEW => {
+                let p: ChatParams = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::Failed("chat belongs to another device".into()));
+                }
+                let cwd = chat
+                    .cwd
+                    .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
+                let review =
+                    crate::forge_reviews::detect(&self.repos, std::path::Path::new(&cwd)).await;
+                RpcReply::value(&review)
             }
             methods::SWITCH_REF => {
                 let p: SwitchRefParams = parse_params(params)?;
@@ -1821,7 +1918,11 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::LIST_COMMANDS));
         assert!(forwardable(methods::SEARCH_FILES));
+        assert!(forwardable(methods::GET_CHECKOUT_REVIEW));
         assert!(forwardable(methods::GET_TURN_DIFF_PAGE));
+        assert!(forwardable(methods::PIN_DIFF_DOCUMENT));
+        assert!(!forwardable(methods::GET_REVIEW_DRAFT));
+        assert!(local_only(methods::GET_REVIEW_DRAFT));
         assert!(!forwardable(methods::UPSERT_HARNESS_SECRET));
         assert!(local_only(methods::UPSERT_HARNESS_SECRET));
     }

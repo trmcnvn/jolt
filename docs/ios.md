@@ -2,6 +2,8 @@
 
 The iOS app is a native SwiftUI viewport onto the same Jolt account. It syncs workspace rows and a tail-first transcript projection from the edge, then sends durable commands to the computer running each session's engine and agent CLI.
 
+Jolt's native mobile apps follow one [mobile feature parity policy](mobile-parity.md). iOS is the behavioral reference while Android is being ported; after Android scaffolding starts, new mobile capabilities are implemented and released for both apps together rather than advancing either platform independently.
+
 ## Requirements and build
 
 The project requires Xcode 26 or newer and the iOS 26 SDK.
