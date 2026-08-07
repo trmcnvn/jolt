@@ -3332,7 +3332,11 @@ impl Render for ComposerInput {
             (INPUT_TEXT_SIZE, INPUT_LINE_HEIGHT, theme.font_sans.clone())
         };
         let text_color = if self.content.is_empty() {
-            theme.text_faint
+            if self.prompt_typography {
+                theme.text_muted.opacity(0.6)
+            } else {
+                theme.text_faint
+            }
         } else {
             theme.text
         };

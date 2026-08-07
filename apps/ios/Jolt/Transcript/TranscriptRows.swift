@@ -128,7 +128,11 @@ enum TranscriptRowBuilder {
         }
 
         var first = true
-        let hasChanges = entry.parts.contains { part in
+        let hasSuccessfulFileMutation = entry.parts.contains { part in
+            guard case .tool(_, let call, let isError, let resolved) = part else { return false }
+            return resolved && !isError && isFileMutation(call)
+        }
+        let showChanges = hasSuccessfulFileMutation && entry.parts.contains { part in
             if case .changes = part { return true }
             return false
         }
@@ -156,7 +160,7 @@ enum TranscriptRowBuilder {
                 // The filesystem snapshot is authoritative. Once it exists,
                 // successful mutation chips are duplicate noise; failed chips
                 // remain visible because they still explain the turn.
-                if hasChanges, resolved, !isError, isFileMutation(call) { continue }
+                if showChanges, resolved, !isError, isFileMutation(call) { continue }
                 pendingTools.append(ToolItem(call: call, isError: isError, resolved: resolved))
                 if ix == lastPartIx { flushTools(lastIx: ix) }
 
@@ -203,6 +207,7 @@ enum TranscriptRowBuilder {
                 first = false
 
             case .changes(let partId, let diff):
+                guard showChanges else { continue }
                 flushTools(lastIx: ix - 1)
                 rows.append(TranscriptRow(id: "\(entry.id)#\(partId)",
                                           version: fnv1a(diff.catalogRevision),

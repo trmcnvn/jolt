@@ -78,6 +78,10 @@ icon_assets![
     // terminal/plus/return ports) — the set has no branch icon.
     (GIT_BRANCH, "git-branch"),
     (SIDEBAR_MINIMALISTIC, "sidebar-minimalistic"),
+    // Rotated variant: the terminal toggle shows the panel line on the bottom;
+    // gpui divs have no transform at the pinned rev, so the rotation is baked
+    // into the asset.
+    (SIDEBAR_MINIMALISTIC_BOTTOM, "sidebar-minimalistic-bottom"),
     // Mirrored variant: the left sidebar toggle shows the panel line on the
     // left; gpui divs have no
     // scale transform at the pinned rev, so the flip is baked into the asset.

@@ -83,4 +83,42 @@ final class TranscriptChangesTests: XCTestCase {
         }
         XCTAssertEqual(rowDiff, diff)
     }
+
+    func testChangesRowWithoutSuccessfulMutationToolIsHidden() {
+        let diff = TurnDiffSummary(
+            catalogRevision: "catalog-1",
+            files: [
+                TurnDiffFileSummary(id: "file-1", path: "Sources/App.swift",
+                                    additions: 8, deletions: 3),
+            ],
+            additions: 8,
+            deletions: 3,
+            truncated: false
+        )
+        let entry = MessageEntry(
+            id: "assistant-1",
+            role: .assistant,
+            parts: [
+                .tool(id: "read-1",
+                      call: RenderToolCall(tag: "readFile", fields: ["path": "Sources/App.swift"]),
+                      isError: false, resolved: true),
+                .changes(id: "changes", diff: diff),
+            ],
+            createdAt: 1,
+            deviceId: "device-1",
+            status: .complete,
+            continuationOf: nil
+        )
+        var parsers: [String: IncrementalMarkdownParser] = [:]
+        var completed: [String: CompletedParse] = [:]
+
+        let rows = TranscriptRowBuilder.rows(entries: [entry], pendingSends: [],
+                                               parsers: &parsers, completed: &completed)
+
+        XCTAssertEqual(rows.count, 1)
+        guard case .toolGroup(let tools, _) = rows[0].kind else {
+            return XCTFail("Expected the read tool group")
+        }
+        XCTAssertEqual(tools.map(\.call.tag), ["readFile"])
+    }
 }

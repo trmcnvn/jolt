@@ -967,7 +967,7 @@ impl TerminalPanel {
             return;
         };
         // Closing the LAST terminal closes the drawer too — an empty dock is
-        // dead space (user request). Same path as the collapse chevron.
+        // dead space (user request).
         if now_empty && self.open {
             window.dispatch_action(Box::new(ToggleTerminal), cx);
         }
@@ -1248,6 +1248,10 @@ impl TerminalPanel {
                     ))
                     .on_hover(motion::hover_listener("term-expand"))
                     .on_click(cx.listener(|_, _, _, cx| {
+                        // This button moves with the panel. GPUI does not emit
+                        // a leave when the same element relocates under the
+                        // pointer, so clear the old-location hover explicitly.
+                        motion::set_hover("term-expand", false, motion::reduced_motion(cx));
                         cx.emit(TerminalPanelEvent::ToggleExpanded);
                     }))
                     .child(
@@ -1258,32 +1262,6 @@ impl TerminalPanel {
                         })
                         .size(px(15.0))
                         .text_color(theme.text_muted.opacity(0.55)),
-                    ),
-            )
-            // Collapse chevron ("Hide terminal" ⌘`).
-            .child(
-                div()
-                    .id("terminal-collapse")
-                    .size(px(28.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(8.0))
-                    .cursor_pointer()
-                    .bg(motion::hover_blend(
-                        "term-collapse",
-                        gpui::transparent_black(),
-                        crate::theme::ink(0.05),
-                    ))
-                    .on_hover(motion::hover_listener("term-collapse"))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(ToggleTerminal), cx);
-                    })
-                    .child(
-                        crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
-                            .size(px(13.0))
-                            .text_color(theme.text_muted.opacity(0.55)),
                     ),
             )
     }

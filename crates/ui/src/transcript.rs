@@ -368,10 +368,22 @@ pub fn rows_for_entry(
     }
 
     // Assistant/system: split parts into block rows, folding consecutive tools.
-    let has_changes = entry
-        .parts
-        .iter()
-        .any(|part| matches!(part, MessagePart::Changes { .. }));
+    let has_successful_file_mutation = entry.parts.iter().any(|part| {
+        matches!(
+            part,
+            MessagePart::Tool {
+                call,
+                is_error: false,
+                resolved: true,
+                ..
+            } if is_file_mutation(call)
+        )
+    });
+    let show_changes = has_successful_file_mutation
+        && entry
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::Changes { .. }));
     let last_part_ix = entry.parts.len().saturating_sub(1);
     let mut group_ix = 0usize;
     let mut pending_group: Vec<ToolItem> = Vec::new();
@@ -410,7 +422,7 @@ pub fn rows_for_entry(
                 // mutation chips are redundant. Failed mutations remain
                 // visible, and active turns retain their latest-tool preview
                 // until the finalized Changes part lands.
-                if has_changes && *resolved && !*is_error && is_file_mutation(call) {
+                if show_changes && *resolved && !*is_error && is_file_mutation(call) {
                     continue;
                 }
                 pending_group.push(ToolItem {
@@ -512,6 +524,9 @@ pub fn rows_for_entry(
                         });
                     }
                     MessagePart::Changes { id: part_id, diff } => {
+                        if !show_changes {
+                            continue;
+                        }
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),
                             version: fnv1a(diff.catalog_revision.as_bytes()),
@@ -3761,6 +3776,34 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert!(tools[0].is_error);
         assert!(matches!(rows[1].kind, RowKind::Changes { .. }));
+    }
+
+    #[test]
+    fn changes_without_a_successful_mutation_are_hidden() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                MessagePart::Tool {
+                    id: "read".into(),
+                    call: ToolCall::ReadFile {
+                        path: "src/lib.rs".into(),
+                        offset: None,
+                        limit: None,
+                    },
+                    is_error: false,
+                    resolved: true,
+                },
+                MessagePart::Changes {
+                    id: "changes".into(),
+                    diff: turn_diff(),
+                },
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
     }
 
     #[test]

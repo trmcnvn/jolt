@@ -99,7 +99,7 @@ struct ComposerShell<Chips: View>: View {
             if draft.isEmpty {
                 Text(placeholder)
                     .font(Theme.sans(16))
-                    .foregroundStyle(Theme.textFaint)
+                    .foregroundStyle(Theme.textMuted.opacity(0.6))
                     .allowsHitTesting(false)
             }
             ComposerTextInput(

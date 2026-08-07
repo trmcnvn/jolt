@@ -11,8 +11,8 @@
 //! new-session canvas (the tab materializes on first send) in the sidebar's
 //! filter space — or the last selected space when the filter is "All". The
 //! strip inherits the old header's titlebar duties: 44px tall, drag region,
-//! animated window-controls inset, and the toggle-changes button (git spaces
-//! only).
+//! animated window-controls inset, the terminal toggle, and the Changes toggle
+//! (git spaces only).
 //!
 //! Styling and drag-reorder mirror the terminal tab bar
 //! (`terminal/panel.rs::render_tab_bar`) — same fixed-width tabs, drop-index
@@ -403,7 +403,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// The tab strip: [scrollable tabs (edge fades)][+][drag spacer][toggle-changes].
+    /// The tab strip: [scrollable tabs (edge fades)][+][drag spacer][panel toggles].
     pub(super) fn render_session_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
@@ -831,8 +831,14 @@ impl Shell {
             .child(tab_region)
             .when(has_space && has_tabs, |el| el.child(new_tab))
             .child(div().flex_1())
-            // Stable location: the toggle shows whether the pane is open or
-            // not (the pane's own header is gone).
+            // Stable panel controls: terminal first, then Changes when the
+            // selected space has git.
+            .child(header_icon_button(
+                "toggle-terminal",
+                icons::SIDEBAR_MINIMALISTIC_BOTTOM,
+                &theme,
+                cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
+            ))
             .when(git, |el| {
                 el.child(header_icon_button(
                     "toggle-changes",
