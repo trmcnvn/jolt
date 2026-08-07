@@ -430,7 +430,9 @@ fn search_preview(text: &str, terms: &[String], limit: usize) -> String {
         let word = word.to_lowercase();
         terms.iter().any(|term| word.contains(term))
     });
-    let start = matched.map_or(0, |index| index.saturating_sub(8));
+    // Keep the first matching word near the front so the single-line result
+    // row cannot truncate away the reason this message matched.
+    let start = matched.map_or(0, |index| index.saturating_sub(3));
     let end = (start + 24).min(words.len());
     let mut preview = words[start..end].join(" ");
     if start > 0 {
@@ -578,5 +580,12 @@ mod tests {
                 .any(|page| page.id == results[1].page_id)
         );
         assert!(results[0].preview.contains("distinctive Needle phrase"));
+    }
+
+    #[test]
+    fn search_preview_keeps_the_match_near_the_front() {
+        let text = "one two three four five six seven eight nine distinctive Needle phrase after";
+        let preview = search_preview(text, &["needle".into()], 240);
+        assert!(preview.starts_with("… eight nine distinctive Needle"));
     }
 }

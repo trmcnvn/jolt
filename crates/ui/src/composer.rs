@@ -1547,6 +1547,9 @@ pub struct ComposerInput {
     /// mention token is active, keeping input focus and native text editing.
     mention_open: bool,
     mention_has_selection: bool,
+    /// Optional right-click menu, enabled only for the primary composer input.
+    context_menu_enabled: bool,
+    context_menu: Option<Point<Pixels>>,
     /// Last prepainted chip bounds; the paint-phase pointer listener uses
     /// these instead of attempting to infer text geometry from the cursor.
     mention_hits: Vec<MentionHit>,
@@ -1607,6 +1610,8 @@ impl ComposerInput {
             last_edit: None,
             mention_open: false,
             mention_has_selection: false,
+            context_menu_enabled: false,
+            context_menu: None,
             mention_hits: Vec::new(),
             mention_tooltip: MentionTooltipPhase::Hidden,
             mention_tooltip_generation: 0,
@@ -1675,6 +1680,10 @@ impl ComposerInput {
 
     fn enable_message_history(&mut self) {
         self.message_history_enabled = true;
+    }
+
+    fn enable_context_menu(&mut self) {
+        self.context_menu_enabled = true;
     }
 
     pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
@@ -1785,6 +1794,7 @@ impl ComposerInput {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.context_menu = None;
         self.invalidate_mention_tooltip();
         self.content = text.into();
         self.refresh_projection();
@@ -1980,6 +1990,7 @@ impl ComposerInput {
     }
 
     fn restore(&mut self, snapshot: EditSnapshot, cx: &mut Context<Self>) {
+        self.context_menu = None;
         self.invalidate_mention_tooltip();
         self.content = snapshot.content;
         self.refresh_projection();
@@ -2021,6 +2032,7 @@ impl ComposerInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.context_menu = None;
         let offset = self.projection.normalize_range(offset..offset).start;
         self.selected_range = offset..offset;
         self.follow_cursor = true;
@@ -2030,6 +2042,7 @@ impl ComposerInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.context_menu = None;
         if crate::markdown::selection::clear() {
             cx.refresh_windows();
         }
@@ -2361,6 +2374,7 @@ impl ComposerInput {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
@@ -2420,7 +2434,9 @@ impl ComposerInput {
     }
 
     fn mention_escape(&mut self, _: &MentionEscape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mention_open {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        } else if self.mention_open {
             cx.emit(ComposerInputEvent::MentionDismiss);
         } else {
             cx.propagate();
@@ -2558,6 +2574,7 @@ impl ComposerInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.context_menu = None;
         self.invalidate_mention_tooltip();
         if crate::markdown::selection::clear() {
             cx.refresh_windows();
@@ -2573,6 +2590,26 @@ impl ComposerInput {
         } else {
             self.move_to(index, cx);
         }
+    }
+
+    fn on_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.invalidate_mention_tooltip();
+        if crate::markdown::selection::clear() {
+            cx.refresh_windows();
+        }
+        window.focus(&self.focus_handle, cx);
+        let index = self.index_for_mouse_position(event.position);
+        if !self.selected_range.contains(&index) {
+            self.move_to(index, cx);
+        }
+        self.context_menu = Some(event.position);
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -2926,6 +2963,7 @@ impl EntityInputHandler for ComposerInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = self.projection.normalize_range(range);
+        self.context_menu = None;
         self.invalidate_mention_tooltip();
         // An IME commit is the tail of a composition whose pre-composition
         // snapshot was already taken (`replace_and_mark_text_in_range`);
@@ -2959,6 +2997,7 @@ impl EntityInputHandler for ComposerInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = self.projection.normalize_range(range);
+        self.context_menu = None;
         self.invalidate_mention_tooltip();
         // First keystroke of a composition: snapshot the text as it stood
         // before any of it existed, so one undo drops the whole composition.
@@ -3334,7 +3373,37 @@ impl gpui::Element for ComposerTextElement {
 
 impl Render for ComposerInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
+        let theme = Theme::of(cx).clone();
+        let context_menu = self.context_menu.map(|position| {
+            let shortcut = if cfg!(target_os = "macos") {
+                "⌘V"
+            } else {
+                "Ctrl+V"
+            };
+            let menu = crate::popover::popover_card(&theme)
+                .w(px(160.0))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.context_menu = None;
+                    cx.notify();
+                }))
+                .child(
+                    crate::popover::menu_row(&theme, false, "composer-context-menu-paste")
+                        .id("composer-context-menu-paste")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.context_menu = None;
+                            this.paste(&Paste, window, cx);
+                            cx.notify();
+                        }))
+                        .child(div().flex_1().child("Paste"))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted.opacity(0.55))
+                                .child(shortcut),
+                        ),
+                );
+            crate::popover::menu_at("composer-context-menu", position, menu.into_any_element())
+        });
         let (text_size, line_height, font_family) = if self.prompt_typography {
             (
                 f32::from(theme.font_sizes.prompt),
@@ -3396,6 +3465,9 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .when(self.context_menu_enabled, |input| {
+                input.on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_menu))
+            })
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -3410,6 +3482,7 @@ impl Render for ComposerInput {
                 // box minus its `pt-4 pb-1` padding.
                 max_content_height: TEXTAREA_MAX - TEXTAREA_PAD_V,
             })
+            .children(context_menu)
     }
 }
 
@@ -3815,6 +3888,7 @@ impl Composer {
             input.enable_prompt_typography();
             input.enable_mentions();
             input.enable_message_history();
+            input.enable_context_menu();
             input
         });
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));

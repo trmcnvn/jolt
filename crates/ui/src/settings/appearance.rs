@@ -15,7 +15,7 @@ use gpui::{
     Render, SharedString, Subscription, Window, div, prelude::*, px,
 };
 
-use crate::appearance::{self, AppearanceMode, FontRole, FontSizeRole};
+use crate::appearance::{self, AppearanceMode, FontRole};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
 use crate::settings::widgets;
@@ -33,14 +33,12 @@ struct ThemeEditor {
 
 pub struct AppearancePage {
     open_font: Option<FontRole>,
-    open_size: Option<FontSizeRole>,
     font_names: Vec<SharedString>,
     font_search: Entity<ComposerInput>,
     font_active: usize,
     font_focus: FocusHandle,
     font_scroll: gpui::ScrollHandle,
     menu_dismissed_at: Option<Instant>,
-    size_menu_dismissed_at: Option<Instant>,
     theme_editor: Option<ThemeEditor>,
     theme_name: Entity<ComposerInput>,
     theme_color: Entity<ComposerInput>,
@@ -119,14 +117,12 @@ impl AppearancePage {
         font_names.dedup();
         Self {
             open_font: None,
-            open_size: None,
             font_names,
             font_search,
             font_active: 0,
             font_focus: cx.focus_handle(),
             font_scroll: gpui::ScrollHandle::new(),
             menu_dismissed_at: None,
-            size_menu_dismissed_at: None,
             theme_editor: None,
             theme_name,
             theme_color,
@@ -227,7 +223,6 @@ impl AppearancePage {
                     this.open_font = None;
                 } else {
                     this.open_font = Some(role);
-                    this.open_size = None;
                     this.font_search
                         .update(cx, |input, cx| input.set_text("", cx));
                     this.font_active = this
@@ -336,100 +331,6 @@ impl AppearancePage {
                     .child(list)
                     .into_any_element();
             trigger = trigger.child(popover::anchored_menu("font-family-menu", menu));
-        }
-        trigger.into_any_element()
-    }
-
-    fn size_picker(
-        &mut self,
-        role: FontSizeRole,
-        current: u8,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let open = self.open_size == Some(role);
-        let mut trigger = div()
-            .id(match role {
-                FontSizeRole::Interface => "interface-font-size-picker",
-                FontSizeRole::Prompt => "prompt-font-size-picker",
-                FontSizeRole::Code => "code-font-size-picker",
-                FontSizeRole::Terminal => "terminal-font-size-picker",
-            })
-            .relative()
-            .w(px(88.0))
-            .h(px(36.0))
-            .px(px(10.0))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(if open {
-                theme.border_strong
-            } else {
-                theme.border
-            })
-            .bg(theme.bg)
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .cursor_pointer()
-            .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.03))))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let just_dismissed = this
-                    .size_menu_dismissed_at
-                    .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
-                if this.open_size == Some(role) || just_dismissed {
-                    this.open_size = None;
-                } else {
-                    this.open_size = Some(role);
-                    this.open_font = None;
-                }
-                this.size_menu_dismissed_at = None;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .flex_1()
-                    .text_size(px(13.0))
-                    .text_color(theme.text)
-                    .child(SharedString::from(format!("{current} px"))),
-            )
-            .child(
-                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
-                    .size(px(14.0))
-                    .text_color(theme.text_muted),
-            );
-
-        if open {
-            let rows = role.range().map(|size| {
-                popover::menu_row(
-                    theme,
-                    size == current,
-                    format!("font-size-row-{role:?}-{size}"),
-                )
-                .id(("font-size", size as usize))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    appearance::set_font_size(role, size, cx);
-                    this.open_size = None;
-                    cx.notify();
-                }))
-                .child(SharedString::from(format!("{size} px")))
-            });
-            let menu = popover::popover_card(theme)
-                .id("font-size-options")
-                .w(px(96.0))
-                .max_h(px(320.0))
-                .overflow_y_scroll()
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.open_size = None;
-                    this.size_menu_dismissed_at = Some(Instant::now());
-                    cx.notify();
-                }))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .children(rows)
-                .into_any_element();
-            trigger = trigger.child(popover::anchored_menu("font-size-menu", menu));
         }
         trigger.into_any_element()
     }
@@ -1058,17 +959,10 @@ impl Render for AppearancePage {
         let (ui_font, prompt_font, code_font, terminal_font) = appearance::font_families(cx);
         let font_sizes = appearance::font_sizes(cx);
         let ui_picker = self.font_picker(FontRole::Ui, ui_font.clone(), &theme, cx);
-        let ui_size_picker =
-            self.size_picker(FontSizeRole::Interface, font_sizes.interface, &theme, cx);
         let prompt_picker = self.font_picker(FontRole::Prompt, prompt_font.clone(), &theme, cx);
-        let prompt_size_picker =
-            self.size_picker(FontSizeRole::Prompt, font_sizes.prompt, &theme, cx);
         let code_picker = self.font_picker(FontRole::Code, code_font.clone(), &theme, cx);
-        let code_size_picker = self.size_picker(FontSizeRole::Code, font_sizes.code, &theme, cx);
         let terminal_picker =
             self.font_picker(FontRole::Terminal, terminal_font.clone(), &theme, cx);
-        let terminal_size_picker =
-            self.size_picker(FontSizeRole::Terminal, font_sizes.terminal, &theme, cx);
 
         let mut cards = Vec::new();
         for mode in AppearanceMode::ALL {
@@ -1187,15 +1081,7 @@ impl Render for AppearancePage {
                                                             )),
                                                     ),
                                             )
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .gap(px(8.0))
-                                                    .child(ui_picker)
-                                                    .child(ui_size_picker),
-                                            ),
+                                            .child(div().flex_none().child(ui_picker)),
                                     )
                                     .child(
                                         widgets::card_row(&theme, false)
@@ -1220,15 +1106,7 @@ impl Render for AppearancePage {
                                                             )),
                                                     ),
                                             )
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .gap(px(8.0))
-                                                    .child(prompt_picker)
-                                                    .child(prompt_size_picker),
-                                            ),
+                                            .child(div().flex_none().child(prompt_picker)),
                                     )
                                     .child(
                                         widgets::card_row(&theme, false)
@@ -1250,15 +1128,7 @@ impl Render for AppearancePage {
                                                             )),
                                                     ),
                                             )
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .gap(px(8.0))
-                                                    .child(code_picker)
-                                                    .child(code_size_picker),
-                                            ),
+                                            .child(div().flex_none().child(code_picker)),
                                     )
                                     .child(
                                         widgets::card_row(&theme, false)
@@ -1283,15 +1153,7 @@ impl Render for AppearancePage {
                                                             )),
                                                     ),
                                             )
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .gap(px(8.0))
-                                                    .child(terminal_picker)
-                                                    .child(terminal_size_picker),
-                                            ),
+                                            .child(div().flex_none().child(terminal_picker)),
                                     ),
                             )
                             .child(

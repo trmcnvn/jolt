@@ -293,6 +293,10 @@ impl ShortcutId {
     }
 }
 
+fn default_search_transcript() -> String {
+    ShortcutId::SearchTranscript.default_combo().into()
+}
+
 /// Persisted hotkey combinations. Stored platform-neutral (for example,
 /// "mod-e"); translated to "cmd-e"/"ctrl-e" at bind time by
 /// [`platform_combo`].
@@ -304,6 +308,7 @@ pub struct KeymapConfig {
     pub close_tab: String,
     pub previous_transcript_turn: String,
     pub next_transcript_turn: String,
+    #[serde(default = "default_search_transcript")]
     pub search_transcript: String,
     pub open_settings: String,
     pub open_spaces_dropdown: String,
@@ -339,7 +344,7 @@ impl Default for KeymapConfig {
             close_tab: ShortcutId::CloseTab.default_combo().into(),
             previous_transcript_turn: ShortcutId::PreviousTranscriptTurn.default_combo().into(),
             next_transcript_turn: ShortcutId::NextTranscriptTurn.default_combo().into(),
-            search_transcript: ShortcutId::SearchTranscript.default_combo().into(),
+            search_transcript: default_search_transcript(),
             open_settings: ShortcutId::OpenSettings.default_combo().into(),
             open_spaces_dropdown: ShortcutId::OpenSpacesDropdown.default_combo().into(),
             add_space: ShortcutId::AddSpace.default_combo().into(),
@@ -678,6 +683,27 @@ mod tests {
         assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
         std::fs::write(UiSettings::path(dir.path()), "{not json").unwrap();
         assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
+    }
+
+    #[test]
+    fn missing_search_transcript_hotkey_preserves_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = UiSettings::default();
+        settings.keymap.toggle_sidebar = "mod-shift-s".into();
+        settings.save(dir.path()).unwrap();
+
+        let path = UiSettings::path(dir.path());
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        json["keymap"]
+            .as_object_mut()
+            .unwrap()
+            .remove("searchTranscript");
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.keymap.search_transcript, "mod-f");
+        assert_eq!(loaded.keymap.toggle_sidebar, "mod-shift-s");
     }
 
     #[test]

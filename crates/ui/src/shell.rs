@@ -855,9 +855,9 @@ pub struct Shell {
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
-    /// Focus target for secondary pages, which otherwise have no consistently
-    /// focusable child to receive route-level keyboard events.
-    settings_focus: FocusHandle,
+    /// Focus target for shell-only layouts, which otherwise have no consistently
+    /// mounted focusable child to receive route-level keyboard events.
+    shell_focus: FocusHandle,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
     /// window): app hotkeys dispatch through the window focus chain, so
     /// with nothing focused they go dead. Initial focus lands on the composer
@@ -1116,7 +1116,7 @@ impl Shell {
             splash: SplashPhase::Visible,
             splash_task: None,
             save_task: None,
-            settings_focus: cx.focus_handle(),
+            shell_focus: cx.focus_handle(),
             focus_sub: None,
             _ticker: ticker,
             _account_usage_task: account_usage_task,
@@ -5254,30 +5254,39 @@ impl Render for Shell {
         // App hotkeys (mod-e/b/`) dispatch through the window focus
         // chain — with nothing focused they go dead. Land initial focus on the
         // composer, and whenever focus is lost with no successor (e.g. the
-        // focused element unmounted), route it back there.
+        // focused element unmounted), route it to a handle that remains mounted.
+        // Maximizing Changes removes the composer, so its fallback is the shell
+        // itself; this keeps the panel toggle live so it can close the view.
         if self.focus_sub.is_none() {
             self.focus_sub =
                 Some(
                     cx.on_focus_lost(window, |this: &mut Shell, window, cx| match this.route {
-                        Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
-                        Route::Archived | Route::Settings(_) => {
-                            window.focus(&this.settings_focus, cx)
+                        Route::Chat if !this.changes_expanded => {
+                            window.focus(&this.composer.focus_handle(cx), cx)
+                        }
+                        Route::Chat | Route::Archived | Route::Settings(_) => {
+                            window.focus(&this.shell_focus, cx)
                         }
                     }),
                 );
         }
         if matches!(gate, GatePhase::Ready) && window.focused(cx).is_none() {
             match self.route {
-                Route::Chat => window.focus(&self.composer.focus_handle(cx), cx),
-                Route::Archived | Route::Settings(_) => window.focus(&self.settings_focus, cx),
+                Route::Chat if !self.changes_expanded => {
+                    window.focus(&self.composer.focus_handle(cx), cx)
+                }
+                Route::Chat | Route::Archived | Route::Settings(_) => {
+                    window.focus(&self.shell_focus, cx)
+                }
             }
         }
 
         let root = div()
             .id("shell-root")
-            .when(!matches!(self.route, Route::Chat), |root| {
-                root.track_focus(&self.settings_focus)
-            })
+            .when(
+                !matches!(self.route, Route::Chat) || self.changes_expanded,
+                |root| root.track_focus(&self.shell_focus),
+            )
             .relative()
             .flex()
             .flex_row()

@@ -1,14 +1,30 @@
 //! Current-session transcript search command center.
 
+use std::ops::Range;
+
+use gpui::{StyledText, TextRun, font};
+use jolt_doc::{MessageRole, TranscriptSearchResult};
+
 use super::*;
 use crate::settings::{ShortcutId, display_combo};
-use jolt_doc::{MessageRole, TranscriptSearchResult};
 
 const SEARCH_DEBOUNCE_MS: u64 = 120;
 
+#[derive(Clone)]
+struct TranscriptSearchMatches {
+    query: String,
+    rows: Vec<TranscriptSearchResult>,
+}
+
+fn begin_transcript_search(results: &mut Loadable<TranscriptSearchMatches>) {
+    if results.ready().is_none() {
+        *results = Loadable::Loading;
+    }
+}
+
 pub(super) struct TranscriptSearchFlow {
     search: Entity<ComposerInput>,
-    results: Loadable<Vec<TranscriptSearchResult>>,
+    results: Loadable<TranscriptSearchMatches>,
     active: usize,
     focus: FocusHandle,
     list_scroll: gpui::ScrollHandle,
@@ -72,7 +88,9 @@ impl Shell {
             return;
         };
 
-        flow.results = Loadable::Loading;
+        // Keep useful rows mounted while the replacement request runs. This
+        // avoids flashing back to the empty "Searching…" state on every edit.
+        begin_transcript_search(&mut flow.results);
         let request_query = query.clone();
         let request_chat = chat_id.clone();
         let task = cx.spawn(async move |this, cx| {
@@ -98,7 +116,7 @@ impl Shell {
                 }
                 flow.task = None;
                 flow.results = match result {
-                    Ok(results) => Loadable::Ready(results),
+                    Ok(rows) => Loadable::Ready(TranscriptSearchMatches { query, rows }),
                     Err(error) => {
                         tracing::warn!(%chat_id, %error, "transcript search failed");
                         Loadable::Error("Search is unavailable".into())
@@ -118,7 +136,7 @@ impl Shell {
         let result = self.transcript_search.as_ref().and_then(|flow| {
             flow.results
                 .ready()
-                .and_then(|results| results.get(flow.active))
+                .and_then(|results| results.rows.get(flow.active))
                 .cloned()
         });
         let Some(result) = result else {
@@ -147,7 +165,7 @@ impl Shell {
                     .transcript_search
                     .as_ref()
                     .and_then(|flow| flow.results.ready())
-                    .map_or(0, Vec::len);
+                    .map_or(0, |results| results.rows.len());
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 if let Some(flow) = self.transcript_search.as_mut() {
                     flow.active = popover::menu_step(Some(flow.active), count, delta).unwrap_or(0);
@@ -234,7 +252,7 @@ impl Shell {
                     .child(SharedString::from("esc")),
             );
 
-        let result_count = results.ready().map_or(0, Vec::len);
+        let result_count = results.ready().map_or(0, |results| results.rows.len());
         let list = match results {
             Loadable::Idle => transcript_search_message(&theme, "Type to search this transcript"),
             Loadable::Loading => transcript_search_message(&theme, "Searching…"),
@@ -255,78 +273,87 @@ impl Shell {
                     .child(retry)
                     .into_any_element()
             }
-            Loadable::Ready(rows) if rows.is_empty() => {
+            Loadable::Ready(results) if results.rows.is_empty() => {
                 transcript_search_message(&theme, "No matches")
             }
-            Loadable::Ready(rows) => div()
-                .id("transcript-search-results")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&list_scroll)
-                .px(px(8.0))
-                .py(px(6.0))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .children(rows.into_iter().enumerate().map(|(index, result)| {
-                    let message_id = result.message_id.clone();
-                    let page_id = result.page_id.clone();
-                    let role = match result.role {
-                        MessageRole::User => "You",
-                        MessageRole::Assistant => "Assistant",
-                        MessageRole::System => "System",
-                    };
-                    let timestamp = transcript::format_timestamp(result.created_at, &chrono::Local);
-                    popover::menu_row_nav(
-                        &theme,
-                        false,
-                        index == active.min(result_count.saturating_sub(1)),
-                        format!("transcript-search-row-{index}"),
-                    )
-                    .id(("transcript-search-row", index))
-                    .h(px(52.0))
-                    .when(
-                        index == active.min(result_count.saturating_sub(1)),
-                        |element| element.shadow(crate::theme::card_selected_shadows()),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.transcript_search = None;
-                        this.transcript.update(cx, |transcript, cx| {
-                            transcript.scroll_to_message(message_id.clone(), page_id.clone(), cx);
-                        });
-                        cx.notify();
+            Loadable::Ready(results) => {
+                let query = results.query;
+                div()
+                    .id("transcript-search-results")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&list_scroll)
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(results.rows.into_iter().enumerate().map(|(index, result)| {
+                        let message_id = result.message_id.clone();
+                        let page_id = result.page_id.clone();
+                        let role = match result.role {
+                            MessageRole::User => "You",
+                            MessageRole::Assistant => "Assistant",
+                            MessageRole::System => "System",
+                        };
+                        let timestamp =
+                            transcript::format_timestamp(result.created_at, &chrono::Local);
+                        let preview = highlighted_preview(&result.preview, &query, &theme);
+                        popover::menu_row_nav(
+                            &theme,
+                            false,
+                            index == active.min(result_count.saturating_sub(1)),
+                            format!("transcript-search-row-{index}"),
+                        )
+                        .id(("transcript-search-row", index))
+                        .h(px(52.0))
+                        .when(
+                            index == active.min(result_count.saturating_sub(1)),
+                            |element| element.shadow(crate::theme::card_selected_shadows()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.transcript_search = None;
+                            this.transcript.update(cx, |transcript, cx| {
+                                transcript.scroll_to_message(
+                                    message_id.clone(),
+                                    page_id.clone(),
+                                    cx,
+                                );
+                            });
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .text_size(px(10.5))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .child(SharedString::from(role))
+                                        .child(SharedString::from(timestamp)),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(13.0))
+                                        .text_color(theme.text)
+                                        .child(preview),
+                                ),
+                        )
                     }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .text_size(px(10.5))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(role))
-                                    .child(SharedString::from(timestamp)),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.0))
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(result.preview)),
-                            ),
-                    )
-                }))
-                .into_any_element(),
+                    .into_any_element()
+            }
         };
 
         let footer = div()
@@ -397,6 +424,77 @@ impl Shell {
     }
 }
 
+fn highlighted_preview(preview: &str, query: &str, theme: &Theme) -> StyledText {
+    let ranges = transcript_match_ranges(preview, query);
+    let mut runs = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(1));
+    let mut offset = 0;
+    let base_font = font(theme.font_sans.clone());
+    let mut push_run = |len: usize, highlighted: bool| {
+        if len == 0 {
+            return;
+        }
+        let mut run_font = base_font.clone();
+        if highlighted {
+            run_font.weight = gpui::FontWeight::SEMIBOLD;
+        }
+        runs.push(TextRun {
+            len,
+            font: run_font,
+            color: theme.text,
+            background_color: highlighted.then_some(theme.warning.opacity(0.22)),
+            underline: None,
+            strikethrough: None,
+        });
+    };
+    for range in ranges {
+        push_run(range.start.saturating_sub(offset), false);
+        push_run(range.end.saturating_sub(range.start), true);
+        offset = range.end;
+    }
+    push_run(preview.len().saturating_sub(offset), false);
+    StyledText::new(preview.to_string()).with_runs(runs)
+}
+
+fn transcript_match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
+    let mut normalized = String::new();
+    let mut source_ranges = Vec::new();
+    for (start, character) in text.char_indices() {
+        let end = start + character.len_utf8();
+        let lowercase = character.to_lowercase().to_string();
+        normalized.push_str(&lowercase);
+        source_ranges.extend(std::iter::repeat_n(start..end, lowercase.len()));
+    }
+
+    let mut ranges = Vec::new();
+    for term in query.split_whitespace().map(str::to_lowercase) {
+        if term.is_empty() {
+            continue;
+        }
+        let mut offset = 0;
+        while let Some(relative) = normalized[offset..].find(&term) {
+            let start = offset + relative;
+            let end = start + term.len();
+            if let (Some(first), Some(last)) = (
+                source_ranges.get(start),
+                source_ranges.get(end.saturating_sub(1)),
+            ) {
+                ranges.push(first.start..last.end);
+            }
+            offset = end;
+        }
+    }
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    ranges
+        .into_iter()
+        .fold(Vec::<Range<usize>>::new(), |mut merged, range| {
+            match merged.last_mut() {
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => merged.push(range),
+            }
+            merged
+        })
+}
+
 fn transcript_search_message(theme: &Theme, message: &'static str) -> AnyElement {
     div()
         .flex_1()
@@ -406,4 +504,46 @@ fn transcript_search_message(theme: &Theme, message: &'static str) -> AnyElement
         .text_color(theme.text_faint)
         .child(SharedString::from(message))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn beginning_search_preserves_existing_results() {
+        let mut results = Loadable::Ready(TranscriptSearchMatches {
+            query: "old query".into(),
+            rows: Vec::new(),
+        });
+        begin_transcript_search(&mut results);
+        assert!(matches!(
+            results,
+            Loadable::Ready(TranscriptSearchMatches { ref query, .. }) if query == "old query"
+        ));
+
+        let mut empty = Loadable::Idle;
+        begin_transcript_search(&mut empty);
+        assert!(empty.is_loading());
+    }
+
+    #[test]
+    fn transcript_matches_are_case_insensitive_and_cover_each_term() {
+        let text = "Alpha beta ALPHA";
+        let ranges = transcript_match_ranges(text, "alpha BETA");
+        assert_eq!(ranges, vec![0..5, 6..10, 11..16]);
+    }
+
+    #[test]
+    fn transcript_matches_preserve_unicode_source_ranges() {
+        let text = "CAFÉ and café";
+        let ranges = transcript_match_ranges(text, "café");
+        assert_eq!(
+            ranges
+                .into_iter()
+                .map(|range| &text[range])
+                .collect::<Vec<_>>(),
+            vec!["CAFÉ", "café"]
+        );
+    }
 }
