@@ -335,18 +335,18 @@ extension RenderToolCall {
         }
     }
 
-    var chipSymbol: String {
+    var chipIcon: TablerIcon {
         switch tag {
-        case "exec": return "terminal"
-        case "readFile", "applyPatch": return "doc.text"
-        case "writeFile": return "doc.badge.plus"
-        case "editFile": return "pencil"
-        case "search": return "magnifyingglass"
-        case "glob": return "folder"
-        case "webFetch", "webSearch": return "globe"
-        case "todo": return "checklist"
-        case "spawnAgent": return "person.2"
-        default: return "square.grid.2x2"
+        case "exec": return .terminal
+        case "readFile", "applyPatch": return .fileText
+        case "writeFile": return .filePlus
+        case "editFile": return .pencil
+        case "search": return .search
+        case "glob": return .folder
+        case "webFetch", "webSearch": return .world
+        case "todo": return .listCheck
+        case "spawnAgent": return .users
+        default: return .apps
         }
     }
 

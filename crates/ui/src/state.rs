@@ -264,7 +264,7 @@ pub struct AppState {
     pub connection: ConnectionStatus,
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
-    /// Active Local/Account data scope. Older/headless engines may not expose it.
+    /// Active Local/Account data scope.
     pub scope: Option<ScopeStatus>,
     pub devices: Vec<Device>,
     /// Sorted (see [`sort_spaces`]).
@@ -769,6 +769,14 @@ impl AppState {
             .map(|d| d.name.as_str())
     }
 
+    pub fn device_display_name(&self, device_id: &str) -> Option<&str> {
+        if self.active_scope() == ScopeKind::Local {
+            Some("local")
+        } else {
+            self.device_name(device_id)
+        }
+    }
+
     /// Host-presence check: is this device's 15s presence heartbeat fresh?
     /// Distinguishes "host offline" (its queued work syncs when it returns)
     /// from slow sync. The local device is trivially online; unknown devices
@@ -786,9 +794,10 @@ impl AppState {
     /// Space provenance shared by filter rows, new-session chips, and tab
     /// tooltips. Returns the rendered tag and whether the host is offline.
     pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
-        let offline = !self.device_online(&space.device_id, now);
+        let offline =
+            self.active_scope() != ScopeKind::Local && !self.device_online(&space.device_id, now);
         let device = self
-            .device_name(&space.device_id)
+            .device_display_name(&space.device_id)
             .unwrap_or("Unknown device");
         let tag = if offline {
             format!("@ {device} · offline")
@@ -1280,9 +1289,10 @@ fn spawn_scope_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
         {
             Ok(rx) => rx,
             Err(err) => {
-                tracing::debug!(error = %err, "scope watch unavailable");
+                tracing::warn!(error = %err, "scope watch unavailable");
                 this.update(cx, |state, cx| {
-                    state.connection = ConnectionStatus::Ready;
+                    state.connection =
+                        ConnectionStatus::Failed(format!("ScopeStatus unavailable: {err}"));
                     cx.notify();
                 })
                 .ok();
@@ -1314,14 +1324,13 @@ fn spawn_scope_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 break;
             }
         }
-        // Account-only headless engines do not expose scope switching and
-        // reject this stream. RPC stream errors arrive as a closed receiver
-        // after subscribe succeeds, so treat a close before the first frame as
-        // unsupported.
+        // RPC stream errors arrive as a closed receiver after subscribe succeeds.
         if !received_status {
-            tracing::debug!("scope watch unsupported; continuing with the engine's fixed scope");
+            tracing::warn!("scope watch closed before its initial status");
             this.update(cx, |state, cx| {
-                state.connection = ConnectionStatus::Ready;
+                state.connection = ConnectionStatus::Failed(
+                    "ScopeStatus stream closed before initialization".into(),
+                );
                 cx.notify();
             })
             .ok();
@@ -2010,6 +2019,19 @@ mod tests {
         // No spaces at all: selection clears.
         state.apply_spaces(vec![]);
         assert_eq!(state.selected_space, None);
+    }
+
+    #[test]
+    fn local_space_device_tag_describes_the_scope() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.scope = Some(ScopeStatus::local());
+
+        assert_eq!(state.device_display_name("dev"), Some("local"));
+        assert_eq!(
+            state.space_device_tag(&space("s1", "dev", "/a", 1), now),
+            ("@ local".to_string(), false)
+        );
     }
 
     #[test]

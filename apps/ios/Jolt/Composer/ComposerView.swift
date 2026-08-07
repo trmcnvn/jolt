@@ -115,8 +115,7 @@ struct ComposerShell<Chips: View>: View {
         Button {
             onAttach?()
         } label: {
-            Image(systemName: "plus")
-                .font(.system(size: 15, weight: .medium))
+            TablerIconView(.plus, size: 15)
                 .foregroundStyle(Theme.textMuted)
                 .frame(width: 36, height: 36)
                 .background(whiteAlpha(0.06), in: Circle())
@@ -151,8 +150,7 @@ struct ComposerShell<Chips: View>: View {
                         .fill(Theme.bg)
                         .frame(width: 12, height: 12)
                 } else {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 16, weight: .semibold))
+                    TablerIconView(.arrowUp, size: 16)
                         .foregroundStyle(buttonActive ? Theme.bg : Theme.textFaint)
                 }
             }
@@ -793,8 +791,7 @@ struct ExtractedAnswerPanel: View {
                     .font(Theme.sans(10))
                     .foregroundStyle(Theme.textMuted)
                 Button(action: onCancel) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
+                    TablerIconView(.x, size: 10)
                         .foregroundStyle(Theme.textMuted)
                         .frame(width: 24, height: 24)
                 }

@@ -155,7 +155,7 @@ pub struct EngineCore {
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
     links: std::sync::Mutex<Option<Arc<jolt_rpc::LinkCache>>>,
-    /// Release checker (attached by [`Engine::assemble_runtime`]) — the
+    /// Release checker (attached by [`EngineSupervisor`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<jolt_update::Updater>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
@@ -626,6 +626,13 @@ impl EngineSupervisor {
             }
             return Ok(());
         }
+        let (org_id, user_id) = self.account_identity()?;
+        if ScopeLayout::new(&self.config.data_dir).has_account_data(&org_id, &user_id) {
+            self.ensure_account_runtime()?;
+            self.activate(ScopeKind::Account)?;
+            self.publish_scope(ScopeKind::Account, false);
+            return Ok(());
+        }
         let local_has_data = self.local_has_data();
         if local_has_data {
             self.scope_tx.send_modify(|status| {
@@ -1015,63 +1022,6 @@ impl Engine {
         Auth::detect(auth_config).await
     }
 
-    /// Assemble the account-only runtime used by headless mode. Authentication
-    /// is mandatory there; the headed app uses [`EngineSupervisor`] instead.
-    pub async fn assemble_runtime(
-        config: &EngineConfig,
-        auth: Auth,
-    ) -> anyhow::Result<EngineRuntime> {
-        let dev_token_org = config
-            .edge_token
-            .as_deref()
-            .and_then(|token| token.split_once('@'))
-            .map(|(_, org)| org.to_string())
-            .filter(|org| !org.is_empty());
-        let org_id = auth
-            .state()
-            .org_id()
-            .map(str::to_string)
-            .or(dev_token_org)
-            .or(config.org_id.clone())
-            .unwrap_or_else(|| env_or("JOLT_ORG_ID", DEFAULT_ORG_ID));
-        let user_id = auth
-            .user_id()
-            .ok_or_else(|| anyhow::anyhow!("headless mode requires an account"))?;
-        let scope = ScopeLayout::new(&config.data_dir).ensure_account(&org_id, &user_id)?;
-        let device_id = load_or_create_device_id(&scope.dir)?;
-        let edge =
-            EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id);
-        let core = EngineCore::assemble_scoped(
-            &config.data_dir,
-            &scope.dir,
-            &config.data_dir,
-            Arc::new(default_registry()),
-            config.default_harness,
-            Some(edge.clone()),
-            &org_id,
-            &user_id,
-            None,
-        )?;
-        core.set_auth(auth.clone());
-        let quiescent: jolt_update::QuiescentCheck = {
-            let sessions = core.sessions.clone();
-            let terminals = core.terminals.clone();
-            Arc::new(move || !sessions.any_active() && !terminals.any_open())
-        };
-        core.set_updater(jolt_update::Updater::spawn(
-            config.edge_url.clone(),
-            Some(quiescent),
-        ));
-        tracing::info!(device_id = %core.device_id, "account engine core assembled");
-        let host_relay = Some(configure_online_core(&core, &edge, &auth));
-
-        Ok(EngineRuntime {
-            core,
-            _host_relay: host_relay,
-            owns_updater: true,
-        })
-    }
-
     /// Run until ctrl-c: auth (dev or WorkOS), sessions engine + doc host + command
     /// executor, IPC server, and — when edge+auth are ready — the device-room host
     /// relay + peer link cache (targetDeviceId routing).
@@ -1081,7 +1031,7 @@ impl Engine {
 
         std::fs::create_dir_all(&config.data_dir)?;
         let auth = Self::build_auth(&config).await;
-        let _refresh_loop = auth.spawn_refresh_loop();
+        let refresh_loop = auth.spawn_refresh_loop();
 
         // WorkOS mode: gate edge features on a signed-in, org-scoped session. A TTY
         // gets the interactive paste-code flow; a service manager (systemd/launchd)
@@ -1090,18 +1040,37 @@ impl Engine {
             terminal_sign_in(&auth).await?;
         }
 
-        let runtime = Self::assemble_runtime(&config, auth).await?;
-        let service = runtime.core().rpc_service();
+        // Headless and headed ownership expose the same Local/Account service.
+        // Otherwise a desktop attached to the background daemon loses scope
+        // switching even though the Local runtime still exists on disk.
+        let supervisor = EngineSupervisor::new(config.clone(), auth);
+        let boot_task = supervisor.spawn_when_ready();
+        if let Err(error) = supervisor.wait_ready().await {
+            boot_task.abort();
+            refresh_loop.abort();
+            return Err(error);
+        }
 
         // A daemon exists to serve this port, so a bind failure is fatal here —
         // unlike the headed app, which can still work over its in-process
         // transport (see `serve_ipc`).
-        let server = serve_ipc(config.ipc_port, service).await?;
+        let server = match serve_ipc(config.ipc_port, supervisor.clone()).await {
+            Ok(server) => server,
+            Err(error) => {
+                boot_task.abort();
+                supervisor.shutdown().await;
+                refresh_loop.abort();
+                return Err(error.into());
+            }
+        };
 
-        shutdown_signal().await?;
+        let signal = shutdown_signal().await;
         tracing::info!("shutting down");
         server.abort();
-        runtime.shutdown().await;
+        boot_task.abort();
+        supervisor.shutdown().await;
+        refresh_loop.abort();
+        signal?;
         Ok(())
     }
 }
@@ -1269,7 +1238,7 @@ mod supervisor_tests {
     use super::*;
 
     #[tokio::test]
-    async fn existing_account_coexists_with_local() {
+    async fn existing_account_with_local_data_opens_without_merge_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let existing = EngineCore::assemble_with_identity(
             dir.path(),
@@ -1283,6 +1252,28 @@ mod supervisor_tests {
         let account_device = existing.device_id.clone();
         existing.shutdown().await;
         drop(existing);
+
+        let layout = ScopeLayout::new(dir.path());
+        let local_dir = layout.ensure_local().unwrap();
+        let local = EngineCore::assemble_scoped(
+            dir.path(),
+            &local_dir,
+            dir.path(),
+            Arc::new(default_registry()),
+            HarnessId::Mock,
+            None,
+            "local",
+            &layout.local_scope_id().unwrap(),
+            None,
+        )
+        .unwrap();
+        local
+            .workspace
+            .claim_chat("chat-local", Some("/tmp/local"))
+            .unwrap();
+        local.shutdown().await;
+        drop(local);
+
         std::fs::write(
             dir.path().join("session.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -1319,6 +1310,10 @@ mod supervisor_tests {
         .expect("Account runtime booted")
         .unwrap();
         assert_eq!(account_local_device["deviceId"], account_device);
+        let scope = supervisor.scope_tx.borrow().clone();
+        assert!(!scope.merge_pending);
+        assert!(scope.account_available);
+        assert!(scope.local_has_data);
         assert!(
             dir.path()
                 .join("scopes/accounts/org-1/user-1/docs.sqlite3")

@@ -453,11 +453,7 @@ impl Shell {
                                 cx.stop_propagation();
                                 this.close_session_tab(close_id.clone(), cx);
                             }))
-                            .child(
-                                icon(icons::CLOSE)
-                                    .size(px(12.0))
-                                    .text_color(theme.text_muted),
-                            )
+                            .child(icon(icons::X).size(px(12.0)).text_color(theme.text_muted))
                             .into_any_element()
                     } else {
                         // Working animates with the compact text spinner
@@ -766,7 +762,7 @@ impl Shell {
             // selected space has git.
             .child(header_icon_button(
                 "toggle-terminal",
-                icons::TERMINAL,
+                icons::TERMINAL_2,
                 &theme,
                 cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
             ))

@@ -411,7 +411,7 @@ impl Render for SecretsPage {
                             .join(", ");
                         list = list.child(
                             widgets::card_row(&theme, index == 0)
-                                .child(widgets::row_tile(&theme, icons::KEY_MINIMALISTIC))
+                                .child(widgets::row_tile(&theme, icons::KEY))
                                 .child(
                                     div()
                                         .flex_1()

@@ -140,7 +140,7 @@ Completed assistant turns that changed files also show a collapsed `N changed fi
 
 The `$` glyph in the composer footer shows current-session prompt, output, cache, context, model, and reported cost data. Its context warning changes at 70% and 90% of the model window.
 
-Open **Usage breakdown** from the user menu for 7-, 30-, or 90-day activity grouped by harness, model, and space. Usage is recorded on each host device and merged from reachable devices for display; it is not synced in conversation documents.
+Open **Usage breakdown** from the user menu for 7-, 30-, or 90-day activity grouped by device, harness, model, and space. Usage is recorded on each host device and merged from reachable devices for display; it is not synced in conversation documents.
 
 Provider account quota meters are separate. Claude Code and Codex account cards warn at 80% and 95% of their reported rate-limit windows.
 

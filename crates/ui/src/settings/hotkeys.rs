@@ -274,9 +274,9 @@ impl Render for HotkeysPage {
             let count = category_hotkeys.len();
             let collapsed = self.collapsed_categories.contains(&category);
             let chevron = if collapsed {
-                crate::icons::ALT_ARROW_RIGHT
+                crate::icons::CHEVRON_RIGHT
             } else {
-                crate::icons::ALT_ARROW_DOWN
+                crate::icons::CHEVRON_DOWN
             };
             let rows = category_hotkeys
                 .into_iter()
@@ -479,7 +479,7 @@ impl Render for HotkeysPage {
                                         )
                                     })
                                     .child(
-                                        crate::icons::icon(crate::icons::RESTART)
+                                        crate::icons::icon(crate::icons::RELOAD)
                                             .size(px(14.0))
                                             .text_color(theme.text_muted),
                                     )

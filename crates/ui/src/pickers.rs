@@ -1853,11 +1853,10 @@ impl Pickers {
         }?;
         let link = div()
             .id("new-chat-space-selector")
-            .underline()
             .cursor_pointer()
             .hover(|style| style.text_color(theme.text_muted.opacity(0.9)))
             .on_click(cx.listener(|this, _, window, cx| this.toggle(PickerKind::Space, window, cx)))
-            .child(label);
+            .child(div().underline().child(label));
         if self.open != Some(PickerKind::Space) {
             return Some(link.into_any_element());
         }
@@ -1918,7 +1917,7 @@ impl Pickers {
             )
             .child(div().min_w_0().truncate().child(label))
             .child(
-                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                crate::icons::icon(crate::icons::CHEVRON_DOWN)
                     .size(px(12.0))
                     .text_color(theme.text_muted.opacity(0.5)),
             )
@@ -2125,11 +2124,11 @@ impl Pickers {
                 Some(_) | None => outside_space,
             };
             let (icon_path, label) = if jujutsu && is_secondary_checkout {
-                (crate::icons::FOLDER_WITH_FILES, "Workspace")
+                (crate::icons::FOLDERS, "Workspace")
             } else if jujutsu {
                 (crate::icons::FOLDER, "Working copy")
             } else if is_secondary_checkout {
-                (crate::icons::FOLDER_WITH_FILES, "Worktree")
+                (crate::icons::FOLDERS, "Worktree")
             } else {
                 (crate::icons::FOLDER, "Local checkout")
             };
@@ -2148,7 +2147,7 @@ impl Pickers {
 
         let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
             (CheckoutKind::Local, false) => crate::icons::FOLDER,
-            _ => crate::icons::FOLDER_WITH_FILES,
+            _ => crate::icons::FOLDERS,
         };
         let kind_chip = self.footer_chip(
             PickerKind::Checkout,
@@ -2406,7 +2405,7 @@ impl Pickers {
             "Current checkout"
         };
         let local_icon = if has_worktree {
-            crate::icons::FOLDER_WITH_FILES
+            crate::icons::FOLDERS
         } else {
             crate::icons::FOLDER
         };
@@ -2419,7 +2418,7 @@ impl Pickers {
                 } else {
                     "New worktree"
                 },
-                crate::icons::FOLDER_WITH_FILES,
+                crate::icons::FOLDERS,
             ),
         ];
         let active = self.active;
@@ -2739,7 +2738,11 @@ impl Pickers {
                         crate::icons::ARROW_DOWN,
                         "Navigate",
                     ))
-                    .child(popover::key_hint(&theme, crate::icons::RETURN, "Select")),
+                    .child(popover::key_hint(
+                        &theme,
+                        crate::icons::CORNER_DOWN_LEFT,
+                        "Select",
+                    )),
             )
             .into_any_element()
     }

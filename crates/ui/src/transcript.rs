@@ -2952,7 +2952,7 @@ impl Transcript {
                             }))
                             .child(div().size(px(14.0)).flex_none())
                             .child(
-                                crate::icons::icon(crate::icons::DOCUMENT)
+                                crate::icons::icon(crate::icons::FILE)
                                     .size(px(14.0))
                                     .flex_none()
                                     .text_color(theme.text_muted),
@@ -3181,7 +3181,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                         .items_center()
                         .justify_center()
                         .child(
-                            crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                            crate::icons::icon(crate::icons::ALERT_TRIANGLE)
                                 .size(px(12.0))
                                 .text_color(red_300.opacity(0.8)),
                         ),
@@ -3245,7 +3245,7 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
                         .items_center()
                         .justify_center()
                         .child(
-                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                            crate::icons::icon(crate::icons::MESSAGE_CIRCLE)
                                 .size(px(12.0))
                                 .text_color(theme.text_muted),
                         ),
@@ -3269,21 +3269,19 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
         .into_any_element()
 }
 
-/// A small glyph standing in for the tool's icon (jolt uses an icon set; a
-/// quiet monochrome character keeps the tile without shipping SVGs).
-/// The glyph for a tool call from the Solar icon set.
+/// The Tabler glyph for a tool call.
 fn tool_icon_path(call: &ToolCall) -> &'static str {
     match call {
-        ToolCall::Exec { .. } => crate::icons::TERMINAL,
-        ToolCall::ReadFile { .. } | ToolCall::ApplyPatch { .. } => crate::icons::DOCUMENT,
-        ToolCall::WriteFile { .. } => crate::icons::DOCUMENT_ADD,
-        ToolCall::EditFile { .. } => crate::icons::PEN,
-        ToolCall::Search { .. } => crate::icons::MAGNIFER,
-        ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
-        ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
-        ToolCall::Todo { .. } => crate::icons::CHECKLIST,
+        ToolCall::Exec { .. } => crate::icons::TERMINAL_2,
+        ToolCall::ReadFile { .. } | ToolCall::ApplyPatch { .. } => crate::icons::FILE,
+        ToolCall::WriteFile { .. } => crate::icons::FILE_PLUS,
+        ToolCall::EditFile { .. } => crate::icons::PENCIL,
+        ToolCall::Search { .. } => crate::icons::SEARCH,
+        ToolCall::Glob { .. } => crate::icons::FOLDERS,
+        ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::WORLD,
+        ToolCall::Todo { .. } => crate::icons::LIST_CHECK,
         ToolCall::SpawnAgent { .. } => crate::icons::USER,
-        ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
+        ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::APPS,
     }
 }
 
@@ -4247,7 +4245,7 @@ mod tests {
         let run = ToolCall::Exec {
             command: "cargo test".into(),
         };
-        assert_eq!(tool_icon_path(&run), crate::icons::TERMINAL);
+        assert_eq!(tool_icon_path(&run), crate::icons::TERMINAL_2);
         assert_eq!(tool_chip_content(&run), ("Run", "cargo test".to_string()));
         assert_eq!(
             tool_chip_content(&ToolCall::ReadFile {

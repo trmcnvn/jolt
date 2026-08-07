@@ -91,14 +91,6 @@ pub struct UiSettings {
     pub code_font: String,
     /// Font family used by terminal grids.
     pub terminal_font: String,
-    /// Interface and prose font size in logical pixels.
-    pub font_size_interface: u8,
-    /// Composer input font size in logical pixels.
-    pub font_size_prompt: u8,
-    /// Code block and diff font size in logical pixels.
-    pub font_size_code: u8,
-    /// Terminal grid font size in logical pixels.
-    pub font_size_terminal: u8,
     /// Shell command run when a new terminal opens. Empty uses the default
     /// interactive login shell.
     pub terminal_command: String,
@@ -125,10 +117,6 @@ impl Default for UiSettings {
             prompt_font: crate::theme::DEFAULT_UI_FONT.into(),
             code_font: crate::theme::DEFAULT_CODE_FONT.into(),
             terminal_font: crate::theme::DEFAULT_CODE_FONT.into(),
-            font_size_interface: crate::theme::DEFAULT_INTERFACE_FONT_SIZE,
-            font_size_prompt: crate::theme::DEFAULT_PROMPT_FONT_SIZE,
-            font_size_code: crate::theme::DEFAULT_CODE_FONT_SIZE,
-            font_size_terminal: crate::theme::DEFAULT_TERMINAL_FONT_SIZE,
             terminal_command: String::new(),
         }
     }
@@ -577,21 +565,7 @@ impl UiSettings {
         if self.dark_theme.trim().is_empty() {
             self.dark_theme = crate::themes::JOLT_THEME_ID.into();
         }
-        let sizes = self.font_sizes().clamped();
-        self.font_size_interface = sizes.interface;
-        self.font_size_prompt = sizes.prompt;
-        self.font_size_code = sizes.code;
-        self.font_size_terminal = sizes.terminal;
         self
-    }
-
-    pub fn font_sizes(&self) -> crate::theme::FontSizes {
-        crate::theme::FontSizes {
-            interface: self.font_size_interface,
-            prompt: self.font_size_prompt,
-            code: self.font_size_code,
-            terminal: self.font_size_terminal,
-        }
     }
 
     /// Load from `{data_dir}/ui-settings.json`; defaults on any failure.
@@ -667,10 +641,6 @@ mod tests {
             prompt_font: "Iosevka".into(),
             code_font: "Menlo".into(),
             terminal_font: "Berkeley Mono".into(),
-            font_size_interface: 16,
-            font_size_prompt: 15,
-            font_size_code: 14,
-            font_size_terminal: 12,
             terminal_command: "exec fish".into(),
         };
         settings.save(dir.path()).unwrap();
@@ -712,10 +682,6 @@ mod tests {
         UiSettings {
             sidebar_width: 10_000.0,
             right_pane_width: 1.0,
-            font_size_interface: 255,
-            font_size_prompt: 1,
-            font_size_code: 255,
-            font_size_terminal: 1,
             ..Default::default()
         }
         .save(dir.path())
@@ -723,16 +689,25 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.sidebar_width, SIDEBAR_MAX);
         assert_eq!(loaded.right_pane_width, RIGHT_PANE_MIN);
-        assert_eq!(
-            loaded.font_size_interface,
-            crate::theme::MAX_INTERFACE_FONT_SIZE
-        );
-        assert_eq!(loaded.font_size_prompt, crate::theme::MIN_PROMPT_FONT_SIZE);
-        assert_eq!(loaded.font_size_code, crate::theme::MAX_CODE_FONT_SIZE);
-        assert_eq!(
-            loaded.font_size_terminal,
-            crate::theme::MIN_TERMINAL_FONT_SIZE
-        );
+    }
+
+    #[test]
+    fn persisted_font_sizes_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = UiSettings::default();
+        expected.save(dir.path()).unwrap();
+
+        let path = UiSettings::path(dir.path());
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.insert("fontSizeInterface".into(), 20.into());
+        object.insert("fontSizePrompt".into(), 20.into());
+        object.insert("fontSizeCode".into(), 18.into());
+        object.insert("fontSizeTerminal".into(), 20.into());
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        assert_eq!(UiSettings::load(dir.path()), expected);
     }
 
     #[test]
@@ -756,7 +731,6 @@ mod tests {
         assert_eq!(d.prompt_font, crate::theme::DEFAULT_UI_FONT);
         assert_eq!(d.code_font, crate::theme::DEFAULT_CODE_FONT);
         assert_eq!(d.terminal_font, crate::theme::DEFAULT_CODE_FONT);
-        assert_eq!(d.font_sizes(), crate::theme::FontSizes::default());
         assert!(d.terminal_command.is_empty());
         assert!(!d.system_notifications_enabled);
     }

@@ -19,8 +19,8 @@
 //!    Claude, merge the identity back into `~/.claude.json`) with a saved slot.
 //! 3. **Add** (`start_login`…): drive an OAuth flow for a NEW account without
 //!    touching the live one. Claude uses the public PKCE code flow (paste-code);
-//!    Codex spawns `codex login` against a throwaway `CODEX_HOME` and polls
-//!    until its loopback callback lands.
+//!    Codex spawns `codex login --device-auth` against a throwaway `CODEX_HOME`
+//!    so the browser can stay on the device running Jolt's UI.
 //!
 //! Usage probes: both providers expose the rate-limit view their own CLIs render
 //! (`/usage` in Claude Code, `/status` in Codex). Unlike jolt (fetch on every
@@ -42,8 +42,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use jolt_proto::{
-    AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode,
-    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
+    AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginPoll,
+    AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
 };
 
 use crate::repos::home_dir;
@@ -170,7 +170,7 @@ enum LoginFlow {
         started_at: Instant,
     },
     Codex {
-        /// The `codex login` child; monitored (try_wait) + killable from cancel.
+        /// The `codex login --device-auth` child; monitored (try_wait) + killable from cancel.
         child: Arc<Mutex<Option<tokio::process::Child>>>,
         /// Throwaway `CODEX_HOME` — the live `~/.codex` is never touched.
         home: PathBuf,
@@ -547,17 +547,12 @@ impl AgentAccounts {
                 started_at: Instant::now(),
             },
         );
-        AgentLoginStart {
-            login_id,
-            url,
-            mode: AgentLoginMode::PasteCode,
-        }
+        AgentLoginStart::PasteCode { login_id, url }
     }
 
     async fn start_codex_login(&self) -> Result<AgentLoginStart, EngineError> {
-        // At most ONE codex login flow at a time: `codex login` binds a fixed
-        // loopback OAuth port, so a lingering earlier flow makes every retry exit
-        // on EADDRINUSE. Starting a new flow supersedes — and reaps — any pending.
+        // At most one Codex login flow at a time. Starting a new flow supersedes
+        // and reaps any pending attempt and its isolated credential directory.
         let stale: Vec<String> = lock(&self.inner.flows)
             .iter()
             .filter(|(_, f)| matches!(f, LoginFlow::Codex { .. }))
@@ -577,7 +572,7 @@ impl AgentAccounts {
             .join(format!(".login-{login_id}"));
         std::fs::create_dir_all(&home)?;
         let mut child = match tokio::process::Command::new("codex")
-            .arg("login")
+            .args(["login", "--device-auth"])
             .env("CODEX_HOME", &home)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -597,9 +592,9 @@ impl AgentAccounts {
             }
         };
 
-        // codex prints the authorize URL (to stderr as of 0.142 — scan both
-        // streams) and usually opens the browser itself; grab it so the app can
-        // open it too.
+        // Device auth prints a verification URL and one-time code without
+        // opening a browser. Scan both streams so the UI can open the URL on
+        // its own device even when this engine is remote or headless.
         let output = Arc::new(Mutex::new(String::new()));
         for pipe in [
             child
@@ -671,19 +666,30 @@ impl AgentAccounts {
         );
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let url = loop {
-            if let Some(url) = scan_openai_url(&lock(&output)) {
-                break url;
+        let prompt = loop {
+            let parsed = {
+                let output = lock(&output);
+                (scan_openai_url(&output), scan_openai_device_code(&output))
+            };
+            if let (Some(url), Some(user_code)) = parsed {
+                break Some((url, user_code));
             }
             if lock(&exit).is_some() || Instant::now() > deadline {
-                break String::new();
+                break None;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
-        Ok(AgentLoginStart {
+        let Some((url, user_code)) = prompt else {
+            self.cancel_login(&login_id);
+            return Err(EngineError::Other(
+                "Codex did not provide a device login code. Update the Codex CLI and try again."
+                    .into(),
+            ));
+        };
+        Ok(AgentLoginStart::DeviceCode {
             login_id,
             url,
-            mode: AgentLoginMode::Browser,
+            user_code,
         })
     }
 
@@ -898,8 +904,8 @@ impl AgentAccounts {
         })
     }
 
-    /// Drop a flow: kill a pending `codex login` child (it holds the fixed
-    /// loopback OAuth port) and reclaim its throwaway home dir. Idempotent.
+    /// Drop a flow: kill a pending `codex login --device-auth` child and
+    /// reclaim its throwaway home dir. Idempotent.
     pub fn cancel_login(&self, login_id: &str) {
         let flow = lock(&self.inner.flows).remove(login_id);
         if let Some(LoginFlow::Codex { child, home, .. }) = flow {
@@ -910,8 +916,8 @@ impl AgentAccounts {
         }
     }
 
-    /// Engine shutdown: kill any in-flight login child so an orphan `codex login`
-    /// can't survive the restart and brick the next attempt.
+    /// Engine shutdown: kill any in-flight login child so it cannot outlive
+    /// its owning process.
     pub fn shutdown(&self) {
         let ids: Vec<String> = lock(&self.inner.flows).keys().cloned().collect();
         for id in ids {
@@ -1496,8 +1502,25 @@ fn parse_when(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
 fn scan_openai_url(output: &str) -> Option<String> {
     let start = output.find("https://auth.openai.com/")?;
     let rest = &output[start..];
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let end = rest
+        .find(|character: char| character.is_whitespace() || character == '\u{1b}')
+        .unwrap_or(rest.len());
     Some(rest[..end].to_string())
+}
+
+fn scan_openai_device_code(output: &str) -> Option<String> {
+    let prompt = output.split_once("one-time code")?.1;
+    prompt
+        .split(|character: char| {
+            !(character.is_ascii_uppercase() || character.is_ascii_digit() || character == '-')
+        })
+        .find(|candidate| {
+            let Some((left, right)) = candidate.split_once('-') else {
+                return false;
+            };
+            left.len() >= 4 && right.len() >= 4 && !right.contains('-')
+        })
+        .map(str::to_string)
 }
 
 /// Minimal percent-encoding for OAuth query params (matches `encodeURIComponent`
@@ -1569,13 +1592,20 @@ mod tests {
     }
 
     #[test]
-    fn openai_url_scan() {
+    fn openai_device_prompt_scan() {
+        let prompt = "Open this link\n\x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n\
+                      Enter this one-time code (expires in 15 minutes)\n\
+                      \x1b[94mFZ0G-KUU60\x1b[0m\n";
         assert_eq!(
-            scan_openai_url("open https://auth.openai.com/authorize?x=1 in your browser\n")
-                .as_deref(),
-            Some("https://auth.openai.com/authorize?x=1")
+            scan_openai_url(prompt).as_deref(),
+            Some("https://auth.openai.com/codex/device")
+        );
+        assert_eq!(
+            scan_openai_device_code(prompt).as_deref(),
+            Some("FZ0G-KUU60")
         );
         assert_eq!(scan_openai_url("nothing here"), None);
+        assert_eq!(scan_openai_device_code("nothing here"), None);
     }
 
     #[test]

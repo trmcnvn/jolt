@@ -46,7 +46,7 @@ Jolt speaks JSON-RPC to `codex app-server`. It starts or resumes a thread, start
 
 Command and file-change approval requests are auto-approved for unattended operation. Steering and interrupts use Codex's native turn methods. Unexpected exits include a bounded stderr tail in the surfaced error.
 
-**Accounts:** **Settings → Accounts** can manage Codex login slots on a selected device. Codex login completes through the browser and Jolt polls until the CLI writes the new session.
+**Accounts:** **Settings → Accounts** can manage Codex login slots on a selected device. Jolt opens the device-authorization page on the device running the UI, shows the one-time code there, and polls until the Codex CLI on the selected device writes the new session.
 
 ## Pi
 

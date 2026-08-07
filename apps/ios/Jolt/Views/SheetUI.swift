@@ -80,8 +80,7 @@ struct SheetSelectionIndicator: View {
     let selected: Bool
 
     var body: some View {
-        Image(systemName: "checkmark")
-            .font(.system(size: 14, weight: .semibold))
+        TablerIconView(.check, size: 14)
             .foregroundStyle(.tint)
             .frame(width: 20)
             .opacity(selected ? 1 : 0)

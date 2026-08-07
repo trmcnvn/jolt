@@ -313,7 +313,7 @@ pub fn error_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::Div
         .gap(px(8.0))
         .child(
             div().flex_none().mt(px(2.0)).child(
-                crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                crate::icons::icon(crate::icons::ALERT_TRIANGLE)
                     .size(px(16.0))
                     .text_color(red_text.opacity(0.9)),
             ),
@@ -343,7 +343,7 @@ pub fn warning_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::D
         .gap(px(8.0))
         .child(
             div().flex_none().mt(px(2.0)).child(
-                crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                crate::icons::icon(crate::icons::ALERT_TRIANGLE)
                     .size(px(14.0))
                     .text_color(amber_text.opacity(0.9)),
             ),

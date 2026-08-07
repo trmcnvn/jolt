@@ -453,23 +453,23 @@ pub struct AgentAccountWarning {
     pub message: String,
 }
 
-/// `StartAgentLogin` reply: open `url`, then either paste the code back
-/// (`CompleteAgentLogin`) or poll until the browser flow lands (`PollAgentLogin`).
+/// `StartAgentLogin` reply: the local UI opens the URL, then either submits the
+/// pasted authorization code or displays a device code while polling the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentLoginStart {
-    pub login_id: String,
-    pub url: String,
-    pub mode: AgentLoginMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AgentLoginMode {
+#[serde(
+    tag = "mode",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum AgentLoginStart {
     /// Claude: the user pastes the OAuth code back into the app.
-    PasteCode,
-    /// Codex: the CLI's loopback callback completes in the browser; poll until done.
-    Browser,
+    PasteCode { login_id: String, url: String },
+    /// Codex: the local browser authorizes the CLI running on the target device.
+    DeviceCode {
+        login_id: String,
+        url: String,
+        user_code: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

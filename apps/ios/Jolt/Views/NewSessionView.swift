@@ -267,8 +267,7 @@ struct NewSessionView: View {
                             .font(Theme.sans(12))
                             .foregroundStyle(Theme.textMuted)
                     }
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 9, weight: .medium))
+                    TablerIconView(.selector, size: 9)
                         .foregroundStyle(Theme.textFaint)
                 }
                 .padding(.horizontal, 13)
@@ -294,10 +293,10 @@ struct NewSessionView: View {
         }
     }
 
-    private func chip(icon: LineIcon, label: String, action: @escaping () -> Void) -> some View {
+    private func chip(icon: TablerIcon, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 6) {
-                LineIconView(icon, size: 13, color: Theme.textMuted)
+                TablerIconView(icon, size: 13, color: Theme.textMuted)
                 Text(label)
                     .font(Theme.sans(13, weight: .medium))
                     .foregroundStyle(Theme.text.opacity(0.9))
@@ -332,8 +331,8 @@ struct NewSessionView: View {
         }
     }
 
-    private var checkoutIcon: LineIcon {
-        checkoutKind == .local && selectedRefRow?.worktreePath == nil ? .folder : .folderWithFiles
+    private var checkoutIcon: TablerIcon {
+        checkoutKind == .local && selectedRefRow?.worktreePath == nil ? .folder : .folders
     }
 
     /// "From <ref>" only when a new isolated checkout will be created.
@@ -782,8 +781,7 @@ struct ModelPickerSheet: View {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .semibold))
+                        TablerIconView(.x, size: 13)
                     }
                     .accessibilityLabel("Close")
                 }
@@ -837,7 +835,7 @@ struct ModelPickerSheet: View {
             SheetLabel("Checkout")
             SheetCard {
                 HStack(spacing: 12) {
-                    LineIconView(checkout.isWorktree ? .folderWithFiles : .folder,
+                    TablerIconView(checkout.isWorktree ? .folders : .folder,
                                  size: 16, color: Theme.textMuted)
                         .frame(width: 22)
                     VStack(alignment: .leading, spacing: 2) {
@@ -900,7 +898,7 @@ struct ModelPickerSheet: View {
             }
         } label: {
             HStack(spacing: 12) {
-                LineIconView(.gitBranch, size: 15, color: Theme.textMuted)
+                TablerIconView(.gitBranch, size: 15, color: Theme.textMuted)
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(ref.name)
@@ -1008,8 +1006,7 @@ struct RefPickerSheet: View {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .semibold))
+                        TablerIconView(.x, size: 13)
                     }
                     .accessibilityLabel("Close")
                 }
@@ -1040,7 +1037,7 @@ struct RefPickerSheet: View {
             }
         } label: {
             HStack(spacing: 12) {
-                LineIconView(.gitBranch, size: 15, color: Theme.textMuted)
+                TablerIconView(.gitBranch, size: 15, color: Theme.textMuted)
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(ref.name)
@@ -1097,7 +1094,7 @@ struct CheckoutPickerSheet: View {
                     SheetLabel("Checkout")
                     SheetCard {
                         row(.local,
-                            icon: selectedRefHasWorktree ? .folderWithFiles : .folder,
+                            icon: selectedRefHasWorktree ? .folders : .folder,
                             title: selectedRefHasWorktree
                                 ? (isJujutsu ? "Current workspace" : "Current worktree")
                                 : "Current checkout",
@@ -1107,7 +1104,7 @@ struct CheckoutPickerSheet: View {
                                    : "Reuse the picked ref's existing worktree")
                                 : "Run in the space's folder as-is")
                         SheetSeparator()
-                        row(.newWorktree, icon: .folderWithFiles,
+                        row(.newWorktree, icon: .folders,
                             title: isJujutsu ? "New workspace" : "New worktree",
                             subtitle: isJujutsu
                                 ? "A fresh isolated workspace created from the picked revision"
@@ -1124,8 +1121,7 @@ struct CheckoutPickerSheet: View {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .semibold))
+                        TablerIconView(.x, size: 13)
                     }
                     .accessibilityLabel("Close")
                 }
@@ -1137,14 +1133,14 @@ struct CheckoutPickerSheet: View {
         .preferredColorScheme(.dark)
     }
 
-    private func row(_ rowKind: CheckoutKind, icon: LineIcon, title: String, subtitle: String) -> some View {
+    private func row(_ rowKind: CheckoutKind, icon: TablerIcon, title: String, subtitle: String) -> some View {
         Button {
             UISelectionFeedbackGenerator().selectionChanged()
             onPick(rowKind)
             dismiss()
         } label: {
             HStack(spacing: 12) {
-                LineIconView(icon, size: 16, color: Theme.textMuted)
+                TablerIconView(icon, size: 16, color: Theme.textMuted)
                     .frame(width: 22)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)

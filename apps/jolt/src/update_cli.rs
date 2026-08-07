@@ -54,6 +54,18 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
                 .unwrap_or_else(super::dirs_data_dir);
             let staged = jolt_update::stage_mac_app(edge_url, &manifest, &data_dir).await?;
             jolt_update::apply_mac_app(&staged, &bundle)?;
+            match jolt_ui::background_service::installed() {
+                Ok(true) => match jolt_update::restart_service() {
+                    Ok(()) => println!("engine service restarted."),
+                    Err(err) => println!(
+                        "note: service restart failed ({err:#}) — restart the engine manually to finish."
+                    ),
+                },
+                Ok(false) => {}
+                Err(err) => println!(
+                    "note: could not check the engine service ({err:#}) — restart it manually if enabled."
+                ),
+            }
             println!("updated {} — relaunch Jolt to finish.", bundle.display());
             Ok(())
         }

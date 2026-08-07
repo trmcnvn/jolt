@@ -417,7 +417,7 @@ impl Shell {
                     }),
             )
             .child(
-                icon(icons::ALT_ARROW_DOWN)
+                icon(icons::CHEVRON_DOWN)
                     .size(px(14.0))
                     .flex_none()
                     .text_color(theme.text_muted.opacity(0.6)),
@@ -624,7 +624,7 @@ impl Shell {
                     .map(|space| space.display_name().to_string())
                     .unwrap_or_else(|| "?".to_string());
                 // Unknown device → no fragment, same as the archived list.
-                if let Some(device) = state.device_name(&chat.device_id) {
+                if let Some(device) = state.device_display_name(&chat.device_id) {
                     folder = format!("{folder}@{device}");
                 }
                 // The branch shows whenever the engine has stamped one —
@@ -704,7 +704,7 @@ impl Shell {
                         .space_for_chat(chat)
                         .map(|space| {
                             let device = state
-                                .device_name(&space.device_id)
+                                .device_display_name(&space.device_id)
                                 .unwrap_or("Unknown device");
                             format!("{} @ {device}", space.display_name())
                         })
@@ -986,7 +986,7 @@ impl Shell {
                 icons::ARROW_DOWN,
                 "Navigate",
             ))
-            .child(popover::key_hint(&theme, icons::RETURN, "Open"));
+            .child(popover::key_hint(&theme, icons::CORNER_DOWN_LEFT, "Open"));
 
         let card = div()
             .id("session-search-palette")
@@ -1772,10 +1772,10 @@ impl Shell {
                 let online = device_presence.get(ix).copied().unwrap_or(false);
                 // The Devices-page platform mapping (settings::devices).
                 let platform_icon = match dev.platform.as_str() {
-                    "macos" | "darwin" => icons::LAPTOP,
-                    "web" => icons::GLOBAL,
-                    "ios" | "android" => icons::SMARTPHONE,
-                    _ => icons::MONITOR,
+                    "macos" | "darwin" => icons::DEVICE_LAPTOP,
+                    "web" => icons::WORLD,
+                    "ios" | "android" => icons::DEVICE_MOBILE,
+                    _ => icons::DEVICE_DESKTOP,
                 };
                 let name: SharedString = dev.name.clone().into();
                 let pick = dev.clone();
@@ -2021,7 +2021,11 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_rename_space(rename_id.clone(), cx)
                         }))
-                        .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
+                        .child(
+                            icon(icons::PENCIL)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
                         .child(SharedString::from("Rename…")),
                 )
                 .child(popover::menu_separator())
@@ -2034,11 +2038,7 @@ impl Shell {
                             this.delete_space_confirm = Some(delete_id.clone());
                             cx.notify();
                         }))
-                        .child(
-                            icon(icons::TRASH_BIN_MINIMALISTIC)
-                                .size(px(16.0))
-                                .text_color(theme.danger),
-                        )
+                        .child(icon(icons::TRASH).size(px(16.0)).text_color(theme.danger))
                         .child(SharedString::from("Remove…")),
                 )
                 .into_any_element();
@@ -2099,7 +2099,7 @@ impl Shell {
                         .map(|s| s.display_name().to_string())
                         .unwrap_or_else(|| "this space".into()),
                     space
-                        .and_then(|s| state.device_name(&s.device_id))
+                        .and_then(|s| state.device_display_name(&s.device_id))
                         .unwrap_or("its device")
                         .to_string(),
                     state.chats_in_space(&space_id).len(),

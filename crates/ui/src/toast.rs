@@ -33,7 +33,7 @@ impl ToastKind {
         match self {
             Self::Info => icons::INFO_CIRCLE,
             Self::Success => icons::CHECK,
-            Self::Warning | Self::Error => icons::DANGER_TRIANGLE,
+            Self::Warning | Self::Error => icons::ALERT_TRIANGLE,
         }
     }
 
@@ -336,7 +336,7 @@ impl Render for ToastCenter {
                             center.dismiss_in_app(close_dismiss_id.as_ref(), cx);
                         }))
                         .child(
-                            icons::icon(icons::CLOSE)
+                            icons::icon(icons::X)
                                 .size(px(13.0))
                                 .text_color(theme.text_muted),
                         ),

@@ -49,6 +49,8 @@ The saved WorkOS session is `~/.jolt/session.json` by default and is written wit
 
 ## Daemon management
 
+The desktop exposes the same macOS/Linux service through **Settings → Devices → Keep this device available**. Changing it restarts the app so engine ownership transfers safely.
+
 ```bash
 jolt daemon install
 jolt daemon uninstall
@@ -73,7 +75,7 @@ For the macOS LaunchAgent, the default service log is `~/.jolt/daemon.log`.
 
 ## Updates
 
-Jolt polls the edge release manifest every six hours after startup. The UI reports available versions and can update a packaged macOS app or a managed remote device.
+Jolt polls the edge release manifest every six hours after startup. The UI reports available versions and can update a packaged macOS app or a managed remote device. Restarting after a macOS app update also restarts an installed background engine so both processes load the same release.
 
 Managed Linux installs use versioned directories under `~/.jolt/app/<version>` and an atomic `current` symlink. Downloads are verified against the release manifest's SHA-256 when present. On startup, the active version refreshes its desktop launcher and icon, including for installations created before desktop integration was available.
 

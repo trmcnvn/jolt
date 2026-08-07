@@ -23,7 +23,7 @@ jolt update      # update to the latest release
 jolt daemon start|stop|restart|status
 ```
 
-On macOS: build `jolt` from source, then `jolt daemon install` (launchd).
+On macOS and Linux desktops, enable **Settings → Devices → Keep this device available** to run the engine in the background. The CLI equivalent is `jolt daemon install`.
 
 ## Agent CLIs
 

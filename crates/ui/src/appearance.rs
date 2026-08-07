@@ -25,11 +25,7 @@ use gpui::{App, Global, SharedString, Subscription, Window};
 use serde::{Deserialize, Serialize};
 
 use crate::settings::UiSettings;
-use crate::theme::{
-    Appearance, DEFAULT_CODE_FONT, DEFAULT_UI_FONT, FontSizes, MAX_CODE_FONT_SIZE,
-    MAX_INTERFACE_FONT_SIZE, MAX_PROMPT_FONT_SIZE, MAX_TERMINAL_FONT_SIZE, MIN_CODE_FONT_SIZE,
-    MIN_INTERFACE_FONT_SIZE, MIN_PROMPT_FONT_SIZE, MIN_TERMINAL_FONT_SIZE, Theme,
-};
+use crate::theme::{Appearance, DEFAULT_CODE_FONT, DEFAULT_UI_FONT, Theme};
 use crate::themes::{EditableTheme, JOLT_THEME_ID, ThemeCatalog, ThemeSummary};
 
 /// The user's appearance preference. Persisted in `ui-settings.json`.
@@ -73,7 +69,6 @@ pub struct AppearanceState {
     pub prompt_font: SharedString,
     pub code_font: SharedString,
     pub terminal_font: SharedString,
-    pub font_sizes: FontSizes,
     /// Where `ui-settings.json` lives, so a menu action can persist the choice
     /// without routing through the shell entity that normally owns settings.
     pub data_dir: PathBuf,
@@ -88,28 +83,6 @@ pub enum FontRole {
     Prompt,
     Code,
     Terminal,
-}
-
-/// Which independently configurable font size a preference controls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FontSizeRole {
-    Interface,
-    Prompt,
-    Code,
-    Terminal,
-}
-
-impl FontSizeRole {
-    pub const ALL: [Self; 4] = [Self::Interface, Self::Prompt, Self::Code, Self::Terminal];
-
-    pub fn range(self) -> std::ops::RangeInclusive<u8> {
-        match self {
-            Self::Interface => MIN_INTERFACE_FONT_SIZE..=MAX_INTERFACE_FONT_SIZE,
-            Self::Prompt => MIN_PROMPT_FONT_SIZE..=MAX_PROMPT_FONT_SIZE,
-            Self::Code => MIN_CODE_FONT_SIZE..=MAX_CODE_FONT_SIZE,
-            Self::Terminal => MIN_TERMINAL_FONT_SIZE..=MAX_TERMINAL_FONT_SIZE,
-        }
-    }
 }
 
 /// Combine the user's choice with the OS state.
@@ -142,7 +115,6 @@ pub fn init(
     prompt_font: impl AsRef<str>,
     code_font: impl AsRef<str>,
     terminal_font: impl AsRef<str>,
-    font_sizes: FontSizes,
     data_dir: impl Into<PathBuf>,
     cx: &mut App,
 ) {
@@ -175,19 +147,10 @@ pub fn init(
         prompt_font: prompt_font.clone().into(),
         code_font: code_font.clone().into(),
         terminal_font: terminal_font.clone().into(),
-        font_sizes: font_sizes.clamped(),
         data_dir,
     });
     sync_ns_appearance(mode);
-    Theme::install_resolved_with_fonts(
-        theme,
-        ui_font,
-        prompt_font,
-        code_font,
-        terminal_font,
-        font_sizes,
-        cx,
-    );
+    Theme::install_resolved_with_fonts(theme, ui_font, prompt_font, code_font, terminal_font, cx);
 }
 
 /// The mode currently in effect (defaults to `System` before [`init`]).
@@ -386,13 +349,6 @@ pub fn font_families(cx: &App) -> (SharedString, SharedString, SharedString, Sha
         })
 }
 
-/// The effective interface, prompt, code, and terminal font sizes.
-pub fn font_sizes(cx: &App) -> FontSizes {
-    cx.try_global::<AppearanceState>()
-        .map(|state| state.font_sizes)
-        .unwrap_or_default()
-}
-
 /// Change the user's preference, repaint if that changed the palette, and write
 /// the choice to disk.
 pub fn set_mode(mode: AppearanceMode, cx: &mut App) {
@@ -434,27 +390,6 @@ pub fn set_font(role: FontRole, family: impl AsRef<str>, cx: &mut App) {
     persist_current(cx);
 }
 
-/// Change one font size, immediately re-lay out every window, and persist it.
-pub fn set_font_size(role: FontSizeRole, size: u8, cx: &mut App) {
-    if !cx.has_global::<AppearanceState>() {
-        return;
-    }
-    let state = cx.global_mut::<AppearanceState>();
-    let size = size.clamp(*role.range().start(), *role.range().end());
-    let target = match role {
-        FontSizeRole::Interface => &mut state.font_sizes.interface,
-        FontSizeRole::Prompt => &mut state.font_sizes.prompt,
-        FontSizeRole::Code => &mut state.font_sizes.code,
-        FontSizeRole::Terminal => &mut state.font_sizes.terminal,
-    };
-    if *target == size {
-        return;
-    }
-    *target = size;
-    apply(cx);
-    persist_current(cx);
-}
-
 /// Resolve a persisted family against the current machine's catalogue. Family
 /// names are matched case-insensitively, preserving the platform's spelling.
 pub fn resolve_font_family(requested: &str, fallback: &str, available: &[String]) -> String {
@@ -489,7 +424,6 @@ fn persist_current(cx: &App) {
         &state.prompt_font,
         &state.code_font,
         &state.terminal_font,
-        state.font_sizes,
         &state.data_dir,
     );
 }
@@ -503,7 +437,6 @@ fn persist(
     prompt_font: &str,
     code_font: &str,
     terminal_font: &str,
-    font_sizes: FontSizes,
     data_dir: &Path,
 ) {
     let mut settings = UiSettings::load(data_dir);
@@ -514,10 +447,6 @@ fn persist(
     settings.prompt_font = prompt_font.to_string();
     settings.code_font = code_font.to_string();
     settings.terminal_font = terminal_font.to_string();
-    settings.font_size_interface = font_sizes.interface;
-    settings.font_size_prompt = font_sizes.prompt;
-    settings.font_size_code = font_sizes.code;
-    settings.font_size_terminal = font_sizes.terminal;
     if let Err(err) = settings.save(data_dir) {
         tracing::warn!(error = %err, "could not persist appearance");
     }
@@ -587,7 +516,6 @@ pub fn apply(cx: &mut App) {
     let prompt_font = state.prompt_font.clone();
     let code_font = state.code_font.clone();
     let terminal_font = state.terminal_font.clone();
-    let font_sizes = state.font_sizes;
     let changed = !cx.try_global::<Theme>().is_some_and(|theme| {
         theme.palette_id == wanted.palette_id
             && theme.palette_revision == wanted.palette_revision
@@ -596,7 +524,6 @@ pub fn apply(cx: &mut App) {
             && theme.font_prompt == prompt_font
             && theme.font_mono == code_font
             && theme.font_terminal == terminal_font
-            && theme.font_sizes == font_sizes
     });
     if changed {
         tracing::debug!(appearance = ?wanted.appearance, palette = %wanted.palette_id, %ui_font, %prompt_font, %code_font, %terminal_font, "appearance: installing theme");
@@ -606,7 +533,6 @@ pub fn apply(cx: &mut App) {
             prompt_font,
             code_font,
             terminal_font,
-            font_sizes,
             cx,
         );
         cx.refresh_windows();
@@ -703,14 +629,6 @@ mod tests {
     #[test]
     fn default_mode_is_system() {
         assert_eq!(AppearanceMode::default(), AppearanceMode::System);
-    }
-
-    #[test]
-    fn font_size_roles_expose_bounded_non_empty_ranges() {
-        for role in FontSizeRole::ALL {
-            let range = role.range();
-            assert!(range.start() < range.end(), "{role:?}");
-        }
     }
 
     #[test]

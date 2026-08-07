@@ -577,6 +577,13 @@ enum UpdateFlow {
     Failed,
 }
 
+fn app_update_available(status: &jolt_update::UpdateStatus) -> bool {
+    status
+        .latest_version
+        .as_deref()
+        .is_some_and(|latest| jolt_update::version_newer(latest, jolt_update::current_version()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum UsageWarningLevel {
     Normal,
@@ -601,9 +608,21 @@ struct OrgGateUi {
 
 struct BreakdownDialog {
     days: u16,
-    data: Loadable<UsageBreakdown>,
+    data: Loadable<MergedUsageBreakdown>,
     unavailable_devices: usize,
     task: Option<Task<()>>,
+}
+
+#[derive(Debug, Clone)]
+struct DeviceUsageBreakdownRow {
+    device_id: String,
+    usage: UsageBreakdownRow,
+}
+
+#[derive(Debug, Clone)]
+struct MergedUsageBreakdown {
+    totals: UsageBreakdown,
+    rows: Vec<DeviceUsageBreakdownRow>,
 }
 
 fn add_reported_cost(total: &mut Option<f64>, value: Option<f64>) {
@@ -612,28 +631,30 @@ fn add_reported_cost(total: &mut Option<f64>, value: Option<f64>) {
     }
 }
 
-fn merge_breakdowns(days: u16, breakdowns: Vec<UsageBreakdown>) -> UsageBreakdown {
-    let mut merged = UsageBreakdown {
+fn merge_breakdowns(days: u16, breakdowns: Vec<UsageBreakdown>) -> MergedUsageBreakdown {
+    let mut totals = UsageBreakdown {
         days,
         device_id: "all".into(),
         ..UsageBreakdown::default()
     };
     let mut activity: std::collections::BTreeMap<String, UsageDay> =
         std::collections::BTreeMap::new();
-    let mut rows: std::collections::HashMap<(HarnessId, String, String), UsageBreakdownRow> =
-        std::collections::HashMap::new();
+    let mut rows: std::collections::HashMap<
+        (String, HarnessId, String, String),
+        DeviceUsageBreakdownRow,
+    > = std::collections::HashMap::new();
     for breakdown in breakdowns {
-        merged.sessions = merged.sessions.saturating_add(breakdown.sessions);
-        merged.calls = merged.calls.saturating_add(breakdown.calls);
-        merged.input_tokens = merged.input_tokens.saturating_add(breakdown.input_tokens);
-        merged.output_tokens = merged.output_tokens.saturating_add(breakdown.output_tokens);
-        merged.cache_read_input_tokens = merged
+        totals.sessions = totals.sessions.saturating_add(breakdown.sessions);
+        totals.calls = totals.calls.saturating_add(breakdown.calls);
+        totals.input_tokens = totals.input_tokens.saturating_add(breakdown.input_tokens);
+        totals.output_tokens = totals.output_tokens.saturating_add(breakdown.output_tokens);
+        totals.cache_read_input_tokens = totals
             .cache_read_input_tokens
             .saturating_add(breakdown.cache_read_input_tokens);
-        merged.cache_write_input_tokens = merged
+        totals.cache_write_input_tokens = totals
             .cache_write_input_tokens
             .saturating_add(breakdown.cache_write_input_tokens);
-        add_reported_cost(&mut merged.cost_usd, breakdown.cost_usd);
+        add_reported_cost(&mut totals.cost_usd, breakdown.cost_usd);
         for day in breakdown.activity {
             let entry = activity.entry(day.day.clone()).or_insert_with(|| UsageDay {
                 day: day.day,
@@ -644,38 +665,46 @@ fn merge_breakdowns(days: u16, breakdowns: Vec<UsageBreakdown>) -> UsageBreakdow
             add_reported_cost(&mut entry.cost_usd, day.cost_usd);
         }
         for row in breakdown.rows {
-            let key = (row.harness, row.model.clone(), row.cwd.clone());
-            let entry = rows.entry(key).or_insert_with(|| UsageBreakdownRow {
-                harness: row.harness,
-                model: row.model.clone(),
-                cwd: row.cwd.clone(),
-                sessions: 0,
-                calls: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_input_tokens: 0,
-                cache_write_input_tokens: 0,
-                cost_usd: None,
+            let key = (
+                breakdown.device_id.clone(),
+                row.harness,
+                row.model.clone(),
+                row.cwd.clone(),
+            );
+            let entry = rows.entry(key).or_insert_with(|| DeviceUsageBreakdownRow {
+                device_id: breakdown.device_id.clone(),
+                usage: UsageBreakdownRow {
+                    harness: row.harness,
+                    model: row.model.clone(),
+                    cwd: row.cwd.clone(),
+                    sessions: 0,
+                    calls: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    cost_usd: None,
+                },
             });
-            entry.sessions = entry.sessions.saturating_add(row.sessions);
-            entry.calls = entry.calls.saturating_add(row.calls);
-            entry.input_tokens = entry.input_tokens.saturating_add(row.input_tokens);
-            entry.output_tokens = entry.output_tokens.saturating_add(row.output_tokens);
-            entry.cache_read_input_tokens = entry
+            entry.usage.sessions = entry.usage.sessions.saturating_add(row.sessions);
+            entry.usage.calls = entry.usage.calls.saturating_add(row.calls);
+            entry.usage.input_tokens = entry.usage.input_tokens.saturating_add(row.input_tokens);
+            entry.usage.output_tokens = entry.usage.output_tokens.saturating_add(row.output_tokens);
+            entry.usage.cache_read_input_tokens = entry
+                .usage
                 .cache_read_input_tokens
                 .saturating_add(row.cache_read_input_tokens);
-            entry.cache_write_input_tokens = entry
+            entry.usage.cache_write_input_tokens = entry
+                .usage
                 .cache_write_input_tokens
                 .saturating_add(row.cache_write_input_tokens);
-            add_reported_cost(&mut entry.cost_usd, row.cost_usd);
+            add_reported_cost(&mut entry.usage.cost_usd, row.cost_usd);
         }
     }
-    merged.activity = activity.into_values().collect();
-    merged.rows = rows.into_values().collect();
-    merged
-        .rows
-        .sort_by_key(|row| std::cmp::Reverse(row.total_tokens()));
-    merged
+    totals.activity = activity.into_values().collect();
+    let mut rows: Vec<_> = rows.into_values().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.usage.total_tokens()));
+    MergedUsageBreakdown { totals, rows }
 }
 
 fn compact_number(value: u64) -> String {
@@ -708,6 +737,7 @@ struct JumpToBottom {
 
 pub struct Shell {
     state: Entity<AppState>,
+    background_service: crate::background_service::BackgroundServiceController,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
     /// Independent copy of the composer's target-space picker for the empty
@@ -881,7 +911,12 @@ fn scope_key(scope: jolt_engine::ScopeKind) -> &'static str {
 }
 
 impl Shell {
-    pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        state: Entity<AppState>,
+        boot: EngineBootConfig,
+        background_service: crate::background_service::BackgroundServiceController,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
             cx.notify();
@@ -1030,6 +1065,7 @@ impl Shell {
             crate::debug::performance_hud_requested().then(|| cx.new(PerformanceHud::new));
         Self {
             state,
+            background_service,
             transcript,
             composer,
             new_chat_space_picker,
@@ -1353,7 +1389,9 @@ impl Shell {
             .read(cx)
             .update
             .as_ref()
-            .filter(|status| status.update_available)
+            // A long-running background engine may predate this app bundle.
+            // Announce releases newer than the viewport, not newer than that engine.
+            .filter(|status| app_update_available(status))
             .and_then(|status| status.latest_version.clone())
         else {
             return;
@@ -1450,6 +1488,15 @@ impl Shell {
         cx.notify();
     }
 
+    /// Expanded panels unmount the sidebar. Drop its FLIP baseline and stale
+    /// offsets so remounting establishes the current order without replaying a
+    /// completed resort animation.
+    fn reset_sidebar_resort(&mut self) {
+        self.sidebar_prev_order.clear();
+        self.sidebar_resort.clear();
+        self.sidebar_new_keys.clear();
+    }
+
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
         // No git in this space → no diff pane, Cmd-B goes dead.
         if !self.space_git_detected(cx) {
@@ -1482,6 +1529,9 @@ impl Shell {
             return;
         }
         self.changes_expanded = expanded;
+        if expanded {
+            self.reset_sidebar_resort();
+        }
         if let Some(changes) = self.changes.clone() {
             changes.update(cx, |changes, cx| changes.set_expanded_view(expanded, cx));
         }
@@ -1589,6 +1639,9 @@ impl Shell {
             return;
         }
         self.terminal_expanded = expanded;
+        if expanded {
+            self.reset_sidebar_resort();
+        }
         if let Some(terminal) = self.terminal.clone() {
             terminal.update(cx, |terminal, cx| terminal.set_expanded_view(expanded, cx));
         }
@@ -1731,11 +1784,6 @@ impl Shell {
                 shell.settings.prompt_font = prompt_font.to_string();
                 shell.settings.code_font = code_font.to_string();
                 shell.settings.terminal_font = terminal_font.to_string();
-                let sizes = crate::appearance::font_sizes(cx);
-                shell.settings.font_size_interface = sizes.interface;
-                shell.settings.font_size_prompt = sizes.prompt;
-                shell.settings.font_size_code = sizes.code;
-                shell.settings.font_size_terminal = sizes.terminal;
                 if let Some(scope) = shell.observed_scope {
                     shell.settings.scope_navigation.insert(
                         scope_key(scope).into(),
@@ -1867,7 +1915,9 @@ impl Shell {
             SettingsSection::Devices => {
                 if self.devices_page.is_none() {
                     let state = self.state.clone();
-                    self.devices_page = Some(cx.new(|cx| DevicesPage::new(state, cx)));
+                    let background_service = self.background_service.clone();
+                    self.devices_page =
+                        Some(cx.new(|cx| DevicesPage::new(state, background_service, cx)));
                 }
                 match &self.devices_page {
                     Some(page) => page.clone().into_any_element(),
@@ -2485,7 +2535,7 @@ impl Shell {
             .children(self.titlebar_spacer(12.0))
             .child(window_control_button(
                 "toggle-sidebar",
-                icons::SIDEBAR_MINIMALISTIC_LEFT,
+                icons::LAYOUT_SIDEBAR,
                 &theme,
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
             ))
@@ -2582,12 +2632,12 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
-            SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::Devices => icons::DEVICE_DESKTOP,
             SettingsSection::Agents => icons::USER,
-            SettingsSection::Secrets => icons::KEY_MINIMALISTIC,
+            SettingsSection::Secrets => icons::KEY,
             SettingsSection::VersionControl => icons::GIT_BRANCH,
-            SettingsSection::Terminal => icons::TERMINAL,
-            SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Terminal => icons::TERMINAL_2,
+            SettingsSection::Appearance => icons::ADJUSTMENTS_HORIZONTAL,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Hotkeys => icons::KEYBOARD,
         };
@@ -2672,7 +2722,7 @@ impl Shell {
                         .child(
                             // Use the AltArrowLeft chevron, not the straight
                             // history arrow.
-                            icon(icons::ALT_ARROW_LEFT)
+                            icon(icons::CHEVRON_LEFT)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
@@ -2849,7 +2899,7 @@ impl Shell {
                                                 this.archive_chat(archive_id.clone(), cx);
                                             }))
                                             .child(
-                                                icon(icons::ARCHIVE_MINIMALISTIC)
+                                                icon(icons::ARCHIVE)
                                                     .size(px(12.0))
                                                     .text_color(theme.text_muted),
                                             ),
@@ -2880,7 +2930,7 @@ impl Shell {
                                                 this.confirm_delete_chat(delete_id.clone(), cx);
                                             }))
                                             .child(
-                                                icon(icons::TRASH_BIN_MINIMALISTIC)
+                                                icon(icons::TRASH)
                                                     .size(px(12.0))
                                                     .text_color(theme.danger),
                                             ),
@@ -3129,7 +3179,7 @@ impl Shell {
                                                 this.open_session_search(cx)
                                             }))
                                             .child(
-                                                icon(icons::MAGNIFER)
+                                                icon(icons::SEARCH)
                                                     .size(px(14.0))
                                                     .text_color(theme.text_muted.opacity(0.7)),
                                             ),
@@ -3324,15 +3374,18 @@ impl Shell {
         );
     }
 
-    /// Swap the staged bundle over the installed one, arm the detached
-    /// relauncher, and quit — the relauncher `open`s the new bundle once this
-    /// process (and its engine lock / IPC port) is gone.
+    /// Swap the staged bundle over the installed one, restart an installed
+    /// background engine during graceful app teardown, then relaunch the new
+    /// bundle once this process (and its engine lock / IPC port) is gone.
     fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
         let jolt_update::InstallKind::MacApp { bundle } = self.install.clone() else {
             return;
         };
         match jolt_update::apply_mac_app(&staged, &bundle) {
             Ok(()) => {
+                if self.background_service.enabled() {
+                    self.background_service.request_restart();
+                }
                 jolt_update::relaunch_app_after_exit(&bundle);
                 cx.quit();
             }
@@ -3417,13 +3470,9 @@ impl Shell {
             // The menu is exactly as wide as the trigger row: sidebar minus
             // its gutters. Local and Account share settings/update actions;
             // only their final scope/auth actions differ.
-            let (active_scope, account_available, scopes_supported) = {
+            let (active_scope, account_available) = {
                 let state = self.state.read(cx);
-                (
-                    state.active_scope(),
-                    state.account_available(),
-                    state.scope.is_some(),
-                )
+                (state.active_scope(), state.account_available())
             };
             let mut scope_rows: Vec<AnyElement> = match active_scope {
                 jolt_engine::ScopeKind::Account => vec![
@@ -3431,7 +3480,7 @@ impl Shell {
                         .id("user-menu-signout")
                         .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
                         .child(
-                            icon(icons::LOGOUT_2)
+                            icon(icons::LOGOUT)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
@@ -3445,7 +3494,7 @@ impl Shell {
                             this.switch_scope(jolt_engine::ScopeKind::Account, cx)
                         }))
                         .child(
-                            icon(icons::GLOBAL)
+                            icon(icons::WORLD)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
@@ -3457,7 +3506,7 @@ impl Shell {
                         .id("user-menu-signin")
                         .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
                         .child(
-                            icon(icons::GLOBAL)
+                            icon(icons::WORLD)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
@@ -3465,7 +3514,7 @@ impl Shell {
                         .into_any_element(),
                 ],
             };
-            if active_scope == jolt_engine::ScopeKind::Account && scopes_supported {
+            if active_scope == jolt_engine::ScopeKind::Account {
                 scope_rows.insert(
                     0,
                     popover::menu_row(theme, false, "user-menu-switch-local")
@@ -3474,7 +3523,7 @@ impl Shell {
                             this.switch_scope(jolt_engine::ScopeKind::Local, cx)
                         }))
                         .child(
-                            icon(icons::LAPTOP)
+                            icon(icons::DEVICE_LAPTOP)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
@@ -3510,7 +3559,7 @@ impl Shell {
                             this.open_settings(SettingsSection::Devices, cx)
                         }))
                         .child(
-                            icon(icons::SETTINGS_MINIMALISTIC)
+                            icon(icons::SETTINGS)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
@@ -3521,7 +3570,7 @@ impl Shell {
                         .id("user-menu-archived")
                         .on_click(cx.listener(|this, _, _, cx| this.open_archived(cx)))
                         .child(
-                            icon(icons::ARCHIVE_MINIMALISTIC)
+                            icon(icons::ARCHIVE)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
@@ -3554,7 +3603,7 @@ impl Shell {
                     }))
                     .child(
                         icon(if update_ready {
-                            icons::RESTART
+                            icons::RELOAD
                         } else {
                             icons::REFRESH
                         })
@@ -3750,14 +3799,15 @@ impl Shell {
                 );
             }
             Loadable::Ready(breakdown) => {
-                let cost = breakdown
+                let totals = &breakdown.totals;
+                let cost = totals
                     .cost_usd
                     .map(|value| format!("${value:.2}"))
                     .unwrap_or_else(|| "—".into());
                 let summaries = [
-                    ("Sessions", compact_number(breakdown.sessions)),
-                    ("Output", compact_number(breakdown.output_tokens)),
-                    ("Tokens", compact_number(breakdown.total_tokens())),
+                    ("Sessions", compact_number(totals.sessions)),
+                    ("Output", compact_number(totals.output_tokens)),
+                    ("Tokens", compact_number(totals.total_tokens())),
                     ("Reported cost", cost),
                 ];
                 body = body.child(
@@ -3789,19 +3839,19 @@ impl Shell {
                         })),
                 );
 
-                let by_day: std::collections::HashMap<_, _> = breakdown
+                let by_day: std::collections::HashMap<_, _> = totals
                     .activity
                     .iter()
                     .map(|day| (day.day.as_str(), day.tokens))
                     .collect();
-                let max_tokens = breakdown
+                let max_tokens = totals
                     .activity
                     .iter()
                     .map(|day| day.tokens)
                     .max()
                     .unwrap_or(1)
                     .max(1);
-                let cells = (0..breakdown.days).rev().map(|offset| {
+                let cells = (0..totals.days).rev().map(|offset| {
                     let day = (chrono::Local::now().date_naive()
                         - chrono::Duration::days(i64::from(offset)))
                     .format("%Y-%m-%d")
@@ -3827,12 +3877,29 @@ impl Shell {
                         .child(div().flex().flex_wrap().gap(px(4.0)).children(cells)),
                 );
 
+                let device_names: std::collections::HashMap<_, _> = {
+                    let state = self.state.read(cx);
+                    breakdown
+                        .rows
+                        .iter()
+                        .filter_map(|row| {
+                            state
+                                .device_display_name(&row.device_id)
+                                .map(|name| (row.device_id.clone(), name.to_string()))
+                        })
+                        .collect()
+                };
                 let mut rows = div().flex().flex_col();
-                for row in breakdown.rows.iter().take(8) {
+                for device_row in breakdown.rows.iter().take(8) {
+                    let row = &device_row.usage;
                     let location = std::path::Path::new(&row.cwd)
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or(&row.cwd);
+                    let device = device_names
+                        .get(&device_row.device_id)
+                        .map(String::as_str)
+                        .unwrap_or(&device_row.device_id);
                     rows = rows.child(
                         div()
                             .h(px(34.0))
@@ -3865,6 +3932,13 @@ impl Shell {
                             )
                             .child(
                                 div()
+                                    .w(px(100.0))
+                                    .truncate()
+                                    .text_color(theme.text_muted)
+                                    .child(device.to_string()),
+                            )
+                            .child(
+                                div()
                                     .w(px(64.0))
                                     .text_right()
                                     .text_color(theme.text)
@@ -3880,7 +3954,7 @@ impl Shell {
                                 .text_size(px(11.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text_muted)
-                                .child("Harness · model · space"),
+                                .child("Harness · model · space · device"),
                         )
                         .child(rows),
                 );
@@ -4046,7 +4120,11 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_rename_chat(rename_id.clone(), cx)
                         }))
-                        .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
+                        .child(
+                            icon(icons::PENCIL)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
                         .child(SharedString::from("Rename…")),
                 )
                 .child(
@@ -4069,7 +4147,7 @@ impl Shell {
                             this.archive_chat(archive_id.clone(), cx)
                         }))
                         .child(
-                            icon(icons::ARCHIVE_MINIMALISTIC)
+                            icon(icons::ARCHIVE)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
@@ -4083,11 +4161,7 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.confirm_delete_chat(delete_id.clone(), cx)
                         }))
-                        .child(
-                            icon(icons::TRASH_BIN_MINIMALISTIC)
-                                .size(px(16.0))
-                                .text_color(theme.danger),
-                        )
+                        .child(icon(icons::TRASH).size(px(16.0)).text_color(theme.danger))
                         .child(SharedString::from("Delete…")),
                 )
                 .into_any_element();
@@ -5076,7 +5150,7 @@ fn window_control_button(
         .on_hover(motion::hover_listener(fade_key))
         // Buttons in/over a titlebar drag strip must be EXCLUDED from the
         // strip's event surface entirely. `.occlude()` (gpui
-        // `HitboxBehavior::BlockMouse`) makes the window hit-test STOP at the
+        // `HitboxBehavior::BlockMouse`) makes the window hit-test SQUARE at the
         // button, so every `is_hovered`-guarded strip listener — the
         // mouse-down that arms the drag, the mouse-move that hands AppKit a
         // native drag session (`performWindowDragWithEvent:`, whose second
@@ -5686,6 +5760,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stale_engine_does_not_announce_the_installed_app_version() {
+        let status = jolt_update::UpdateStatus {
+            current_version: "0.1.4".into(),
+            latest_version: Some(jolt_update::current_version().into()),
+            update_available: true,
+            checked_at: None,
+            error: None,
+        };
+
+        assert!(!app_update_available(&status));
+    }
+
+    #[test]
     fn account_usage_warnings_match_account_meter_thresholds() {
         assert_eq!(usage_warning_level(0.79), UsageWarningLevel::Normal);
         assert_eq!(usage_warning_level(0.80), UsageWarningLevel::Warning);
@@ -5694,7 +5781,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_breakdowns_merge_devices_by_day_and_model() {
+    fn usage_breakdowns_preserve_devices_while_merging_totals() {
         let row = |tokens| UsageBreakdownRow {
             harness: HarnessId::Pi,
             model: "anthropic/sonnet".into(),
@@ -5724,12 +5811,14 @@ mod tests {
             ..UsageBreakdown::default()
         };
         let merged = merge_breakdowns(30, vec![report("a", 10), report("b", 20)]);
-        assert_eq!(merged.sessions, 2);
-        assert_eq!(merged.total_tokens(), 30);
-        assert_eq!(merged.cost_usd, Some(0.5));
-        assert_eq!(merged.activity[0].tokens, 30);
-        assert_eq!(merged.rows[0].sessions, 2);
-        assert_eq!(merged.rows[0].total_tokens(), 30);
+        assert_eq!(merged.totals.sessions, 2);
+        assert_eq!(merged.totals.total_tokens(), 30);
+        assert_eq!(merged.totals.cost_usd, Some(0.5));
+        assert_eq!(merged.totals.activity[0].tokens, 30);
+        assert_eq!(merged.rows.len(), 2);
+        assert_eq!(merged.rows[0].device_id, "b");
+        assert_eq!(merged.rows[0].usage.sessions, 1);
+        assert_eq!(merged.rows[0].usage.total_tokens(), 20);
     }
 
     #[test]

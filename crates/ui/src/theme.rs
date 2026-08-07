@@ -39,20 +39,12 @@ use gpui::{App, Global, Hsla, SharedString, hsla};
 pub const DEFAULT_UI_FONT: &str = "Geist";
 pub const DEFAULT_CODE_FONT: &str = "Geist Mono";
 
-pub const MIN_INTERFACE_FONT_SIZE: u8 = 12;
-pub const MAX_INTERFACE_FONT_SIZE: u8 = 20;
 pub const DEFAULT_INTERFACE_FONT_SIZE: u8 = 14;
-pub const MIN_PROMPT_FONT_SIZE: u8 = 12;
-pub const MAX_PROMPT_FONT_SIZE: u8 = 20;
 pub const DEFAULT_PROMPT_FONT_SIZE: u8 = 14;
-pub const MIN_CODE_FONT_SIZE: u8 = 10;
-pub const MAX_CODE_FONT_SIZE: u8 = 18;
 pub const DEFAULT_CODE_FONT_SIZE: u8 = 13;
-pub const MIN_TERMINAL_FONT_SIZE: u8 = 8;
-pub const MAX_TERMINAL_FONT_SIZE: u8 = 20;
 pub const DEFAULT_TERMINAL_FONT_SIZE: u8 = 13;
 
-/// The four independently configurable type scales, in logical pixels.
+/// The fixed interface, prompt, code, and terminal type scales, in logical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FontSizes {
     pub interface: u8,
@@ -62,21 +54,6 @@ pub struct FontSizes {
 }
 
 impl FontSizes {
-    pub fn clamped(self) -> Self {
-        Self {
-            interface: self
-                .interface
-                .clamp(MIN_INTERFACE_FONT_SIZE, MAX_INTERFACE_FONT_SIZE),
-            prompt: self
-                .prompt
-                .clamp(MIN_PROMPT_FONT_SIZE, MAX_PROMPT_FONT_SIZE),
-            code: self.code.clamp(MIN_CODE_FONT_SIZE, MAX_CODE_FONT_SIZE),
-            terminal: self
-                .terminal
-                .clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE),
-        }
-    }
-
     pub fn interface_line_height(self) -> f32 {
         f32::from(self.interface) + 8.0
     }
@@ -672,7 +649,6 @@ impl Theme {
             DEFAULT_UI_FONT,
             DEFAULT_CODE_FONT,
             DEFAULT_CODE_FONT,
-            FontSizes::default(),
             cx,
         );
     }
@@ -684,7 +660,6 @@ impl Theme {
         prompt_font: impl Into<SharedString>,
         code_font: impl Into<SharedString>,
         terminal_font: impl Into<SharedString>,
-        font_sizes: FontSizes,
         cx: &mut App,
     ) {
         Self::install_resolved_with_fonts(
@@ -693,7 +668,6 @@ impl Theme {
             prompt_font,
             code_font,
             terminal_font,
-            font_sizes,
             cx,
         );
     }
@@ -705,14 +679,13 @@ impl Theme {
         prompt_font: impl Into<SharedString>,
         code_font: impl Into<SharedString>,
         terminal_font: impl Into<SharedString>,
-        font_sizes: FontSizes,
         cx: &mut App,
     ) {
         let ui_font = ui_font.into();
         let prompt_font = prompt_font.into();
         let code_font = code_font.into();
         let terminal_font = terminal_font.into();
-        let font_sizes = font_sizes.clamped();
+        let font_sizes = FontSizes::default();
         let previous = cx.try_global::<Self>();
         let appearance_changed =
             previous.is_some_and(|current| current.appearance != theme.appearance);

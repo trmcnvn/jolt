@@ -18,7 +18,9 @@ use jolt_engine::{
     worktree_branch_from_title,
 };
 use jolt_harness::mock::MockHarness;
-use jolt_proto::{AgentAccountsSnapshot, AgentEvent, DoneStatus, HarnessId, SandboxLevel};
+use jolt_proto::{
+    AgentAccountsSnapshot, AgentEvent, AgentLoginStart, DoneStatus, HarnessId, SandboxLevel,
+};
 use jolt_rpc::methods;
 
 // ---------------------------------------------------------------------------
@@ -372,6 +374,29 @@ fn snapshot_wire_shape() {
     assert_eq!(value, serde_json::json!({ "accounts": [], "warnings": [] }));
 }
 
+#[test]
+fn device_login_start_wire_shape() {
+    let start = AgentLoginStart::DeviceCode {
+        login_id: "login-1".into(),
+        url: "https://auth.openai.com/codex/device".into(),
+        user_code: "ABCD-EFGH".into(),
+    };
+    let value = serde_json::to_value(&start).expect("serializes");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "mode": "device-code",
+            "loginId": "login-1",
+            "url": "https://auth.openai.com/codex/device",
+            "userCode": "ABCD-EFGH",
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<AgentLoginStart>(value).expect("deserializes"),
+        start
+    );
+}
+
 #[tokio::test]
 async fn claude_login_flow_is_pkce_paste_code() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -380,35 +405,28 @@ async fn claude_login_flow_is_pkce_paste_code() {
         .start_login(HarnessId::ClaudeCode)
         .await
         .expect("start");
-    assert!(
-        start
-            .url
-            .starts_with("https://claude.ai/oauth/authorize?code=true")
-    );
-    assert!(start.url.contains("code_challenge_method=S256"));
-    assert!(
-        start
-            .url
-            .contains("redirect_uri=https%3A%2F%2Fconsole.anthropic.com")
-    );
-    let mode = serde_json::to_value(start.mode).expect("mode");
-    assert_eq!(mode, serde_json::json!("paste-code"));
+    let AgentLoginStart::PasteCode { login_id, url } = start else {
+        panic!("Claude login should use paste-code mode");
+    };
+    assert!(url.starts_with("https://claude.ai/oauth/authorize?code=true"));
+    assert!(url.contains("code_challenge_method=S256"));
+    assert!(url.contains("redirect_uri=https%3A%2F%2Fconsole.anthropic.com"));
 
     // Claude flows poll as pending (paste-code completes them); cancel drops the
     // flow so the next poll reports it expired.
-    let poll = accounts.poll_login(&start.login_id).await.expect("poll");
+    let poll = accounts.poll_login(&login_id).await.expect("poll");
     assert_eq!(
         serde_json::to_value(poll.status).expect("status"),
         serde_json::json!("pending")
     );
-    accounts.cancel_login(&start.login_id);
+    accounts.cancel_login(&login_id);
     assert!(
-        accounts.poll_login(&start.login_id).await.is_err(),
+        accounts.poll_login(&login_id).await.is_err(),
         "cancelled flow is gone"
     );
     assert!(
         accounts
-            .complete_login(&start.login_id, "code#state")
+            .complete_login(&login_id, "code#state")
             .await
             .is_err()
     );

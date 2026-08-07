@@ -87,23 +87,27 @@ struct HomeView: View {
                 .sharedBackgroundVisibility(.hidden)
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: openNewSession) {
-                        Image(systemName: "plus")
+                        TablerIconView(.plus, size: 16)
                     }
                     .accessibilityLabel("New session")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        Button("New space", systemImage: "folder.badge.plus") {
+                        Button {
                             showNewSpace = true
+                        } label: {
+                            TablerLabel("New space", icon: .folderPlus)
                         }
                         if model.demo != nil {
                             Text("Demo mode")
                         }
-                        Button("Sign out", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) {
+                        Button(role: .destructive) {
                             model.signOut()
+                        } label: {
+                            TablerLabel("Sign out", icon: .logout)
                         }
                     } label: {
-                        Image(systemName: "person.circle")
+                        TablerIconView(.userCircle, size: 16)
                     }
                 }
             }
@@ -150,16 +154,14 @@ struct HomeView: View {
             showSpaceFilter = true
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: "folder")
-                    .font(.system(size: 13))
+                TablerIconView(.folder, size: 13)
                     .foregroundStyle(Theme.textMuted)
                 Text(filterLabel)
                     .font(Theme.sans(13, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 9, weight: .medium))
+                TablerIconView(.selector, size: 9)
                     .foregroundStyle(Theme.textFaint)
             }
             .padding(.horizontal, 8)
@@ -203,7 +205,7 @@ struct HomeView: View {
                     Button {
                         sessionToDelete = chat
                     } label: {
-                        Label("Delete", systemImage: "trash")
+                        TablerLabel("Delete", icon: .trash)
                     }
                     // The confirmation button owns the destructive role. Giving
                     // it to this trigger makes List optimistically remove the row.
@@ -213,7 +215,7 @@ struct HomeView: View {
                     Button {
                         model.archive(chatId: chat.id)
                     } label: {
-                        Label("Archive", systemImage: "archivebox")
+                        TablerLabel("Archive", icon: .archive)
                     }
                     .tint(Theme.surfaceRaised)
                 }
@@ -296,7 +298,7 @@ struct SpaceFilterSheet: View {
             dismiss()
         } label: {
             HStack(spacing: 10) {
-                Image(systemName: "folder")
+                TablerIconView(.folder)
                     .foregroundStyle(Theme.textMuted)
                 Text(label)
                     .foregroundStyle(Theme.text)
@@ -377,7 +379,7 @@ struct ChatRow: View {
                     HarnessBadge(harness: harness, size: 11, neutral: subline)
                 }
                 if let branch = chat.branch?.trimmingCharacters(in: .whitespaces), !branch.isEmpty {
-                    LineIconView(.gitBranch, size: 11, color: subline)
+                    TablerIconView(.gitBranch, size: 11, color: subline)
                     Text(branch)
                         .font(Theme.sans(11))
                         .foregroundStyle(subline)

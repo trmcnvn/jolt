@@ -307,7 +307,7 @@ private struct FormulaOrSource: View {
                 Button {
                     UIPasteboard.general.string = run.text
                 } label: {
-                    Label("Copy formula", systemImage: "doc.on.doc")
+                    TablerLabel("Copy formula", icon: .copy)
                 }
             }
         } else {
@@ -426,7 +426,7 @@ private struct MathBlockView: View {
             Button {
                 UIPasteboard.general.string = source
             } label: {
-                Label("Copy formula", systemImage: "doc.on.doc")
+                TablerLabel("Copy formula", icon: .copy)
             }
         }
     }
@@ -482,7 +482,7 @@ private struct MermaidBlockView: View {
             Button {
                 UIPasteboard.general.string = source
             } label: {
-                Label("Copy Mermaid source", systemImage: "doc.on.doc")
+                TablerLabel("Copy Mermaid source", icon: .copy)
             }
         }
     }
@@ -536,7 +536,7 @@ struct CodeBlockView: View {
             Button {
                 UIPasteboard.general.string = code
             } label: {
-                Label("Copy code", systemImage: "doc.on.doc")
+                TablerLabel("Copy code", icon: .copy)
             }
         }
         .task(id: code) {
@@ -641,8 +641,7 @@ struct ListBlockView: View {
     @ViewBuilder
     private func marker(ix: Int, item: MDListItem) -> some View {
         if let checked = item.checked {
-            Image(systemName: checked ? "checkmark.square.fill" : "square")
-                .font(.system(size: 12))
+            TablerIconView(checked ? .squareCheck : .square, size: 12)
                 .foregroundStyle(checked ? Theme.accent.opacity(0.85) : Theme.textMuted)
                 .frame(height: MD.lineHeight)
         } else if let start = orderedStart {

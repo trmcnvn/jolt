@@ -248,7 +248,7 @@ impl AppearancePage {
                     .child(current.clone()),
             )
             .child(
-                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                crate::icons::icon(crate::icons::CHEVRON_DOWN)
                     .size(px(14.0))
                     .text_color(theme.text_muted),
             );
@@ -575,7 +575,7 @@ impl AppearancePage {
                                 this.open_theme_editor(&edit_id, cx)
                             }))
                             .child(
-                                crate::icons::icon(crate::icons::PEN)
+                                crate::icons::icon(crate::icons::PENCIL)
                                     .size(px(13.0))
                                     .text_color(theme.text_muted),
                             ),
@@ -592,7 +592,7 @@ impl AppearancePage {
                                     this.delete_theme(&delete_id, cx)
                                 }))
                                 .child(
-                                    crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                    crate::icons::icon(crate::icons::TRASH)
                                         .size(px(13.0))
                                         .text_color(theme.danger),
                                 ),
@@ -957,7 +957,7 @@ impl Render for AppearancePage {
             .map(|state| state.system)
             .unwrap_or_default();
         let (ui_font, prompt_font, code_font, terminal_font) = appearance::font_families(cx);
-        let font_sizes = appearance::font_sizes(cx);
+        let font_sizes = theme.font_sizes;
         let ui_picker = self.font_picker(FontRole::Ui, ui_font.clone(), &theme, cx);
         let prompt_picker = self.font_picker(FontRole::Prompt, prompt_font.clone(), &theme, cx);
         let code_picker = self.font_picker(FontRole::Code, code_font.clone(), &theme, cx);

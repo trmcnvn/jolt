@@ -1208,7 +1208,7 @@ impl TerminalPanel {
                                 this.close_tab(&chat_close2, key, window, cx);
                             }))
                             .child(
-                                crate::icons::icon(crate::icons::CLOSE)
+                                crate::icons::icon(crate::icons::X)
                                     .size(px(12.0))
                                     .text_color(theme.text_muted.opacity(0.8)),
                             );
@@ -1258,7 +1258,7 @@ impl TerminalPanel {
                             )
                             .when(exited, |el| el.opacity(0.55))
                             .child(
-                                crate::icons::icon(crate::icons::TERMINAL)
+                                crate::icons::icon(crate::icons::TERMINAL_2)
                                     .size(px(16.0))
                                     .text_color(text_color.opacity(glyph_alpha)),
                             )
@@ -1342,9 +1342,9 @@ impl TerminalPanel {
                     }))
                     .child(
                         crate::icons::icon(if self.expanded_view {
-                            crate::icons::RESTORE
+                            crate::icons::ARROWS_DIAGONAL_MINIMIZE
                         } else {
-                            crate::icons::MAXIMIZE
+                            crate::icons::ARROWS_DIAGONAL_2
                         })
                         .size(px(15.0))
                         .text_color(theme.text_muted.opacity(0.55)),

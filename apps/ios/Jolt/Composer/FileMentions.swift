@@ -319,8 +319,7 @@ struct FileMentionMenu: View {
                     ForEach(draft.results) { result in
                         Button { select(result) } label: {
                             HStack(spacing: 10) {
-                                Image(systemName: result.isDir ? "folder" : "doc")
-                                    .font(.system(size: 13))
+                                TablerIconView(result.isDir ? .folder : .file, size: 13)
                                     .foregroundStyle(Theme.textMuted)
                                     .frame(width: 16)
                                 Text(result.path + (result.isDir ? "/" : ""))

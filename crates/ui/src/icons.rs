@@ -5,11 +5,11 @@
 //! SVG text separate from its native text system, so registering the fonts at
 //! app startup is not enough to make them available to Mermaid diagrams.
 //!
-//! Most glyphs come from the **Solar Icons** set (Linear weight) by 480 Design,
-//! licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/);
-//! attribution: "Solar Icons by 480 Design".
-//! The terminal controls and Jolt logo are hand-drawn SVGs. `pi-mark` is Pi's
-//! official mark from https://pi.dev/logo-auto.svg.
+//! UI glyphs come from **Tabler Icons** by Paweł Kuna, licensed under the MIT
+//! License (https://github.com/tabler/tabler-icons). The upstream 24px outline
+//! assets use a 2px stroke; Jolt normalizes them to 1.5px to suit its compact UI.
+//! The Jolt logo is hand-drawn. `pi-mark` is Pi's official mark from
+//! https://pi.dev/logo-auto.svg.
 //! - `jj-mark` is Jujutsu's official logo from docs.jj-vcs.dev, © 2025 J.
 //!   Jennings, adapted to SVG by Lucas Garron, licensed CC BY 4.0. Its opaque
 //!   app-icon background is removed because gpui renders SVGs as tinted alpha
@@ -66,78 +66,64 @@ macro_rules! icon_assets {
 }
 
 icon_assets![
-    // Solar Icons (Linear), CC BY 4.0 — 480 Design.
-    (MONITOR, "monitor"),
-    (LAPTOP, "laptop"),
-    (PEN_NEW_SQUARE, "pen-new-square"),
-    (SORT_VERTICAL, "sort-vertical"),
+    // Tabler Icons (Outline), MIT — Paweł Kuna. Upstream names are preserved.
+    (DEVICE_DESKTOP, "device-desktop"),
+    (DEVICE_LAPTOP, "device-laptop"),
+    (SQUARE_ROUNDED_PLUS, "square-rounded-plus"),
+    (SWITCH_VERTICAL, "switch-vertical"),
     (LIST, "list"),
-    (FOLDER_WITH_FILES, "folder-with-files"),
+    (FOLDERS, "folders"),
     (FOLDER, "folder"),
-    // Hand-drawn Git glyphs in the Solar Linear style (like the
-    // terminal/plus/return ports) — the set has no branch/review icons.
     (GIT_BRANCH, "git-branch"),
     (GIT_PULL_REQUEST, "git-pull-request"),
-    (SIDEBAR_MINIMALISTIC, "sidebar-minimalistic"),
-    // Rotated variant: the terminal toggle shows the panel line on the bottom;
-    // gpui divs have no transform at the pinned rev, so the rotation is baked
-    // into the asset.
-    (SIDEBAR_MINIMALISTIC_BOTTOM, "sidebar-minimalistic-bottom"),
-    // Mirrored variant: the left sidebar toggle shows the panel line on the
-    // left; gpui divs have no
-    // scale transform at the pinned rev, so the flip is baked into the asset.
-    (SIDEBAR_MINIMALISTIC_LEFT, "sidebar-minimalistic-left"),
-    (KEY_MINIMALISTIC, "key-minimalistic"),
+    (LAYOUT_LIST, "layout-list"),
+    (LAYOUT_COLUMNS, "layout-columns"),
+    (LAYOUT_BOTTOMBAR, "layout-bottombar"),
+    (LAYOUT_SIDEBAR, "layout-sidebar"),
+    (KEY, "key"),
     (KEYBOARD, "keyboard"),
     (ARROW_LEFT, "arrow-left"),
     (ARROW_RIGHT, "arrow-right"),
     (ARROW_UP, "arrow-up"),
-    // arrow-up mirrored (like the sidebar flip) — the Solar Linear set here
-    // has no plain arrow-down.
     (ARROW_DOWN, "arrow-down"),
-    // Hand-drawn return/enter arrow in the Solar Linear style (like the
-    // terminal/plus/close ports) — the set has no return glyph.
-    (RETURN, "return"),
-    (ALT_ARROW_DOWN, "alt-arrow-down"),
-    (ALT_ARROW_LEFT, "alt-arrow-left"),
-    (ALT_ARROW_RIGHT, "alt-arrow-right"),
-    (SMARTPHONE, "smartphone"),
-    (ARCHIVE_UP_MINIMALISTIC, "archive-up-minimalistic"),
+    (CORNER_DOWN_LEFT, "corner-down-left"),
+    (CHEVRON_DOWN, "chevron-down"),
+    (CHEVRON_LEFT, "chevron-left"),
+    (CHEVRON_RIGHT, "chevron-right"),
+    (DEVICE_MOBILE, "device-mobile"),
+    (RESTORE, "restore"),
     (REFRESH, "refresh"),
-    (RESTART, "restart"),
-    (ADD_CIRCLE, "add-circle"),
-    (TUNING, "tuning"),
-    // Hand-drawn notification bell in the Solar Linear style.
+    (RELOAD, "reload"),
+    (CIRCLE_PLUS, "circle-plus"),
+    (ADJUSTMENTS_HORIZONTAL, "adjustments-horizontal"),
     (BELL, "bell"),
     (PAPERCLIP, "paperclip"),
-    (PEN, "pen"),
-    (ARCHIVE_MINIMALISTIC, "archive-minimalistic"),
-    (TRASH_BIN_MINIMALISTIC, "trash-bin-minimalistic"),
-    (SETTINGS_MINIMALISTIC, "settings-minimalistic"),
-    (LOGOUT_2, "logout-2"),
+    (PENCIL, "pencil"),
+    (ARCHIVE, "archive"),
+    (TRASH, "trash"),
+    (SETTINGS, "settings"),
+    (LOGOUT, "logout"),
     (USER, "user"),
-    (MAGNIFER, "magnifer"),
+    (SEARCH, "search"),
     (COMMAND, "command"),
-    (DOCUMENT, "document"),
-    (DOCUMENT_ADD, "document-add"),
-    (GLOBAL, "global"),
-    (CHECKLIST, "checklist"),
-    (WIDGET, "widget"),
-    (CLOSE_CIRCLE, "close-circle"),
-    // Hand-drawn info glyph in the Solar Linear style (like the terminal/
-    // plus/return ports) — the embedded set has no info-circle.
+    (FILE, "file"),
+    (FILE_PLUS, "file-plus"),
+    (WORLD, "world"),
+    (LIST_CHECK, "list-check"),
+    (APPS, "apps"),
+    (CIRCLE_X, "circle-x"),
     (INFO_CIRCLE, "info-circle"),
-    (DANGER_TRIANGLE, "danger-triangle"),
-    (CHAT_ROUND_LINE, "chat-round-line"),
-    // Hand-drawn Jolt glyphs.
-    (TERMINAL, "terminal"),
+    (ALERT_TRIANGLE, "alert-triangle"),
+    (MESSAGE_CIRCLE, "message-circle"),
+    (TERMINAL_2, "terminal-2"),
     (PLUS, "plus"),
-    (CLOSE, "close"),
-    (MAXIMIZE, "maximize"),
-    (RESTORE, "restore"),
-    (STOP, "stop"),
+    (X, "x"),
+    (ARROWS_DIAGONAL_2, "arrows-diagonal-2"),
+    (ARROWS_DIAGONAL_MINIMIZE, "arrows-diagonal-minimize"),
+    (SQUARE, "square"),
     (CHECK, "check"),
     (COPY, "copy"),
+    // Hand-drawn Jolt glyph.
     (JOLT_LOGO, "jolt-logo"),
     // Harness brand marks.
     (CLAUDE_MARK, "claude-mark"),

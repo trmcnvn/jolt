@@ -74,8 +74,7 @@ struct SessionView: View {
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                                     .layoutPriority(1)
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 8, weight: .semibold))
+                                TablerIconView(.chevronDown, size: 8)
                                     .foregroundStyle(Theme.textFaint)
                                     .layoutPriority(2)
                             }
@@ -261,8 +260,7 @@ struct SessionView: View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             HStack(spacing: 6) {
                 if model.sendQueuedForOfflineHost(chat) {
-                    Image(systemName: "clock")
-                        .font(.system(size: 11, weight: .medium))
+                    TablerIconView(.clock, size: 11)
                     Text("Queued · \(model.deviceName(chat.deviceId)) is offline")
                         .font(Theme.sans(12))
                 } else {

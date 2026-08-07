@@ -17,6 +17,7 @@ pub mod appearance;
 pub mod archived;
 pub mod ascii_mark;
 pub mod attachments;
+pub mod background_service;
 pub mod changes;
 pub mod composer;
 #[cfg(any(debug_assertions, feature = "debug-ui"))]
@@ -135,6 +136,7 @@ impl UiConfig {
 struct ReopenState {
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
+    background_service: background_service::BackgroundServiceController,
 }
 
 impl gpui::Global for ReopenState {}
@@ -151,8 +153,12 @@ pub fn run_app(config: UiConfig) {
         if cx.windows().is_empty()
             && let Some(reopen) = cx.try_global::<ReopenState>()
         {
-            let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
-            open_main_window(state, boot, cx);
+            let (state, boot, background_service) = (
+                reopen.state.clone(),
+                reopen.boot.clone(),
+                reopen.background_service.clone(),
+            );
+            open_main_window(state, boot, background_service, cx);
         }
     });
     app.run(move |cx: &mut App| {
@@ -174,7 +180,6 @@ pub fn run_app(config: UiConfig) {
             &ui_settings.prompt_font,
             &ui_settings.code_font,
             &ui_settings.terminal_font,
-            ui_settings.font_sizes(),
             data_dir,
             cx,
         );
@@ -183,18 +188,25 @@ pub fn run_app(config: UiConfig) {
 
         let state = cx.new(|_| state::AppState::new());
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
+        let background_service =
+            background_service::BackgroundServiceController::new(config.data_dir.clone());
 
         // Graceful teardown: an in-process engine drains live runs and flushes
         // doc snapshots before the process exits (remote engines outlive us).
         let quit_state = state.clone();
+        let quit_background_service = background_service.clone();
         cx.on_app_quit(move |cx| {
             let shutdown =
                 quit_state.read(cx).engine().cloned().map(|handle| {
                     gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
                 });
+            let background_service = quit_background_service.clone();
             async move {
                 if let Some(task) = shutdown {
                     let _ = task.await;
+                }
+                if let Err(err) = background_service.apply_pending() {
+                    tracing::error!(error = %err, "background-service transition failed");
                 }
             }
         })
@@ -203,8 +215,9 @@ pub fn run_app(config: UiConfig) {
         cx.set_global(ReopenState {
             state: state.clone(),
             boot: config.boot(),
+            background_service: background_service.clone(),
         });
-        open_main_window(state, config.boot(), cx);
+        open_main_window(state, config.boot(), background_service, cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
         // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
@@ -220,7 +233,12 @@ pub fn run_app(config: UiConfig) {
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
 /// clicked after ⌘W closed the window.
-fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
+fn open_main_window(
+    state: gpui::Entity<state::AppState>,
+    boot: EngineBootConfig,
+    background_service: background_service::BackgroundServiceController,
+    cx: &mut App,
+) {
     // Main window geometry: 1320×880, min 900×600.
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
     cx.open_window(
@@ -268,7 +286,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // the subscription lives as long as the window does, and the window
             // owns nothing that would drop it early.
             appearance::observe_window(window, cx).detach();
-            cx.new(|cx| shell::Shell::new(state, boot, cx))
+            cx.new(|cx| shell::Shell::new(state, boot, background_service, cx))
         },
     )
     .expect("failed to open window");

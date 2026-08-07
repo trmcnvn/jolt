@@ -461,8 +461,7 @@ struct AttachmentStripView: View {
                     Button {
                         remove(att.id)
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 8, weight: .bold))
+                        TablerIconView(.x, size: 8)
                             .foregroundStyle(Theme.text)
                             .frame(width: 18, height: 18)
                             .background(.black.opacity(0.65), in: Circle())
@@ -532,8 +531,7 @@ struct AttachmentThumbView: View {
                 Button {
                     cache.load(deviceId: deviceId, chatId: chatId, attachment: attachment)
                 } label: {
-                    Image(systemName: "photo.badge.exclamationmark")
-                        .font(.system(size: 16))
+                    TablerIconView(.photoExclamation, size: 16)
                         .foregroundStyle(Theme.textFaint)
                         .frame(width: 112, height: 80)
                 }

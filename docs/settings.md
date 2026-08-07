@@ -6,7 +6,7 @@ Open settings from the user menu or with `Cmd+,` on macOS / `Ctrl+,` elsewhere. 
 
 | Page | What it controls | Scope |
 | --- | --- | --- |
-| **Devices** | Registered devices, presence, version, rename/removal, and copyable device ID | Device rows sync; UI state is local |
+| **Devices** | Background availability plus registered-device presence, version, rename/removal, and copyable IDs | Service setting is local; device rows sync |
 | **Accounts** | Claude Code and Codex login slots, activation, removal, and provider quota meters | Selected engine device |
 | **Secrets** | Write-only environment secrets scoped to Claude Code, Codex, and/or Pi | Local engine only |
 | **Version control** | Active Git or Jujutsu command-line backend and executable status | Selected engine device |
@@ -16,6 +16,10 @@ Open settings from the user menu or with `Cmd+,` on macOS / `Ctrl+,` elsewhere. 
 | **Hotkeys** | Rebindable app commands with conflict detection and reset controls | Local viewport setting |
 
 Removing a device tombstones its spaces and sessions. Synced R2 backups and attachments are purged asynchronously; folders and other local files on that machine are unaffected. If Jolt later starts there again, it registers as an empty device.
+
+### Devices
+
+Enable **Keep this device available** to install and start Jolt's per-user background engine. The app restarts to hand engine ownership over safely. On macOS this uses a launchd LaunchAgent; on Linux it uses a systemd user service. Disabling it restarts Jolt with an embedded engine instead. The setting affects only the device where it is changed.
 
 ### Accounts
 

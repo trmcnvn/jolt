@@ -4,8 +4,8 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, SharedString, Subscription, Task, Window, div,
-    prelude::*, px,
+    AnyElement, ClipboardItem, Context, Entity, SharedString, Stateful, Subscription, Task, Window,
+    div, prelude::*, px,
 };
 use std::time::Duration;
 
@@ -60,6 +60,7 @@ struct RenameDialog {
 
 pub struct DevicesPage {
     state: Entity<AppState>,
+    background_service: crate::background_service::BackgroundServiceController,
     rename: Option<RenameDialog>,
     delete_confirm: Option<String>,
     /// Device id whose id-chip shows "Copied" right now.
@@ -71,14 +72,20 @@ pub struct DevicesPage {
 }
 
 impl DevicesPage {
-    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        state: Entity<AppState>,
+        background_service: crate::background_service::BackgroundServiceController,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        let error = background_service.take_error().map(SharedString::from);
         Self {
             state,
+            background_service,
             rename: None,
             delete_confirm: None,
             copied: None,
-            error: None,
+            error,
             task: None,
             copy_task: None,
             _observe: observe,
@@ -154,6 +161,16 @@ impl DevicesPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn set_background_service_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Err(err) = crate::background_service::relaunch_after_exit() {
+            self.error = Some(format!("Could not restart Jolt: {err:#}").into());
+            cx.notify();
+            return;
+        }
+        self.background_service.request(enabled);
+        cx.quit();
     }
 
     fn copy_id(&mut self, device_id: String, cx: &mut Context<Self>) {
@@ -277,6 +294,35 @@ impl DevicesPage {
     }
 }
 
+fn background_service_toggle(theme: &Theme, enabled: bool) -> Stateful<gpui::Div> {
+    div()
+        .id("background-service-toggle")
+        .flex_none()
+        .w(px(32.0))
+        .h(px(18.0))
+        .rounded_full()
+        .bg(if enabled {
+            theme.text
+        } else {
+            crate::theme::ink(0.15)
+        })
+        .relative()
+        .cursor_pointer()
+        .child(
+            div()
+                .absolute()
+                .top(px(2.0))
+                .left(px(if enabled { 16.0 } else { 2.0 }))
+                .size(px(14.0))
+                .rounded_full()
+                .bg(if enabled {
+                    theme.on_solid
+                } else {
+                    crate::theme::ink(0.7)
+                }),
+        )
+}
+
 /// Human-readable platform label.
 pub fn platform_label(platform: &str) -> &str {
     match platform {
@@ -313,6 +359,36 @@ impl Render for DevicesPage {
         let delete_dialog = self.render_delete_dialog(window.viewport_size(), cx);
         let emerald = theme.success; // emerald-400
         let count = devices.len();
+        let background_service_card = crate::background_service::supported().then(|| {
+            let enabled = self.background_service.enabled();
+            let toggle = background_service_toggle(&theme, enabled).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.set_background_service_enabled(!enabled, cx);
+                },
+            ));
+            widgets::section_card(&theme).child(
+                widgets::card_row(&theme, true)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(widgets::row_title(
+                                &theme,
+                                "Keep this device available",
+                            ))
+                            .child(
+                                div()
+                                    .mt(px(3.0))
+                                    .text_size(px(11.5))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .child(SharedString::from(
+                                        "Run Jolt’s engine in the background and start it when you sign in, so agents and remote sessions continue after you quit Jolt. Changing this setting restarts the app.",
+                                    )),
+                            ),
+                    )
+                    .child(toggle),
+            )
+        });
 
         let rows: Vec<AnyElement> = devices
             .into_iter()
@@ -327,10 +403,10 @@ impl Render for DevicesPage {
                 let rename_name = device.name.clone();
                 let delete_id = device.id.clone();
                 let platform_icon = match device.platform.as_str() {
-                    "macos" | "darwin" => crate::icons::LAPTOP,
-                    "web" => crate::icons::GLOBAL,
-                    "ios" | "android" => crate::icons::SMARTPHONE,
-                    _ => crate::icons::MONITOR,
+                    "macos" | "darwin" => crate::icons::DEVICE_LAPTOP,
+                    "web" => crate::icons::WORLD,
+                    "ios" | "android" => crate::icons::DEVICE_MOBILE,
+                    _ => crate::icons::DEVICE_DESKTOP,
                 };
                 // Presence lives ON the identity tile: a corner dot (emerald
                 // online with a soft glow, faint offline), ringed by the card
@@ -446,7 +522,7 @@ impl Render for DevicesPage {
                                 this.open_rename(rename_id.clone(), rename_name.clone(), cx);
                             }))
                             .child(
-                                crate::icons::icon(crate::icons::PEN)
+                                crate::icons::icon(crate::icons::PENCIL)
                                     .size(px(14.0))
                                     .text_color(theme.text_muted),
                             )
@@ -469,7 +545,7 @@ impl Render for DevicesPage {
                                 cx.notify();
                             }))
                             .child(
-                                crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                crate::icons::icon(crate::icons::TRASH)
                                     .size(px(14.0))
                                     .text_color(theme.danger),
                             )
@@ -507,8 +583,9 @@ impl Render for DevicesPage {
                     ))
                     .child(widgets::page_subtitle(
                         &theme,
-                        "Manage device names and inspect synced device metadata.",
+                        "Manage device availability, names, and synced metadata.",
                     ))
+                    .when_some(background_service_card, |el, card| el.child(card))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
                             widgets::error_strip(&theme, message)

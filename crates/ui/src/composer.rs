@@ -114,7 +114,7 @@ fn shell_mode_chip(scope: ShellScope, theme: &Theme) -> gpui::AnyElement {
         .text_size(px(12.0))
         .text_color(color)
         .child(
-            crate::icons::icon(crate::icons::TERMINAL)
+            crate::icons::icon(crate::icons::TERMINAL_2)
                 .size(px(13.0))
                 .text_color(color),
         )
@@ -1019,7 +1019,9 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
 
 #[derive(Debug, Clone, Default)]
 struct TextProjection {
-    display: String,
+    /// Shared with the text shaper so layout does not copy the projected draft
+    /// on every frame.
+    display: SharedString,
     mentions: Vec<(FileMentionLink, Range<usize>)>,
 }
 
@@ -1126,32 +1128,32 @@ impl TextProjection {
     fn new(raw: &str) -> Self {
         let links = file_mention_links(raw);
         let labels = mention_display_labels(&links);
-        let mut projection = Self::default();
+        let mut display = String::with_capacity(raw.len());
+        let mut mentions = Vec::with_capacity(links.len());
         let mut raw_at = 0;
         for (link, label) in links.into_iter().zip(labels) {
-            projection.display.push_str(&raw[raw_at..link.range.start]);
-            let display_start = projection.display.len();
+            display.push_str(&raw[raw_at..link.range.start]);
+            let display_start = display.len();
             // The chip is plain projected text — `@` plus the label between
             // non-breaking side bearings; the rounded code wash beneath it is
             // painted by `ComposerTextElement::paint`. Every character here
             // must exist in Geist (no exotic whitespace — U+2003/U+202F shape
             // at fallback width and collapsed the chip once already).
-            projection.display.push_str(MENTION_SIDE_PAD);
-            projection.display.push(MENTION_PREFIX);
+            display.push_str(MENTION_SIDE_PAD);
+            display.push(MENTION_PREFIX);
             for ch in label.chars() {
-                projection
-                    .display
-                    .push(if ch == ' ' { '\u{00A0}' } else { ch });
+                display.push(if ch == ' ' { '\u{00A0}' } else { ch });
             }
-            projection.display.push('\u{00A0}');
-            let display_end = projection.display.len();
-            projection
-                .mentions
-                .push((link.clone(), display_start..display_end));
+            display.push('\u{00A0}');
+            let display_end = display.len();
+            mentions.push((link.clone(), display_start..display_end));
             raw_at = link.range.end;
         }
-        projection.display.push_str(&raw[raw_at..]);
-        projection
+        display.push_str(&raw[raw_at..]);
+        Self {
+            display: display.into(),
+            mentions,
+        }
     }
 
     fn raw_to_display(&self, raw: usize) -> usize {
@@ -1280,7 +1282,7 @@ pub struct SentMentionSpan {
 /// through untouched. `None` when the text has no valid mention — the
 /// substring probe keeps ordinary prompts on the zero-allocation path, so this
 /// is safe to call for every user row.
-pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)> {
+pub fn sent_mention_display(raw: &str) -> Option<(SharedString, Vec<SentMentionSpan>)> {
     if !raw.contains(FILE_MENTION_SCHEME) {
         return None;
     }
@@ -1512,6 +1514,8 @@ pub struct ComposerInput {
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
+    /// Content-local y origin for each shaped logical line.
+    line_offsets: Vec<f32>,
     last_bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
     content_height: f32,
@@ -1592,6 +1596,7 @@ impl ComposerInput {
             follow_cursor: true,
             last_lines: Vec::new(),
             line_starts: vec![0],
+            line_offsets: vec![0.0],
             last_bounds: None,
             line_height: px(INPUT_LINE_HEIGHT),
             content_height: INPUT_LINE_HEIGHT,
@@ -1700,14 +1705,14 @@ impl ComposerInput {
             // One ASCII glyph per source byte preserves every byte-indexed
             // selection/caret mapping, including for non-ASCII secret values.
             TextProjection {
-                display: "*".repeat(self.content.len()),
+                display: "*".repeat(self.content.len()).into(),
                 mentions: Vec::new(),
             }
         } else if self.mentions_enabled {
             TextProjection::new(&self.content)
         } else {
             TextProjection {
-                display: self.content.clone(),
+                display: self.content.clone().into(),
                 mentions: Vec::new(),
             }
         };
@@ -1731,8 +1736,7 @@ impl ComposerInput {
             format!("{path} ")
         };
         self.record_edit(&range, &inserted);
-        self.content =
-            self.content[..range.start].to_owned() + &inserted + &self.content[range.end..];
+        self.content.replace_range(range.clone(), &inserted);
         self.refresh_projection();
         let cursor =
             range.start + inserted.len() + existing_separator.map(char::len_utf8).unwrap_or(0);
@@ -1754,8 +1758,7 @@ impl ComposerInput {
             format!("{command} ")
         };
         self.record_edit(&range, &inserted);
-        self.content =
-            self.content[..range.start].to_owned() + &inserted + &self.content[range.end..];
+        self.content.replace_range(range.clone(), &inserted);
         self.refresh_projection();
         let cursor =
             range.start + inserted.len() + existing_separator.map(char::len_utf8).unwrap_or(0);
@@ -1789,7 +1792,11 @@ impl ComposerInput {
         placeholder: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        self.placeholder = placeholder.into();
+        let placeholder = placeholder.into();
+        if self.placeholder == placeholder {
+            return;
+        }
+        self.placeholder = placeholder;
         cx.notify();
     }
 
@@ -2469,12 +2476,7 @@ impl ComposerInput {
             }
             if index <= line_start + line_len {
                 let local = line.position_for_index(index - line_start, self.line_height)?;
-                let y_offset: f32 = self
-                    .last_lines
-                    .iter()
-                    .take(line_ix)
-                    .map(|l| f32::from(l.size(self.line_height).height))
-                    .sum();
+                let y_offset = self.line_offsets.get(line_ix).copied()?;
                 return Some(point(local.x, local.y + px(y_offset)));
             }
         }
@@ -2774,15 +2776,13 @@ impl ComposerInput {
         window: &mut Window,
         cx: &App,
     ) -> f32 {
-        // Rebuild this even for an empty draft. Otherwise deleting the final
-        // mention can leave its previous paint geometry alive while the
-        // placeholder is already being shaped, tinting it for a frame (or
-        // longer when no subsequent layout is requested).
-        self.refresh_projection();
+        // Every content mutation refreshes the projection before requesting a
+        // frame. Reusing it here avoids reparsing and copying the whole draft
+        // during layout (including animation-only frames).
         let (display, is_placeholder) = if self.content.is_empty() {
             (self.placeholder.clone(), true)
         } else {
-            (SharedString::from(self.projection.display.clone()), false)
+            (self.projection.display.clone(), false)
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = if self.prompt_typography {
@@ -2853,29 +2853,29 @@ impl ComposerInput {
             .map(|small| small.into_vec())
             .unwrap_or_default();
 
-        // Logical line byte offsets (each shaped line covers one \n-split line).
+        // Logical line byte and y offsets (each shaped line covers one
+        // `\n`-split line). Derive all aggregate geometry in this single pass.
         let mut line_starts = Vec::with_capacity(lines.len());
-        let mut at = 0usize;
+        let mut line_offsets = Vec::with_capacity(lines.len());
+        let mut byte_offset = 0usize;
+        let mut content_height = 0.0_f32;
+        let mut max_line_width = 0.0_f32;
         for line in &lines {
-            line_starts.push(at);
-            at += line.len() + 1; // + '\n'
+            line_starts.push(byte_offset);
+            line_offsets.push(content_height);
+            byte_offset += line.len() + 1; // + '\n'
+            content_height += f32::from(line.size(self.line_height).height);
+            max_line_width = max_line_width.max(f32::from(line.unwrapped_layout.width));
         }
         if line_starts.is_empty() {
             line_starts.push(0);
+            line_offsets.push(0.0);
         }
-
-        let content_height: f32 = lines
-            .iter()
-            .map(|l| f32::from(l.size(self.line_height).height))
-            .sum();
-        let max_line_width: f32 = lines
-            .iter()
-            .map(|l| f32::from(l.unwrapped_layout.width))
-            .fold(0.0, f32::max);
 
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
+        self.line_offsets = line_offsets;
         self.content_height = content_height.max(line_height);
         self.max_line_width = if is_placeholder { 0.0 } else { max_line_width };
         self.last_width = f32::from(width);
@@ -2971,8 +2971,7 @@ impl EntityInputHandler for ComposerInput {
         if self.marked_range.is_none() {
             self.record_edit(&range, new_text);
         }
-        self.content =
-            self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
+        self.content.replace_range(range.clone(), new_text);
         self.refresh_projection();
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
@@ -3009,8 +3008,7 @@ impl EntityInputHandler for ComposerInput {
             self.redo_stack.clear();
             self.last_edit = None;
         }
-        self.content =
-            self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
+        self.content.replace_range(range.clone(), new_text);
         self.refresh_projection();
         if new_text.is_empty() {
             self.marked_range = None;
@@ -3792,11 +3790,38 @@ struct GoalDialog {
     _objective_events: Subscription,
 }
 
+/// The checkout/ref toolbar has its own invalidation boundary. Composer edits
+/// redraw the pill at typing cadence; the toolbar only changes when picker or
+/// app state changes, so rebuilding its menus on every keystroke is wasted.
+struct PickerFooter {
+    pickers: Entity<Pickers>,
+    _observe: Subscription,
+}
+
+impl PickerFooter {
+    fn new(pickers: Entity<Pickers>, cx: &mut Context<Self>) -> Self {
+        let observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        Self {
+            pickers,
+            _observe: observe,
+        }
+    }
+}
+
+impl Render for PickerFooter {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.pickers
+            .update(cx, |pickers, cx| pickers.render_footer(cx))
+            .unwrap_or_else(|| gpui::Empty.into_any_element())
+    }
+}
+
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
     pickers: Entity<Pickers>,
+    picker_footer: Entity<PickerFooter>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Offset from the newest sent user message; `None` is the draft below
@@ -3875,7 +3900,6 @@ pub struct Composer {
     /// SNAP instead of morphing (see [`ROUTE_SNAP_MS`]).
     route_snap_until: Option<Instant>,
     _observe: Subscription,
-    _pickers_observe: Subscription,
     _input_events: Subscription,
 }
 
@@ -3892,10 +3916,7 @@ impl Composer {
             input
         });
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
-        // The footer toolbar (checkout kind + ref picker) is rendered INLINE
-        // by the composer from picker state — a pickers-side notify (refs
-        // loaded, popover toggled, pick made) must repaint the composer too.
-        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        let picker_footer = cx.new(|cx| PickerFooter::new(pickers.clone(), cx));
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
@@ -3926,6 +3947,7 @@ impl Composer {
             state,
             input,
             pickers,
+            picker_footer,
             drafts: HashMap::new(),
             message_history_position: None,
             message_history_text: None,
@@ -3969,7 +3991,6 @@ impl Composer {
             morph_clock: Instant::now(),
             route_snap_until: None,
             _observe: observe,
-            _pickers_observe: pickers_observe,
             _input_events: input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
@@ -4162,7 +4183,7 @@ impl Composer {
                                 this.remove_attachment(&remove_id, cx);
                             }))
                             .child(
-                                crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                                crate::icons::icon(crate::icons::CIRCLE_X)
                                     .size(px(14.0))
                                     .text_color(theme.text_muted),
                             ),
@@ -4911,7 +4932,7 @@ impl Composer {
                                     crate::icons::icon(if result.is_dir {
                                         crate::icons::FOLDER
                                     } else {
-                                        crate::icons::DOCUMENT
+                                        crate::icons::FILE
                                     })
                                     .size(px(14.0))
                                     .text_color(theme.text_muted),
@@ -7290,7 +7311,7 @@ impl Composer {
                                 this.cancel_queued_prompt(command_id.clone(), cx)
                             }))
                             .child(
-                                crate::icons::icon(crate::icons::CLOSE)
+                                crate::icons::icon(crate::icons::X)
                                     .size(px(12.0))
                                     .text_color(theme.text_muted),
                             ),
@@ -7583,7 +7604,7 @@ impl Render for Composer {
                             cx.notify();
                         }))
                         .child(
-                            crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                            crate::icons::icon(crate::icons::ALERT_TRIANGLE)
                                 .size(px(14.0))
                                 .mt(px(2.0))
                                 .text_color(text_c),
@@ -7876,14 +7897,16 @@ impl Render for Composer {
         let container = container.child(motion::fade_quick("composer-input", body));
         // Ref/workspace toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
-        // labels once the session exists. VCS spaces only.
-        let footer = self
-            .pickers
-            .update(cx, |pickers, cx| pickers.render_footer(cx));
-        let container = match footer {
-            Some(footer) => container.child(footer),
-            None => container,
-        };
+        // labels once the session exists. Its entity boundary keeps ordinary
+        // composer edits from rebuilding the toolbar and its menus.
+        let has_footer = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .is_some_and(|space| space.git_detected);
+        let container = container.when(has_footer, |container| {
+            container.child(self.picker_footer.clone())
+        });
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
             let weak = cx.weak_entity();

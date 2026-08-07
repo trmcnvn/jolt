@@ -1,1 +1,21 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 4 10 10m0 0V5m0 5H5m15 10-6-6m0 0v5m0-5h5"/></svg>
+<!--
+category: System
+tags: [recover, repair, reinstate, redeem, revive, return, reset, retrieve, reestablish, fix]
+version: "2.24"
+unicode: "fafd"
+-->
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.5"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M3.06 13a9 9 0 1 0 .49 -4.087" />
+  <path d="M3 4.001v5h5" />
+  <path d="M11 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" />
+</svg>

@@ -17,8 +17,8 @@ use gpui::{
 use std::time::Duration;
 
 use jolt_proto::{
-    AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId,
+    AgentAccount, AgentAccountsSnapshot, AgentLoginPoll, AgentLoginStart, AgentLoginStatus,
+    HarnessId,
 };
 use jolt_rpc::methods;
 
@@ -140,15 +140,16 @@ enum LoginFlow {
     Starting { harness: HarnessId },
     /// Claude-style: open the URL, paste the code back.
     PasteCode {
-        harness: HarnessId,
-        start: AgentLoginStart,
+        login_id: String,
+        url: String,
         submitting: bool,
         error: Option<SharedString>,
     },
-    /// Codex-style: open the URL, poll until the browser flow lands.
-    Browser {
-        harness: HarnessId,
-        start: AgentLoginStart,
+    /// Codex device auth: show the code and poll until the target CLI finishes.
+    DeviceCode {
+        login_id: String,
+        url: String,
+        user_code: String,
         message: Option<SharedString>,
         error: Option<SharedString>,
     },
@@ -157,14 +158,12 @@ enum LoginFlow {
 impl LoginFlow {
     /// Dialog title (jolt: "Add Claude account" / "Add Codex account").
     fn title(&self) -> &'static str {
-        let harness = match self {
-            LoginFlow::Starting { harness }
-            | LoginFlow::PasteCode { harness, .. }
-            | LoginFlow::Browser { harness, .. } => *harness,
-        };
-        match harness {
-            HarnessId::Codex => "Add Codex account",
-            _ => "Add Claude account",
+        match self {
+            LoginFlow::Starting {
+                harness: HarnessId::Codex,
+            }
+            | LoginFlow::DeviceCode { .. } => "Add Codex account",
+            LoginFlow::Starting { .. } | LoginFlow::PasteCode { .. } => "Add Claude account",
         }
     }
 }
@@ -337,29 +336,31 @@ impl AccountsPage {
                     serde_json::from_value::<AgentLoginStart>(value)
                         .map_err(|e| jolt_rpc::RpcError::Failed(e.to_string()))
                 }) {
-                    Ok(start) => {
-                        cx.open_url(&start.url);
-                        match start.mode {
-                            AgentLoginMode::PasteCode => {
-                                page.code_input
-                                    .update(cx, |input, cx| input.set_text("", cx));
-                                page.login = Some(LoginFlow::PasteCode {
-                                    harness,
-                                    start,
-                                    submitting: false,
-                                    error: None,
-                                });
-                            }
-                            AgentLoginMode::Browser => {
-                                page.login = Some(LoginFlow::Browser {
-                                    harness,
-                                    start,
-                                    message: None,
-                                    error: None,
-                                });
-                                page.spawn_poll(cx);
-                            }
-                        }
+                    Ok(AgentLoginStart::PasteCode { login_id, url }) => {
+                        cx.open_url(&url);
+                        page.code_input
+                            .update(cx, |input, cx| input.set_text("", cx));
+                        page.login = Some(LoginFlow::PasteCode {
+                            login_id,
+                            url,
+                            submitting: false,
+                            error: None,
+                        });
+                    }
+                    Ok(AgentLoginStart::DeviceCode {
+                        login_id,
+                        url,
+                        user_code,
+                    }) => {
+                        cx.open_url(&url);
+                        page.login = Some(LoginFlow::DeviceCode {
+                            login_id,
+                            url,
+                            user_code,
+                            message: None,
+                            error: None,
+                        });
+                        page.spawn_poll(cx);
                     }
                     Err(err) => {
                         page.login = None;
@@ -375,7 +376,9 @@ impl AccountsPage {
 
     fn submit_code(&mut self, cx: &mut Context<Self>) {
         let Some(LoginFlow::PasteCode {
-            start, submitting, ..
+            login_id,
+            submitting,
+            ..
         }) = &mut self.login
         else {
             return;
@@ -387,7 +390,7 @@ impl AccountsPage {
         if code.is_empty() {
             return;
         }
-        let login_id = start.login_id.clone();
+        let login_id = login_id.clone();
         *submitting = true;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -421,12 +424,12 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// The browser-wait poll loop: PollAgentLogin every 1.5s until Done/Error.
+    /// PollAgentLogin every 1.5s until the device-code flow finishes.
     fn spawn_poll(&mut self, cx: &mut Context<Self>) {
-        let Some(LoginFlow::Browser { start, .. }) = &self.login else {
+        let Some(LoginFlow::DeviceCode { login_id, .. }) = &self.login else {
             return;
         };
-        let login_id = start.login_id.clone();
+        let login_id = login_id.clone();
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -441,7 +444,7 @@ impl AccountsPage {
                     .call(methods::POLL_AGENT_LOGIN, params.clone())
                     .await;
                 let outcome = this.update(cx, |page, cx| {
-                    let Some(LoginFlow::Browser { message, error, .. }) = &mut page.login else {
+                    let Some(LoginFlow::DeviceCode { message, error, .. }) = &mut page.login else {
                         return true; // dialog dismissed — stop polling
                     };
                     match result.as_ref().ok().and_then(|value| {
@@ -492,9 +495,8 @@ impl AccountsPage {
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
         let login_id = match &self.login {
-            Some(LoginFlow::PasteCode { start, .. }) | Some(LoginFlow::Browser { start, .. }) => {
-                Some(start.login_id.clone())
-            }
+            Some(LoginFlow::PasteCode { login_id, .. })
+            | Some(LoginFlow::DeviceCode { login_id, .. }) => Some(login_id.clone()),
             _ => None,
         };
         self.login = None;
@@ -646,7 +648,7 @@ impl AccountsPage {
                             this.account_action(methods::FORGET_AGENT_ACCOUNT, &forget_account, cx);
                         }))
                         .child(
-                            crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                            crate::icons::icon(crate::icons::TRASH)
                                 .size(px(14.0))
                                 .text_color(theme.text_muted),
                         ),
@@ -770,7 +772,7 @@ impl AccountsPage {
                 ))
                 .into_any_element(),
             LoginFlow::PasteCode {
-                start,
+                url,
                 submitting,
                 error,
                 ..
@@ -788,7 +790,7 @@ impl AccountsPage {
                     .child(url_link(
                         "login-open-url",
                         "Reopen the authorization page",
-                        &start.url,
+                        url,
                         cx,
                     ))
                     .child(
@@ -835,8 +837,9 @@ impl AccountsPage {
                     )
                     .into_any_element()
             }
-            LoginFlow::Browser {
-                start,
+            LoginFlow::DeviceCode {
+                url,
+                user_code,
                 message,
                 error,
                 ..
@@ -847,14 +850,21 @@ impl AccountsPage {
                     .flex_col()
                     .child(div().mt(px(8.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in to OpenAI in your browser. The new login is \
-                         captured in an isolated profile — your current session is untouched \
-                         until you switch.",
+                        "Finish signing in to OpenAI in your browser, then enter this one-time \
+                         code when prompted. The new login stays on the selected device.",
                     )))
+                    .child(
+                        div()
+                            .mt(px(10.0))
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(16.0))
+                            .text_color(theme.text)
+                            .child(SharedString::from(user_code.clone())),
+                    )
                     .child(url_link(
                         "login-open-url-browser",
                         "Reopen the sign-in page",
-                        &start.url,
+                        url,
                         cx,
                     ))
                     .when(!has_error, |el| {
@@ -877,7 +887,7 @@ impl AccountsPage {
                                         .text_size(px(12.5))
                                         .text_color(theme.text_muted.opacity(0.7))
                                         .child(message.clone().unwrap_or_else(|| {
-                                            SharedString::from("Waiting for the browser…")
+                                            SharedString::from("Waiting for sign-in…")
                                         })),
                                 ),
                         )
@@ -1004,7 +1014,7 @@ impl Render for AccountsPage {
 
         let provider_icon = |harness: HarnessId| match harness {
             HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
-            HarnessId::Pi => (crate::icons::TERMINAL, None),
+            HarnessId::Pi => (crate::icons::TERMINAL_2, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -1164,7 +1174,7 @@ impl Render for AccountsPage {
                                                 this.start_login(harness, cx);
                                             }))
                                             .child(
-                                                crate::icons::icon(crate::icons::ADD_CIRCLE)
+                                                crate::icons::icon(crate::icons::CIRCLE_PLUS)
                                                     .size(px(16.0))
                                                     .text_color(theme.text_muted),
                                             )

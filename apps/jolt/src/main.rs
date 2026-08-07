@@ -3,10 +3,10 @@
 //! service-managed `jolt headless` only ever loads saved credentials.
 
 mod auth_cli;
-mod daemon;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
+use jolt_ui::background_service as daemon;
 
 #[derive(Parser)]
 #[command(name = "jolt", about = "Multi-device controller for coding agents")]

@@ -310,8 +310,7 @@ private struct JumpToBottomButton: View {
         ZStack(alignment: .bottomTrailing) {
             if scroll.showJump {
                 Button(action: action) {
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 14, weight: .medium))
+                    TablerIconView(.arrowDown, size: 14)
                         .foregroundStyle(Theme.text)
                         .frame(width: 36, height: 36)
                 }
@@ -432,7 +431,7 @@ struct UserBubble: View {
                     Button {
                         UIPasteboard.general.string = mentions.plainText
                     } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
+                        TablerLabel("Copy", icon: .copy)
                     }
                 }
             }
@@ -573,8 +572,7 @@ struct TurnChangesView: View {
         VStack(alignment: .leading, spacing: 0) {
             Button(action: toggle) {
                 HStack(spacing: 7) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
+                    TablerIconView(.chevronRight, size: 9)
                         .foregroundStyle(Theme.textMuted.opacity(0.7))
                         .rotationEffect(.degrees(open ? 90 : 0))
                         .frame(width: 18, height: 18)
@@ -606,13 +604,11 @@ struct TurnChangesView: View {
                         case .directory(let path, let name, let depth, let collapsed):
                             Button { togglePath(path) } label: {
                                 HStack(spacing: 5) {
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 8, weight: .semibold))
+                                    TablerIconView(.chevronRight, size: 8)
                                         .foregroundStyle(Theme.textMuted.opacity(0.7))
                                         .rotationEffect(.degrees(collapsed ? 0 : 90))
                                         .frame(width: 14, height: 14)
-                                    Image(systemName: "folder")
-                                        .font(.system(size: 12))
+                                    TablerIconView(.folder, size: 12)
                                         .foregroundStyle(Theme.textMuted)
                                         .frame(width: 14, height: 14)
                                     Text(name)
@@ -633,8 +629,7 @@ struct TurnChangesView: View {
                         case .file(let file, let name, let depth):
                             HStack(spacing: 5) {
                                 Color.clear.frame(width: 14, height: 14)
-                                Image(systemName: "doc.text")
-                                    .font(.system(size: 11))
+                                TablerIconView(.fileText, size: 11)
                                     .foregroundStyle(Theme.textMuted)
                                     .frame(width: 14, height: 14)
                                 Text(name)
@@ -688,8 +683,7 @@ struct ToolGroupView: View {
             // Header stays quiet even on failure — chips carry the red.
             Button(action: toggle) {
                 HStack(spacing: 8) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
+                    TablerIconView(.chevronRight, size: 9)
                         .foregroundStyle(Theme.textMuted)
                         .rotationEffect(.degrees(open ? 90 : 0))
                         .frame(width: 18, height: 18)
@@ -724,8 +718,7 @@ struct ToolChipRow: View {
     var body: some View {
         HStack(spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: tool.call.chipSymbol)
-                    .font(.system(size: 10))
+                TablerIconView(tool.call.chipIcon, size: 10)
                     .foregroundStyle(Theme.textMuted)
                     .frame(width: 18, height: 18)
                     .background(whiteAlpha(0.08), in: RoundedRectangle(cornerRadius: 5))
@@ -756,8 +749,7 @@ struct ErrorChipView: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 10))
+            TablerIconView(.alertTriangle, size: 10)
                 .foregroundStyle(Theme.dangerSoft.opacity(0.8))
                 .frame(width: 20, height: 20)
                 .background(Theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
@@ -784,8 +776,7 @@ struct InputChipView: View {
     var body: some View {
         // Neutral throughout — resolution never recolors.
         HStack(spacing: 8) {
-            Image(systemName: "bubble.left.and.text.bubble.right")
-                .font(.system(size: 10))
+            TablerIconView(.messages, size: 10)
                 .foregroundStyle(Theme.textMuted)
                 .frame(width: 20, height: 20)
                 .background(whiteAlpha(0.09), in: RoundedRectangle(cornerRadius: 6))

@@ -144,7 +144,7 @@ impl ArchivedPage {
         let device: Option<SharedString> = self
             .state
             .read(cx)
-            .device_name(&chat.device_id)
+            .device_display_name(&chat.device_id)
             .map(|name| name.to_string().into());
         let time_ago: SharedString = crate::state::format_time_ago(
             chat.last_message_at.unwrap_or(chat.created_at),
@@ -189,7 +189,7 @@ impl ArchivedPage {
                             .items_center()
                             .justify_center()
                             .child(
-                                crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
+                                crate::icons::icon(crate::icons::ARCHIVE)
                                     .size(px(16.0))
                                     .text_color(theme.text_muted.opacity(0.6)),
                             ),
@@ -268,7 +268,7 @@ impl ArchivedPage {
                                 this.unarchive(chat_id.clone(), cx);
                             }))
                             .child(
-                                crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
+                                crate::icons::icon(crate::icons::RESTORE)
                                     .size(px(14.0))
                                     .text_color(theme.text_muted),
                             )
@@ -303,7 +303,7 @@ impl ArchivedPage {
             .text_center()
             .text_color(theme.text_muted.opacity(0.5))
             .child(
-                crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
+                crate::icons::icon(crate::icons::ARCHIVE)
                     .size(px(28.0))
                     .text_color(theme.text_muted.opacity(0.2)),
             )
@@ -380,7 +380,7 @@ impl Render for ArchivedPage {
                             .bg(crate::theme::ink(0.03))
                             .px(px(10.0))
                             .child(
-                                crate::icons::icon(crate::icons::MAGNIFER)
+                                crate::icons::icon(crate::icons::SEARCH)
                                     .size(px(15.0))
                                     .text_color(theme.text_muted.opacity(0.65)),
                             )

@@ -2590,9 +2590,9 @@ impl Changes {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(&click_file, cx)))
             .child(
                 crate::icons::icon(if expanded {
-                    crate::icons::ALT_ARROW_DOWN
+                    crate::icons::CHEVRON_DOWN
                 } else {
-                    crate::icons::ALT_ARROW_RIGHT
+                    crate::icons::CHEVRON_RIGHT
                 })
                 .size(px(13.0))
                 .text_color(theme.text_muted.opacity(0.7)),
@@ -3232,7 +3232,7 @@ impl Changes {
                     .border_color(theme.border)
                     .bg(theme.surface_card)
                     .child(
-                        crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                        crate::icons::icon(crate::icons::MESSAGE_CIRCLE)
                             .size(px(15.0))
                             .text_color(theme.accent),
                     )
@@ -3259,7 +3259,7 @@ impl Changes {
                                 this.edit_comment(edit_id.clone(), window, cx);
                             }))
                             .child(
-                                crate::icons::icon(crate::icons::PEN)
+                                crate::icons::icon(crate::icons::PENCIL)
                                     .size(px(13.0))
                                     .text_color(theme.text_muted),
                             ),
@@ -3278,7 +3278,7 @@ impl Changes {
                                 this.delete_comment(&delete_id, cx);
                             }))
                             .child(
-                                crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                crate::icons::icon(crate::icons::TRASH)
                                     .size(px(13.0))
                                     .text_color(theme.text_muted),
                             ),
@@ -3395,8 +3395,6 @@ impl Render for Changes {
                                         .h(px(26.0))
                                         .flex()
                                         .items_center()
-                                        .rounded(px(6.0))
-                                        .bg(theme.surface_raised)
                                         .child(
                                             div()
                                                 .id("diff-layout-unified")
@@ -3408,24 +3406,16 @@ impl Render for Changes {
                                                 .cursor_pointer()
                                                 .text_color(theme.text_muted)
                                                 .when(layout == DiffLayout::Unified, |button| {
-                                                    button
-                                                        .bg(theme.element_hover)
-                                                        .text_color(theme.text)
+                                                    button.bg(theme.element_active)
                                                 })
                                                 .hover(|style| style.bg(theme.element_hover))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.set_layout(DiffLayout::Unified, cx);
                                                 }))
                                                 .child(
-                                                    crate::icons::icon(crate::icons::LIST)
+                                                    crate::icons::icon(crate::icons::LAYOUT_LIST)
                                                         .size(px(14.0))
-                                                        .text_color(
-                                                            if layout == DiffLayout::Unified {
-                                                                theme.text
-                                                            } else {
-                                                                theme.text_muted
-                                                            },
-                                                        ),
+                                                        .text_color(theme.text_muted),
                                                 ),
                                         )
                                         .child(
@@ -3439,9 +3429,7 @@ impl Render for Changes {
                                                 .cursor_pointer()
                                                 .text_color(theme.text_muted)
                                                 .when(layout == DiffLayout::Split, |button| {
-                                                    button
-                                                        .bg(theme.element_hover)
-                                                        .text_color(theme.text)
+                                                    button.bg(theme.element_active)
                                                 })
                                                 .hover(|style| style.bg(theme.element_hover))
                                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -3449,16 +3437,10 @@ impl Render for Changes {
                                                 }))
                                                 .child(
                                                     crate::icons::icon(
-                                                        crate::icons::SIDEBAR_MINIMALISTIC,
+                                                        crate::icons::LAYOUT_COLUMNS,
                                                     )
                                                     .size(px(14.0))
-                                                    .text_color(
-                                                        if layout == DiffLayout::Split {
-                                                            theme.text
-                                                        } else {
-                                                            theme.text_muted
-                                                        },
-                                                    ),
+                                                    .text_color(theme.text_muted),
                                                 ),
                                         ),
                                 )
@@ -3479,9 +3461,9 @@ impl Render for Changes {
                                     }))
                                     .child(
                                         crate::icons::icon(if self.expanded_view {
-                                            crate::icons::RESTORE
+                                            crate::icons::ARROWS_DIAGONAL_MINIMIZE
                                         } else {
-                                            crate::icons::MAXIMIZE
+                                            crate::icons::ARROWS_DIAGONAL_2
                                         })
                                         .size(px(15.0))
                                         .text_color(theme.text_muted),

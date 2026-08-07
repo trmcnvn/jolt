@@ -67,9 +67,9 @@ impl Render for DeviceSwitcher {
             .find(|device| Some(device.id.as_str()) == effective.as_deref())
             .cloned();
         let platform_glyph = |platform: &str| match platform {
-            "macos" | "darwin" => icons::LAPTOP,
-            "ios" | "android" => icons::SMARTPHONE,
-            _ => icons::MONITOR,
+            "macos" | "darwin" => icons::DEVICE_LAPTOP,
+            "ios" | "android" => icons::DEVICE_MOBILE,
+            _ => icons::DEVICE_DESKTOP,
         };
         let trigger_glyph = platform_glyph(
             selected
@@ -134,7 +134,7 @@ impl Render for DeviceSwitcher {
                     },
                 ))
                 .child(
-                    icon(icons::SORT_VERTICAL)
+                    icon(icons::SWITCH_VERTICAL)
                         .size(px(14.0))
                         .flex_none()
                         .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),

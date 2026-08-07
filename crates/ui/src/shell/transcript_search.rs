@@ -379,7 +379,7 @@ impl Shell {
                         icons::ARROW_DOWN,
                         "Navigate",
                     ))
-                    .child(popover::key_hint(&theme, icons::RETURN, "Open")),
+                    .child(popover::key_hint(&theme, icons::CORNER_DOWN_LEFT, "Open")),
             )
             .child(
                 div()

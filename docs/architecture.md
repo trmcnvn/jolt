@@ -54,6 +54,8 @@ The gpui desktop app is a viewport over the RPC service. On startup it probes th
 
 The supervisor resolves the preferred scope behind the splash. It always owns a fully offline Local runtime and, while authenticated, a separate Account runtime. Switching the viewport to Local leaves Account runs, synchronization, and relay hosting alive in the background. Only Account is exposed through the device relay.
 
+On macOS and Linux, the Devices setting can install the same headless engine as a per-user launchd/systemd service. Changing that setting gracefully shuts down the current engine, applies the service configuration, and relaunches the viewport so one process always owns the data directory.
+
 ### iOS viewport
 
 The SwiftUI app maintains a local workspace-registry replica and a byte-bounded transcript page cache. It consumes edge manifest/tail streams, submits commands through a durable device-local outbox, and uses relay RPC when an engine must touch a filesystem or CLI. It does not retain complete session Loro documents.

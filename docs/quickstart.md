@@ -38,7 +38,7 @@ cargo build -p jolt
 ./target/debug/Jolt
 ```
 
-Running `Jolt` with no subcommand opens the desktop app. It connects to an engine already listening on the local IPC port, or embeds an engine in the app when no daemon is present.
+Running `Jolt` with no subcommand opens the desktop app. It connects to an engine already listening on the local IPC port, or embeds an engine in the app when no daemon is present. On macOS and Linux, **Settings → Devices → Keep this device available** installs the per-user background service so agents continue after you quit the app.
 
 See [Development](development.md) for platform dependencies and packaged builds.
 

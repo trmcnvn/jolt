@@ -40,7 +40,7 @@ struct SpaceView: View {
                     Button {
                         sessionToDelete = chat
                     } label: {
-                        Label("Delete", systemImage: "trash")
+                        TablerLabel("Delete", icon: .trash)
                     }
                     // The confirmation button owns the destructive role. Giving
                     // it to this trigger makes List optimistically remove the row.
@@ -50,7 +50,7 @@ struct SpaceView: View {
                     Button {
                         model.archive(chatId: chat.id)
                     } label: {
-                        Label("Archive", systemImage: "archivebox")
+                        TablerLabel("Archive", icon: .archive)
                     }
                     .tint(Theme.surfaceRaised)
                 }
@@ -85,8 +85,7 @@ struct SpaceView: View {
                         .lineLimit(1)
                     if let space {
                         HStack(spacing: 4) {
-                            Image(systemName: "folder")
-                                .font(.system(size: 9))
+                            TablerIconView(.folder, size: 9)
                             Text("\(space.path) · \(model.deviceName(space.deviceId))")
                                 .lineLimit(1)
                                 .truncationMode(.head)
@@ -100,7 +99,7 @@ struct SpaceView: View {
                 Button {
                     path.append(.newSession(spaceId: spaceId))
                 } label: {
-                    Image(systemName: "plus")
+                    TablerIconView(.plus, size: 16)
                 }
                 .accessibilityLabel("New session")
             }
@@ -115,8 +114,7 @@ struct SpaceView: View {
 
     private var emptyState: some View {
         VStack(spacing: 14) {
-            Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 28, weight: .light))
+            TablerIconView(.messages, size: 28)
                 .foregroundStyle(Theme.textFaint)
             Text("No sessions in this space")
                 .font(Theme.sans(13))
@@ -197,8 +195,7 @@ struct NewSpaceSheet: View {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .semibold))
+                        TablerIconView(.x, size: 13)
                     }
                     .accessibilityLabel("Close")
                 }
@@ -262,8 +259,7 @@ struct NewSpaceSheet: View {
                     Task { await load(path: parent) }
                 }
             } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 13, weight: .semibold))
+                TablerIconView(.chevronLeft, size: 13)
                     .foregroundStyle(listing?.parent == nil ? Theme.textFaint.opacity(0.4) : Theme.text)
                     .frame(width: 32, height: 32)
                     .background(whiteAlpha(0.06), in: Circle())
@@ -334,7 +330,7 @@ struct NewSpaceSheet: View {
             Task { await load(path: child) }
         } label: {
             HStack(spacing: 12) {
-                LineIconView(entry.isRepo ? .folderWithFiles : .folder, size: 16,
+                TablerIconView(entry.isRepo ? .folders : .folder, size: 16,
                              color: entry.isRepo ? Theme.accent.opacity(0.85) : Theme.textMuted)
                     .frame(width: 22)
                 Text(entry.name)
@@ -350,8 +346,7 @@ struct NewSpaceSheet: View {
                         .padding(.vertical, 3)
                         .background(Theme.accent.opacity(0.12), in: Capsule())
                 }
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
+                TablerIconView(.chevronRight, size: 12)
                     .foregroundStyle(Theme.textFaint)
             }
             .padding(.horizontal, 16)
@@ -373,8 +368,7 @@ struct NewSpaceSheet: View {
 
     private var emptyDevices: some View {
         VStack(spacing: 12) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 30, weight: .light))
+            TablerIconView(.deviceDesktop, size: 30)
                 .foregroundStyle(Theme.textFaint)
             Text("No devices yet")
                 .font(Theme.sans(15, weight: .medium))
