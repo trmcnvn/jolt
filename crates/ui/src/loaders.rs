@@ -3,18 +3,19 @@
 //! pure helpers, so the math is unit-tested and these elements are
 //! testable-by-compile.
 //!
-//! Rendering pattern: repeating loaders share leased clocks in `motion` so
-//! instances stay phase-locked and stop scheduling when unmounted. The compact
-//! activity spinner updates its isolated glyph view at 10fps; cell loaders
-//! animate inside fixed slots.
+//! Rendering pattern: repeating loaders share clocks so instances stay
+//! phase-locked and stop scheduling when unmounted. The compact activity
+//! spinner updates its isolated glyph view at 10fps; cell loaders animate
+//! inside fixed slots.
 //! Motion never shifts surrounding layout, while reduced motion snaps every
 //! loader to a static frame.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, AppContext, Context, EntityId, Global, Hsla, IntoElement, ParentElement,
-    Render, SharedString, Styled, WeakEntity, div, px,
+    AnyElement, App, AppContext, Context, Entity, EntityId, Global, Hsla, IntoElement,
+    ParentElement, Render, SharedString, Styled, div, px,
 };
 
 use crate::motion::{self, GRADIENT_SPIN, JOLT_PULSE, PULSE_STAGGER, SPLASH_OUT};
@@ -83,15 +84,40 @@ pub use jolt_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 
 const ACTIVITY_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ACTIVITY_SPINNER_FPS: f32 = 10.0;
+const ACTIVITY_SPINNER_TICK: Duration = Duration::from_millis(100);
+/// Keep a mounted spinner through coalesced or delayed window frames. Unmounted
+/// views are dropped after two seconds without a render.
+const ACTIVITY_SPINNER_STALE_TICKS: u64 = 20;
 
 type ActivitySpinnerKey = (EntityId, SharedString);
 
-#[derive(Default)]
-struct ActivitySpinnerRegistry(HashMap<ActivitySpinnerKey, WeakEntity<ActivitySpinner>>);
+struct ActivitySpinnerEntry {
+    spinner: Entity<ActivitySpinner>,
+    last_rendered_tick: u64,
+}
+
+struct ActivitySpinnerRegistry {
+    epoch: Instant,
+    spinners: HashMap<ActivitySpinnerKey, ActivitySpinnerEntry>,
+    tick: u64,
+    running: bool,
+}
+
+impl Default for ActivitySpinnerRegistry {
+    fn default() -> Self {
+        Self {
+            epoch: Instant::now(),
+            spinners: HashMap::new(),
+            tick: 0,
+            running: false,
+        }
+    }
+}
 
 impl Global for ActivitySpinnerRegistry {}
 
 struct ActivitySpinner {
+    key: ActivitySpinnerKey,
     size_px: f32,
     color: Hsla,
     font_family: SharedString,
@@ -99,7 +125,20 @@ struct ActivitySpinner {
 
 impl Render for ActivitySpinner {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let frame = activity_spinner_frame(motion::activity_spinner_elapsed(cx.entity_id(), cx));
+        let elapsed = if cx.reduce_motion() {
+            0.0
+        } else {
+            let entity_id = cx.entity_id();
+            let registry = cx.default_global::<ActivitySpinnerRegistry>();
+            let tick = registry.tick;
+            if let Some(entry) = registry.spinners.get_mut(&self.key)
+                && entry.spinner.entity_id() == entity_id
+            {
+                entry.last_rendered_tick = tick;
+            }
+            registry.epoch.elapsed().as_secs_f32()
+        };
+        let frame = activity_spinner_frame(elapsed);
         div()
             .size(px(self.size_px))
             .flex_none()
@@ -119,6 +158,58 @@ fn activity_spinner_frame(elapsed_secs: f32) -> &'static str {
     ACTIVITY_SPINNER_FRAMES[index]
 }
 
+fn ensure_activity_spinner_clock(cx: &mut App) {
+    let reduce_motion = cx.reduce_motion();
+    let should_start = {
+        let registry = cx.default_global::<ActivitySpinnerRegistry>();
+        if registry.running || reduce_motion {
+            false
+        } else {
+            registry.running = true;
+            true
+        }
+    };
+    if !should_start {
+        return;
+    }
+
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(ACTIVITY_SPINNER_TICK).await;
+            let parked = cx.update(|cx| {
+                let reduce_motion = cx.reduce_motion();
+                let (views, parked) = {
+                    let registry = cx.default_global::<ActivitySpinnerRegistry>();
+                    registry.tick = registry.tick.wrapping_add(1);
+                    let tick = registry.tick;
+                    registry.spinners.retain(|_, entry| {
+                        tick.wrapping_sub(entry.last_rendered_tick) <= ACTIVITY_SPINNER_STALE_TICKS
+                    });
+                    if registry.spinners.is_empty() || reduce_motion {
+                        registry.running = false;
+                        (Vec::new(), true)
+                    } else {
+                        let views = registry
+                            .spinners
+                            .values()
+                            .map(|entry| entry.spinner.entity_id())
+                            .collect::<Vec<_>>();
+                        (views, false)
+                    }
+                };
+                for view in views {
+                    cx.notify(view);
+                }
+                parked
+            });
+            if parked {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
 /// A terminal-style activity spinner used while work is in progress.
 ///
 /// Each instance lives in its own GPUI view, so the shared 10fps clock
@@ -134,11 +225,14 @@ pub fn activity_spinner(
     let registry_key = (owner, key.into());
     let existing = {
         let registry = cx.default_global::<ActivitySpinnerRegistry>();
-        registry.0.retain(|_, spinner| spinner.upgrade().is_some());
-        registry.0.get(&registry_key).and_then(WeakEntity::upgrade)
+        let tick = registry.tick;
+        registry.spinners.get_mut(&registry_key).map(|entry| {
+            entry.last_rendered_tick = tick;
+            entry.spinner.clone()
+        })
     };
 
-    if let Some(spinner) = existing {
+    let spinner = if let Some(spinner) = existing {
         spinner.update(cx, |spinner, cx| {
             if spinner.size_px != size_px
                 || spinner.color != theme.code_text
@@ -152,16 +246,25 @@ pub fn activity_spinner(
         });
         spinner
     } else {
+        let spinner_key = registry_key.clone();
         let spinner = cx.new(|_| ActivitySpinner {
+            key: spinner_key,
             size_px,
             color: theme.code_text,
             font_family: theme.font_mono.clone(),
         });
-        cx.default_global::<ActivitySpinnerRegistry>()
-            .0
-            .insert(registry_key, spinner.downgrade());
+        let registry = cx.default_global::<ActivitySpinnerRegistry>();
+        registry.spinners.insert(
+            registry_key,
+            ActivitySpinnerEntry {
+                spinner: spinner.clone(),
+                last_rendered_tick: registry.tick,
+            },
+        );
         spinner
-    }
+    };
+    ensure_activity_spinner_clock(cx);
+    spinner
 }
 
 /// The gradient matrix spinner: a 3×3 grid of round cells tinted per row from

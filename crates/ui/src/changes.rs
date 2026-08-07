@@ -3418,7 +3418,14 @@ impl Render for Changes {
                                                 }))
                                                 .child(
                                                     crate::icons::icon(crate::icons::LIST)
-                                                        .size(px(14.0)),
+                                                        .size(px(14.0))
+                                                        .text_color(
+                                                            if layout == DiffLayout::Unified {
+                                                                theme.text
+                                                            } else {
+                                                                theme.text_muted
+                                                            },
+                                                        ),
                                                 ),
                                         )
                                         .child(
@@ -3444,7 +3451,14 @@ impl Render for Changes {
                                                     crate::icons::icon(
                                                         crate::icons::SIDEBAR_MINIMALISTIC,
                                                     )
-                                                    .size(px(14.0)),
+                                                    .size(px(14.0))
+                                                    .text_color(
+                                                        if layout == DiffLayout::Split {
+                                                            theme.text
+                                                        } else {
+                                                            theme.text_muted
+                                                        },
+                                                    ),
                                                 ),
                                         ),
                                 )

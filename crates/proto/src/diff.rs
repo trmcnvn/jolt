@@ -23,6 +23,11 @@ pub struct DiffPageDescriptor {
     pub hunk_count: usize,
     pub line_count: usize,
     /// Visual line rows when deletions and additions are paired side by side.
+    ///
+    /// Diff manifests are embedded immutably in transcript entries. Entries
+    /// written before split layout existed omit this field; zero makes the
+    /// viewer use `line_count` without rejecting the containing transcript.
+    #[serde(default)]
     pub split_line_count: usize,
     pub estimated_bytes: usize,
 }
@@ -116,4 +121,27 @@ pub enum CheckoutDiffWatchFrame {
         sequence: u64,
         manifest: CheckoutDiffManifest,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DiffPageDescriptor;
+
+    #[test]
+    fn persisted_page_without_split_count_keeps_transcript_readable() {
+        let descriptor: DiffPageDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "page",
+            "fileId": "file",
+            "firstRow": 0,
+            "rowCount": 4,
+            "noticeCount": 0,
+            "hunkCount": 1,
+            "lineCount": 3,
+            "estimatedBytes": 100
+        }))
+        .unwrap();
+
+        assert_eq!(descriptor.split_line_count, 0);
+        assert_eq!(descriptor.line_count, 3);
+    }
 }

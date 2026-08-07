@@ -44,10 +44,6 @@ pub use gpui::AnimationExt;
 /// Repeat-tick interval for low-motion pulse and skeleton loaders (~30fps).
 const PULSE_TICK: Duration = Duration::from_millis(33);
 
-/// The text spinner has ten discrete frames per second. Tick only when the
-/// visible glyph changes instead of driving it at the display refresh rate.
-const ACTIVITY_SPINNER_TICK: Duration = Duration::from_millis(100);
-
 /// How long a view stays on the tick list after its last spinner paint. One
 /// lease outlives a few missed frames; an unmounted spinner stops renewing and
 /// the view drops off, letting the clock park.
@@ -70,11 +66,6 @@ impl Default for PulseClock {
         }
     }
 }
-
-#[derive(Default)]
-struct ActivitySpinnerClock(PulseClock);
-
-impl Global for ActivitySpinnerClock {}
 
 /// Current phase `[0,1)` of a repeating spec, plus a lease that keeps the
 /// calling view re-rendering at [`PULSE_TICK`] while its spinner stays
@@ -116,46 +107,6 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
         .detach();
     }
     phase
-}
-
-/// Elapsed seconds for a text activity spinner, with a leased 10fps refresh.
-/// Call this from the spinner's own view so each tick invalidates only that
-/// small view. An unmounted spinner stops renewing its lease and the shared
-/// clock parks.
-pub fn activity_spinner_elapsed(view: EntityId, cx: &mut App) -> f32 {
-    if cx.reduce_motion() {
-        return 0.0;
-    }
-    let clock = &mut cx.default_global::<ActivitySpinnerClock>().0;
-    clock.leases.insert(view, Instant::now() + PULSE_LEASE);
-    let elapsed = clock.epoch.elapsed().as_secs_f32();
-    if !clock.running {
-        clock.running = true;
-        cx.spawn(async move |cx| {
-            loop {
-                cx.background_executor().timer(ACTIVITY_SPINNER_TICK).await;
-                let parked = cx.update(|cx| {
-                    let clock = &mut cx.default_global::<ActivitySpinnerClock>().0;
-                    let now = Instant::now();
-                    clock.leases.retain(|_, until| *until > now);
-                    if clock.leases.is_empty() {
-                        clock.running = false;
-                        return true;
-                    }
-                    let views: Vec<EntityId> = clock.leases.keys().copied().collect();
-                    for view in views {
-                        cx.notify(view);
-                    }
-                    false
-                });
-                if parked {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-    elapsed
 }
 
 // ---------------------------------------------------------------------------
