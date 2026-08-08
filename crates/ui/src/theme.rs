@@ -177,7 +177,7 @@ pub fn set_current_appearance(appearance: Appearance) {
 /// for everything else: this palette leans on very low alphas for its subtle
 /// fills — the composer plate is `ink(0.03)`, key caps are `ink(0.05)` — and
 /// halving those produced 1.5% black on white, which is nothing. The composer
-/// lost its background entirely and selected tabs stopped reading as selected.
+/// lost its background entirely and selected rows stopped reading as selected.
 ///
 /// The established light-UI scales (Primer, Radix) land subtle ≈ 3–4%, hover ≈ 8%,
 /// selected ≈ 14% black — which is where the dark palette's white alphas already
@@ -373,7 +373,7 @@ impl Theme {
     pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
     /// Main-panel header height (jolt `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
-    /// The unified window titlebar (traffic lights + cluster + tabs). Content
+    /// The unified window titlebar (traffic lights + controls + session identity). Content
     /// rides [`Self::TITLEBAR_TOP_PAD`] lower than center so the air above
     /// matches the perceived gap to the inset card below (border + card body).
     pub const TITLEBAR_HEIGHT: f32 = 38.0;
@@ -424,7 +424,7 @@ impl Theme {
         self.glass().a < 1.0
     }
 
-    /// Hover wash for chrome that sits ON GLASS (sidebar rows, tabs, titlebar
+    /// Hover wash for chrome that sits ON GLASS (sidebar rows and titlebar
     /// buttons). Dark: the standard luminous hover. Light: a white wash below
     /// [`glass_selected_bg`] — the appearance-neutral `element_hover` is a
     /// *black* wash in light mode, which put a dark hover next to a white
@@ -863,7 +863,7 @@ fn band_for(appearance: Appearance) -> Hsla {
     }
 }
 
-/// Selected-state glass treatment (tabs, session rows, space rows): a
+/// Selected-state glass treatment (session rows and space rows): a
 /// TRANSLUCENT wash the vibrancy reads through — heavier flat washes blocked
 /// the glass (user request).
 ///
@@ -878,7 +878,7 @@ pub fn glass_selected_bg() -> Hsla {
     match current_appearance() {
         Appearance::Dark => wash(0.14),
         // Near-opaque: at 0.55 the chip sank into the (bright) frost and the
-        // active tab lost its contrast — the ring and seat shadow in
+        // active row lost its contrast — the ring and seat shadow in
         // [`glass_selected_shadows`] carry the edge, the fill carries the pop.
         Appearance::Light => hsla(0.0, 0.0, 1.0, 0.92),
     }
@@ -912,8 +912,7 @@ pub fn card_selected_bg() -> Hsla {
 /// recipes were tried (a tight 10% layer, a 6% contact + 5% ambient pair, a
 /// lone 4% whisper) and every one failed on sight: layers sum into a grey rim
 /// exactly where the chip meets the frost, gpui's small-radius blur reads
-/// coarse on a bright field, and the tab strip is a scroll container that
-/// clips its children vertically — any shadow escaping the chip gets cut off
+/// coarse on a bright field, and scroll containers clip escaping shadows
 /// mid-fade. The near-opaque fill plus the ring carry selection, exactly as
 /// dark's wash plus ring does; the two appearances share one recipe now.
 pub fn glass_selected_shadows() -> Vec<gpui::BoxShadow> {
@@ -1580,8 +1579,8 @@ mod tests {
 
     /// Glass selection is edge-only in BOTH appearances — no drop-shadow seat.
     /// Every light seat tried (10% tight, 6%+5% pair, lone 4%) read as a grey
-    /// rim or a coarse smudge, and the tab strip clips escaping shadows
-    /// vertically (user reports). The ring must also stay subtle enough to
+    /// rim or a coarse smudge, and scroll containers clip escaping shadows
+    /// (user reports). The ring must also stay subtle enough to
     /// define the chip rather than frame it.
     #[test]
     fn glass_selection_is_edge_only_and_subtle() {

@@ -50,6 +50,26 @@ final class RegistryDocPersistenceTests: XCTestCase {
     }
 }
 
+final class SessionOrderingTests: XCTestCase {
+    func testPinsSortAheadOfRecency() {
+        let recent = chat(id: "recent", pinned: false, activity: 30)
+        let pinnedRecent = chat(id: "pinned-recent", pinned: true, activity: 20)
+        let pinnedOld = chat(id: "pinned-old", pinned: true, activity: 10)
+
+        XCTAssertEqual(
+            sortActive([recent, pinnedOld, pinnedRecent]).map(\.id),
+            ["pinned-recent", "pinned-old", "recent"]
+        )
+    }
+
+    private func chat(id: String, pinned: Bool, activity: Int64) -> Chat {
+        Chat(id: id, deviceId: "dev", title: id, archived: false, pinned: pinned,
+             cwd: nil, branch: nil, checkoutId: nil, config: nil,
+             lastMessagePreview: nil, lastMessageAt: activity, createdAt: 0,
+             spaceId: "space", lastSeenAt: activity)
+    }
+}
+
 final class HlcMonotonicClockTests: XCTestCase {
     func testNeverEmitsAtOrBelowTheLastClockAcrossWallClockRegression() {
         var clock = HlcClock()

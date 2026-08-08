@@ -49,8 +49,6 @@ const FILE_NAME: &str = "ui-settings.json";
 #[serde(rename_all = "camelCase")]
 pub struct ScopeNavigation {
     pub last_space_id: Option<String>,
-    pub open_tabs: Vec<String>,
-    pub active_tab_id: Option<String>,
     pub space_filter: Option<String>,
 }
 
@@ -62,10 +60,6 @@ pub struct UiSettings {
     /// The last active space — restored on boot and used as the new-session
     /// fallback when the sidebar filter is "All spaces".
     pub last_space_id: Option<String>,
-    /// Device-local open session tabs in drag order.
-    pub open_tabs: Vec<String>,
-    /// Last active session tab, restored when it is still open and live.
-    pub active_tab_id: Option<String>,
     /// Sidebar session filter (`None` = All spaces).
     pub space_filter: Option<String>,
     /// Navigation snapshots partitioned by Local/Account scope.
@@ -102,8 +96,6 @@ impl Default for UiSettings {
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
             last_space_id: None,
-            open_tabs: Vec::new(),
-            active_tab_id: None,
             space_filter: None,
             scope_navigation: std::collections::HashMap::new(),
             system_notifications_enabled: false,
@@ -131,28 +123,27 @@ impl Default for UiSettings {
 pub enum ShortcutId {
     NewSession,
     ClearInput,
-    CloseTab,
     PreviousTranscriptTurn,
     NextTranscriptTurn,
     SearchTranscript,
     OpenSettings,
     OpenSpacesDropdown,
     AddSpace,
-    SearchSessions,
+    SearchThreads,
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
     NewTerminalTab,
     CloseTerminalTab,
-    SelectTab1,
-    SelectTab2,
-    SelectTab3,
-    SelectTab4,
-    SelectTab5,
-    SelectTab6,
-    SelectTab7,
-    SelectTab8,
-    SelectLastTab,
+    SelectSession1,
+    SelectSession2,
+    SelectSession3,
+    SelectSession4,
+    SelectSession5,
+    SelectSession6,
+    SelectSession7,
+    SelectSession8,
+    SelectSession9,
     Quit,
     Hide,
     HideOthers,
@@ -162,16 +153,16 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const TAB_SELECTION: [ShortcutId; 9] = [
-        ShortcutId::SelectTab1,
-        ShortcutId::SelectTab2,
-        ShortcutId::SelectTab3,
-        ShortcutId::SelectTab4,
-        ShortcutId::SelectTab5,
-        ShortcutId::SelectTab6,
-        ShortcutId::SelectTab7,
-        ShortcutId::SelectTab8,
-        ShortcutId::SelectLastTab,
+    pub const SESSION_SELECTION: [ShortcutId; 9] = [
+        ShortcutId::SelectSession1,
+        ShortcutId::SelectSession2,
+        ShortcutId::SelectSession3,
+        ShortcutId::SelectSession4,
+        ShortcutId::SelectSession5,
+        ShortcutId::SelectSession6,
+        ShortcutId::SelectSession7,
+        ShortcutId::SelectSession8,
+        ShortcutId::SelectSession9,
     ];
 
     /// Hotkeys available in this build and on this platform.
@@ -179,21 +170,20 @@ impl ShortcutId {
         let mut ids = vec![
             ShortcutId::NewSession,
             ShortcutId::ClearInput,
-            ShortcutId::CloseTab,
             ShortcutId::PreviousTranscriptTurn,
             ShortcutId::NextTranscriptTurn,
             ShortcutId::SearchTranscript,
             ShortcutId::OpenSettings,
             ShortcutId::OpenSpacesDropdown,
             ShortcutId::AddSpace,
-            ShortcutId::SearchSessions,
+            ShortcutId::SearchThreads,
             ShortcutId::ToggleSidebar,
             ShortcutId::ToggleChanges,
             ShortcutId::ToggleTerminal,
             ShortcutId::NewTerminalTab,
             ShortcutId::CloseTerminalTab,
         ];
-        ids.extend(Self::TAB_SELECTION);
+        ids.extend(Self::SESSION_SELECTION);
         if cfg!(target_os = "macos") {
             ids.extend([
                 ShortcutId::Quit,
@@ -212,30 +202,29 @@ impl ShortcutId {
     /// Row label.
     pub fn label(self) -> &'static str {
         match self {
-            ShortcutId::NewSession => "New session",
+            ShortcutId::NewSession => "New thread",
             ShortcutId::ClearInput => "Clear input",
-            ShortcutId::CloseTab => "Close current tab",
             ShortcutId::PreviousTranscriptTurn => "Previous transcript prompt",
             ShortcutId::NextTranscriptTurn => "Next transcript prompt",
             ShortcutId::SearchTranscript => "Search transcript",
             ShortcutId::OpenSettings => "Open settings",
             ShortcutId::OpenSpacesDropdown => "Open spaces dropdown",
             ShortcutId::AddSpace => "Add space",
-            ShortcutId::SearchSessions => "Search sessions",
+            ShortcutId::SearchThreads => "Search threads",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::NewTerminalTab => "New terminal tab",
             ShortcutId::CloseTerminalTab => "Close terminal tab",
-            ShortcutId::SelectTab1 => "Select tab 1",
-            ShortcutId::SelectTab2 => "Select tab 2",
-            ShortcutId::SelectTab3 => "Select tab 3",
-            ShortcutId::SelectTab4 => "Select tab 4",
-            ShortcutId::SelectTab5 => "Select tab 5",
-            ShortcutId::SelectTab6 => "Select tab 6",
-            ShortcutId::SelectTab7 => "Select tab 7",
-            ShortcutId::SelectTab8 => "Select tab 8",
-            ShortcutId::SelectLastTab => "Select last tab",
+            ShortcutId::SelectSession1 => "Select thread 1",
+            ShortcutId::SelectSession2 => "Select thread 2",
+            ShortcutId::SelectSession3 => "Select thread 3",
+            ShortcutId::SelectSession4 => "Select thread 4",
+            ShortcutId::SelectSession5 => "Select thread 5",
+            ShortcutId::SelectSession6 => "Select thread 6",
+            ShortcutId::SelectSession7 => "Select thread 7",
+            ShortcutId::SelectSession8 => "Select thread 8",
+            ShortcutId::SelectSession9 => "Select thread 9",
             ShortcutId::Quit => "Quit Jolt",
             ShortcutId::Hide => "Hide Jolt",
             ShortcutId::HideOthers => "Hide other applications",
@@ -249,28 +238,27 @@ impl ShortcutId {
         match self {
             ShortcutId::NewSession => "mod-n",
             ShortcutId::ClearInput => "mod-c",
-            ShortcutId::CloseTab => "mod-w",
             ShortcutId::PreviousTranscriptTurn => "mod-shift-up",
             ShortcutId::NextTranscriptTurn => "mod-shift-down",
             ShortcutId::SearchTranscript => "mod-f",
             ShortcutId::OpenSettings => "mod-,",
             ShortcutId::OpenSpacesDropdown => "mod-shift-k",
             ShortcutId::AddSpace => "mod-k",
-            ShortcutId::SearchSessions => "mod-shift-f",
+            ShortcutId::SearchThreads => "mod-shift-f",
             ShortcutId::ToggleSidebar => "mod-e",
             ShortcutId::ToggleChanges => "mod-b",
             ShortcutId::ToggleTerminal => "mod-`",
             ShortcutId::NewTerminalTab => "mod-t",
             ShortcutId::CloseTerminalTab => "mod-shift-w",
-            ShortcutId::SelectTab1 => "mod-1",
-            ShortcutId::SelectTab2 => "mod-2",
-            ShortcutId::SelectTab3 => "mod-3",
-            ShortcutId::SelectTab4 => "mod-4",
-            ShortcutId::SelectTab5 => "mod-5",
-            ShortcutId::SelectTab6 => "mod-6",
-            ShortcutId::SelectTab7 => "mod-7",
-            ShortcutId::SelectTab8 => "mod-8",
-            ShortcutId::SelectLastTab => "mod-9",
+            ShortcutId::SelectSession1 => "mod-1",
+            ShortcutId::SelectSession2 => "mod-2",
+            ShortcutId::SelectSession3 => "mod-3",
+            ShortcutId::SelectSession4 => "mod-4",
+            ShortcutId::SelectSession5 => "mod-5",
+            ShortcutId::SelectSession6 => "mod-6",
+            ShortcutId::SelectSession7 => "mod-7",
+            ShortcutId::SelectSession8 => "mod-8",
+            ShortcutId::SelectSession9 => "mod-9",
             ShortcutId::Quit => "mod-q",
             ShortcutId::Hide => "mod-h",
             ShortcutId::HideOthers => "mod-alt-h",
@@ -289,11 +277,10 @@ fn default_search_transcript() -> String {
 /// "mod-e"); translated to "cmd-e"/"ctrl-e" at bind time by
 /// [`platform_combo`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
     pub new_session: String,
     pub clear_input: String,
-    pub close_tab: String,
     pub previous_transcript_turn: String,
     pub next_transcript_turn: String,
     #[serde(default = "default_search_transcript")]
@@ -307,15 +294,15 @@ pub struct KeymapConfig {
     pub toggle_terminal: String,
     pub new_terminal_tab: String,
     pub close_terminal_tab: String,
-    pub select_tab_1: String,
-    pub select_tab_2: String,
-    pub select_tab_3: String,
-    pub select_tab_4: String,
-    pub select_tab_5: String,
-    pub select_tab_6: String,
-    pub select_tab_7: String,
-    pub select_tab_8: String,
-    pub select_last_tab: String,
+    pub select_session_1: String,
+    pub select_session_2: String,
+    pub select_session_3: String,
+    pub select_session_4: String,
+    pub select_session_5: String,
+    pub select_session_6: String,
+    pub select_session_7: String,
+    pub select_session_8: String,
+    pub select_session_9: String,
     pub quit: String,
     pub hide: String,
     pub hide_others: String,
@@ -329,28 +316,27 @@ impl Default for KeymapConfig {
         Self {
             new_session: ShortcutId::NewSession.default_combo().into(),
             clear_input: ShortcutId::ClearInput.default_combo().into(),
-            close_tab: ShortcutId::CloseTab.default_combo().into(),
             previous_transcript_turn: ShortcutId::PreviousTranscriptTurn.default_combo().into(),
             next_transcript_turn: ShortcutId::NextTranscriptTurn.default_combo().into(),
             search_transcript: default_search_transcript(),
             open_settings: ShortcutId::OpenSettings.default_combo().into(),
             open_spaces_dropdown: ShortcutId::OpenSpacesDropdown.default_combo().into(),
             add_space: ShortcutId::AddSpace.default_combo().into(),
-            search_sessions: ShortcutId::SearchSessions.default_combo().into(),
+            search_sessions: ShortcutId::SearchThreads.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             new_terminal_tab: ShortcutId::NewTerminalTab.default_combo().into(),
             close_terminal_tab: ShortcutId::CloseTerminalTab.default_combo().into(),
-            select_tab_1: ShortcutId::SelectTab1.default_combo().into(),
-            select_tab_2: ShortcutId::SelectTab2.default_combo().into(),
-            select_tab_3: ShortcutId::SelectTab3.default_combo().into(),
-            select_tab_4: ShortcutId::SelectTab4.default_combo().into(),
-            select_tab_5: ShortcutId::SelectTab5.default_combo().into(),
-            select_tab_6: ShortcutId::SelectTab6.default_combo().into(),
-            select_tab_7: ShortcutId::SelectTab7.default_combo().into(),
-            select_tab_8: ShortcutId::SelectTab8.default_combo().into(),
-            select_last_tab: ShortcutId::SelectLastTab.default_combo().into(),
+            select_session_1: ShortcutId::SelectSession1.default_combo().into(),
+            select_session_2: ShortcutId::SelectSession2.default_combo().into(),
+            select_session_3: ShortcutId::SelectSession3.default_combo().into(),
+            select_session_4: ShortcutId::SelectSession4.default_combo().into(),
+            select_session_5: ShortcutId::SelectSession5.default_combo().into(),
+            select_session_6: ShortcutId::SelectSession6.default_combo().into(),
+            select_session_7: ShortcutId::SelectSession7.default_combo().into(),
+            select_session_8: ShortcutId::SelectSession8.default_combo().into(),
+            select_session_9: ShortcutId::SelectSession9.default_combo().into(),
             quit: ShortcutId::Quit.default_combo().into(),
             hide: ShortcutId::Hide.default_combo().into(),
             hide_others: ShortcutId::HideOthers.default_combo().into(),
@@ -366,28 +352,27 @@ impl KeymapConfig {
         match id {
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::ClearInput => &self.clear_input,
-            ShortcutId::CloseTab => &self.close_tab,
             ShortcutId::PreviousTranscriptTurn => &self.previous_transcript_turn,
             ShortcutId::NextTranscriptTurn => &self.next_transcript_turn,
             ShortcutId::SearchTranscript => &self.search_transcript,
             ShortcutId::OpenSettings => &self.open_settings,
             ShortcutId::OpenSpacesDropdown => &self.open_spaces_dropdown,
             ShortcutId::AddSpace => &self.add_space,
-            ShortcutId::SearchSessions => &self.search_sessions,
+            ShortcutId::SearchThreads => &self.search_sessions,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::NewTerminalTab => &self.new_terminal_tab,
             ShortcutId::CloseTerminalTab => &self.close_terminal_tab,
-            ShortcutId::SelectTab1 => &self.select_tab_1,
-            ShortcutId::SelectTab2 => &self.select_tab_2,
-            ShortcutId::SelectTab3 => &self.select_tab_3,
-            ShortcutId::SelectTab4 => &self.select_tab_4,
-            ShortcutId::SelectTab5 => &self.select_tab_5,
-            ShortcutId::SelectTab6 => &self.select_tab_6,
-            ShortcutId::SelectTab7 => &self.select_tab_7,
-            ShortcutId::SelectTab8 => &self.select_tab_8,
-            ShortcutId::SelectLastTab => &self.select_last_tab,
+            ShortcutId::SelectSession1 => &self.select_session_1,
+            ShortcutId::SelectSession2 => &self.select_session_2,
+            ShortcutId::SelectSession3 => &self.select_session_3,
+            ShortcutId::SelectSession4 => &self.select_session_4,
+            ShortcutId::SelectSession5 => &self.select_session_5,
+            ShortcutId::SelectSession6 => &self.select_session_6,
+            ShortcutId::SelectSession7 => &self.select_session_7,
+            ShortcutId::SelectSession8 => &self.select_session_8,
+            ShortcutId::SelectSession9 => &self.select_session_9,
             ShortcutId::Quit => &self.quit,
             ShortcutId::Hide => &self.hide,
             ShortcutId::HideOthers => &self.hide_others,
@@ -401,28 +386,27 @@ impl KeymapConfig {
         match id {
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::ClearInput => self.clear_input = combo,
-            ShortcutId::CloseTab => self.close_tab = combo,
             ShortcutId::PreviousTranscriptTurn => self.previous_transcript_turn = combo,
             ShortcutId::NextTranscriptTurn => self.next_transcript_turn = combo,
             ShortcutId::SearchTranscript => self.search_transcript = combo,
             ShortcutId::OpenSettings => self.open_settings = combo,
             ShortcutId::OpenSpacesDropdown => self.open_spaces_dropdown = combo,
             ShortcutId::AddSpace => self.add_space = combo,
-            ShortcutId::SearchSessions => self.search_sessions = combo,
+            ShortcutId::SearchThreads => self.search_sessions = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::NewTerminalTab => self.new_terminal_tab = combo,
             ShortcutId::CloseTerminalTab => self.close_terminal_tab = combo,
-            ShortcutId::SelectTab1 => self.select_tab_1 = combo,
-            ShortcutId::SelectTab2 => self.select_tab_2 = combo,
-            ShortcutId::SelectTab3 => self.select_tab_3 = combo,
-            ShortcutId::SelectTab4 => self.select_tab_4 = combo,
-            ShortcutId::SelectTab5 => self.select_tab_5 = combo,
-            ShortcutId::SelectTab6 => self.select_tab_6 = combo,
-            ShortcutId::SelectTab7 => self.select_tab_7 = combo,
-            ShortcutId::SelectTab8 => self.select_tab_8 = combo,
-            ShortcutId::SelectLastTab => self.select_last_tab = combo,
+            ShortcutId::SelectSession1 => self.select_session_1 = combo,
+            ShortcutId::SelectSession2 => self.select_session_2 = combo,
+            ShortcutId::SelectSession3 => self.select_session_3 = combo,
+            ShortcutId::SelectSession4 => self.select_session_4 = combo,
+            ShortcutId::SelectSession5 => self.select_session_5 = combo,
+            ShortcutId::SelectSession6 => self.select_session_6 = combo,
+            ShortcutId::SelectSession7 => self.select_session_7 = combo,
+            ShortcutId::SelectSession8 => self.select_session_8 = combo,
+            ShortcutId::SelectSession9 => self.select_session_9 = combo,
             ShortcutId::Quit => self.quit = combo,
             ShortcutId::Hide => self.hide = combo,
             ShortcutId::HideOthers => self.hide_others = combo,
@@ -470,16 +454,6 @@ pub fn combo_from_keystroke(
     Some(parts.join("-"))
 }
 
-/// Whether two actions intentionally share one hotkey. Cmd+W closes the
-/// current tab in chat mode and falls through to Close Window in Settings.
-pub fn hotkeys_can_overlap(first: ShortcutId, second: ShortcutId) -> bool {
-    matches!(
-        (first, second),
-        (ShortcutId::CloseTab, ShortcutId::CloseWindow)
-            | (ShortcutId::CloseWindow, ShortcutId::CloseTab)
-    )
-}
-
 /// Hotkey ids whose combinations collide with another action.
 pub fn conflicted_shortcuts(keymap: &KeymapConfig) -> Vec<ShortcutId> {
     let ids = ShortcutId::all();
@@ -488,9 +462,10 @@ pub fn conflicted_shortcuts(keymap: &KeymapConfig) -> Vec<ShortcutId> {
         .filter(|&id| {
             let combo = keymap.get(id);
             !combo.is_empty()
-                && ids.iter().copied().any(|other| {
-                    other != id && !hotkeys_can_overlap(id, other) && keymap.get(other) == combo
-                })
+                && ids
+                    .iter()
+                    .copied()
+                    .any(|other| other != id && keymap.get(other) == combo)
         })
         .collect()
 }
@@ -617,14 +592,12 @@ mod tests {
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             last_space_id: Some("space-1".into()),
-            open_tabs: vec!["b".into(), "a".into()],
-            active_tab_id: Some("a".into()),
             space_filter: Some("space-1".into()),
             scope_navigation: std::collections::HashMap::from([(
                 "account".into(),
                 ScopeNavigation {
-                    active_tab_id: Some("a".into()),
-                    ..ScopeNavigation::default()
+                    last_space_id: Some("space-1".into()),
+                    space_filter: Some("space-1".into()),
                 },
             )]),
             system_notifications_enabled: true,
@@ -656,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_search_transcript_hotkey_preserves_other_settings() {
+    fn missing_hotkeys_use_defaults_and_preserve_other_settings() {
         let dir = tempfile::tempdir().unwrap();
         let mut settings = UiSettings::default();
         settings.keymap.toggle_sidebar = "mod-shift-s".into();
@@ -665,14 +638,28 @@ mod tests {
         let path = UiSettings::path(dir.path());
         let mut json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        json["keymap"]
-            .as_object_mut()
-            .unwrap()
-            .remove("searchTranscript");
+        let keymap = json["keymap"].as_object_mut().unwrap();
+        for field in [
+            "searchTranscript",
+            "selectSession1",
+            "selectSession2",
+            "selectSession3",
+            "selectSession4",
+            "selectSession5",
+            "selectSession6",
+            "selectSession7",
+            "selectSession8",
+            "selectSession9",
+        ] {
+            keymap.remove(field);
+        }
         std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap.search_transcript, "mod-f");
+        for id in ShortcutId::SESSION_SELECTION {
+            assert_eq!(loaded.keymap.get(id), id.default_combo());
+        }
         assert_eq!(loaded.keymap.toggle_sidebar, "mod-shift-s");
     }
 
@@ -744,7 +731,7 @@ mod tests {
         }
         assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
         assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
-        assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-w");
+        assert_eq!(keymap.get(ShortcutId::SelectSession9), "mod-9");
         assert_eq!(
             keymap.get(ShortcutId::PreviousTranscriptTurn),
             "mod-shift-up"
@@ -754,7 +741,7 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::OpenSettings), "mod-,");
         assert_eq!(keymap.get(ShortcutId::OpenSpacesDropdown), "mod-shift-k");
         assert_eq!(keymap.get(ShortcutId::AddSpace), "mod-k");
-        assert_eq!(keymap.get(ShortcutId::SearchSessions), "mod-shift-f");
+        assert_eq!(keymap.get(ShortcutId::SearchThreads), "mod-shift-f");
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-e");
         assert_eq!(keymap.get(ShortcutId::ToggleChanges), "mod-b");
         assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-`");
@@ -764,10 +751,6 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-shift-c");
         keymap.reset(ShortcutId::ClearInput);
         assert_eq!(keymap.get(ShortcutId::ClearInput), "mod-c");
-        keymap.set(ShortcutId::CloseTab, "mod-shift-w".into());
-        assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-shift-w");
-        keymap.reset(ShortcutId::CloseTab);
-        assert_eq!(keymap.get(ShortcutId::CloseTab), "mod-w");
         keymap.set(ShortcutId::ToggleSidebar, "mod-shift-x".into());
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
         keymap.reset(ShortcutId::ToggleSidebar);
@@ -816,12 +799,12 @@ mod tests {
         assert!(conflicts.contains(&ShortcutId::ToggleChanges));
         assert!(!conflicts.contains(&ShortcutId::ToggleTerminal));
         assert!(!conflicts.contains(&ShortcutId::AddSpace));
-        assert!(!conflicts.contains(&ShortcutId::SearchSessions));
+        assert!(!conflicts.contains(&ShortcutId::SearchThreads));
         assert!(!conflicts.contains(&ShortcutId::OpenSpacesDropdown));
         assert!(!conflicts.contains(&ShortcutId::OpenSettings));
         assert!(!conflicts.contains(&ShortcutId::NewSession));
         assert!(!conflicts.contains(&ShortcutId::ClearInput));
-        assert!(!conflicts.contains(&ShortcutId::CloseTab));
+        assert!(!conflicts.contains(&ShortcutId::SelectSession1));
         keymap.reset(ShortcutId::ToggleChanges);
         assert!(conflicted_shortcuts(&keymap).is_empty());
     }

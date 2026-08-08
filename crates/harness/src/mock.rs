@@ -93,7 +93,7 @@ impl Harness for MockHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         // Optional pacing knob for demos/manual testing: `JOLT_MOCK_DELAY_MS`
         // spaces the scripted events out so live-run UI states (working
-        // indicator, streaming fade, active tool-group preview) are
+        // indicator, semantic text reveals, active tool-group preview) are
         // observable. Unset (the default, and in tests) streams instantly.
         let delay_ms = std::env::var("JOLT_MOCK_DELAY_MS")
             .ok()
@@ -156,8 +156,8 @@ impl Harness for MockHarness {
 
         // Dev/testing knob: `JOLT_MOCK_REPEAT=N` loops the script body N times
         // before the final Done — long single-reply streams for frame-cost /
-        // smoothness measurement (the terminal `Done` is emitted exactly once,
-        // at the very end).
+        // durability/sync measurement (the terminal `Done` is emitted exactly
+        // once, at the very end).
         let repeat = std::env::var("JOLT_MOCK_REPEAT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -230,8 +230,7 @@ impl Harness for MockHarness {
         });
         // Dev/testing knob: `JOLT_MOCK_MEND=1` appends a link/list-heavy
         // passage — bold-led list items, inline links, emphasis, strikethrough
-        // — the shapes whose half-streamed markers the display mend
-        // (crates/ui markdown/mend.rs) must hold steady while streaming.
+        // — useful for validating the completed-chunk Markdown presentation.
         let mock_mend = std::env::var("JOLT_MOCK_MEND")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
@@ -282,9 +281,8 @@ impl Harness for MockHarness {
             .collect();
         // Dev/testing knob: `JOLT_MOCK_CHARS=N` re-chunks every TextDelta
         // into N-char deltas, so `JOLT_MOCK_DELAY_MS` paces *characters*
-        // instead of whole scripted blocks — delta boundaries then land inside
-        // inline markers and links, which is the streaming shape real
-        // harnesses produce and the display mend exists for.
+        // instead of whole scripted blocks. The transcript still withholds
+        // those deltas until the next semantic reveal boundary.
         let chunk_chars = std::env::var("JOLT_MOCK_CHARS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())

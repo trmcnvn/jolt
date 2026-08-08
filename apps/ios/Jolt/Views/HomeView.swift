@@ -1,5 +1,5 @@
-// Home — Sessions are the durable corpus. Spaces are a searchable local
-// filter and new-session target rather than the mobile navigation spine.
+// Home — Threads are the durable corpus. Spaces are a searchable local
+// filter and new-thread target rather than the mobile navigation spine.
 
 import SwiftUI
 
@@ -53,7 +53,7 @@ struct HomeView: View {
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(Theme.surface.ignoresSafeArea())
             .confirmationDialog(
-                "Delete session?",
+                "Delete thread?",
                 isPresented: deleteConfirmationPresented,
                 titleVisibility: .visible,
                 presenting: sessionToDelete
@@ -89,7 +89,7 @@ struct HomeView: View {
                     Button(action: openNewSession) {
                         TablerIconView(.plus, size: 16)
                     }
-                    .accessibilityLabel("New session")
+                    .accessibilityLabel("New thread")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
@@ -176,7 +176,7 @@ struct HomeView: View {
 
     private var sessionsSection: some View {
         Section {
-            Text("Sessions")
+            Text("Threads")
                 .font(Theme.sans(11, weight: .medium))
                 .foregroundStyle(Theme.textMuted.opacity(0.6))
                 .listRowBackground(Color.clear)
@@ -185,12 +185,14 @@ struct HomeView: View {
 
             let chats = filteredChats
             if chats.isEmpty {
-                Text(spaceFilter == nil ? "No sessions yet" : "No sessions in this space")
+                Text(spaceFilter == nil ? "No threads yet" : "No threads in this space")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
             }
+            let firstUnpinnedId = chats.firstIndex(where: { !$0.pinned })
+                .flatMap { $0 > 0 ? chats[$0].id : nil }
             ForEach(chats) { chat in
                 Button {
                     path.append(.chat(chat.id))
@@ -198,6 +200,14 @@ struct HomeView: View {
                     ChatRow(chat: chat, showLocation: true)
                 }
                 .buttonStyle(PressWashButtonStyle())
+                .overlay(alignment: .top) {
+                    if chat.id == firstUnpinnedId {
+                        Rectangle()
+                            .fill(Theme.textFaint.opacity(0.35))
+                            .frame(height: 0.5)
+                            .allowsHitTesting(false)
+                    }
+                }
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
@@ -213,11 +223,19 @@ struct HomeView: View {
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button {
+                        model.setPinned(chatId: chat.id, pinned: !chat.pinned)
+                    } label: {
+                        TablerLabel(chat.pinned ? "Unpin" : "Pin", icon: .pin)
+                    }
+                    .tint(Theme.textMuted)
+                    Button {
                         model.archive(chatId: chat.id)
                     } label: {
-                        TablerLabel("Archive", icon: .archive)
+                        TablerLabel("Close", icon: .messageCircleX)
                     }
                     .tint(Theme.surfaceRaised)
+                    .disabled(model.indicator(for: chat) == .working
+                              || model.indicator(for: chat) == .awaitingInput)
                 }
             }
             .motionAnimation(Motion.resort, value: chats.map(\.id))
@@ -246,7 +264,7 @@ struct SpaceFilterSheet: View {
     @Environment(\.dismiss) private var dismiss
     let selected: String?
     var includeAll = true
-    var title = "Filter sessions"
+    var title = "Filter threads"
     let onSelect: (String?) -> Void
     @State private var query = ""
 
@@ -329,9 +347,9 @@ struct SpaceFilterSheet: View {
 /// the context line rather than beside the rail.
 ///
 /// The one addition the phone needs: the desktop row names only the space
-/// because its sidebar sits on the machine running the work. Here the Sessions
-/// list interleaves every device, and a session whose host has gone offline
-/// can't be driven at all — so the context line reads "space · device".
+/// because its sidebar sits on the machine running the work. Here the Threads
+/// list interleaves every device, and a thread whose host has gone offline
+/// can't be driven at all — so the context line reads "space @ device".
 struct ChatRow: View {
     @Environment(AppModel.self) private var model
     let chat: Chat
@@ -345,7 +363,7 @@ struct ChatRow: View {
     var body: some View {
         let indicator = model.indicator(for: chat)
         VStack(alignment: .leading, spacing: 2) {
-            // Line 1: status rail, space · device, time-ago.
+            // Line 1: status rail, space @ device, time-ago.
             HStack(spacing: 8) {
                 StatusRail(indicator: indicator)
                 if showLocation {
@@ -358,13 +376,17 @@ struct ChatRow: View {
                 } else {
                     Spacer(minLength: 4)
                 }
+                if chat.pinned {
+                    TablerIconView(.pin, size: 10, color: subline)
+                        .accessibilityLabel("Pinned")
+                }
                 Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
                     .font(Theme.sans(11))
                     .foregroundStyle(subline)
                     .fixedSize()
             }
 
-            // Line 2: the session title.
+            // Line 2: the thread title.
             Text(chat.displayTitle)
                 .font(Theme.sans(13))
                 .foregroundStyle(Theme.text)
@@ -395,7 +417,7 @@ struct ChatRow: View {
         .contentShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    /// "space · device", with offline marker. The space name (not the cwd
+    /// "space @ device", with offline marker. The space name (not the cwd
     /// basename) is what the desktop row shows — they differ once a space has
     /// been renamed, or when the session runs in a worktree off to the side.
     private var location: String {
@@ -404,8 +426,8 @@ struct ChatRow: View {
             ?? "?"
         let name = model.deviceName(chat.deviceId)
         return model.deviceOnline(chat.deviceId)
-            ? "\(space) · \(name)"
-            : "\(space) · \(name) (offline)"
+            ? "\(space) @ \(name)"
+            : "\(space) @ \(name) (offline)"
     }
 }
 

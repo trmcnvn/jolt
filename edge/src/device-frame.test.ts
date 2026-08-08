@@ -10,10 +10,23 @@ describe("device frame codec", () => {
     expect([...decoded.payload]).toEqual([...payload]);
   });
 
-  it("handles empty payloads and long headers", () => {
-    const header = { s: "x".repeat(200), k: "rpc", from: "conn-1" };
+  it("handles empty payloads, long headers, and compression capability", () => {
+    const header = { s: "x".repeat(200), k: "rpc", from: "conn-1", z: true };
     const decoded = decodeDeviceFrame(encodeDeviceFrame(header, new Uint8Array()));
     expect(decoded.header).toEqual(header);
     expect(decoded.payload.length).toBe(0);
+  });
+
+  it("rejects malformed header fields and oversized payloads", () => {
+    expect(() => encodeDeviceFrame({ s: "x".repeat(257), k: "rpc" }, new Uint8Array())).toThrow();
+    expect(() =>
+      encodeDeviceFrame({ s: "rpc", k: "rpc" }, new Uint8Array(8 * 1024 * 1024 + 1))
+    ).toThrow();
+
+    const json = new TextEncoder().encode('{"s":1,"k":"rpc"}');
+    const malformed = new Uint8Array(1 + json.length);
+    malformed[0] = json.length;
+    malformed.set(json, 1);
+    expect(() => decodeDeviceFrame(malformed)).toThrow();
   });
 });

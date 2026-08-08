@@ -1,14 +1,14 @@
 # Using Jolt
 
-Jolt separates where work is displayed from where it runs. A desktop window or iPhone can control a session, but the agent process, terminal, repository, and files remain on the session's host device.
+Jolt separates where work is displayed from where it runs. A desktop window or iPhone can control a thread, but the agent process, terminal, repository, and files remain on the thread's host device.
 
 ## Core concepts
 
 ### Local and Account
 
-Desktop Jolt always has a Local scope that never synchronizes. Signing in adds an Account scope for cross-device synchronization, remote control, and iOS. **Switch to Local** changes only the desktop viewport, so Account sessions can keep running and syncing in the background. Local and Account have separate spaces, sessions, tabs, device identities, journals, usage, and uploads; harness credentials and Jolt secrets remain device-local.
+Desktop Jolt always has a Local scope that never synchronizes. Signing in adds an Account scope for cross-device synchronization, remote control, and iOS. **Switch to Local** changes only the desktop viewport, so Account threads can keep running and syncing in the background. Local and Account have separate spaces, threads, device identities, journals, usage, and uploads; harness credentials and Jolt secrets remain device-local. Switching between Local and Account always opens the New Thread page.
 
-Moving non-empty Local data into an account requires explicit approval. After the move, Jolt creates a fresh blank Local scope. Keeping data Local means those sessions are unavailable remotely and on iOS.
+Moving non-empty Local data into an account requires explicit approval. After the move, Jolt creates a fresh blank Local scope. Keeping data Local means those threads are unavailable remotely and on iOS.
 
 ### Devices
 
@@ -19,34 +19,34 @@ A device is a signed-in Jolt installation with a stable local ID. Engine hosts o
 - PTYs and working-tree diffs;
 - local transcript snapshots, run journals, and usage records.
 
-iOS installations are registered viewer devices: they appear in **Settings → Devices** and publish presence, but they cannot host spaces, harnesses, or device RPCs. Presence indicates recent contact. Jolt also checks the device relay before remote calls, so a stale presence row does not make an offline engine look usable forever. Removing an engine device cascades through its spaces and sessions without deleting folders or other local files; viewer devices own no spaces.
+iOS installations are registered viewer devices: they appear in **Settings → Devices** and publish presence, but they cannot host spaces, harnesses, or device RPCs. Presence indicates recent contact. Jolt also checks the device relay before remote calls, so a stale presence row does not make an offline engine look usable forever. Removing an engine device cascades through its spaces and threads without deleting folders or other local files; viewer devices own no spaces.
 
 ### Spaces
 
-A space is a synced `(device, folder)` pair. Spaces filter the desktop session list and provide the host device and base folder for new sessions; they are execution context rather than the navigation spine.
+A space is a synced `(device, folder)` pair. Spaces filter the desktop thread list and provide the host device and base folder for new threads; they are execution context rather than the navigation spine.
 
 The owning engine detects whether the folder is under the selected version-control backend and stamps checkout metadata into the workspace registry. Renaming a space changes only its display name. Deleting one tombstones the space and its chat/session index rows. Any chat deletion also retires its edge transcript room and asynchronously purges its R2 backup and attachments.
 
-### Sessions
+### Threads
 
-A session is one durable conversation attached to a space. Its row records the host device, folder, checkout, harness configuration, title, activity, and seen state. The transcript and command queue live in a separate Loro document. After the first completed exchange, an untitled session is named asynchronously with an economy-tier model; a user rename always wins, and Jolt-created worktree branches can be renamed with the generated title. The session-row context menu can regenerate an existing name through the same model path.
+A thread is one durable conversation attached to a space. Its row records the host device, folder, checkout, harness configuration, title, activity, pin, and seen state. The transcript and command queue live in a separate Loro document. After the first completed exchange, an untitled thread is named asynchronously with an economy-tier model; a user rename always wins, and Jolt-created worktree branches can be renamed with the generated title. The thread-row context menu can regenerate an existing name through the same model path.
 
-The desktop shows an attention-sorted session list and device-local, cross-space tabs. Closing a tab only closes that local viewport; the synced session keeps running and remains in the sidebar. Archiving is an explicit session-row action. The searchable **Archived sessions** page opens from the user menu and restores archived sessions across devices.
+The desktop shows pinned threads first, then the remaining threads by recency. Pins sync across viewports and remain subject to the selected space filter. Threads are selected directly from this active sidebar order; `Mod+1` through `Mod+9` select its first nine rows, and holding `Mod` replaces those rows' timestamps with their configured shortcuts. Closing moves a thread into the compact **Closed** section below active threads without clearing its pin; an active run must be stopped first. Selecting a closed row opens it without reopening it. Sending a message or using its hover reopen control returns it to the active list and its pinned bucket. Closed rows load automatically as the sidebar approaches the end, and title search covers active and closed threads.
 
 ## The desktop shell
 
-- **Left sidebar:** searchable space filter (`Mod+Shift+K`), filtered sessions, title search (`Mod+Shift+F`), add-space action, and user menu.
-- **Session tabs:** device-local open sessions across spaces; tabs can be reordered or closed without changing session state.
+- **Left sidebar:** searchable space filter (`Mod+Shift+K`), filtered active and closed threads, title search (`Mod+Shift+F`), add-space action, and user menu.
+- **Thread header:** identifies the selected thread and its `space @ device` provenance while keeping New Thread, terminal, and Changes controls available.
 - **Conversation:** virtualized transcript with Markdown, code highlighting, grouped tools, input requests, errors, attachments, and a message rail on wide layouts. `Mod+Shift+Up/Down` moves between user prompts, including unloaded history.
-- **Composer:** prompt input, harness/model controls, checkout controls, attachments, context usage, and send/steer/stop state.
-- **Terminal panel:** session-scoped PTY tabs hosted on the session's device.
-- **Changes pane:** the latest working-copy patch for the session checkout.
+- **Composer:** prompt input, separate model and traits controls, checkout controls, attachments, context usage, and send/steer/stop state.
+- **Terminal panel:** thread-scoped PTY tabs hosted on the thread's device.
+- **Changes pane:** the latest working-copy patch for the thread checkout.
 
-Sidebar, Changes, and terminal dimensions are resizable. Panel open state is per session; dimensions and sidebar state persist on the local device.
+Sidebar, Changes, and terminal dimensions are resizable. Panel open state is per thread; dimensions and sidebar state persist on the local device.
 
-## Creating a session
+## Creating a thread
 
-A new session defaults to the sidebar's filtered space, then the last active valid space. The canvas space picker can change the target device and base folder before sending. Jolt also lets you choose:
+A new thread defaults to the sidebar's filtered space, then the last active valid space. The canvas space picker can change the target device and base folder before sending. Jolt also lets you choose:
 
 - harness, model, reasoning level, and harness-specific model options;
 - the current checkout;
@@ -69,7 +69,7 @@ Prompts appear optimistically with a client-minted message ID. If delivery fails
 
 ### File mentions
 
-Type `@` at a token boundary to search files and directories inside the current session checkout. In a new session, search is rooted in the selected space or existing worktree. Jolt stores the selection as a `jolt-file:` Markdown link and renders it as an atomic file chip.
+Type `@` at a token boundary to search files and directories inside the current thread checkout. In a new thread, search is rooted in the selected space or existing worktree. Jolt stores the selection as a `jolt-file:` Markdown link and renders it as an atomic file chip.
 
 Only paths verified inside the resolved checkout are returned. Mentioning a file does not upload its contents; the agent reads it through its own tools if needed.
 
@@ -83,13 +83,13 @@ Type `/` as the first message token to open Jolt's command completion menu.
 | `/bro` | Ask the active harness to restate the latest assistant response plainly and concisely. |
 | `/goal` | Open the goal manager. |
 
-Create, edit, budget, pause, resume, and clear goals through the goal manager; there are no `/goal` subcommands. Opening it from the new-session canvas creates the session when the goal is submitted. The composer shows objective, status, and token usage while a goal exists. Goals work with Claude Code, Codex, and Pi; Jolt injects the goal contract and schedules hidden continuation turns rather than relying on a harness-specific command.
+Create, edit, budget, pause, resume, and clear goals through the goal manager; there are no `/goal` subcommands. Opening it from the new-thread canvas creates the thread when the goal is submitted. The composer shows objective, status, and token usage while a goal exists. Goals work with Claude Code, Codex, and Pi; Jolt injects the goal contract and schedules hidden continuation turns rather than relying on a harness-specific command.
 
 These are Jolt commands, not a passthrough to an agent CLI's interactive command parser.
 
 ### Shell commands
 
-A leading bang runs a shell command on the session's host device without starting a normal agent turn:
+A leading bang runs a shell command on the thread's host device without starting a normal agent turn:
 
 ```text
 !cargo test
@@ -104,9 +104,9 @@ Pi handles this through its native RPC bash command. Other harnesses use Jolt's 
 
 ### Attachments
 
-Paste, drop, or pick images. Jolt stages them on the session's host device, persists local-file references in the prompt, and sends inline image blocks to harnesses that support them. Sent images render as thumbnails and can be opened in a lightbox.
+Paste, drop, or pick images. Jolt stages them on the thread's host device, persists local-file references in the prompt, and sends inline image blocks to harnesses that support them. Sent images render as thumbnails and can be opened in a lightbox.
 
-If upload fails, the files return to the session draft. Attachment values are not placed in the workspace registry.
+If upload fails, the files return to the thread draft. Attachment values are not placed in the workspace registry.
 
 ### Questions from agents
 
@@ -116,9 +116,9 @@ When a harness requests structured input—or an agent calls Jolt's `request_ans
 
 ## Transcript and status
 
-Jolt derives the visible transcript from the session document. Consecutive tools are grouped and can be folded. Streaming text is committed in small increments and rendered with a paint-only fade without changing layout.
+Jolt derives the visible transcript from the thread document. Consecutive tools are grouped and can be folded. Assistant text is durably synced in small increments but appears only when the harness completes a semantic message chunk; tools and status remain live. Interrupted or failed runs reveal any preserved partial text.
 
-Session indicators are derived from live status plus the synced seen marker:
+Thread indicators are derived from live status plus the synced seen marker:
 
 - **Working**
 - **Awaiting input**
@@ -126,7 +126,7 @@ Session indicators are derived from live status plus the synced seen marker:
 - **Completed but unseen**
 - **Idle**
 
-Live status is freshness-gated so a crashed engine cannot leave a permanent Working indicator. Opening a session updates its synced seen marker on every device. When a harness compacts its context, Jolt syncs the ephemeral compacting flag and shows **Compacting context…** without writing a transcript part.
+Live status is freshness-gated so a crashed engine cannot leave a permanent Working indicator. Opening a thread updates its synced seen marker on every device. When a harness compacts its context, Jolt syncs the ephemeral compacting flag and shows **Compacting context…** without writing a transcript part.
 
 ## Terminal and changes
 
@@ -138,7 +138,7 @@ Completed assistant turns that changed files also show a collapsed `N changed fi
 
 ## Usage
 
-The `$` glyph in the composer footer shows current-session prompt, output, cache, context, model, and reported cost data. Its context warning changes at 70% and 90% of the model window.
+The context wheel beside the composer’s model and traits controls shows current-thread prompt, output, cache, context, model, and estimated API-equivalent cost data. Costs are estimates, not subscription charges; Codex Fast uses the corresponding API Priority rates rather than ChatGPT credit multipliers. Its context warning changes at 70% and 90% of the model window.
 
 Open **Usage breakdown** from the user menu for 7-, 30-, or 90-day activity grouped by device, harness, model, and space. Usage is recorded on each host device and merged from reachable devices for display; it is not synced in conversation documents.
 
@@ -146,6 +146,6 @@ Provider account quota meters are separate. Claude Code and Codex account cards 
 
 ## Offline behavior
 
-Prompts, steering, interrupts, and input answers are durable session-document commands. A remote viewport can queue work while the host is disconnected; the command remains pending until the host reconnects, joins the document, and drains it. A durable device-room nudge makes cold hosts open the relevant document without keeping every chat resident.
+Prompts, steering, interrupts, and input answers are durable thread-document commands. A remote viewport can queue work while the host is disconnected; the command remains pending until the host reconnects, joins the document, and drains it. A durable device-room nudge makes cold hosts open the relevant document without keeping every chat resident.
 
 Filesystem RPCs, terminals, account changes, and live attachment upload require the target engine to be reachable.

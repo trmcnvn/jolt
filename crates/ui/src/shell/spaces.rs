@@ -1,17 +1,18 @@
 //! Spaces sidebar: the space-filter dropdown (searchable, with "All spaces"),
-//! the filtered Sessions list, and the add-space palette (⌘K-style: device
+//! the filtered Threads list, and the add-space palette (⌘K-style: device
 //! tabs + filtered folder browser).
 //!
-//! A space = a synced (device, folder) pair. Spaces stopped being a
-//! navigation spine when tabs went device-local: the dropdown only FILTERS
-//! the sidebar's session list (never the tab strip) and hosts space
-//! management (add via the palette; rename/delete via row context menus).
+//! A space = a synced (device, folder) pair. The dropdown filters the sidebar's
+//! session list and hosts space management (add via the palette; rename/delete
+//! via row context menus); selecting a session remains independent of the
+//! current filter.
 //! Child module of `shell` so it renders straight off `Shell`'s private state.
 
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
 use crate::settings::{ShortcutId, display_combo};
 use gpui::FocusHandle;
+use jolt_api::{ListFolders, Mutate, call as call_api};
 use jolt_proto::{ChatIndicator, Device, FolderListing, Space};
 
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
@@ -34,10 +35,16 @@ pub(super) struct SpacesMenu {
 /// the surface stays current while it is open.
 pub(super) struct SessionSearchFlow {
     search: Entity<ComposerInput>,
+    rows: Vec<SessionSearchRow>,
     active: usize,
     focus: FocusHandle,
     list_scroll: gpui::ScrollHandle,
     focus_pending: bool,
+    generation: u64,
+    loading: bool,
+    next_cursor: Option<String>,
+    total: Option<usize>,
+    load_task: Option<Task<()>>,
     _search_events: Subscription,
 }
 
@@ -51,7 +58,16 @@ pub(super) struct ActiveChatRow {
     pub(super) branch: Option<SharedString>,
     pub(super) harness: Option<jolt_proto::HarnessId>,
     pub(super) status: ChatIndicator,
+    pub(super) pinned: bool,
     pub(super) selected: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct ArchivedChatRow {
+    pub(super) key: String,
+    pub(super) id: String,
+    pub(super) title: SharedString,
+    pub(super) time_ago: SharedString,
 }
 
 #[derive(Clone)]
@@ -62,6 +78,8 @@ struct SessionSearchRow {
     time_ago: String,
     status: ChatIndicator,
     harness: Option<jolt_proto::HarnessId>,
+    pinned: bool,
+    archived: bool,
 }
 
 /// One row of the open dropdown, in display order.
@@ -116,7 +134,7 @@ pub(super) struct RenameSpaceDialog {
     pub _events: Subscription,
 }
 
-/// Dot color for a chat's display status (tab dots + Sessions rows).
+/// Dot color for a chat's display status (tab dots + Threads rows).
 pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
     match status {
         // Pink, not amber — the harsh yellow read as a warning; running is
@@ -603,9 +621,9 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The sidebar's Sessions list: every session (idle included) of the
-    /// filter space — or all spaces under "All" — attention-sorted. Rows are
-    /// keyed for the FLIP resort glide.
+    /// The sidebar's Threads list: every thread (idle included) of the
+    /// filter space — or all spaces under "All" — pinned first, then by
+    /// recency. Rows are keyed for the FLIP resort glide.
     pub(super) fn active_rows(&self, cx: &App) -> Vec<ActiveChatRow> {
         let now = Utc::now();
         let filter = self.settings.space_filter.as_deref();
@@ -625,7 +643,7 @@ impl Shell {
                     .unwrap_or_else(|| "?".to_string());
                 // Unknown device → no fragment, same as the archived list.
                 if let Some(device) = state.device_display_name(&chat.device_id) {
-                    folder = format!("{folder}@{device}");
+                    folder = format!("{folder} @ {device}");
                 }
                 // The branch shows whenever the engine has stamped one —
                 // main-checkout sessions included, not just worktrees.
@@ -639,7 +657,7 @@ impl Shell {
                     key: format!("c:{}", chat.id),
                     id: chat.id.clone(),
                     title: transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        &chat.title.clone().unwrap_or_else(|| "New thread".into()),
                     )
                     .into(),
                     time_ago: format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
@@ -648,8 +666,41 @@ impl Shell {
                     branch,
                     harness: chat.config.as_ref().map(|config| config.harness),
                     status,
+                    pinned: chat.pinned,
                     selected: selected == Some(chat.id.as_str()),
                 }
+            })
+            .collect()
+    }
+
+    /// Loaded archived sessions for the current space filter, in recency order.
+    pub(super) fn archived_rows(&self, cx: &App) -> Vec<ArchivedChatRow> {
+        let now = Utc::now();
+        let filter = self.settings.space_filter.as_deref();
+        let state = self.state.read(cx);
+        state
+            .chats
+            .iter()
+            .filter(|chat| {
+                chat.archived
+                    && chat
+                        .space_id
+                        .as_deref()
+                        .is_some_and(|space_id| state.space_row(space_id).is_some())
+                    && match filter {
+                        Some(space_id) => chat.space_id.as_deref() == Some(space_id),
+                        None => true,
+                    }
+            })
+            .map(|chat| ArchivedChatRow {
+                key: format!("a:{}", chat.id),
+                id: chat.id.clone(),
+                title: transcript::single_line(
+                    &chat.title.clone().unwrap_or_else(|| "New thread".into()),
+                )
+                .into(),
+                time_ago: format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
+                    .into(),
             })
             .collect()
     }
@@ -662,72 +713,156 @@ impl Shell {
         self.spaces_menu = None;
         self.user_menu_open = false;
         let search =
-            cx.new(|cx| ComposerInput::with_context("Search sessions…", "PaletteSearch", cx));
+            cx.new(|cx| ComposerInput::with_context("Search threads…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
                 if let Some(flow) = this.session_search.as_mut() {
                     flow.active = 0;
                     flow.list_scroll.set_offset(gpui::Point::default());
                 }
-                cx.notify();
+                this.refresh_session_search(cx);
             }
         });
         self.session_search = Some(SessionSearchFlow {
             search,
+            rows: Vec::new(),
             active: 0,
             focus: cx.focus_handle(),
             list_scroll: gpui::ScrollHandle::new(),
             focus_pending: true,
+            generation: 0,
+            loading: false,
+            next_cursor: None,
+            total: None,
+            load_task: None,
             _search_events: search_events,
         });
+        self.refresh_session_search(cx);
         cx.notify();
     }
 
-    /// Non-archived sessions in sidebar recency order, filtered only by title.
-    fn session_search_rows(&self, cx: &App) -> Vec<SessionSearchRow> {
-        let query = self
-            .session_search
-            .as_ref()
-            .map(|flow| flow.search.read(cx).text().to_string())
-            .unwrap_or_default();
-        let now = Utc::now();
-        let rows: Vec<SessionSearchRow> = {
-            let state = self.state.read(cx);
-            state
-                .overview_chats(now)
-                .into_iter()
-                .map(|(status, chat)| {
-                    let title = transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    );
-                    let location = state
-                        .space_for_chat(chat)
-                        .map(|space| {
-                            let device = state
-                                .device_display_name(&space.device_id)
-                                .unwrap_or("Unknown device");
-                            format!("{} @ {device}", space.display_name())
-                        })
-                        .unwrap_or_else(|| "Unknown space".into());
-                    SessionSearchRow {
-                        chat_id: chat.id.clone(),
-                        title,
-                        location,
-                        time_ago: format_time_ago(
-                            chat.last_message_at.unwrap_or(chat.created_at),
-                            now,
-                        ),
-                        status,
-                        harness: chat.config.as_ref().map(|config| config.harness),
-                    }
-                })
-                .collect()
+    fn refresh_session_search(&mut self, cx: &mut Context<Self>) {
+        self.load_session_search_page(true, cx);
+    }
+
+    fn load_more_session_search(&mut self, cx: &mut Context<Self>) {
+        self.load_session_search_page(false, cx);
+    }
+
+    fn load_session_search_page(&mut self, reset: bool, cx: &mut Context<Self>) {
+        let Some(flow) = self.session_search.as_mut() else {
+            return;
         };
-        let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
-        popover::filter_indices(&query, &titles)
-            .into_iter()
-            .map(|index| rows[index].clone())
-            .collect()
+        if !reset && (flow.loading || flow.next_cursor.is_none()) {
+            return;
+        }
+        if reset {
+            flow.generation = flow.generation.wrapping_add(1);
+            flow.rows.clear();
+            flow.next_cursor = None;
+            flow.total = None;
+            flow.load_task = None;
+        }
+        let generation = flow.generation;
+        let query = flow.search.read(cx).text().to_string();
+        let cursor = flow.next_cursor.clone();
+        flow.loading = true;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            flow.loading = false;
+            return;
+        };
+        let request = QueryChats {
+            section: ChatSection::Any,
+            space_id: None,
+            query,
+            cursor,
+            limit: 100,
+        };
+        flow.load_task = Some(cx.spawn(async move |this, cx| {
+            if reset {
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+            }
+            let result = call_api(engine.client(), &request).await;
+            this.update(cx, |shell, cx| {
+                let Some(flow) = shell.session_search.as_ref() else {
+                    return;
+                };
+                if flow.generation != generation {
+                    return;
+                }
+                let page = match result {
+                    Ok(page) => page,
+                    Err(error) => {
+                        tracing::warn!(%error, "session title search failed");
+                        if let Some(flow) = shell.session_search.as_mut() {
+                            flow.loading = false;
+                            flow.load_task = None;
+                        }
+                        cx.notify();
+                        return;
+                    }
+                };
+                let chats = page.chats;
+                shell.state.update(cx, |state, _| {
+                    state.merge_chat_page(chats.clone());
+                });
+                let now = Utc::now();
+                let rows = {
+                    let state = shell.state.read(cx);
+                    chats
+                        .iter()
+                        .map(|chat| {
+                            let title = transcript::single_line(
+                                &chat.title.clone().unwrap_or_else(|| "New thread".into()),
+                            );
+                            let location = state
+                                .space_for_chat(chat)
+                                .map(|space| {
+                                    let device = state
+                                        .device_display_name(&space.device_id)
+                                        .unwrap_or("Unknown device");
+                                    format!("{} @ {device}", space.display_name())
+                                })
+                                .unwrap_or_else(|| "Unknown space".into());
+                            SessionSearchRow {
+                                chat_id: chat.id.clone(),
+                                title,
+                                location,
+                                time_ago: format_time_ago(
+                                    chat.last_message_at.unwrap_or(chat.created_at),
+                                    now,
+                                ),
+                                status: state.display_status_for(chat, now),
+                                harness: chat.config.as_ref().map(|config| config.harness),
+                                pinned: chat.pinned,
+                                archived: chat.archived,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
+                if let Some(flow) = shell.session_search.as_mut() {
+                    let known: std::collections::HashSet<_> =
+                        flow.rows.iter().map(|row| row.chat_id.clone()).collect();
+                    flow.rows
+                        .extend(rows.into_iter().filter(|row| !known.contains(&row.chat_id)));
+                    flow.next_cursor = page.next_cursor;
+                    flow.total = Some(page.total);
+                    flow.loading = false;
+                    flow.load_task = None;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn session_search_rows(&self) -> Vec<SessionSearchRow> {
+        self.session_search
+            .as_ref()
+            .map(|flow| flow.rows.clone())
+            .unwrap_or_default()
     }
 
     fn activate_session_search(&mut self, cx: &mut Context<Self>) {
@@ -736,10 +871,10 @@ impl Shell {
             .as_ref()
             .map(|flow| flow.active)
             .unwrap_or(0);
-        if let Some(row) = self.session_search_rows(cx).get(active) {
+        if let Some(row) = self.session_search_rows().get(active) {
             let chat_id = row.chat_id.clone();
             self.session_search = None;
-            self.open_chat_tab(chat_id, cx);
+            self.open_chat(chat_id, cx);
         }
     }
 
@@ -755,7 +890,7 @@ impl Shell {
                 cx.notify();
             }
             popover::MenuKey::Up | popover::MenuKey::Down => {
-                let count = self.session_search_rows(cx).len();
+                let count = self.session_search_rows().len();
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 if let Some(flow) = self.session_search.as_mut() {
                     flow.active = popover::menu_step(Some(flow.active), count, delta).unwrap_or(0);
@@ -783,20 +918,21 @@ impl Shell {
                 window.focus(&flow.search.focus_handle(cx), cx);
             }
         }
-        let (search, active, focus, list_scroll) = {
+        let (search, active, focus, list_scroll, loading) = {
             let flow = self.session_search.as_ref()?;
             (
                 flow.search.clone(),
                 flow.active,
                 flow.focus.clone(),
                 flow.list_scroll.clone(),
+                flow.loading,
             )
         };
-        let rows = self.session_search_rows(cx);
+        let rows = self.session_search_rows();
         let active = active.min(rows.len().saturating_sub(1));
         let query_empty = search.read(cx).is_empty();
         let shortcut: SharedString =
-            display_combo(self.settings.keymap.get(ShortcutId::SearchSessions)).into();
+            display_combo(self.settings.keymap.get(ShortcutId::SearchThreads)).into();
         let hairline = crate::theme::hairline(0.06);
         let band = popover::band();
 
@@ -852,10 +988,12 @@ impl Shell {
                 .py(px(18.0))
                 .text_size(px(12.5))
                 .text_color(theme.text_faint)
-                .child(SharedString::from(if query_empty {
-                    "No sessions yet"
+                .child(SharedString::from(if loading {
+                    "Searching…"
+                } else if query_empty {
+                    "No threads yet"
                 } else {
-                    "No sessions match"
+                    "No threads match"
                 }))
                 .into_any_element()
         } else {
@@ -869,13 +1007,29 @@ impl Shell {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&list_scroll)
+                        .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                            let should_load = this.session_search.as_ref().is_some_and(|flow| {
+                                let remaining = f32::from(flow.list_scroll.max_offset().y)
+                                    + f32::from(flow.list_scroll.offset().y);
+                                remaining <= 120.0
+                            });
+                            if should_load {
+                                this.load_more_session_search(cx);
+                            }
+                        }))
                         .px(px(8.0))
                         .flex()
                         .flex_col()
                         .gap(px(2.0))
                         .children(rows.into_iter().enumerate().map(|(index, row)| {
                             let chat_id = row.chat_id.clone();
-                            let status_rail: AnyElement = if row.status == ChatIndicator::Working {
+                            let status_rail: AnyElement = if row.archived {
+                                icon(icons::MESSAGE_CIRCLE_X)
+                                    .size(px(13.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted.opacity(0.55))
+                                    .into_any_element()
+                            } else if row.status == ChatIndicator::Working {
                                 div()
                                     .w(px(6.0))
                                     .flex_none()
@@ -914,7 +1068,7 @@ impl Shell {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.session_search = None;
-                                this.open_chat_tab(chat_id.clone(), cx);
+                                this.open_chat(chat_id.clone(), cx);
                             }))
                             .child(status_rail)
                             .child(
@@ -959,8 +1113,14 @@ impl Shell {
                             .child(
                                 div()
                                     .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
                                     .text_size(px(11.0))
                                     .text_color(theme.text_muted.opacity(0.45))
+                                    .when(row.pinned, |element| {
+                                        element.child(icon(icons::PINNED).size(px(11.0)))
+                                    })
                                     .child(time_ago),
                             )
                         })),
@@ -1164,38 +1324,24 @@ impl Shell {
         flow.active = 0;
         flow.list_scroll.set_offset(gpui::Point::default());
         flow.load_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::Map::new();
-            if let Some(p) = &path {
-                params.insert("path".into(), serde_json::Value::String(p.clone()));
-            }
-            // Only target remote devices — local calls skip the relay.
-            if let (Some(target), local) = (&device_id, &local)
-                && local.as_deref() != Some(target.as_str())
-            {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(target.clone()),
-                );
-            }
-            let result = engine
-                .client()
-                .call(methods::LIST_FOLDERS, serde_json::Value::Object(params))
-                .await;
+            let request = ListFolders {
+                path,
+                // Only target remote devices — local calls skip the relay.
+                target_device_id: device_id
+                    .filter(|target| local.as_deref() != Some(target.as_str())),
+            };
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |shell, cx| {
                 if let Some(flow) = shell.add_space.as_mut() {
                     flow.browser = match result {
-                        Ok(value) => match serde_json::from_value::<FolderListing>(value) {
-                            Ok(listing) => {
-                                // A pathless browse resolved home — remember it
-                                // so the breadcrumbs can fold it into the
-                                // device crumb.
-                                if went_home {
-                                    flow.home = Some(listing.path.clone());
-                                }
-                                Loadable::Ready(listing)
+                        Ok(listing) => {
+                            // A pathless browse resolved home — remember it
+                            // so the breadcrumbs can fold it into the device crumb.
+                            if went_home {
+                                flow.home = Some(listing.path.clone());
                             }
-                            Err(err) => Loadable::Error(err.to_string()),
-                        },
+                            Loadable::Ready(listing)
+                        }
                         Err(err) => Loadable::Error(err.to_string()),
                     };
                 }
@@ -1263,16 +1409,16 @@ impl Shell {
             }
             cx.notify();
         });
-        let params = serde_json::json!({
-            "op": "createSpace",
-            "spaceId": space_id,
-            "deviceId": device.id,
-            "path": path,
-            "gitDetected": git_detected,
-        });
         let submit_id = space_id.clone();
+        let request = Mutate::CreateSpace {
+            space_id,
+            device_id: device.id,
+            path,
+            name: None,
+            git_detected,
+        };
         let task = cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::MUTATE, params).await;
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |shell, cx| {
                 match result {
                     Ok(_) => {
@@ -1977,7 +2123,10 @@ impl Shell {
         let name = dialog.input.read(cx).text().trim().to_string();
         if !name.is_empty() {
             self.mutate(
-                serde_json::json!({ "op": "renameSpace", "spaceId": dialog.space_id, "name": name }),
+                Mutate::RenameSpace {
+                    space_id: dialog.space_id,
+                    name: Some(name),
+                },
                 cx,
             );
         }
@@ -1986,10 +2135,7 @@ impl Shell {
 
     pub(super) fn delete_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.delete_space_confirm = None;
-        self.mutate(
-            serde_json::json!({ "op": "deleteSpace", "spaceId": space_id }),
-            cx,
-        );
+        self.mutate(Mutate::DeleteSpace { space_id }, cx);
         cx.notify();
     }
 
@@ -2107,11 +2253,11 @@ impl Shell {
             };
             let copy = if count == 1 {
                 format!(
-                    "Removing “{name}” permanently deletes its 1 session on {device}. This can’t be undone."
+                    "Removing “{name}” permanently deletes its 1 thread on {device}. This can’t be undone."
                 )
             } else {
                 format!(
-                    "Removing “{name}” permanently deletes its {count} sessions on {device}. This can’t be undone."
+                    "Removing “{name}” permanently deletes its {count} threads on {device}. This can’t be undone."
                 )
             };
             let card = popover::dialog_card(&theme)

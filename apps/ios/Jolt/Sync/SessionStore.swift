@@ -300,6 +300,7 @@ final class SessionStore {
     private func runRequest(prompt: String, chat: Chat,
                             attachments: [String] = []) -> RunRequest {
         RunRequest(prompt: prompt,
+                   harness: chat.config?.harness,
                    model: chat.config?.model,
                    reasoning: chat.config?.reasoning,
                    modelOptions: chat.config?.modelOptions ?? [:],

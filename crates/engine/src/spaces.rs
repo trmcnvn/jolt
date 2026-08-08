@@ -28,8 +28,8 @@ use tokio::sync::{mpsc, watch};
 
 use jolt_proto::Space;
 
-use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
+use jolt_vcs::Repos;
 
 /// Trailing debounce after a filesystem event burst.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);

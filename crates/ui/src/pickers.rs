@@ -16,16 +16,19 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, Render,
-    SharedString, Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, PathBuilder,
+    Render, SharedString, Subscription, Task, Window, canvas, div, point, prelude::*, px,
 };
 
-use jolt_engine::registry::HarnessDescriptor;
+use jolt_api::{
+    GetCheckoutReview, HarnessDescriptor, ListModels, ListRefs, Mutate, SwitchRef, call as call_api,
+};
 use jolt_proto::{
     ChatConfig, CheckoutReview, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef,
     SandboxLevel, Space, UsageSummary,
 };
-use jolt_rpc::methods;
+
+mod checkout;
 
 /// Display cap for the ref list (t3code shows pages of 100 with a status
 /// footer; a flat cap + "Showing X of Y refs" reads the same without
@@ -57,7 +60,7 @@ pub struct DraftConfig {
     /// when reusing one). `None` = the repo's current branch.
     pub branch: Option<String>,
     /// Backend revision corresponding to `branch`; differs for JJ working-copy
-    /// labels (`Working copy · …` displays, `@` executes).
+    /// labels (the change id displays, `@` executes).
     pub revision: Option<String>,
     /// Where the new session runs (the t3code env-mode).
     pub checkout: CheckoutKind,
@@ -295,14 +298,134 @@ fn search_active_index(query: &str, selected_index: usize) -> usize {
     }
 }
 
+fn compact_decimal(value: f64) -> String {
+    let formatted = format!("{value:.1}");
+    formatted
+        .strip_suffix(".0")
+        .unwrap_or(&formatted)
+        .to_string()
+}
+
 fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
-        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+        format!("{}m", compact_decimal(tokens as f64 / 1_000_000.0))
     } else if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
+        format!("{}k", compact_decimal(tokens as f64 / 1_000.0))
     } else {
         tokens.to_string()
     }
+}
+
+fn format_context(usage: &UsageSummary) -> String {
+    match (usage.context_tokens, usage.context_window) {
+        (Some(tokens), Some(window)) if window != 0 => format!(
+            "{}% · {}/{}",
+            compact_decimal(tokens as f64 / window as f64 * 100.0),
+            format_tokens(tokens),
+            format_tokens(window)
+        ),
+        (Some(tokens), _) => format!("{} used", format_tokens(tokens)),
+        _ => "Unavailable".into(),
+    }
+}
+
+fn usage_stat(label: &'static str, value: String, theme: &Theme) -> gpui::Div {
+    div()
+        .min_w_0()
+        .flex_1()
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(theme.text_muted)
+                .child(label),
+        )
+        .child(
+            div()
+                .mt(px(3.0))
+                .truncate()
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(value),
+        )
+}
+
+fn usage_progress_ring(
+    fraction: Option<f64>,
+    progress_color: gpui::Hsla,
+    track_color: gpui::Hsla,
+) -> impl IntoElement {
+    let progress = fraction.unwrap_or_default().clamp(0.0, 1.0) as f32;
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let center_x = bounds.origin.x + bounds.size.width / 2.0;
+            let center_y = bounds.origin.y + bounds.size.height / 2.0;
+            let radius = px(6.0);
+            let stroke = px(2.0);
+
+            let mut track = PathBuilder::stroke(stroke);
+            track.move_to(point(center_x + radius, center_y));
+            track.arc_to(
+                point(radius, radius),
+                px(0.0),
+                false,
+                true,
+                point(center_x - radius, center_y),
+            );
+            track.arc_to(
+                point(radius, radius),
+                px(0.0),
+                false,
+                true,
+                point(center_x + radius, center_y),
+            );
+            track.close();
+            if let Ok(path) = track.build() {
+                window.paint_path(path, track_color);
+            }
+
+            if progress == 0.0 {
+                return;
+            }
+            let mut arc = PathBuilder::stroke(stroke);
+            if progress >= 0.999 {
+                arc.move_to(point(center_x + radius, center_y));
+                arc.arc_to(
+                    point(radius, radius),
+                    px(0.0),
+                    false,
+                    true,
+                    point(center_x - radius, center_y),
+                );
+                arc.arc_to(
+                    point(radius, radius),
+                    px(0.0),
+                    false,
+                    true,
+                    point(center_x + radius, center_y),
+                );
+                arc.close();
+            } else {
+                arc.move_to(point(center_x, center_y - radius));
+                let angle = -std::f32::consts::FRAC_PI_2 + progress * std::f32::consts::TAU;
+                arc.arc_to(
+                    point(radius, radius),
+                    px(0.0),
+                    progress > 0.5,
+                    true,
+                    point(
+                        center_x + radius * angle.cos(),
+                        center_y + radius * angle.sin(),
+                    ),
+                );
+            }
+            if let Ok(path) = arc.build() {
+                window.paint_path(path, progress_color);
+            }
+        },
+    )
+    .size(px(16.0))
 }
 
 struct UsagePopover {
@@ -312,65 +435,135 @@ struct UsagePopover {
 impl Render for UsagePopover {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        let content = match &self.usage {
-            Some(usage) if usage.calls != 0 => {
-                let context = match (usage.context_tokens, usage.context_window) {
-                    (Some(tokens), Some(window)) if window != 0 => format!(
-                        "{} / {} ({:.0}%)",
-                        format_tokens(tokens),
-                        format_tokens(window),
-                        tokens as f64 / window as f64 * 100.0
-                    ),
-                    (Some(tokens), _) => format_tokens(tokens),
-                    _ => "Unavailable".into(),
-                };
-                let cost = usage
-                    .cost_usd
-                    .map(|cost| format!("${cost:.2} reported"))
-                    .unwrap_or_else(|| "Unavailable".into());
-                let model = usage.model.as_deref().unwrap_or("Unknown model");
-                vec![
-                    ("Context", context),
-                    ("Prompt", format_tokens(usage.prompt_tokens())),
-                    ("Output", format_tokens(usage.output_tokens)),
-                    ("Cache read", format_tokens(usage.cache_read_input_tokens)),
-                    ("Cache write", format_tokens(usage.cache_write_input_tokens)),
-                    ("Total", format_tokens(usage.total_tokens())),
-                    ("Cost", cost),
-                    ("Model", model.to_string()),
-                ]
-            }
-            _ => vec![("Usage", "Available after the first response".into())],
-        };
-        let mut card = div()
-            .w(px(270.0))
-            .p(px(10.0))
-            .rounded(px(7.0))
+        let card = div()
+            .w(px(300.0))
+            .p(px(14.0))
+            .rounded(px(12.0))
             .border_1()
             .border_color(theme.border_strong)
             .bg(theme.surface_raised)
             .shadow_md()
-            .flex()
-            .flex_col()
-            .gap(px(5.0))
             .text_size(px(11.0));
-        for (label, value) in content {
-            card = card.child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .gap(px(16.0))
-                    .child(div().text_color(theme.text_muted).child(label))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme.text)
-                            .child(value),
-                    ),
-            );
-        }
-        card
+        let Some(usage) = self.usage.as_ref().filter(|usage| usage.calls != 0) else {
+            return card
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child("Context window"),
+                )
+                .child(
+                    div()
+                        .mt(px(5.0))
+                        .text_color(theme.text_muted)
+                        .child("Available after the first response"),
+                );
+        };
+
+        let fraction = usage.context_fraction().map(|value| value.clamp(0.0, 1.0));
+        let progress_color = match context_pressure(Some(usage)) {
+            ContextPressure::Normal => theme.text_muted.opacity(0.8),
+            ContextPressure::Warning => theme.warning,
+            ContextPressure::Danger => theme.danger,
+        };
+        let cost = usage
+            .cost_usd
+            .map(|cost| format!("${cost:.2}"))
+            .unwrap_or_else(|| "Unavailable".into());
+        let model = usage
+            .model
+            .as_deref()
+            .unwrap_or("Unknown model")
+            .to_string();
+
+        card.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child("Context window"),
+                )
+                .child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .child(format_context(usage)),
+                ),
+        )
+        .child(
+            div()
+                .mt(px(9.0))
+                .h(px(5.0))
+                .w_full()
+                .overflow_hidden()
+                .rounded_full()
+                .bg(theme.element_hover)
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(fraction.unwrap_or_default() as f32))
+                        .rounded_full()
+                        .bg(progress_color),
+                ),
+        )
+        .child(
+            div()
+                .mt(px(13.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(div().text_color(theme.text_muted).child("Total processed"))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(format_tokens(usage.total_tokens())),
+                ),
+        )
+        .child(div().my(px(12.0)).h(px(1.0)).bg(theme.border))
+        .child(
+            div()
+                .flex()
+                .gap(px(18.0))
+                .child(usage_stat(
+                    "Prompt",
+                    format_tokens(usage.prompt_tokens()),
+                    theme,
+                ))
+                .child(usage_stat(
+                    "Output",
+                    format_tokens(usage.output_tokens),
+                    theme,
+                )),
+        )
+        .child(
+            div()
+                .mt(px(10.0))
+                .flex()
+                .gap(px(18.0))
+                .child(usage_stat(
+                    "Cache read",
+                    format_tokens(usage.cache_read_input_tokens),
+                    theme,
+                ))
+                .child(usage_stat(
+                    "Cache write",
+                    format_tokens(usage.cache_write_input_tokens),
+                    theme,
+                )),
+        )
+        .child(
+            div()
+                .mt(px(10.0))
+                .flex()
+                .gap(px(18.0))
+                .child(usage_stat("Estimated API equivalent", cost, theme))
+                .child(usage_stat("Model", model, theme)),
+        )
     }
 }
 
@@ -557,8 +750,8 @@ impl Pickers {
     }
 
     /// Harness is locked once the chat exists.
-    fn harness_locked(&self, cx: &App) -> bool {
-        self.state.read(cx).selected_chat.is_some()
+    fn harness_locked(&self, _cx: &App) -> bool {
+        false
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -734,13 +927,6 @@ impl Pickers {
     }
 
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
-        // Model + traits merged into ONE menu (user request): the traits chip
-        // opens the combined harness/model/reasoning popover.
-        let kind = if kind == PickerKind::Traits {
-            PickerKind::HarnessModel
-        } else {
-            kind
-        };
         if self.open == Some(kind) {
             self.open = None;
             cx.notify();
@@ -822,26 +1008,19 @@ impl Pickers {
         let generation = self.catalog_generation;
         self.harnesses = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::Map::new();
-            if let Some(target) = &target {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(target.clone()),
-                );
-            }
-            let result = engine
-                .client()
-                .call(methods::LIST_HARNESSES, serde_json::Value::Object(params))
-                .await;
+            let result = jolt_api::call(
+                engine.client(),
+                &jolt_api::ListHarnesses {
+                    target_device_id: target,
+                },
+            )
+            .await;
             this.update(cx, |pickers, cx| {
                 if pickers.catalog_generation != generation {
                     return;
                 }
                 pickers.harnesses = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
-                        Ok(list) => Loadable::Ready(list),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
+                    Ok(list) => Loadable::Ready(list),
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 if let Some(harness) = pickers.effective_harness(cx) {
@@ -870,23 +1049,20 @@ impl Pickers {
         let generation = self.catalog_generation;
         self.models.insert(harness, Loadable::Loading);
         cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
-            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
-                object.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(target.clone()),
-                );
-            }
-            let result = engine.client().call(methods::LIST_MODELS, params).await;
+            let result = call_api(
+                engine.client(),
+                &ListModels {
+                    harness,
+                    target_device_id: target,
+                },
+            )
+            .await;
             this.update(cx, |pickers, cx| {
                 if pickers.catalog_generation != generation {
                     return;
                 }
                 let loaded = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
-                        Ok(models) => Loadable::Ready(models),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
+                    Ok(models) => Loadable::Ready(models),
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 if let Loadable::Ready(models) = &loaded {
@@ -909,366 +1085,24 @@ impl Pickers {
         .detach();
     }
 
-    fn invalidate_checkout_review(&mut self) {
-        self.checkout_review = None;
-        self.review_lookup = None;
-        self.review_loaded = false;
-        self.review_task = None;
-    }
-
-    fn selected_review_lookup(&self, cx: &App) -> Option<ReviewLookup> {
-        let chat = self.state.read(cx).selected_chat_row()?;
-        Some(ReviewLookup {
-            chat_id: chat.id.clone(),
-            cwd: chat.cwd.clone()?,
-            branch: chat.branch.clone(),
-            activity_at: chat.last_message_at.map(|at| at.timestamp_millis()),
-            device_id: chat.device_id.clone(),
-        })
-    }
-
-    /// Resolve the selected session checkout's open provider review on its host
-    /// device. Failures are intentionally silent: unavailable/unsupported forge
-    /// tooling is absence, not a broken composer state.
-    fn ensure_checkout_review(&mut self, force: bool, cx: &mut Context<Self>) {
-        let Some(lookup) = self.selected_review_lookup(cx) else {
-            self.invalidate_checkout_review();
-            return;
-        };
-        if self.review_lookup.as_ref() != Some(&lookup) {
-            self.invalidate_checkout_review();
-            self.review_lookup = Some(lookup.clone());
-        } else if !force && (self.review_loaded || self.review_task.is_some()) {
-            return;
-        }
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        let local = self.state.read(cx).local_device_id.clone();
-        let mut params = serde_json::Map::new();
-        params.insert(
-            "chatId".into(),
-            serde_json::Value::String(lookup.chat_id.clone()),
-        );
-        if local.as_deref() != Some(lookup.device_id.as_str()) {
-            params.insert(
-                "targetDeviceId".into(),
-                serde_json::Value::String(lookup.device_id.clone()),
-            );
-        }
-        self.review_loaded = false;
-        self.review_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::GET_CHECKOUT_REVIEW,
-                    serde_json::Value::Object(params),
-                )
-                .await;
-            this.update(cx, |pickers, cx| {
-                if pickers.review_lookup.as_ref() != Some(&lookup) {
-                    return;
-                }
-                pickers.checkout_review = result
-                    .ok()
-                    .and_then(|value| serde_json::from_value::<Option<CheckoutReview>>(value).ok())
-                    .flatten();
-                pickers.review_loaded = true;
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    /// ListRefs for the selected SPACE's folder — targeted at the space's
-    /// device (relay-forwarded when remote), keyed/invalidated by space id.
-    /// Rows carry checkout state (`current`, `worktreePath`) so the picker can
-    /// tag refs and the checkout-kind selector can offer worktree reuse.
-    fn ensure_refs(&mut self, force: bool, cx: &mut Context<Self>) {
-        let Some(space) = self.state.read(cx).selected_space_row().cloned() else {
-            return;
-        };
-        if !space.git_detected {
-            return;
-        }
-        let fresh = self.refs_space.as_deref() == Some(space.id.as_str());
-        if fresh && matches!(self.refs, Loadable::Loading) {
-            return; // a load is already in flight
-        }
-        // Non-forced (the footer's eager kick, re-run every render) only loads
-        // from Idle: an Error must WAIT for an explicit retry/reopen (force),
-        // or re-render would flip Error back to Loading before the retry row
-        // ever paints — an eternal skeleton plus an RPC storm (user report:
-        // "the ref dropdown never loads anything").
-        if !force && fresh && !matches!(self.refs, Loadable::Idle) {
-            return;
-        }
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        let local = self.state.read(cx).local_device_id.clone();
-        // Stale-while-revalidate: a forced refresh of an already-loaded space
-        // keeps the current rows on screen while the reload runs — a send that
-        // just minted a worktree (or a terminal-side branch) appears on the
-        // popover's next open without the list ever flashing to a skeleton.
-        if !(force && fresh && matches!(self.refs, Loadable::Ready(_))) {
-            self.refs = Loadable::Loading;
-        }
-        self.refs_space = Some(space.id.clone());
-        let generation = self.catalog_generation;
-        self.refs_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::Map::new();
-            params.insert(
-                "repoPath".into(),
-                serde_json::Value::String(space.path.clone()),
-            );
-            if local.as_deref() != Some(space.device_id.as_str()) {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(space.device_id.clone()),
-                );
-            }
-            let result = engine
-                .client()
-                .call(methods::LIST_REFS, serde_json::Value::Object(params))
-                .await;
-            this.update(cx, |pickers, cx| {
-                if pickers.catalog_generation != generation {
-                    return;
-                }
-                pickers.refs = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<RepoRef>>(value) {
-                        Ok(refs) => Loadable::Ready(refs),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
-                    Err(err) => Loadable::Error(err.to_string()),
-                };
-                // Rows landed under an open, un-searched popover: re-home the
-                // nav highlight to the selected row.
-                if pickers.open == Some(PickerKind::Branch)
-                    && pickers.search.read(cx).text().is_empty()
-                {
-                    pickers.active = pickers.selected_ref_index(cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    // ---- selections ----
-
-    fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        // Existing session: the pick SWITCHES the session's checkout (the
-        // t3code mid-session `switchRef`) instead of updating the draft.
-        if self.state.read(cx).selected_chat_row().is_some() {
-            self.switch_session_ref(row, cx);
-            return;
-        }
-        if row.worktree_path.is_some() {
-            // Reuse the ref's existing worktree ("Current worktree") — the
-            // t3code `reuseExistingWorktree` path.
-            self.config.branch = Some(row.name.clone());
-            self.config.checkout = CheckoutKind::Local;
-            self.config.revision = Some(row.revision.clone());
-        } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
-            // Base pick for a new worktree, or the already-current ref.
-            self.config.branch = Some(row.name.clone());
-            self.config.revision = Some(row.revision.clone());
-        } else {
-            // Local mode + a plain non-current ref: CHECK OUT the space
-            // folder (full t3code `switchRef` — picking `main` means "put my
-            // local checkout on main", it must never flip the mode).
-            self.switch_draft_ref(row, cx);
-            return;
-        }
-        self.open = None;
-        cx.notify();
-    }
-
-    /// Draft-mode ref switch in the SPACE's folder
-    /// (relay-forwarded for remote spaces). Success records the pick and
-    /// refreshes tags; failure keeps the popover open with the VCS message.
-    fn switch_draft_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        if self.switching.is_some() {
-            return; // one switch at a time
-        }
-        let Some(space) = self.state.read(cx).selected_space_row().cloned() else {
-            return;
-        };
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        let local = self.state.read(cx).local_device_id.clone();
-        self.switch_error = None;
-        self.switching = Some(row.name.clone());
-        let ref_name = row.name.clone();
-        let revision = row.revision.clone();
-        let jujutsu = row.kind != jolt_proto::RepoRefKind::Branch;
-        self.switch_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::Map::new();
-            params.insert(
-                "repoPath".into(),
-                serde_json::Value::String(space.path.clone()),
-            );
-            params.insert(
-                "refName".into(),
-                serde_json::Value::String(revision.clone()),
-            );
-            if local.as_deref() != Some(space.device_id.as_str()) {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(space.device_id.clone()),
-                );
-            }
-            let result = engine
-                .client()
-                .call(methods::SWITCH_REF, serde_json::Value::Object(params))
-                .await;
-            this.update(cx, |pickers, cx| {
-                pickers.switching = None;
-                match result {
-                    Ok(value) => {
-                        let label = value
-                            .get("branch")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or(&ref_name)
-                            .to_string();
-                        pickers.config.branch = Some(label);
-                        pickers.config.revision = Some(if jujutsu { "@".into() } else { revision });
-                        pickers.open = None;
-                        pickers.ensure_refs(true, cx);
-                    }
-                    Err(err) => pickers.switch_error = Some(err.to_string()),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// Mid-session ref switch, two shapes (both t3code):
-    ///
-    /// - The picked ref already lives in ANOTHER worktree → RETARGET the
-    ///   session onto that worktree (`reuseExistingWorktree`): a `setChatCwd`
-    ///   + `setChatBranch` mutate, no VCS mutation. Resume is cwd-scoped, so the next
-    ///   run there starts a fresh harness conversation — the transcript
-    ///   itself carries on.
-    /// - Otherwise → switch the ref in the SESSION's own cwd (`SwitchRef`,
-    ///   relay-forwarded to the host device). The host's HEAD watcher
-    ///   reconciles `chat.branch` to every device. Errors (dirty tree, ref
-    ///   held by the MAIN checkout) keep the popover open with the VCS message.
-    fn switch_session_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        if self.switching.is_some() {
-            return; // one switch at a time
-        }
-        let Some(chat) = self.state.read(cx).selected_chat_row().cloned() else {
-            return;
-        };
-        let Some(cwd) = chat.cwd.clone() else {
-            return;
-        };
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        if row.worktree_path.as_deref() == Some(cwd.as_str()) {
-            // Already this session's worktree — nothing to do.
-            self.open = None;
-            cx.notify();
-            return;
-        }
-        let local = self.state.read(cx).local_device_id.clone();
-        self.switch_error = None;
-        self.switching = Some(row.name.clone());
-        let ref_name = row.name.clone();
-        let revision = row.revision.clone();
-        let retarget = row.worktree_path.clone();
-        self.switch_task = Some(cx.spawn(async move |this, cx| {
-            let result = match retarget {
-                // Reuse the ref's existing worktree: move the session there.
-                Some(path) => {
-                    let cwd_mutate = serde_json::json!({
-                        "op": "setChatCwd",
-                        "chatId": chat.id,
-                        "cwd": path,
-                    });
-                    let branch_mutate = serde_json::json!({
-                        "op": "setChatBranch",
-                        "chatId": chat.id,
-                        "branch": ref_name,
-                    });
-                    match engine.client().call(methods::MUTATE, cwd_mutate).await {
-                        Ok(_) => engine.client().call(methods::MUTATE, branch_mutate).await,
-                        Err(err) => Err(err),
-                    }
-                }
-                // Plain ref: checkout in place on the chat's HOST device.
-                None => {
-                    let mut params = serde_json::Map::new();
-                    params.insert("repoPath".into(), serde_json::Value::String(cwd));
-                    params.insert("refName".into(), serde_json::Value::String(revision));
-                    if local.as_deref() != Some(chat.device_id.as_str()) {
-                        params.insert(
-                            "targetDeviceId".into(),
-                            serde_json::Value::String(chat.device_id.clone()),
-                        );
-                    }
-                    engine
-                        .client()
-                        .call(methods::SWITCH_REF, serde_json::Value::Object(params))
-                        .await
-                }
-            };
-            this.update(cx, |pickers, cx| {
-                pickers.switching = None;
-                match result {
-                    Ok(_) => {
-                        pickers.open = None;
-                        // Checkout state changed — refresh tags/current and its
-                        // provider review association.
-                        pickers.ensure_refs(true, cx);
-                        pickers.invalidate_checkout_review();
-                        pickers.ensure_checkout_review(true, cx);
-                    }
-                    Err(err) => pickers.switch_error = Some(err.to_string()),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn pick_checkout(&mut self, kind: CheckoutKind, cx: &mut Context<Self>) {
-        if kind == CheckoutKind::Local
-            && self.config.checkout == CheckoutKind::NewWorktree
-            && self.selected_ref_worktree().is_none()
-            && self.selected_ref().is_some_and(|r| !r.current)
-        {
-            // Back to "Current checkout" with a non-current plain ref picked:
-            // drop the pick (we don't checkout the main folder) — the current
-            // branch takes over.
-            self.config.branch = None;
-            self.config.revision = None;
-        }
-        self.config.checkout = kind;
-        self.open = None;
-        cx.notify();
-    }
-
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        if self.harness_locked(cx) {
-            return;
+        if self.effective_harness(cx) != Some(harness) {
+            if self.state.read(cx).selected_chat.is_some() {
+                self.update_chat_config(cx, |config| {
+                    config.harness = harness;
+                    config.model = None;
+                    config.reasoning = None;
+                    config.model_options.clear();
+                });
+            } else {
+                // The remembered model for this harness takes over via the
+                // defaults fallback; a foreign pick must not linger.
+                self.config.harness = Some(harness);
+                self.config.model = None;
+                self.config.reasoning = None;
+                self.config.model_options.clear();
+            }
         }
-        if self.config.harness != Some(harness) {
-            // The remembered model for this harness takes over via the
-            // defaults fallback; a foreign pick must not linger.
-            self.config.model = None;
-            self.config.reasoning = None;
-            self.config.model_options.clear();
-        }
-        self.config.harness = Some(harness);
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
@@ -1392,12 +1226,8 @@ impl Pickers {
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |_, _| {
-            let params = serde_json::json!({
-                "op": "setChatConfig",
-                "chatId": chat_id,
-                "config": config,
-            });
-            if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+            let request = Mutate::SetChatConfig { chat_id, config };
+            if let Err(err) = call_api(engine.client(), &request).await {
                 tracing::warn!(error = %err, "setChatConfig mutate failed");
             }
         }));
@@ -1445,148 +1275,6 @@ impl Pickers {
             return;
         };
         self.pick_model(id, cx);
-    }
-
-    fn filtered_ref_rows(&self, cx: &App) -> Vec<RepoRef> {
-        let Some(refs) = self.refs.ready() else {
-            return Vec::new();
-        };
-        let names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
-        let query = self.search.read(cx).text().to_string();
-        popover::filter_indices(&query, &names)
-            .into_iter()
-            .map(|ix| refs[ix].clone())
-            .collect()
-    }
-
-    // ---- checkout resolution (the t3code env-mode semantics) ----
-
-    /// The ref that actually owns an existing chat's cwd. Live checkout state
-    /// wins over the persisted branch label: JJ working-copy labels change as
-    /// the change id advances, and a new chat can appear before its branch has
-    /// been stamped by the host.
-    fn session_ref<'a>(
-        &'a self,
-        chat: &jolt_proto::Chat,
-        space: &jolt_proto::Space,
-    ) -> Option<&'a RepoRef> {
-        let refs = self.refs.ready()?;
-        let same_checkout = chat.cwd.as_deref() == Some(space.path.as_str())
-            || chat
-                .checkout_id
-                .as_deref()
-                .zip(space.checkout_id.as_deref())
-                .is_some_and(|(chat, space)| chat == space);
-        session_checkout_ref(
-            refs,
-            chat.branch.as_deref(),
-            chat.cwd.as_deref(),
-            same_checkout,
-        )
-    }
-
-    /// Selected ref for either an existing chat or the new-chat draft. An
-    /// unstamped chat defaults to the working-copy/current row rather than
-    /// displaying an unselected "Select ref" state.
-    fn selected_ref_name(&self, cx: &App) -> Option<String> {
-        let state = self.state.read(cx);
-        if let Some(chat) = state.selected_chat_row() {
-            return state
-                .space_for_chat(chat)
-                .and_then(|space| self.session_ref(chat, space))
-                .map(|row| row.name.clone())
-                .or_else(|| chat.branch.clone());
-        }
-        self.config
-            .branch
-            .clone()
-            .or_else(|| self.selected_ref().map(|row| row.name.clone()))
-    }
-
-    /// Index of the highlighted-by-default row in the (filtered) ref list.
-    /// Capped to the displayed window.
-    fn selected_ref_index(&self, cx: &App) -> usize {
-        let rows = self.filtered_ref_rows(cx);
-        let selected = self.selected_ref_name(cx);
-        let index = match selected {
-            Some(name) => rows.iter().position(|r| r.name == name).unwrap_or(0),
-            None => rows.iter().position(|r| r.current).unwrap_or(0),
-        };
-        index.min(MAX_REF_ROWS.saturating_sub(1))
-    }
-
-    /// The picked ref's row, else the repo's current branch's row.
-    fn selected_ref(&self) -> Option<&RepoRef> {
-        let refs = self.refs.ready()?;
-        match self.config.branch.as_deref() {
-            Some(name) => refs.iter().find(|r| r.name == name),
-            None => refs.iter().find(|r| r.current),
-        }
-    }
-
-    /// The picked (or current) ref's name.
-    fn effective_ref_name(&self) -> Option<String> {
-        self.config
-            .branch
-            .clone()
-            .or_else(|| self.selected_ref().map(|r| r.name.clone()))
-    }
-
-    fn effective_ref_revision(&self) -> Option<String> {
-        self.config
-            .revision
-            .clone()
-            .or_else(|| self.selected_ref().map(|row| row.revision.clone()))
-            .or_else(|| self.effective_ref_name())
-    }
-
-    /// The existing worktree the picked ref is materialized in, if any.
-    fn selected_ref_worktree(&self) -> Option<String> {
-        self.selected_ref().and_then(|r| r.worktree_path.clone())
-    }
-
-    /// The resolved on-send checkout action for a new session.
-    pub fn checkout_plan(&self) -> CheckoutPlan {
-        match self.config.checkout {
-            CheckoutKind::NewWorktree => CheckoutPlan::NewWorktree {
-                base: self.effective_ref_revision(),
-            },
-            CheckoutKind::Local => match self.selected_ref_worktree() {
-                Some(path) => CheckoutPlan::ReuseWorktree {
-                    path,
-                    branch: self.effective_ref_name().unwrap_or_default(),
-                },
-                None => CheckoutPlan::CurrentCheckout {
-                    branch: self.effective_ref_name(),
-                },
-            },
-        }
-    }
-
-    /// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel` /
-    /// `resolveCurrentWorkspaceLabel`).
-    fn checkout_label(&self) -> &'static str {
-        let jujutsu = self.refs.ready().is_some_and(|refs| {
-            refs.iter()
-                .any(|row| row.kind != jolt_proto::RepoRefKind::Branch)
-        });
-        match self.config.checkout {
-            CheckoutKind::NewWorktree if jujutsu => "New workspace",
-            CheckoutKind::NewWorktree => "New worktree",
-            CheckoutKind::Local if jujutsu => "Working copy",
-            CheckoutKind::Local if self.selected_ref_worktree().is_some() => "Current worktree",
-            CheckoutKind::Local => "Current checkout",
-        }
-    }
-
-    /// Label of the ref trigger: `From <ref>` only when a NEW worktree will be
-    /// created off it (t3code `getBranchTriggerLabel`); the bare name otherwise.
-    fn ref_label(&self) -> SharedString {
-        match (self.config.checkout, self.effective_ref_name()) {
-            (_, None) => SharedString::from("Select ref"),
-            (CheckoutKind::NewWorktree, Some(name)) => SharedString::from(format!("From {name}")),
-            (CheckoutKind::Local, Some(name)) => SharedString::from(name),
-        }
     }
 
     fn filtered_space_rows(&self, cx: &App) -> Vec<Space> {
@@ -1770,7 +1458,6 @@ impl Pickers {
         label: SharedString,
         set: bool,
         chip_icon: Option<(&'static str, Option<gpui::Hsla>)>,
-        suffix: Option<SharedString>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1782,19 +1469,29 @@ impl Pickers {
             PickerKind::Space => "picker-space",
             PickerKind::Usage => "composer-usage",
         };
-        let open = self.open == Some(kind)
-            || (kind == PickerKind::Traits && self.open == Some(PickerKind::HarnessModel));
-        // Ghost pill: 32px high, rounded, compact padded content with 12px
-        // medium muted text, 16px icons, and hover/open wash; no border or caret.
+        let open = self.open == Some(kind);
+        // The adjacent model/traits pair uses a 4px inner edge inset so the
+        // visible content gap matches the rest of the 4px action rhythm. The
+        // model keeps its 10px leading inset around the brand mark.
+        let (pad_left, pad_right) = match kind {
+            PickerKind::HarnessModel => (10.0, Theme::SPACE_XS),
+            PickerKind::Traits => (Theme::SPACE_XS, Theme::SPACE_XS),
+            _ => (10.0, 10.0),
+        };
+        // Ghost pill: 32px high with 12px medium muted text, 16px icons, and
+        // hover/open wash; no border or caret.
         div()
             .id(id)
+            .debug_selector(move || format!("{id}-bounds"))
             .h(px(32.0))
+            .min_w_0()
             .max_w(px(208.0))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .px(px(10.0))
+            .pl(px(pad_left))
+            .pr(px(pad_right))
             .rounded(px(8.0))
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
@@ -1823,17 +1520,13 @@ impl Pickers {
                         .text_color(tint.unwrap_or(theme.text_muted)),
                 )
             })
-            .child(div().min_w_0().truncate().child(label))
-            // The effort half of the combined model+effort chip: muted, no
-            // icon (user request) — one button, two tones.
-            .when_some(suffix, |el, suffix| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .text_color(theme.text_muted.opacity(0.7))
-                        .child(suffix),
-                )
-            })
+            .child(
+                div()
+                    .debug_selector(move || format!("{id}-label-bounds"))
+                    .min_w_0()
+                    .truncate()
+                    .child(label),
+            )
     }
 
     /// The empty new-session canvas's inline target-space link. It owns its
@@ -1974,11 +1667,8 @@ impl Pickers {
 
     fn usage_indicator(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let usage = self.state.read(cx).selected_usage.clone();
-        let color = match context_pressure(usage.as_ref()) {
-            ContextPressure::Normal => theme.text_muted.opacity(0.6),
-            ContextPressure::Warning => theme.warning,
-            ContextPressure::Danger => theme.danger,
-        };
+        let ring_fraction = usage.as_ref().and_then(UsageSummary::context_fraction);
+        let color = theme.text_muted.opacity(0.6);
         let open = self.open == Some(PickerKind::Usage);
         let popover = open.then(|| {
             let content = div()
@@ -1991,17 +1681,15 @@ impl Pickers {
         });
         div()
             .id("composer-usage")
+            .debug_selector(|| "composer-usage-bounds".into())
             .relative()
             .size(px(20.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(6.0))
+            .rounded_full()
             .cursor_pointer()
-            .text_size(px(13.0))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(color)
             .bg(if open {
                 theme.element_hover
             } else {
@@ -2014,7 +1702,22 @@ impl Pickers {
             .on_hover(motion::hover_listener("composer-usage"))
             .on_click(cx.listener(|this, _, window, cx| this.toggle(PickerKind::Usage, window, cx)))
             .children(popover)
-            .child("$")
+            .child(usage_progress_ring(
+                ring_fraction,
+                color,
+                theme.text_muted.opacity(0.18),
+            ))
+    }
+
+    /// Render the context-window control independently from the picker bar.
+    ///
+    /// The compact composer gives the established model/thinking picker an
+    /// intrinsic-width flex slot. Keeping this control as its next sibling
+    /// preserves that sizing contract instead of making the picker entity
+    /// responsible for an additional child.
+    pub(crate) fn render_usage(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        self.usage_indicator(&theme, cx).into_any_element()
     }
 
     /// The composer footer row (t3code BranchToolbar): checkout-kind on the
@@ -2113,11 +1816,7 @@ impl Pickers {
                 || self.refs.ready().is_some_and(|refs| {
                     refs.iter()
                         .any(|row| row.kind != jolt_proto::RepoRefKind::Branch)
-                })
-                || chat
-                    .branch
-                    .as_deref()
-                    .is_some_and(|branch| branch.starts_with("Working copy · "));
+                });
             let outside_space = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
             let is_secondary_checkout = match session_ref {
                 Some(row) if row.kind == jolt_proto::RepoRefKind::WorkingCopy => !row.current,
@@ -2140,8 +1839,7 @@ impl Pickers {
                     icon_path,
                     SharedString::from(label),
                     &theme,
-                ))
-                .child(self.usage_indicator(&theme, cx));
+                ));
             return Some(row.child(left).child(ref_side).into_any_element());
         }
 
@@ -2166,8 +1864,7 @@ impl Pickers {
                 &mut overlay,
                 PickerKind::Checkout,
                 "checkout-popover",
-            ))
-            .child(self.usage_indicator(&theme, cx));
+            ));
         Some(row.child(kind_side).child(ref_side).into_any_element())
     }
 
@@ -2252,218 +1949,7 @@ impl Pickers {
     /// The ref picker (t3code BranchToolbarBranchSelector): search on top,
     /// rows with right-aligned muted `current`/`worktree` tags, and a
     /// "Showing X of Y refs" footer when the list is capped.
-    fn render_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        if self.state.read(cx).selected_space_row().is_none() {
-            return div()
-                .p(px(Theme::SPACE_SM))
-                .text_size(px(12.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from("No space selected"))
-                .into_any_element();
-        }
-        let rows = self.filtered_ref_rows(cx);
-        let total = rows.len();
-        let shown = total.min(MAX_REF_ROWS);
-        // Existing session: the highlighted row is the ref owning the
-        // session's cwd; a new chat highlights the draft/current ref.
-        let selected_ref = self.selected_ref_name(cx);
-        let switching = self.switching.clone();
-        let body: AnyElement =
-            match &self.refs {
-                Loadable::Loading | Loadable::Idle => {
-                    popover::skeleton_rows("branch-skeleton", &theme, 4, cx.entity_id(), cx)
-                }
-                Loadable::Error(message) => {
-                    let message = message.clone();
-                    self.retry_row("branch-retry", &message, PickerKind::Branch, &theme, cx)
-                }
-                Loadable::Ready(_) if rows.is_empty() => div()
-                    .p(px(Theme::SPACE_SM))
-                    .text_size(px(12.0))
-                    .text_color(theme.text_faint)
-                    .child(SharedString::from("No refs found."))
-                    .into_any_element(),
-                Loadable::Ready(_) => {
-                    let active = self.active;
-                    let selected = selected_ref;
-                    div()
-                        .id("branch-list")
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .max_h(px(224.0))
-                        .overflow_y_scroll()
-                        .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
-                            |(ix, row)| {
-                                let label: SharedString = row.name.clone().into();
-                                let is_selected = selected.as_deref() == Some(row.name.as_str());
-                                // Right-aligned muted tag (t3code `text-[10px]
-                                // text-muted-foreground/45`): current beats worktree.
-                                let tag: Option<&'static str> = match row.kind {
-                                    jolt_proto::RepoRefKind::WorkingCopy if row.current => {
-                                        Some("working copy")
-                                    }
-                                    jolt_proto::RepoRefKind::WorkingCopy => Some("workspace"),
-                                    jolt_proto::RepoRefKind::Bookmark => Some("bookmark"),
-                                    jolt_proto::RepoRefKind::Branch if row.current => {
-                                        Some("current")
-                                    }
-                                    jolt_proto::RepoRefKind::Branch
-                                        if row.worktree_path.is_some() =>
-                                    {
-                                        Some("worktree")
-                                    }
-                                    jolt_proto::RepoRefKind::Branch => None,
-                                };
-                                let is_switching = switching.as_deref() == Some(row.name.as_str());
-                                popover::menu_row_nav(
-                                    &theme,
-                                    is_selected,
-                                    ix == active,
-                                    format!("branch-row-{ix}"),
-                                )
-                                .id(("branch-row", ix))
-                                .when(switching.is_some(), |el| el.opacity(0.55))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pick_ref(row.clone(), cx);
-                                }))
-                                .child(div().flex_1().min_w_0().truncate().child(label))
-                                .when(is_switching, |el| {
-                                    el.child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(px(10.0))
-                                            .text_color(theme.text_muted.opacity(0.6))
-                                            .child(SharedString::from("switching…")),
-                                    )
-                                })
-                                .when_some(tag, |el, tag| {
-                                    el.child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(px(10.0))
-                                            .text_color(theme.text_muted.opacity(0.45))
-                                            .child(SharedString::from(tag)),
-                                    )
-                                })
-                            },
-                        ))
-                        .into_any_element()
-                }
-            };
-        let mut popover = div()
-            .flex()
-            .flex_col()
-            .child(self.search_box(&theme))
-            .child(body);
-        // Mid-session switch failure (dirty tree, ref checked out elsewhere):
-        // the VCS's own message, under a hairline.
-        if let Some(error) = &self.switch_error {
-            popover = popover.child(
-                popover::menu_section().child(
-                    div()
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(4.0))
-                        .text_size(px(11.0))
-                        .text_color(theme.danger.opacity(0.9))
-                        .child(SharedString::from(error.clone())),
-                ),
-            );
-        }
-        if total > shown {
-            popover = popover.child(
-                popover::menu_section().child(
-                    div()
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(4.0))
-                        .text_size(px(11.0))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(format!(
-                            "Showing {shown} of {total} refs"
-                        ))),
-                ),
-            );
-        }
-        popover.into_any_element()
-    }
-
-    /// The checkout-kind dropdown (t3code BranchToolbarEnvModeSelector): two
-    /// rows — "Current checkout"/"Current worktree" (local) and "New worktree".
-    fn render_checkout_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let has_worktree = self.selected_ref_worktree().is_some();
-        let jujutsu = self.refs.ready().is_some_and(|refs| {
-            refs.iter()
-                .any(|row| row.kind != jolt_proto::RepoRefKind::Branch)
-        });
-        let local_label: &'static str = if jujutsu {
-            "Working copy"
-        } else if has_worktree {
-            "Current worktree"
-        } else {
-            "Current checkout"
-        };
-        let local_icon = if has_worktree {
-            crate::icons::FOLDERS
-        } else {
-            crate::icons::FOLDER
-        };
-        let options: [(CheckoutKind, &'static str, &'static str); 2] = [
-            (CheckoutKind::Local, local_label, local_icon),
-            (
-                CheckoutKind::NewWorktree,
-                if jujutsu {
-                    "New workspace"
-                } else {
-                    "New worktree"
-                },
-                crate::icons::FOLDERS,
-            ),
-        ];
-        let active = self.active;
-        let current = self.config.checkout;
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .children(
-                options
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ix, (kind, label, icon_path))| {
-                        let is_selected = current == kind;
-                        popover::menu_row_nav(
-                            &theme,
-                            is_selected,
-                            ix == active,
-                            format!("checkout-row-{ix}"),
-                        )
-                        .id(("checkout-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.pick_checkout(kind, cx);
-                        }))
-                        .child(
-                            crate::icons::icon(icon_path)
-                                .size(px(14.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(SharedString::from(label)),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    /// The combined harness and model switcher: a vertical harness rail of
-    /// square brand-icon tabs on the left, the
-    /// viewed harness's models on the right. On an existing chat the other
-    /// tabs stay visible but disabled — the lock reads as a rule.
+    /// Combined harness/model switcher; existing chats keep other harnesses disabled.
     fn render_harness_model_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let locked = self.harness_locked(cx);
@@ -2643,17 +2129,10 @@ impl Pickers {
             ],
         };
 
-        // One combined menu (user request): harness tabs across the top,
-        // then the viewed harness's models, then the reasoning ladder and
-        // model options that used to live in the separate traits popover.
-        let traits = self.render_traits_sections(cx);
-        // The palette architecture: agents rail LEFT, models pane beside it
-        // with the traits INSPECTOR pinned below (models are the decision;
-        // reasoning/options are properties of it — they never scroll away
-        // with the list), legend footer under everything. FIXED height so
-        // harness switches and loading skeletons don't resize the card.
+        // The model picker owns only harness/model selection. Traits are kept
+        // in their own adjacent picker so each control has one clear job.
         div()
-            .h(px(420.0))
+            .h(px(320.0))
             .flex()
             .flex_col()
             .child(
@@ -2703,19 +2182,6 @@ impl Pickers {
                                         .track_scroll(&model_scroll)
                                         .children(model_children),
                                 ),
-                            )
-                            .child(
-                                // The pinned inspector tray (scrolls only if
-                                // a model advertises many option groups).
-                                div()
-                                    .id("model-traits-scroll")
-                                    .flex_none()
-                                    .max_h(px(190.0))
-                                    .overflow_y_scroll()
-                                    .border_t_1()
-                                    .border_color(crate::theme::hairline(0.06))
-                                    .p(px(4.0))
-                                    .child(traits),
                             ),
                     ),
             )
@@ -2747,11 +2213,10 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// The traits INSPECTOR: the reasoning ladder plus every advertised
-    /// model option as headed segmented-chip sections, pinned under the
-    /// models pane (formerly menu rows in the shared scroll). Selecting
-    /// keeps the menu open; the active chip carries the wash + ring.
-    /// Mouse-only — arrow keys walk the model list above, never these chips.
+    /// The traits dropdown body (Comet PR #29 / t3code TraitsPicker): the
+    /// reasoning ladder plus every advertised model option as headed sections
+    /// of menu rows. Default choices carry a quiet badge and sections are
+    /// separated by hairlines. Selecting keeps the menu open for multi-adjust.
     fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(model) = self.selected_model(cx).cloned() else {
@@ -2762,118 +2227,104 @@ impl Pickers {
         // the ladder check mirrors the chip summary.
         let current = self.effective_reasoning(cx);
 
-        let ladder: AnyElement = if levels.is_empty() {
-            gpui::Empty.into_any_element()
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .child(popover::menu_heading(&theme, "Reasoning"))
-                .child(
-                    div()
-                        .px(px(4.0))
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap(px(4.0))
-                        .children(levels.into_iter().enumerate().map(|(ix, level)| {
-                            let is_active = current == Some(level);
-                            trait_chip(&theme, is_active)
+        let mut sections: Vec<AnyElement> = Vec::new();
+        if !levels.is_empty() {
+            let default_level = default_reasoning(&levels);
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(popover::menu_heading(&theme, "Reasoning"))
+                    .children(levels.into_iter().enumerate().map(|(ix, level)| {
+                        let is_active = current == Some(level);
+                        let is_default = default_level == Some(level);
+                        let mut row =
+                            popover::menu_row(&theme, is_active, format!("trait-reasoning-{ix}"))
                                 .id(("reasoning-row", ix))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.pick_reasoning(level, cx);
                                 }))
                                 .child(SharedString::from(reasoning_label(level)))
-                        })),
-                )
-                .into_any_element()
-        };
+                                .child(div().flex_1());
+                        if is_default {
+                            row = row.child(default_badge(&theme));
+                        }
+                        row
+                    }))
+                    .into_any_element(),
+            );
+        }
 
         let selections = self.explicit_options(cx);
-        let options =
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .children(model.options.iter().enumerate().map(|(opt_ix, option)| {
-                    let selected_choice = selections
-                        .get(&option.id)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&option.default_choice)
-                        .to_string();
-                    let option_id = option.id.clone();
-                    let default_choice = option.default_choice.clone();
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(popover::menu_heading(&theme, &option.label))
-                        .child(
-                            div()
-                                .px(px(4.0))
-                                .flex()
-                                .flex_row()
-                                .flex_wrap()
-                                .gap(px(4.0))
-                                .children(option.choices.iter().enumerate().map(
-                                    |(choice_ix, choice)| {
-                                        let is_active = selected_choice == choice.id;
-                                        let choice_id = choice.id.clone();
-                                        let option_id = option_id.clone();
-                                        let is_default = choice.id == default_choice;
-                                        trait_chip(&theme, is_active)
-                                            .id(("trait-choice", opt_ix * 32 + choice_ix))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.pick_option(
-                                                    option_id.clone(),
-                                                    choice_id.clone(),
-                                                    is_default,
-                                                    cx,
-                                                );
-                                            }))
-                                            .child(SharedString::from(choice.label.clone()))
-                                    },
-                                )),
-                        )
-                }));
+        for (opt_ix, option) in model.options.iter().enumerate() {
+            if !sections.is_empty() {
+                sections.push(popover::menu_separator().into_any_element());
+            }
+            let selected_choice = selections
+                .get(&option.id)
+                .and_then(|v| v.as_str())
+                .unwrap_or(&option.default_choice)
+                .to_string();
+            let option_id = option.id.clone();
+            let default_choice = option.default_choice.clone();
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(popover::menu_heading(&theme, &option.label))
+                    .children(
+                        option
+                            .choices
+                            .iter()
+                            .enumerate()
+                            .map(|(choice_ix, choice)| {
+                                let is_active = selected_choice == choice.id;
+                                let choice_id = choice.id.clone();
+                                let option_id = option_id.clone();
+                                let is_default = choice.id == default_choice;
+                                let mut row = popover::menu_row(
+                                    &theme,
+                                    is_active,
+                                    format!("trait-choice-{opt_ix}-{choice_ix}"),
+                                )
+                                .id(("trait-choice", opt_ix * 32 + choice_ix))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_option(
+                                        option_id.clone(),
+                                        choice_id.clone(),
+                                        is_default,
+                                        cx,
+                                    );
+                                }))
+                                .child(SharedString::from(choice.label.clone()))
+                                .child(div().flex_1());
+                                if is_default {
+                                    row = row.child(default_badge(&theme));
+                                }
+                                row
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
 
         div()
             .flex()
             .flex_col()
-            .gap(px(4.0))
-            .pb(px(4.0))
-            .child(ladder)
-            .child(options)
+            .pb(px(2.0))
+            .children(sections)
             .into_any_element()
     }
 }
 
-/// A segmented choice chip for the traits inspector (reasoning ladder /
-/// model options): the key-cap voice — every chip carries a faint fill so it
-/// reads as a pressable segment (bare text read as labels, not buttons);
-/// the active chip adds the app-wide wash + glass ring.
-/// The caller adds id/click/label.
-fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
+/// Quiet marker beside a section's default choice, matching Comet PR #29.
+fn default_badge(theme: &Theme) -> gpui::Div {
     div()
-        .h(px(24.0))
-        .px(px(10.0))
-        .rounded(px(6.0))
-        .flex()
-        .flex_row()
-        .items_center()
-        .text_size(px(11.5))
-        .cursor_pointer()
-        .when(active, |el| {
-            el.bg(crate::theme::card_selected_bg())
-                .text_color(theme.text)
-        })
-        .when(!active, |el| {
-            el.bg(crate::theme::ink(0.04))
-                .text_color(theme.text_muted.opacity(0.7))
-                .hover(|s| s.bg(theme.element_hover))
-        })
-        .when(active, |el| {
-            el.shadow(crate::theme::card_selected_shadows())
-        })
+        .flex_none()
+        .text_size(px(10.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.text_muted.opacity(0.6))
+        .child(SharedString::from("Default"))
 }
 
 /// Brand mark + optional tint for a harness (the Claude mark keeps its brand
@@ -3005,8 +2456,17 @@ fn attach_overlay_end(
     chip
 }
 
-impl Render for Pickers {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl Pickers {
+    /// Render composer controls with either a definite full width (expanded)
+    /// or their intrinsic width (compact). A percentage width inside the
+    /// compact composer's `flex_none` slot resolves to zero and lets the chip
+    /// text paint over later siblings.
+    pub(crate) fn render_controls(
+        &mut self,
+        fill_width: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         // A JOLT_OPEN_PICKER popover never went through `toggle`, so claim
         // its keyboard focus here (re-claim until it sticks — the shell's
@@ -3107,9 +2567,17 @@ impl Render for Pickers {
                 let content = self.render_space_popover(cx);
                 Some((PickerKind::Space, self.popover_frame(300.0, content, cx)))
             }
-            // Traits merged into the HarnessModel popover; usage renders in
-            // the composer footer beside its trigger.
-            Some(PickerKind::Traits | PickerKind::Usage) | None => None,
+            Some(PickerKind::Traits) => {
+                let content = div()
+                    .p(px(4.0))
+                    .child(self.render_traits_sections(cx))
+                    .into_any_element();
+                Some((
+                    PickerKind::Traits,
+                    self.popover_frame_flush(240.0, content, cx),
+                ))
+            }
+            Some(PickerKind::Usage) | None => None,
         };
 
         // The target-space chip exists only on the new-session canvas.
@@ -3135,7 +2603,6 @@ impl Render for Pickers {
                 label,
                 true,
                 Some((crate::icons::FOLDER, None)),
-                None,
                 &theme,
                 cx,
             );
@@ -3146,34 +2613,75 @@ impl Render for Pickers {
                 "space-popover",
             ));
         }
-        // ONE combined model+effort chip (user request): brand icon + model
-        // name, then the effort level muted with no icon — a single button
-        // opening the single merged menu.
-        let combined_chip = self.trigger_chip(
+        let model_chip = self.trigger_chip(
             PickerKind::HarnessModel,
             model_label,
             true,
             Some(harness_icon),
-            Some(traits_label),
             &theme,
             cx,
         );
-        let _ = traits_set;
+        // During catalog loading keep the trigger stable; once a concrete
+        // model is known, hide it when that model advertises no traits.
+        let has_traits = self
+            .selected_model(cx)
+            .is_none_or(|model| !self.trait_ladder(cx).is_empty() || !model.options.is_empty());
+        let traits_chip = has_traits.then(|| {
+            self.trigger_chip(
+                PickerKind::Traits,
+                traits_label,
+                traits_set.is_some(),
+                None,
+                &theme,
+                cx,
+            )
+        });
+        let model_chip = attach_overlay_end(
+            model_chip,
+            &mut overlay,
+            PickerKind::HarnessModel,
+            "model-popover",
+        );
+        let traits_chip = traits_chip.map(|chip| {
+            attach_overlay_end(chip, &mut overlay, PickerKind::Traits, "traits-popover")
+        });
+        // Compact gives this entity a flexible lane. Put any unused width at
+        // the lane's START, then keep the natural Model/Traits group pinned to
+        // Context at the end. Previously the Traits hit box stretched across
+        // that remainder, creating the large visible hole in screenshots.
+        if !fill_width {
+            return div()
+                .debug_selector(|| "picker-controls-compact".into())
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap(px(Theme::SPACE_XS))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .justify_end()
+                        .child(model_chip.max_w_full()),
+                )
+                .children(traits_chip.map(|chip| chip.flex_none()))
+                .into_any_element();
+        }
         let right = div()
             .flex()
             .flex_row()
             .items_center()
             .flex_none()
-            .gap(px(4.0))
+            .gap(px(Theme::SPACE_XS))
             // End-anchored: the menu's right edge sits flush with the chip's
             // right edge (user request), same as the footer's ref popover.
-            .child(attach_overlay_end(
-                combined_chip,
-                &mut overlay,
-                PickerKind::HarnessModel,
-                "model-popover",
-            ));
+            .child(model_chip)
+            .children(traits_chip);
         div()
+            .debug_selector(|| "picker-controls-expanded".into())
             .w_full()
             .min_w_0()
             .flex()
@@ -3182,281 +2690,16 @@ impl Render for Pickers {
             .justify_between()
             .gap(px(Theme::SPACE_SM))
             .child(left)
-            .child(right)
+            .child(right.flex_none())
+            .into_any_element()
+    }
+}
+
+impl Render for Pickers {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_controls(true, window, cx)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use jolt_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
-
-    fn repo_ref(
-        name: &str,
-        kind: jolt_proto::RepoRefKind,
-        current: bool,
-        worktree_path: Option<&str>,
-    ) -> RepoRef {
-        RepoRef {
-            name: name.into(),
-            revision: name.into(),
-            kind,
-            current,
-            worktree_path: worktree_path.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn empty_search_keeps_the_selected_row_active() {
-        assert_eq!(search_active_index("", 2), 2);
-        assert_eq!(search_active_index("   ", 2), 2);
-        assert_eq!(search_active_index("jo", 2), 0);
-    }
-
-    #[test]
-    fn context_pressure_changes_at_seventy_and_ninety_percent() {
-        let usage = |tokens| UsageSummary {
-            context_tokens: Some(tokens),
-            context_window: Some(100),
-            ..UsageSummary::default()
-        };
-        assert_eq!(context_pressure(Some(&usage(69))), ContextPressure::Normal);
-        assert_eq!(context_pressure(Some(&usage(70))), ContextPressure::Warning);
-        assert_eq!(context_pressure(Some(&usage(89))), ContextPressure::Warning);
-        assert_eq!(context_pressure(Some(&usage(90))), ContextPressure::Danger);
-        assert_eq!(context_pressure(None), ContextPressure::Normal);
-    }
-
-    #[test]
-    fn session_checkout_ref_defaults_to_the_jj_working_copy() {
-        let refs = [
-            repo_ref(
-                "Working copy · abcdef12",
-                jolt_proto::RepoRefKind::WorkingCopy,
-                true,
-                None,
-            ),
-            repo_ref(
-                "Working copy · 12345678",
-                jolt_proto::RepoRefKind::WorkingCopy,
-                false,
-                Some("/repo/other"),
-            ),
-            repo_ref("main", jolt_proto::RepoRefKind::Bookmark, false, None),
-        ];
-
-        assert_eq!(
-            session_checkout_ref(&refs, Some("main"), Some("/repo"), true).map(|row| &*row.name),
-            Some("Working copy · abcdef12")
-        );
-        assert_eq!(
-            session_checkout_ref(&refs, None, Some("/repo/other"), false).map(|row| &*row.name),
-            Some("Working copy · 12345678")
-        );
-    }
-
-    #[test]
-    fn pi_uses_its_brand_mark() {
-        assert_eq!(harness_brand_icon(HarnessId::Pi).0, crate::icons::PI_MARK);
-    }
-
-    #[test]
-    fn traits_summary_formats_non_defaults() {
-        let model = Model {
-            id: "opus".into(),
-            label: "Opus".into(),
-            description: None,
-            reasoning_levels: vec![ReasoningLevel::Medium, ReasoningLevel::High],
-            options: vec![
-                ModelOption {
-                    id: "context".into(),
-                    label: "Context window".into(),
-                    choices: vec![
-                        ModelOptionChoice {
-                            id: "standard".into(),
-                            label: "Standard".into(),
-                        },
-                        ModelOptionChoice {
-                            id: "1m".into(),
-                            label: "1M".into(),
-                        },
-                    ],
-                    default_choice: "standard".into(),
-                },
-                ModelOption {
-                    id: "speed".into(),
-                    label: "Speed".into(),
-                    choices: vec![
-                        ModelOptionChoice {
-                            id: "normal".into(),
-                            label: "Normal".into(),
-                        },
-                        ModelOptionChoice {
-                            id: "fast".into(),
-                            label: "Fast".into(),
-                        },
-                    ],
-                    default_choice: "normal".into(),
-                },
-            ],
-        };
-        let mut selections = serde_json::Map::new();
-        selections.insert("context".into(), serde_json::Value::String("1m".into()));
-        selections.insert("speed".into(), serde_json::Value::String("fast".into()));
-        assert_eq!(
-            traits_summary(Some(&model), Some(ReasoningLevel::High), &selections),
-            Some("High · 1M · Fast".to_string())
-        );
-        // All defaults → no summary.
-        assert_eq!(
-            traits_summary(Some(&model), None, &serde_json::Map::new()),
-            None
-        );
-        // Default-choice selections don't count as non-default.
-        let mut defaults = serde_json::Map::new();
-        defaults.insert("speed".into(), serde_json::Value::String("normal".into()));
-        assert_eq!(traits_summary(Some(&model), None, &defaults), None);
-        // Reasoning shows without a model too.
-        assert_eq!(
-            traits_summary(
-                None,
-                Some(ReasoningLevel::Ultrathink),
-                &serde_json::Map::new()
-            ),
-            Some("Ultrathink".to_string())
-        );
-    }
-
-    #[test]
-    fn folder_paths_and_breadcrumbs() {
-        assert_eq!(parent_path("/home/w/dev"), Some("/home/w".to_string()));
-        assert_eq!(parent_path("/home"), Some("/".to_string()));
-        assert_eq!(parent_path("/home/"), Some("/".to_string()));
-        assert_eq!(parent_path("/"), None);
-        assert_eq!(parent_path(""), None);
-        assert_eq!(child_path("/home", "w"), "/home/w");
-        assert_eq!(child_path("/", "home"), "/home");
-        let crumbs = breadcrumbs("/home/w/dev");
-        let labels: Vec<&str> = crumbs.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, ["/", "home", "w", "dev"]);
-        assert_eq!(crumbs[2].1, "/home/w");
-        assert_eq!(breadcrumbs("/").len(), 1);
-    }
-
-    #[test]
-    fn browser_navigation_reducer() {
-        let listing = FolderListing {
-            path: "/home/w".into(),
-            entries: vec![
-                FolderEntry {
-                    name: "notes.txt".into(),
-                    is_dir: false,
-                    is_repo: false,
-                },
-                FolderEntry {
-                    name: "dev".into(),
-                    is_dir: true,
-                    is_repo: false,
-                },
-                FolderEntry {
-                    name: "jolt".into(),
-                    is_dir: true,
-                    is_repo: true,
-                },
-            ],
-            truncated: false,
-        };
-        // Files never show as rows.
-        assert_eq!(browser_rows(&listing).len(), 2);
-        assert_eq!(browser_rows(&listing)[1].name, "jolt");
-    }
-
-    #[test]
-    fn resolved_chat_config_requires_harness() {
-        let mut resolved = ResolvedRunConfig::default();
-        assert!(resolved.chat_config().is_none());
-        resolved.harness = Some(HarnessId::ClaudeCode);
-        resolved.model = Some("opus".into());
-        resolved.reasoning = Some(ReasoningLevel::High);
-        let config = resolved.chat_config().expect("harness set");
-        assert_eq!(config.harness, HarnessId::ClaudeCode);
-        assert_eq!(config.model.as_deref(), Some("opus"));
-        assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
-    }
-
-    #[test]
-    fn default_model_is_first_catalog_row() {
-        let models = vec![
-            Model {
-                id: "flagship".into(),
-                label: "Flagship".into(),
-                description: None,
-                reasoning_levels: vec![],
-                options: vec![],
-            },
-            Model {
-                id: "fast".into(),
-                label: "Fast".into(),
-                description: None,
-                reasoning_levels: vec![],
-                options: vec![],
-            },
-        ];
-        assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));
-        assert!(default_model(&[]).is_none());
-    }
-
-    #[test]
-    fn default_reasoning_prefers_high_then_medium() {
-        use ReasoningLevel::*;
-        // Recommended default is High (user-corrected), even on full ladders.
-        assert_eq!(
-            default_reasoning(&[Low, Medium, High, XHigh, Max, Ultracode, Ultrathink]),
-            Some(High)
-        );
-        assert_eq!(default_reasoning(&[Low, Medium, High, Max]), Some(High));
-        // No High: Medium.
-        assert_eq!(default_reasoning(&[Minimal, Low, Medium]), Some(Medium));
-        // Neither offered: first entry.
-        assert_eq!(default_reasoning(&[Minimal, Low]), Some(Minimal));
-        // Ladder-less model (Haiku): no reasoning at all.
-        assert_eq!(default_reasoning(&[]), None);
-    }
-
-    #[test]
-    fn clamp_reasoning_keeps_offered_levels_and_heals_foreign_ones() {
-        use ReasoningLevel::*;
-        let ladder = [Low, Medium, High, Max];
-        // A pick the ladder offers survives.
-        assert_eq!(clamp_reasoning(Some(Max), &ladder), Some(Max));
-        // A remembered level the new model doesn't offer heals to its default.
-        assert_eq!(clamp_reasoning(Some(XHigh), &ladder), Some(High));
-        // No pick at all resolves to the concrete default too.
-        assert_eq!(clamp_reasoning(None, &ladder), Some(High));
-        assert_eq!(clamp_reasoning(Some(High), &[]), None);
-    }
-
-    #[test]
-    fn mock_harness_hidden_unless_alone() {
-        let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {
-            id,
-            name: name.into(),
-            supports_steering: true,
-            steering_mode: jolt_proto::SteeringMode::StepBoundary,
-            reasoning_levels: vec![],
-        };
-        let mixed = vec![
-            descriptor(HarnessId::Mock, "Mock"),
-            descriptor(HarnessId::ClaudeCode, "Claude Code"),
-        ];
-        // Env-independent core: mock hidden in production…
-        let visible = visible_harnesses_impl(&mixed, false);
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].id, HarnessId::ClaudeCode);
-        let only_mock = vec![descriptor(HarnessId::Mock, "Mock")];
-        assert_eq!(visible_harnesses_impl(&only_mock, false).len(), 1);
-        // …and opted back in by JOLT_HARNESS=mock (the e2e rig).
-        assert_eq!(visible_harnesses_impl(&mixed, true).len(), 2);
-        assert_eq!(visible_harnesses_impl(&mixed, true)[0].id, HarnessId::Mock);
-    }
-}
+mod tests;

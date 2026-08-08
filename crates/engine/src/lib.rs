@@ -12,22 +12,23 @@ use jolt_rpc::{RpcError, RpcReply, RpcService};
 
 pub use jolt_proto::HarnessId;
 
-use jolt_sync::DocsStore;
+use jolt_store::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
 pub mod diff_projection;
 pub mod diff_sync;
 pub mod doc_host;
-mod forge_reviews;
 mod goals;
+mod handoff;
+mod harness_updates;
 pub mod instance_lock;
 mod mcp;
 mod model_selection;
 mod pinned_diffs;
+mod pricing;
 mod question_extraction;
 pub mod registry;
-pub mod repos;
 pub mod review_store;
 pub mod rpc;
 pub mod run_journal;
@@ -36,12 +37,10 @@ pub mod secrets;
 pub mod sessions;
 mod simd_base64;
 pub mod spaces;
-pub mod terminals;
 pub mod titles;
 pub mod turn_diffs;
 pub mod uploads;
 pub mod usage;
-pub mod vcs;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -53,8 +52,9 @@ pub use diff_sync::{
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
+pub use jolt_terminal::{TerminalOutput, Terminals};
+pub use jolt_vcs::{CheckoutIdentity, Repos, Vcs, worktree_branch_from_title};
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
-pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use review_store::ReviewStore;
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
@@ -62,22 +62,26 @@ pub use scopes::{AccountScope, ScopeKind, ScopeLayout, ScopeStatus};
 pub use secrets::{HarnessSecrets, SecretsError};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
-pub use terminals::{TerminalOutput, Terminals};
 pub use titles::TitleGenerator;
 pub use turn_diffs::TurnDiffStore;
 pub use uploads::{AttachmentChunk, CommittedAttachment, Uploads};
 pub use usage::UsageStore;
-pub use vcs::Vcs;
 pub use workspace_host::{DEFAULT_ORG_ID, DEFAULT_USER_ID, WorkspaceHost, WorkspaceHostConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("doc: {0}")]
-    Doc(#[from] jolt_doc::DocError),
+    Doc(#[from] jolt_session_doc::DocError),
+    #[error("registry: {0}")]
+    Registry(#[from] jolt_registry_model::RegistryError),
     #[error("journal: {0}")]
     Journal(#[from] run_journal::JournalError),
     #[error("store: {0}")]
-    Store(#[from] jolt_sync::StoreError),
+    Store(#[from] jolt_store::StoreError),
+    #[error("vcs: {0}")]
+    Vcs(#[from] jolt_vcs::VcsError),
+    #[error("terminal: {0}")]
+    Terminal(#[from] jolt_terminal::TerminalError),
     #[error("harness: {0}")]
     Harness(#[from] jolt_harness::HarnessError),
     #[error("io: {0}")]
@@ -123,14 +127,18 @@ pub struct EngineConfig {
 struct DeviceServices {
     secrets: HarnessSecrets,
     agent_accounts: AgentAccounts,
+    pricing: pricing::PricingCatalog,
 }
 
 impl DeviceServices {
     fn open(data_dir: &Path) -> Result<Self, EngineError> {
+        let pricing = pricing::PricingCatalog::load(data_dir);
+        pricing.start_refresh_loop();
         Ok(Self {
             secrets: HarnessSecrets::open(data_dir)
                 .map_err(|error| EngineError::Other(format!("secrets: {error}")))?,
             agent_accounts: AgentAccounts::new(AgentAccountsConfig::detect(data_dir)),
+            pricing,
         })
     }
 }
@@ -154,10 +162,12 @@ pub struct EngineCore {
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
-    links: std::sync::Mutex<Option<Arc<jolt_rpc::LinkCache>>>,
+    links: std::sync::Mutex<Option<Arc<jolt_relay::LinkCache>>>,
     /// Release checker (attached by [`EngineSupervisor`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<jolt_update::Updater>>,
+    /// Device-wide coding-harness checker and maintenance coordinator.
+    harness_updater: std::sync::Mutex<Option<harness_updates::HarnessUpdater>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -253,13 +263,18 @@ impl EngineCore {
         std::fs::create_dir_all(lock_dir)?;
         let lock = InstanceLock::acquire(lock_dir)?;
         let services = services.map_or_else(|| DeviceServices::open(data_dir), Ok)?;
+        let pricing = services.pricing.clone();
         let secrets = services.secrets;
         registry.set_environment_provider(Arc::new(secrets.clone()));
         let device_id = load_or_create_device_id(device_dir)?;
         let store = Arc::new(DocsStore::open(identity_dir)?);
         let journal = Arc::new(RunJournal::open(identity_dir.join("journals"))?);
-        let usage = UsageStore::open(&identity_dir.join("usage.sqlite"), device_id.clone())
-            .map_err(|error| EngineError::Other(format!("usage store: {error}")))?;
+        let usage = UsageStore::open_with_pricing(
+            &identity_dir.join("usage.sqlite"),
+            device_id.clone(),
+            pricing,
+        )
+        .map_err(|error| EngineError::Other(format!("usage store: {error}")))?;
         let repos = Repos::new(data_dir, &device_id);
         let sessions =
             SessionsEngine::new(device_id.clone(), journal, registry.clone(), usage.clone());
@@ -336,6 +351,7 @@ impl EngineCore {
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
+            harness_updater: std::sync::Mutex::new(None),
             _instance_lock: lock,
         })
     }
@@ -368,14 +384,14 @@ impl EngineCore {
     }
 
     /// Attach the peer link cache — enables `targetDeviceId` routing and [`Self::dial_device`].
-    pub fn set_links(&self, links: Arc<jolt_rpc::LinkCache>) {
+    pub fn set_links(&self, links: Arc<jolt_relay::LinkCache>) {
         *self
             .links
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(links);
     }
 
-    pub fn links(&self) -> Option<Arc<jolt_rpc::LinkCache>> {
+    pub fn links(&self) -> Option<Arc<jolt_relay::LinkCache>> {
         self.links
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -392,6 +408,20 @@ impl EngineCore {
 
     pub fn updater(&self) -> Option<jolt_update::Updater> {
         self.updater
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_harness_updater(&self, updater: harness_updates::HarnessUpdater) {
+        *self
+            .harness_updater
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(updater);
+    }
+
+    fn harness_updater(&self) -> Option<harness_updates::HarnessUpdater> {
+        self.harness_updater
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -415,12 +445,12 @@ impl EngineCore {
     /// Start hosting our device room: serve the full RPC surface to relay clients and
     /// warm-open chat docs on nudges (§7 cold-chat command delivery). The token source
     /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
-    pub fn start_host_relay(&self, edge_url: &str) -> jolt_rpc::HostRelay {
+    pub fn start_host_relay(&self, edge_url: &str) -> jolt_relay::HostRelay {
         let auth = self.auth();
         let config =
-            jolt_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+            jolt_relay::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
         let doc_host = self.doc_host.clone();
-        let on_nudge: jolt_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
+        let on_nudge: jolt_relay::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
             // subscription — the command executes with no standing per-chat socket.
             match doc_host.open(&chat_id) {
@@ -430,7 +460,7 @@ impl EngineCore {
                 }
             }
         });
-        jolt_rpc::HostRelay::spawn(
+        jolt_relay::HostRelay::spawn(
             config,
             crate::rpc::relay_service(self.rpc_service()),
             on_nudge,
@@ -459,6 +489,9 @@ impl EngineCore {
         if let Some(updater) = self.updater() {
             rpc = rpc.with_updater(updater);
         }
+        if let Some(updater) = self.harness_updater() {
+            rpc = rpc.with_harness_updater(updater);
+        }
         Arc::new(rpc)
     }
 
@@ -483,7 +516,7 @@ pub struct Engine {
 /// in-process engine so their production authentication paths cannot diverge.
 pub struct EngineRuntime {
     core: EngineCore,
-    _host_relay: Option<jolt_rpc::HostRelay>,
+    _host_relay: Option<jolt_relay::HostRelay>,
     owns_updater: bool,
 }
 
@@ -502,6 +535,7 @@ pub struct EngineSupervisor {
     auth: Auth,
     auth_rpc: rpc::AuthRpc,
     updater: jolt_update::Updater,
+    harness_updater: harness_updates::HarnessUpdater,
     state_tx: tokio::sync::watch::Sender<SupervisedEngineState>,
     scope_tx: tokio::sync::watch::Sender<ScopeStatus>,
     local: std::sync::Mutex<Option<EngineRuntime>>,
@@ -511,13 +545,33 @@ pub struct EngineSupervisor {
 }
 
 impl EngineSupervisor {
+    fn session_engines(&self) -> Vec<SessionsEngine> {
+        let mut sessions = Vec::with_capacity(2);
+        if let Some(runtime) = lock(&self.local).as_ref() {
+            sessions.push(runtime.core().sessions.clone());
+        }
+        if let Some(runtime) = lock(&self.account).as_ref() {
+            sessions.push(runtime.core().sessions.clone());
+        }
+        sessions
+    }
+
+    fn wake_harness_commands(&self) {
+        if let Some(runtime) = lock(&self.local).as_ref() {
+            runtime.core().doc_host.kick_all_commands();
+        }
+        if let Some(runtime) = lock(&self.account).as_ref() {
+            runtime.core().doc_host.kick_all_commands();
+        }
+    }
+
     pub fn new(config: EngineConfig, auth: Auth) -> Arc<Self> {
         let (state_tx, _) = tokio::sync::watch::channel(SupervisedEngineState::Waiting);
         let (scope_tx, _) = tokio::sync::watch::channel(ScopeStatus::local());
         Arc::new_cyclic(|weak: &Weak<Self>| {
-            let weak = weak.clone();
+            let quiescent_supervisor = weak.clone();
             let quiescent: jolt_update::QuiescentCheck = Arc::new(move || {
-                weak.upgrade().is_none_or(|supervisor| {
+                quiescent_supervisor.upgrade().is_none_or(|supervisor| {
                     let quiet = |slot: &Mutex<Option<EngineRuntime>>| {
                         lock(slot).as_ref().is_none_or(|runtime| {
                             !runtime.core().sessions.any_active()
@@ -528,11 +582,56 @@ impl EngineSupervisor {
                 })
             });
             let updater = jolt_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+
+            let counts_supervisor = weak.clone();
+            let counts: harness_updates::HarnessRunCounts = Arc::new(move |harness| {
+                counts_supervisor.upgrade().map_or((0, 0), |supervisor| {
+                    supervisor
+                        .session_engines()
+                        .into_iter()
+                        .map(|sessions| sessions.harness_run_counts(harness))
+                        .fold((0, 0), |(busy, idle), (next_busy, next_idle)| {
+                            (busy + next_busy, idle + next_idle)
+                        })
+                })
+            });
+            let fence_supervisor = weak.clone();
+            let fence: harness_updates::HarnessFence = Arc::new(move |harness, enabled| {
+                if let Some(supervisor) = fence_supervisor.upgrade() {
+                    for sessions in supervisor.session_engines() {
+                        sessions.set_harness_maintenance(harness, enabled);
+                    }
+                }
+            });
+            let retire_supervisor = weak.clone();
+            let retire_idle: harness_updates::RetireIdleHarness = Arc::new(move |harness| {
+                retire_supervisor.upgrade().map_or(0, |supervisor| {
+                    supervisor
+                        .session_engines()
+                        .into_iter()
+                        .map(|sessions| sessions.retire_idle_harness(harness))
+                        .sum()
+                })
+            });
+            let wake_supervisor = weak.clone();
+            let wake_commands: harness_updates::WakeHarnessCommands = Arc::new(move || {
+                if let Some(supervisor) = wake_supervisor.upgrade() {
+                    supervisor.wake_harness_commands();
+                }
+            });
+            let harness_updater = harness_updates::HarnessUpdater::spawn(
+                Arc::new(default_registry()),
+                counts,
+                fence,
+                retire_idle,
+                wake_commands,
+            );
             Self {
                 config,
                 auth: auth.clone(),
                 auth_rpc: rpc::AuthRpc::new(auth),
                 updater,
+                harness_updater,
                 state_tx,
                 scope_tx,
                 local: std::sync::Mutex::new(None),
@@ -681,6 +780,10 @@ impl EngineSupervisor {
         )?;
         core.set_auth(self.auth.clone());
         core.set_updater(self.updater.clone());
+        core.set_harness_updater(self.harness_updater.clone());
+        for harness in self.harness_updater.active_maintenance() {
+            core.sessions.set_harness_maintenance(harness, true);
+        }
         *lock(&self.local) = Some(EngineRuntime {
             core,
             _host_relay: None,
@@ -713,6 +816,10 @@ impl EngineSupervisor {
         )?;
         core.set_auth(self.auth.clone());
         core.set_updater(self.updater.clone());
+        core.set_harness_updater(self.harness_updater.clone());
+        for harness in self.harness_updater.active_maintenance() {
+            core.sessions.set_harness_maintenance(harness, true);
+        }
         let host_relay = edge
             .as_ref()
             .map(|edge| configure_online_core(&core, edge, &self.auth));
@@ -892,6 +999,7 @@ impl EngineSupervisor {
             local.shutdown().await;
         }
         self.updater.shutdown();
+        self.harness_updater.shutdown();
     }
 }
 
@@ -899,12 +1007,12 @@ impl EngineSupervisor {
 impl RpcService for EngineSupervisor {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
-            jolt_rpc::methods::SCOPE_STATUS => {
+            jolt_api::methods::SCOPE_STATUS => {
                 return Ok(RpcReply::Stream(rpc::watch_stream(
                     self.scope_tx.subscribe(),
                 )));
             }
-            jolt_rpc::methods::SWITCH_SCOPE => {
+            jolt_api::methods::SWITCH_SCOPE => {
                 #[derive(serde::Deserialize)]
                 struct Params {
                     scope: ScopeKind,
@@ -914,7 +1022,7 @@ impl RpcService for EngineSupervisor {
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 return RpcReply::value(&self.scope_tx.borrow().clone());
             }
-            jolt_rpc::methods::RESOLVE_ACCOUNT_LINK => {
+            jolt_api::methods::RESOLVE_ACCOUNT_LINK => {
                 #[derive(serde::Deserialize)]
                 struct Params {
                     merge: bool,
@@ -925,7 +1033,7 @@ impl RpcService for EngineSupervisor {
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 return RpcReply::value(&self.scope_tx.borrow().clone());
             }
-            jolt_rpc::methods::SIGN_OUT => {
+            jolt_api::methods::SIGN_OUT => {
                 self.activate(ScopeKind::Local)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 self.auth.sign_out();
@@ -941,6 +1049,28 @@ impl RpcService for EngineSupervisor {
                 let Some(account_service) = account_service else {
                     return Err(RpcError::Failed(
                         "theme sync requires a signed-in account".into(),
+                    ));
+                };
+                return account_service.handle(method, params).await;
+            }
+            _ if matches!(
+                method,
+                jolt_api::methods::WATCH_HARNESS_UPDATES
+                    | jolt_api::methods::CHECK_HARNESS_UPDATES
+                    | jolt_api::methods::APPLY_HARNESS_UPDATE
+                    | jolt_api::methods::UPDATE_STATUS
+                    | jolt_api::methods::APPLY_UPDATE
+            ) && params
+                .get("targetDeviceId")
+                .and_then(serde_json::Value::as_str)
+                .is_some() =>
+            {
+                let account_service = lock(&self.account)
+                    .as_ref()
+                    .map(|runtime| runtime.core().rpc_service());
+                let Some(account_service) = account_service else {
+                    return Err(RpcError::Failed(
+                        "remote updates require a signed-in account".into(),
                     ));
                 };
                 return account_service.handle(method, params).await;
@@ -980,8 +1110,12 @@ impl EngineRuntime {
     }
 }
 
-fn configure_online_core(core: &EngineCore, edge: &EdgeConfig, auth: &Auth) -> jolt_rpc::HostRelay {
-    let links = jolt_rpc::LinkCache::new(jolt_rpc::LinkCacheConfig::new(
+fn configure_online_core(
+    core: &EngineCore,
+    edge: &EdgeConfig,
+    auth: &Auth,
+) -> jolt_relay::HostRelay {
+    let links = jolt_relay::LinkCache::new(jolt_relay::LinkCacheConfig::new(
         edge.url.clone(),
         Arc::new(auth.clone()),
     ));
@@ -1304,7 +1438,7 @@ mod supervisor_tests {
         let client = jolt_rpc::memory_client(supervisor.clone());
         let account_local_device = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            client.call(jolt_rpc::methods::LOCAL_DEVICE, serde_json::json!({})),
+            client.call(jolt_api::methods::LOCAL_DEVICE, serde_json::json!({})),
         )
         .await
         .expect("Account runtime booted")
@@ -1322,17 +1456,43 @@ mod supervisor_tests {
 
         client
             .call(
-                jolt_rpc::methods::SWITCH_SCOPE,
+                jolt_api::methods::SWITCH_SCOPE,
                 serde_json::json!({ "scope": "local" }),
             )
             .await
             .unwrap();
         let local_device = client
-            .call(jolt_rpc::methods::LOCAL_DEVICE, serde_json::json!({}))
+            .call(jolt_api::methods::LOCAL_DEVICE, serde_json::json!({}))
             .await
             .unwrap();
         assert_ne!(local_device["deviceId"], account_device);
         assert!(lock(&supervisor.account).is_some(), "Account keeps running");
+
+        let mut remote_updates = client
+            .subscribe(
+                jolt_api::methods::WATCH_HARNESS_UPDATES,
+                serde_json::json!({ "targetDeviceId": account_device.clone() }),
+            )
+            .await
+            .expect("targeted harness updates route through the Account runtime");
+        assert_eq!(
+            remote_updates
+                .recv()
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let mut remote_jolt_update = client
+            .subscribe(
+                jolt_api::methods::UPDATE_STATUS,
+                serde_json::json!({ "targetDeviceId": account_device }),
+            )
+            .await
+            .expect("targeted Jolt updates route through the Account runtime");
+        assert!(remote_jolt_update.recv().await.is_some());
 
         task.abort();
         supervisor.shutdown().await;
@@ -1360,20 +1520,29 @@ mod supervisor_tests {
         let client = jolt_rpc::memory_client(supervisor.clone());
         let harnesses = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            client.call(jolt_rpc::methods::LIST_HARNESSES, serde_json::json!({})),
+            client.call(jolt_api::methods::LIST_HARNESSES, serde_json::json!({})),
         )
         .await
         .expect("Local runtime booted")
         .expect("harness list");
         assert!(harnesses.as_array().is_some_and(|rows| !rows.is_empty()));
         let mut updates = client
-            .subscribe(jolt_rpc::methods::UPDATE_STATUS, serde_json::json!({}))
+            .subscribe(jolt_api::methods::UPDATE_STATUS, serde_json::json!({}))
             .await
             .unwrap();
         assert!(
             updates.recv().await.is_some(),
             "Local receives update status"
         );
+        let mut harness_updates = client
+            .subscribe(
+                jolt_api::methods::WATCH_HARNESS_UPDATES,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let harness_updates = harness_updates.recv().await.unwrap();
+        assert_eq!(harness_updates.as_array().unwrap().len(), 3);
         task.abort();
         supervisor.shutdown().await;
     }

@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{
-    ClientFrame, RpcError, RpcReply, RpcService, ServerFrame, WireFrame, encode_binary_stream_item,
+    ClientFrame, MAX_WIRE_FRAME_BYTES, RpcError, RpcReply, RpcService, ServerFrame, WireFrame,
+    decode_binary_request, encode_binary_stream_item,
 };
 
 /// Serve one connection: read client frames from `inbound`, write ordered text or binary frames to `out`.
@@ -21,42 +22,77 @@ pub async fn serve_connection(
 ) {
     let mut running: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
     while let Some(frame) = inbound.recv().await {
-        let WireFrame::Text(payload) = frame else {
-            tracing::warn!("rpc: unexpected client binary frame");
-            continue;
-        };
-        // ndjson: a transport may batch several frames per message.
-        for line in payload.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let frame: ClientFrame = match serde_json::from_str(line) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    tracing::warn!(error = %err, "rpc: dropping malformed client frame");
+        match frame {
+            WireFrame::Text(payload) => {
+                if payload.len() > MAX_WIRE_FRAME_BYTES {
+                    tracing::warn!(
+                        bytes = payload.len(),
+                        "rpc: dropping oversized client frame"
+                    );
                     continue;
                 }
-            };
-            running.retain(|_, task| !task.is_finished());
-            if frame.cancel {
-                if let Some(task) = running.remove(&frame.id) {
-                    task.abort();
+                // ndjson: a transport may batch several frames per message.
+                for line in payload.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let frame: ClientFrame = match serde_json::from_str(line) {
+                        Ok(frame) => frame,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "rpc: dropping malformed client frame");
+                            continue;
+                        }
+                    };
+                    if let Err(err) = frame.validate() {
+                        tracing::warn!(error = %err, "rpc: dropping invalid client frame");
+                        continue;
+                    }
+                    running.retain(|_, task| !task.is_finished());
+                    if frame.cancel {
+                        if let Some(task) = running.remove(&frame.id) {
+                            task.abort();
+                        }
+                        continue;
+                    }
+                    let method = frame.method.expect("validated method frame has a method");
+                    let task = tokio::spawn(handle_request(
+                        service.clone(),
+                        out.clone(),
+                        frame.id,
+                        method,
+                        frame.params,
+                        None,
+                    ));
+                    running.insert(frame.id, task.abort_handle());
                 }
-                continue;
             }
-            let Some(method) = frame.method else {
-                tracing::warn!(id = frame.id, "rpc: frame has neither method nor cancel");
-                continue;
-            };
-            let task = tokio::spawn(handle_request(
-                service.clone(),
-                out.clone(),
-                frame.id,
-                method,
-                frame.params,
-            ));
-            running.insert(frame.id, task.abort_handle());
+            WireFrame::Binary(bytes) => {
+                if bytes.len() > MAX_WIRE_FRAME_BYTES {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        "rpc: dropping oversized binary request"
+                    );
+                    continue;
+                }
+                let request = match decode_binary_request(bytes) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "rpc: dropping malformed binary request");
+                        continue;
+                    }
+                };
+                running.retain(|_, task| !task.is_finished());
+                let task = tokio::spawn(handle_request(
+                    service.clone(),
+                    out.clone(),
+                    request.id,
+                    request.method,
+                    request.params,
+                    Some(request.payload),
+                ));
+                running.insert(request.id, task.abort_handle());
+            }
         }
     }
     for (_, task) in running {
@@ -70,10 +106,12 @@ async fn handle_request(
     id: u64,
     method: String,
     params: serde_json::Value,
+    binary: Option<bytes::Bytes>,
 ) {
     let send = |frame: ServerFrame| {
         let out = out.clone();
         async move {
+            frame.validate()?;
             match serde_json::to_string(&frame) {
                 Ok(json) => out
                     .send(WireFrame::Text(json))
@@ -86,7 +124,11 @@ async fn handle_request(
             }
         }
     };
-    match service.handle(&method, params).await {
+    let reply = match binary {
+        Some(payload) => service.handle_binary(&method, params, payload).await,
+        None => service.handle(&method, params).await,
+    };
+    match reply {
         Ok(RpcReply::Value(value)) => {
             let _ = send(ServerFrame {
                 id,
@@ -117,11 +159,14 @@ async fn handle_request(
         }
         Ok(RpcReply::BinaryStream(mut stream)) => {
             while let Some(item) = stream.next().await {
-                if out
-                    .send(WireFrame::Binary(encode_binary_stream_item(id, &item)))
-                    .await
-                    .is_err()
-                {
+                let encoded = match encode_binary_stream_item(id, item) {
+                    Ok(encoded) => encoded,
+                    Err(err) => {
+                        tracing::warn!(id, error = %err, "rpc: dropping invalid binary stream item");
+                        return;
+                    }
+                };
+                if out.send(WireFrame::Binary(encoded)).await.is_err() {
                     return;
                 }
             }
@@ -160,7 +205,10 @@ pub async fn serve_ws_listener(listener: TcpListener, service: Arc<dyn RpcServic
 }
 
 async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
-    let ws = match tokio_tungstenite::accept_async(stream).await {
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_WIRE_FRAME_BYTES))
+        .max_frame_size(Some(MAX_WIRE_FRAME_BYTES));
+    let ws = match tokio_tungstenite::accept_async_with_config(stream, Some(config)).await {
         Ok(ws) => ws,
         Err(err) => {
             tracing::warn!(error = %err, "rpc: websocket handshake failed");
@@ -182,7 +230,7 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
                         }
                     }
                     Some(WireFrame::Binary(bytes)) => {
-                        if sink.send(WsMessage::Binary(bytes.into())).await.is_err() {
+                        if sink.send(WsMessage::Binary(bytes)).await.is_err() {
                             break;
                         }
                     }
@@ -198,7 +246,7 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
                         }
                     }
                     Some(Ok(WsMessage::Binary(bytes))) => {
-                        if in_tx.send(WireFrame::Binary(bytes.to_vec())).await.is_err() {
+                        if in_tx.send(WireFrame::Binary(bytes)).await.is_err() {
                             break;
                         }
                     }

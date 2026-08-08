@@ -1,6 +1,6 @@
 //! In-process registry server speaking the same JSON WS protocol as
 //! `edge/src/registry-room.ts`, built on the SAME merge fn the client uses
-//! (`jolt_doc::apply_op`). Test infrastructure only (`mock-server` feature):
+//! (`jolt_session_doc::apply_op`). Test infrastructure only (`mock-server` feature):
 //! jolt-sync's client tests and jolt-engine's two-engine integration tests
 //! run against this; TS↔Rust interop is proven separately against a real DO
 //! by the `--ignored` live-edge tests and scripts/e2e-smoke.sh.
@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use jolt_doc::{RegistryRow, RowOp, apply_op};
+use jolt_registry_model::{RegistryRow, RowOp, apply_op};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)

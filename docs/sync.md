@@ -167,11 +167,11 @@ Relevant edge endpoints are authenticated and intended for diagnostics/repair:
 
 ## Source map
 
-- Registry model and merge: `crates/doc/src/registry.rs`
+- Registry model and merge: `crates/session-doc/src/registry.rs`
 - Registry client: `crates/sync/src/registry.rs`
 - Registry DO: `edge/src/registry-room.ts`, `edge/src/registry-core.ts`
-- Session schema and commands: `crates/doc/src/schema.rs`, `crates/doc/src/commands.rs`
+- Session schema and commands: `crates/session-doc/src/schema.rs`, `crates/session-doc/src/commands.rs`
 - Loro room client: `crates/sync/src/room.rs`
 - Session DO: `edge/src/session-room.ts`
-- Device relay: `crates/rpc/src/device_room.rs`, `edge/src/device-room.ts`
+- Device relay: `crates/relay/src/lib.rs`, `edge/src/device-room.ts`
 - Engine document host: `crates/engine/src/doc_host.rs`

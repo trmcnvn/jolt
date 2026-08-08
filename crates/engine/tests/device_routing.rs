@@ -16,22 +16,23 @@ use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
+use tokio_tungstenite::tungstenite::{Bytes, Message as WsMessage};
 
-use jolt_doc::SessionCommandPayload;
+use jolt_api::methods;
 use jolt_engine::{EngineCore, HarnessRegistry};
 use jolt_harness::{Harness, HarnessError, RunControls};
 use jolt_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SteeringMode,
 };
-use jolt_rpc::{
+use jolt_relay::{
     DeviceFrameHeader, LinkCache, LinkCacheConfig, StaticToken, decode_device_frame,
-    encode_device_frame, methods,
+    encode_device_frame,
 };
+use jolt_session_doc::SessionCommandPayload;
 
 // ---------------------------------------------------------------------------
 // Minimal in-memory device room (route-only subset of the DO semantics)
@@ -39,8 +40,8 @@ use jolt_rpc::{
 
 #[derive(Default)]
 struct RelayState {
-    host: Option<mpsc::UnboundedSender<Vec<u8>>>,
-    clients: HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    host: Option<mpsc::UnboundedSender<Bytes>>,
+    clients: HashMap<String, mpsc::UnboundedSender<Bytes>>,
 }
 
 async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
@@ -77,7 +78,7 @@ async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
                     .unwrap_or("anon")
                     .to_string();
                 let (mut sink, mut ws_stream) = ws.split();
-                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
                 {
                     let mut st = state.lock().expect("lock");
                     if is_host {
@@ -88,7 +89,7 @@ async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
                 }
                 let writer = tokio::spawn(async move {
                     while let Some(bytes) = rx.recv().await {
-                        if sink.send(WsMessage::Binary(bytes.into())).await.is_err() {
+                        if sink.send(WsMessage::Binary(bytes)).await.is_err() {
                             break;
                         }
                     }
@@ -97,20 +98,22 @@ async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
                     let WsMessage::Binary(bytes) = message else {
                         continue;
                     };
-                    let Ok((header, payload)) = decode_device_frame(&bytes) else {
+                    let Ok((header, payload)) = decode_device_frame(bytes) else {
                         break;
                     };
                     let st = state.lock().expect("lock");
                     if is_host {
                         let Some(to) = header.to else { continue };
                         if let Some(client) = st.clients.get(&to) {
-                            let stripped = DeviceFrameHeader::new(header.s, header.k);
+                            let mut stripped = DeviceFrameHeader::new(header.s, header.k);
+                            stripped.z = header.z;
                             let _ = client
                                 .send(encode_device_frame(&stripped, &payload).expect("encode"));
                         }
                     } else if let Some(host) = &st.host {
                         let mut routed = DeviceFrameHeader::new(header.s, header.k);
                         routed.from = Some(conn_id.clone());
+                        routed.z = header.z;
                         let _ = host.send(encode_device_frame(&routed, &payload).expect("encode"));
                     }
                 }
@@ -320,6 +323,7 @@ async fn target_device_id_routes_over_the_relay() {
     let command = serde_json::to_value(SessionCommandPayload::Run {
         request: RunRequest {
             prompt: "run remotely".into(),
+            harness: None,
             model: None,
             reasoning: None,
             model_options: serde_json::Map::new(),
@@ -352,6 +356,43 @@ async fn target_device_id_routes_over_the_relay() {
         commands.iter().any(|c| c.id == command_id),
         "command must live in B's doc"
     );
+
+    // Raw attachment chunks remain binary through both forwarding hops.
+    let capabilities = client
+        .call(
+            methods::GET_TRANSPORT_CAPABILITIES,
+            serde_json::json!({ "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect("transport capabilities from B");
+    assert_eq!(capabilities["binaryUnary"], true);
+    let attachment = Bytes::from_static(b"binary attachment payload");
+    client
+        .call_binary(
+            methods::UPLOAD_BINARY_CHUNK,
+            serde_json::json!({
+                "uploadId": "relay-upload",
+                "seq": 0,
+                "targetDeviceId": "device-b",
+            }),
+            attachment.clone(),
+        )
+        .await
+        .expect("binary upload on B");
+    let committed = client
+        .call(
+            methods::UPLOAD_COMMIT,
+            serde_json::json!({
+                "uploadId": "relay-upload",
+                "fileName": "remote.png",
+                "chatId": "chat-remote",
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("commit upload on B");
+    let path = committed["path"].as_str().expect("committed path");
+    assert_eq!(std::fs::read(path).expect("remote attachment"), attachment);
 
     core_a.shutdown().await;
     core_b.shutdown().await;
@@ -454,7 +495,7 @@ async fn terminal_stream_proxies_over_the_relay() {
             .expect("proxied terminal output before timeout")
             .expect("stream alive");
         if let jolt_rpc::terminal_wire::TerminalBinaryEvent::Data { data, .. } =
-            jolt_rpc::terminal_wire::decode(&item).expect("valid terminal binary frame")
+            jolt_rpc::terminal_wire::decode(item).expect("valid terminal binary frame")
         {
             transcript.extend(data);
         }

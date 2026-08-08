@@ -2,29 +2,51 @@
 resolver = "2"
 members = [
     "crates/proto",
-    "crates/doc",
+    "crates/platform",
+    "crates/session-doc",
+    "crates/registry-model",
+    "crates/store",
     "crates/sync",
     "crates/harness",
+    "crates/harness-claude",
+    "crates/harness-codex",
+    "crates/harness-pi",
+    "crates/mcp",
+    "crates/vcs",
+    "crates/terminal",
     "crates/engine",
     "crates/rpc",
+    "crates/api",
+    "crates/relay",
     "crates/update",
     "crates/ui",
     "apps/jolt",
 ]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
 jolt-proto = { path = "crates/proto" }
-jolt-doc = { path = "crates/doc" }
+jolt-platform = { path = "crates/platform" }
+jolt-session-doc = { path = "crates/session-doc" }
+jolt-registry-model = { path = "crates/registry-model" }
+jolt-store = { path = "crates/store" }
 jolt-sync = { path = "crates/sync" }
 jolt-harness = { path = "crates/harness" }
+jolt-harness-claude = { path = "crates/harness-claude" }
+jolt-harness-codex = { path = "crates/harness-codex" }
+jolt-harness-pi = { path = "crates/harness-pi" }
+jolt-mcp = { path = "crates/mcp" }
+jolt-vcs = { path = "crates/vcs" }
+jolt-terminal = { path = "crates/terminal" }
 jolt-engine = { path = "crates/engine" }
 jolt-rpc = { path = "crates/rpc" }
+jolt-api = { path = "crates/api" }
+jolt-relay = { path = "crates/relay" }
 jolt-update = { path = "crates/update" }
 jolt-ui = { path = "crates/ui" }
 
@@ -64,6 +86,8 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 futures = "0.3"
 async-trait = "0.1"
+bytes = "1"
+flate2 = "1"
 
 # serialization
 serde = { version = "1", features = ["derive"] }

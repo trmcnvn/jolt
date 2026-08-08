@@ -149,6 +149,25 @@ pub struct ChatConfig {
     pub sandbox: SandboxLevel,
 }
 
+/// One harness-native conversation backing a Jolt chat. A chat may retain one
+/// conversation per harness/cwd so switching away and back can resume the
+/// original native context with only a delta handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessConversationRef {
+    pub id: String,
+    pub harness: HarnessId,
+    pub device_id: String,
+    pub cwd: String,
+    pub native_session_id: String,
+    #[serde(default)]
+    pub generation: u32,
+    /// Latest settled assistant entry whose app context this native
+    /// conversation has consumed, either natively or through a handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_through_message_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Chat {
@@ -157,6 +176,9 @@ pub struct Chat {
     pub device_id: String,
     pub title: Option<String>,
     pub archived: bool,
+    /// Synced sidebar priority. Pinned sessions stay ahead of the recency list.
+    #[serde(default)]
+    pub pinned: bool,
     pub cwd: Option<String>,
     pub branch: Option<String>,
     /// Canonical id of the repo checkout/worktree this chat operates in.
@@ -176,6 +198,9 @@ pub struct Chat {
     /// is only injected when the next run launches from the same cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_cwd: Option<String>,
+    /// Native continuations retained independently per harness and cwd.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harness_conversations: Vec<HarnessConversationRef>,
     /// The space this chat belongs to. Invariant: `Some` for every UI-created
     /// chat; rows with a missing/dangling space id are not rendered (the host
     /// device's repair sweep deletes its own danglers).

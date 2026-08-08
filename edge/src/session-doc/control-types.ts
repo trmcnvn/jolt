@@ -32,6 +32,8 @@ export type ToolCall =
     | { readonly _tag: "Mcp"; readonly server?: string; readonly tool: string; readonly input: unknown }
     | { readonly _tag: "Unknown"; readonly name: string; readonly input: unknown };
 
+export type HarnessId = "claude-code" | "codex" | "pi" | "mock";
+
 /** A question the agent poses to the user mid-run (mirrors the harness type). */
 export interface UserInputQuestion {
     readonly id: string;
@@ -48,6 +50,11 @@ export type MessagePart =
         /** Stable identity for rendering (text blocks have no natural id). */
         readonly id: string;
         readonly text: string;
+    }
+    | {
+        /** Reveals preceding buffered text as one completed assistant chunk. */
+        readonly kind: "textReveal";
+        readonly id: string;
     }
     | {
         readonly kind: "tool";
@@ -68,4 +75,11 @@ export type MessagePart =
         readonly kind: "error";
         readonly id: string;
         readonly message: string;
+    }
+    | {
+        /** Durable boundary between native harness conversations. */
+        readonly kind: "harnessSwitch";
+        readonly id: string;
+        readonly from: HarnessId;
+        readonly to: HarnessId;
     };

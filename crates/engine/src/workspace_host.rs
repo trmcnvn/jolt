@@ -19,9 +19,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use chrono::Utc;
 use tokio::sync::watch;
 
-use jolt_doc::{DeletedDevice, DeletedSpace, REGISTRY_DOC_ID, RegistryDoc};
-use jolt_proto::{Chat, ChatConfig, Device, Session, Space, ThemeFileRecord};
-use jolt_sync::{DocsStore, RegistryClient, RegistryTuning};
+use jolt_proto::{
+    Chat, ChatConfig, Device, HarnessConversationRef, HarnessId, Session, Space, ThemeFileRecord,
+};
+use jolt_registry_model::{DeletedDevice, DeletedSpace, REGISTRY_DOC_ID, RegistryDoc};
+use jolt_store::DocsStore;
+use jolt_sync::{RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
 use crate::{EngineError, now_ms};
@@ -538,13 +541,15 @@ impl WorkspaceHost {
     /// Claim-on-first-command: create the chat row under OUR device id when a run
     /// command arrives for a chat with no row yet. No-op when the row exists.
     ///
+    /// The claim writes only identity, cwd, and space. The command plane can
+    /// outrun the registry channel, so a full `createChat` with older clocks
+    /// must still be able to supply config and title when it arrives.
+    ///
     /// Spaces invariant: every chat belongs to a space, so the claim resolves an
     /// own-device space matching `cwd` — or auto-creates one (gitDetected false;
     /// SpacesSync corrects on its next pass). A cwd-less claim (e.g. note_message
     /// racing ahead of the run command) leaves `spaceId` unset; the row is
-    /// invisible to the UI until a spaced claim/create lands. NOTE: a worktree
-    /// cwd claims a space *at the worktree path*, not the repo root — acceptable
-    /// for tooling-only (raw doc command) traffic.
+    /// invisible to the UI until a spaced claim/create lands.
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(());
@@ -553,43 +558,33 @@ impl WorkspaceHost {
             Some(cwd) => Some(self.space_for_path(cwd)?),
             None => None,
         };
-        self.mutate(|doc| {
-            doc.upsert_chat(&Chat {
-                id: chat_id.to_string(),
-                device_id: doc.device_id().to_string(),
-                title: None,
-                archived: false,
-                cwd: cwd.map(str::to_string),
-                branch: None,
-                checkout_id: None,
-                config: None,
-                last_message_preview: None,
-                last_message_at: None,
-                created_at: Utc::now(),
-                harness_session_id: None,
-                harness_session_cwd: None,
-                space_id,
-                last_seen_at: None,
-                goal: None,
-            })
-        })?;
+        self.mutate(|doc| doc.claim_chat(chat_id, cwd, space_id.as_deref(), Utc::now()));
         Ok(())
     }
 
-    /// An own-device space whose path matches, else a freshly created one.
+    /// An own-device space whose path matches, else one at the linked
+    /// worktree's parent checkout root, else a fresh space at that root.
     fn space_for_path(&self, path: &str) -> Result<String, EngineError> {
         let device_id = &self.inner.config.device_id;
-        if let Some(space) = self
-            .read(|doc| doc.read_spaces())?
-            .into_iter()
+        let spaces = self.read(|doc| doc.read_spaces())?;
+        if let Some(space) = spaces
+            .iter()
             .find(|s| s.device_id == *device_id && s.path == path)
         {
-            return Ok(space.id);
+            return Ok(space.id.clone());
+        }
+        let root = linked_worktree_root(std::path::Path::new(path));
+        if let Some(root) = root.as_deref()
+            && let Some(space) = spaces
+                .iter()
+                .find(|s| s.device_id == *device_id && s.path == root)
+        {
+            return Ok(space.id.clone());
         }
         let space = Space {
             id: crate::new_id(),
             device_id: device_id.clone(),
-            path: path.to_string(),
+            path: root.unwrap_or_else(|| path.to_string()),
             name: None,
             git_detected: false,
             git_checked_at: None,
@@ -624,6 +619,44 @@ impl WorkspaceHost {
         });
         if let Err(err) = result {
             tracing::warn!(chat = %chat_id, error = %err, "registry last-message write failed");
+        }
+    }
+
+    /// The retained native conversation for one harness/cwd on this host.
+    pub fn chat_harness_conversation(
+        &self,
+        chat_id: &str,
+        harness: HarnessId,
+        cwd: &str,
+    ) -> Option<HarnessConversationRef> {
+        let device_id = &self.inner.config.device_id;
+        match self.read(|doc| doc.chat(chat_id)) {
+            Ok(chat) => chat.and_then(|chat| {
+                chat.harness_conversations.into_iter().find(|conversation| {
+                    conversation.harness == harness
+                        && conversation.device_id == *device_id
+                        && conversation.cwd == cwd
+                })
+            }),
+            Err(error) => {
+                tracing::warn!(chat = %chat_id, %error, "registry harness-conversation read failed");
+                None
+            }
+        }
+    }
+
+    /// Persist one native conversation without replacing continuations owned by
+    /// other harnesses or working directories.
+    pub fn set_chat_harness_conversation(
+        &self,
+        chat_id: &str,
+        conversation: &HarnessConversationRef,
+    ) {
+        match self.mutate(|doc| doc.set_chat_harness_conversation(chat_id, conversation)) {
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(chat = %chat_id, %error, "registry harness-conversation write failed");
+            }
         }
     }
 
@@ -743,6 +776,7 @@ impl WorkspaceHost {
                 device_id: space.device_id.clone(),
                 title: None,
                 archived: false,
+                pinned: false,
                 cwd: Some(cwd.unwrap_or_else(|| space.path.clone())),
                 branch: None,
                 checkout_id: None,
@@ -752,6 +786,7 @@ impl WorkspaceHost {
                 created_at: Utc::now(),
                 harness_session_id: None,
                 harness_session_cwd: None,
+                harness_conversations: Vec::new(),
                 space_id: Some(space.id.clone()),
                 last_seen_at: None,
                 goal: None,
@@ -845,6 +880,10 @@ impl WorkspaceHost {
 
     pub fn rename_chat(&self, chat_id: &str, title: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.rename_chat(chat_id, title))?)
+    }
+
+    pub fn set_chat_pinned(&self, chat_id: &str, pinned: bool) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_pinned(chat_id, pinned))?)
     }
 
     /// Backdate a chat's activity timestamps (epoch ms). Returns false when
@@ -1099,6 +1138,32 @@ impl WorkspaceHostInner {
     }
 }
 
+/// Return the parent checkout root for a standard linked Git worktree.
+/// Linked worktrees contain a `.git` file pointing at
+/// `<root>/.git/worktrees/<name>`; primary checkouts and other layouts return
+/// `None`. This stays filesystem-only because claims run synchronously.
+fn linked_worktree_root(path: &std::path::Path) -> Option<String> {
+    let gitfile = path.join(".git");
+    if !std::fs::metadata(&gitfile).ok()?.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&gitfile).ok()?;
+    let target = content
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    let mut target = std::path::PathBuf::from(target);
+    if target.is_relative() {
+        target = std::fs::canonicalize(path.join(target)).ok()?;
+    }
+    let worktrees = target.parent()?;
+    let dot_git = worktrees.parent()?;
+    if worktrees.file_name()? != "worktrees" || dot_git.file_name()? != ".git" {
+        return None;
+    }
+    Some(dot_git.parent()?.to_string_lossy().into_owned())
+}
+
 fn theme_revision(contents: &str) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(contents)
         .ok()?
@@ -1243,5 +1308,49 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
                 inner.publish();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::linked_worktree_root;
+
+    #[test]
+    fn linked_worktree_resolves_to_checkout_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let worktree = dir.path().join("clever-ember");
+        std::fs::create_dir_all(root.join(".git/worktrees/clever-ember")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                root.join(".git/worktrees/clever-ember").display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            linked_worktree_root(&worktree).as_deref(),
+            Some(root.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn primary_checkout_and_other_layouts_have_no_parent_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        std::fs::create_dir_all(primary.join(".git")).unwrap();
+        assert_eq!(linked_worktree_root(&primary), None);
+
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(linked_worktree_root(&plain), None);
+
+        let odd = dir.path().join("odd");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join(".git"), "gitdir: /somewhere/else\n").unwrap();
+        assert_eq!(linked_worktree_root(&odd), None);
     }
 }

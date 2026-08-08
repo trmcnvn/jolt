@@ -10,7 +10,7 @@
 use gpui::{AnyElement, Context, ListOffset, SharedString, div, prelude::*, px};
 use std::time::{Duration, Instant};
 
-use jolt_doc::{MessagePart, MessageRole, SessionMessageEntry};
+use jolt_session_doc::{MessagePart, MessageRole, SessionMessageEntry};
 
 use crate::motion;
 use crate::popover;
@@ -48,6 +48,13 @@ struct RailTarget {
 pub enum RailDirection {
     Previous,
     Next,
+}
+
+fn step_turn_index(index: usize, count: usize, direction: RailDirection) -> Option<usize> {
+    match direction {
+        RailDirection::Previous => index.checked_sub(1),
+        RailDirection::Next => (index + 1 < count).then_some(index + 1),
+    }
 }
 
 fn user_text(entry: &SessionMessageEntry) -> String {
@@ -261,7 +268,7 @@ impl Transcript {
     /// Smooth-scroll the list so `target` sits at the viewport top, reusing the
     /// transcript scroll-task slot (any running stick/jump animation yields).
     ///
-    /// A [`motion::SCROLL_GLIDE`] (500ms ease-in-out) timeline drives every
+    /// A [`motion::SCROLL_GLIDE`] (180ms ease-out) timeline drives every
     /// frame's position; per-frame movement comes from the timeline, never
     /// from a percent of the remaining distance:
     ///
@@ -276,10 +283,12 @@ impl Transcript {
     /// - once the target row is measured the glide is pixel-exact.
     pub fn scroll_to_row(&mut self, target: usize, cx: &mut Context<Self>) {
         if motion::reduced_motion(cx) {
+            self.begin_navigation_scroll();
             self.list_state().scroll_to(ListOffset {
                 item_ix: target,
                 offset_in_item: px(0.0),
             });
+            self.finish_navigation_scroll();
             cx.notify();
             return;
         }
@@ -304,6 +313,7 @@ impl Transcript {
                             item_ix: target,
                             offset_in_item: px(0.0),
                         });
+                        t.finish_navigation_scroll();
                         cx.notify();
                         return true;
                     }
@@ -426,6 +436,7 @@ impl Transcript {
                     item_ix: target,
                     offset_in_item: px(0.0),
                 });
+                t.finish_navigation_scroll();
                 cx.notify();
             })
             .ok();
@@ -440,6 +451,7 @@ impl Transcript {
         page_id: String,
         cx: &mut Context<Self>,
     ) {
+        self.clear_turn_navigation();
         if let Some(row) = self
             .rows()
             .iter()
@@ -447,7 +459,7 @@ impl Transcript {
         {
             self.scroll_to_row(row, cx);
         } else {
-            self.load_and_scroll_to_message(message_id, page_id, cx);
+            self.load_and_scroll_to_message(message_id, page_id, false, cx);
         }
     }
 
@@ -455,6 +467,7 @@ impl Transcript {
         &mut self,
         message_id: String,
         page_id: String,
+        highlight_user: bool,
         cx: &mut Context<Self>,
     ) {
         self.state_entity().update(cx, |state, cx| {
@@ -477,6 +490,11 @@ impl Transcript {
                         item_ix: target,
                         offset_in_item: px(0.0),
                     });
+                    transcript.finish_navigation_scroll();
+                    if highlight_user {
+                        transcript.clear_turn_navigation_loading();
+                        transcript.highlight_user_message(message_id.clone(), cx);
+                    }
                     cx.notify();
                     true
                 });
@@ -485,6 +503,7 @@ impl Transcript {
                 }
             }
         }));
+        cx.notify();
     }
 
     /// Ordered prompt targets shared by the visual rail and keyboard
@@ -563,27 +582,82 @@ impl Transcript {
             .collect()
     }
 
-    fn scroll_to_rail_target(&mut self, target: RailTarget, cx: &mut Context<Self>) {
+    fn reveal_rail_target(
+        &mut self,
+        target: RailTarget,
+        index: usize,
+        total: usize,
+        keyboard: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let message_id = target.tick.message_id.clone();
+        let loading = target.unloaded_page.as_ref().map(|_| (index + 1, total));
+        self.set_turn_navigation_target(message_id.clone(), loading);
         if let Some(page_id) = target.unloaded_page {
-            self.load_and_scroll_to_message(target.tick.message_id, page_id, cx);
+            // Keep the current viewport still while history loads. Repeated
+            // keys replace this waiter but advance from the semantic message
+            // id above, so the latest requested user message always wins.
+            self.load_and_scroll_to_message(message_id, page_id, true, cx);
+        } else if keyboard {
+            // Keyboard traversal is structural navigation, not animated
+            // scrolling: land immediately so key repeat stays responsive.
+            self.begin_navigation_scroll();
+            self.list_state().scroll_to(ListOffset {
+                item_ix: target.row,
+                offset_in_item: px(0.0),
+            });
+            self.clear_turn_navigation_loading();
+            self.finish_navigation_scroll();
+            self.highlight_user_message(message_id, cx);
+            cx.notify();
         } else {
-            self.scroll_to_row(target.row, cx);
+            self.clear_turn_navigation_loading();
+            let list = self.list_state();
+            let viewport = list.viewport_bounds();
+            let nearby = list.bounds_for_item(target.row).is_some_and(|bounds| {
+                f32::from((bounds.top() - viewport.top()).abs()) <= f32::from(viewport.size.height)
+            });
+            if nearby && !motion::reduced_motion(cx) {
+                self.highlight_user_message(message_id, cx);
+                self.scroll_to_row(target.row, cx);
+            } else {
+                // Long rail jumps contain no useful visual information between
+                // endpoints; snap and identify the destination instead.
+                self.begin_navigation_scroll();
+                self.list_state().scroll_to(ListOffset {
+                    item_ix: target.row,
+                    offset_in_item: px(0.0),
+                });
+                self.finish_navigation_scroll();
+                self.highlight_user_message(message_id, cx);
+                cx.notify();
+            }
         }
     }
 
-    /// Navigate to the nearest prompt marker above or below the viewport. This
-    /// remains available when the compact visual rail is hidden by width.
+    /// Navigate between user-authored messages only. Once navigation starts,
+    /// repeated keys advance from the last requested message rather than an
+    /// in-flight viewport position. This remains available when the visual rail
+    /// is hidden by width.
     pub fn navigate_rail(&mut self, direction: RailDirection, cx: &mut Context<Self>) {
         let targets = self.rail_targets(cx);
-        let top = self.list_state().logical_scroll_top();
-        let rows: Vec<usize> = targets.iter().map(|target| target.row).collect();
-        let Some(index) =
+        let cursor = self.turn_navigation_target().and_then(|message_id| {
+            targets
+                .iter()
+                .position(|target| target.tick.message_id == message_id)
+        });
+        let index = if let Some(index) = cursor {
+            step_turn_index(index, targets.len(), direction)
+        } else {
+            let top = self.list_state().logical_scroll_top();
+            let rows: Vec<usize> = targets.iter().map(|target| target.row).collect();
             adjacent_tick(&rows, top.item_ix, f32::from(top.offset_in_item), direction)
-        else {
+        };
+        let Some(index) = index else {
             return;
         };
-        if let Some(target) = targets.into_iter().nth(index) {
-            self.scroll_to_rail_target(target, cx);
+        if let Some(target) = targets.get(index).cloned() {
+            self.reveal_rail_target(target, index, targets.len(), true, cx);
         }
     }
 
@@ -611,7 +685,8 @@ impl Transcript {
         // single tick.
         let viewport_h = f32::from(self.list_state().viewport_bounds().size.height);
         let capacity = rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
-        let buckets = tick_buckets(pairs.len(), capacity);
+        let total = pairs.len();
+        let buckets = tick_buckets(total, capacity);
         let active_bucket = active.and_then(|ix| bucket_of(&buckets, ix));
 
         div()
@@ -695,7 +770,7 @@ impl Transcript {
                         cx.notify();
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.scroll_to_rail_target(target.clone(), cx);
+                        this.reveal_rail_target(target.clone(), rep, total, false, cx);
                     }))
                     .child(
                         div()
@@ -720,7 +795,7 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jolt_doc::MessageStatus;
+    use jolt_session_doc::MessageStatus;
 
     fn entry(id: &str, role: MessageRole, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -795,6 +870,7 @@ mod tests {
     #[test]
     fn ticks_map_user_prompts_with_reply_openings() {
         let entries = vec![
+            entry("s1", MessageRole::System, "internal status"),
             entry("u1", MessageRole::User, "first question"),
             entry("a1", MessageRole::Assistant, "first answer"),
             entry("u2", MessageRole::User, "second question"),
@@ -846,6 +922,14 @@ mod tests {
         // Above the first tick row → first tick still active.
         assert_eq!(active_tick(&[3, 7], 1), Some(0));
         assert_eq!(active_tick(&[], 4), None);
+    }
+
+    #[test]
+    fn semantic_turn_steps_are_ordered_and_do_not_wrap() {
+        assert_eq!(step_turn_index(2, 5, RailDirection::Previous), Some(1));
+        assert_eq!(step_turn_index(2, 5, RailDirection::Next), Some(3));
+        assert_eq!(step_turn_index(0, 5, RailDirection::Previous), None);
+        assert_eq!(step_turn_index(4, 5, RailDirection::Next), None);
     }
 
     #[test]
@@ -948,17 +1032,18 @@ mod tests {
         assert_eq!(timeline.step(1.0), 1.0); // idempotent at the end
     }
 
-    /// The first 16ms frame of the 500ms glide covers under 2% of the
-    /// distance — no first-frame majority jump by construction.
+    /// Pointer navigation responds visibly on its first frame and still eases
+    /// into the destination; keyboard navigation bypasses this glide entirely.
     #[test]
-    fn glide_first_frame_is_gentle() {
+    fn pointer_glide_starts_promptly() {
         let spec = motion::SCROLL_GLIDE;
-        assert_eq!(spec.duration_ms, 500);
-        let first = spec.curve.eval(16.0 / 500.0);
-        assert!(first < 0.02, "first frame covered {first} of the distance");
-        // And the ease-in-out midpoint is exactly half the distance.
-        let mid = spec.curve.eval(0.5);
-        assert!((mid - 0.5).abs() < 0.01);
+        assert_eq!(spec.duration_ms, 180);
+        let first = spec.curve.eval(16.0 / 180.0);
+        assert!(
+            first > 0.05,
+            "first frame covered only {first} of the distance"
+        );
+        assert!(spec.curve.eval(0.5) > 0.5);
     }
 
     #[test]

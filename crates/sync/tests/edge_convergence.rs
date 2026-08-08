@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use jolt_doc::{MessagePart, MessageRole, SessionDoc, SessionMessageEntry};
+use jolt_session_doc::{MessagePart, MessageRole, SessionDoc, SessionMessageEntry};
 use jolt_sync::RoomClient;
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {

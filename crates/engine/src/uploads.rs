@@ -1,9 +1,9 @@
 //! Uploads — attachment staging and the content-addressed edge mirror.
 //!
-//! The UI streams a file as base64 chunks (~60KB, sized for the relay when the
-//! target device is remote); chunks stage on disk under `{data_dir}/uploads/tmp/
-//! {uploadId}/{seq}.b64` so they survive an engine restart mid-upload, and
-//! `commit` assembles them into
+//! The UI streams raw binary chunks sized for the relay; legacy clients may
+//! still send base64 chunks. Chunks stage on disk under `{data_dir}/uploads/tmp/
+//! {uploadId}/{seq}.{bin,b64}` so they survive an engine restart mid-upload, and
+//! `commit` incrementally assembles them into
 //! `{data_dir}/uploads/{id8}-{name}` and returns the absolute path plus hash;
 //! the composer appends the path to the prompt so the agent can read the file.
 //!
@@ -17,16 +17,17 @@
 //! only files under the uploads dir or a workspace-known chat cwd are readable
 //! (the RPC layer supplies the cwd roots), and only supported image types.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::EngineError;
 use crate::doc_host::EdgeConfig;
-use crate::repos::hex;
+pub use jolt_api::{AttachmentChunk, CommittedAttachment};
+use jolt_vcs::hex;
 
 /// A pending upload must finish within this window (covers slow mesh links).
 const STAGING_TTL: Duration = Duration::from_secs(10 * 60);
@@ -34,26 +35,6 @@ const STAGING_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Multiple of 3 so independent base64 chunks concatenate losslessly.
 const READ_CHUNK_BYTES: u64 = 45_000;
-
-/// A committed attachment's durable host path and edge content address.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommittedAttachment {
-    pub path: String,
-    pub sha256: String,
-}
-
-/// `ReadAttachmentChunk` reply.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AttachmentChunk {
-    pub name: String,
-    pub mime_type: String,
-    /// Base64 of this chunk's byte range.
-    pub data: String,
-    pub next_offset: u64,
-    pub done: bool,
-}
 
 struct UploadsInner {
     /// Durable home for committed attachments (`{data_dir}/uploads`).
@@ -104,17 +85,37 @@ impl Uploads {
         if at > 1_000_000 {
             return Err(EngineError::Other("Invalid chunk index".into()));
         }
-        // Base64 inflates by ~4/3; bound the staged payload against the file cap.
-        let staged: u64 = chunk_files(&dir)?
-            .iter()
-            .filter(|(seq, _)| *seq != at)
-            .map(|(_, path)| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-            .sum();
-        if (staged + data.len() as u64) * 3 / 4 > MAX_BYTES {
+        // Base64 inflates by ~4/3; bound decoded bytes against the file cap.
+        let staged = staged_bytes(&dir, Some(at))?;
+        let decoded_bound = (data.len() as u64).div_ceil(4).saturating_mul(3);
+        if staged.saturating_add(decoded_bound) > MAX_BYTES {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(EngineError::Other("Upload too large".into()));
         }
         std::fs::write(dir.join(format!("{at:06}.b64")), data)?;
+        Ok(())
+    }
+
+    /// Stage one raw binary chunk without base64 expansion.
+    pub fn append_bytes(
+        &self,
+        upload_id: &str,
+        data: &[u8],
+        seq: Option<u64>,
+    ) -> Result<(), EngineError> {
+        let dir = self.staging_dir(upload_id)?;
+        self.sweep();
+        std::fs::create_dir_all(&dir)?;
+        let at = seq.unwrap_or(next_free_seq(&dir)?);
+        if at > 1_000_000 {
+            return Err(EngineError::Other("Invalid chunk index".into()));
+        }
+        let staged = staged_bytes(&dir, Some(at))?;
+        if staged.saturating_add(data.len() as u64) > MAX_BYTES {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(EngineError::Other("Upload too large".into()));
+        }
+        std::fs::write(dir.join(format!("{at:06}.bin")), data)?;
         Ok(())
     }
 
@@ -136,28 +137,18 @@ impl Uploads {
             return Err(EngineError::Other("Unknown or expired upload".into()));
         }
         parts.sort_by_key(|(seq, _)| *seq);
-        // Positional appends may leave holes if a chunk never arrived — joining
-        // around them would silently corrupt the file.
-        let mut joined = String::new();
-        for (i, (seq, path)) in parts.iter().enumerate() {
-            if *seq != i as u64 {
-                return Err(EngineError::Other("Upload is missing a chunk".into()));
-            }
-            joined.push_str(std::fs::read_to_string(path)?.trim());
-        }
-        let bytes = crate::simd_base64::decode(joined.as_bytes())
-            .map_err(|e| EngineError::Other(format!("upload is not valid base64: {e}")))?;
-        if bytes.len() as u64 > MAX_BYTES {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(EngineError::Other("Upload too large".into()));
-        }
         std::fs::create_dir_all(&self.inner.dir)?;
         let name = sanitize(file_name);
         let id8: String = upload_id.chars().take(8).collect();
         let path = self.inner.dir.join(format!("{id8}-{name}"));
-        std::fs::write(&path, &bytes)?;
-        let sha256 = hex(&Sha256::digest(&bytes));
-        self.mirror_to_edge(&path, chat_id, &sha256, bytes).await?;
+        let sha256 = match assemble_chunks(&parts, &path) {
+            Ok(sha256) => sha256,
+            Err(error) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        self.mirror_to_edge(&path, chat_id, &sha256).await?;
         // Keep staged chunks until the edge write succeeds so a failed commit
         // can be retried without retransmitting the image.
         let _ = std::fs::remove_dir_all(&dir);
@@ -175,7 +166,7 @@ impl Uploads {
         offset: u64,
         extra_roots: &[PathBuf],
     ) -> Result<AttachmentChunk, EngineError> {
-        use std::io::{Read, Seek};
+        use std::io::Seek;
         let file = self.inspect(path, extra_roots)?;
         let size = file.size;
         let start = offset.min(size);
@@ -280,7 +271,6 @@ impl Uploads {
         path: &Path,
         chat_id: &str,
         sha256: &str,
-        bytes: Vec<u8>,
     ) -> Result<(), EngineError> {
         let Some(edge) = self.inner.edge.clone() else {
             return Ok(());
@@ -294,13 +284,17 @@ impl Uploads {
             "{}/attachments/{chat_id}/{sha256}",
             edge.url.trim_end_matches('/')
         );
+        let size = std::fs::metadata(path)?.len();
+        let file = tokio::fs::File::open(path).await?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
         let response = self
             .inner
             .http
             .put(url)
             .bearer_auth(bearer)
             .header("content-type", mime)
-            .body(bytes)
+            .header("content-length", size)
+            .body(body)
             .send()
             .await
             .map_err(|error| {
@@ -345,13 +339,98 @@ fn chunk_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, EngineError> {
             .file_stem()
             .and_then(|s| s.to_str())
             .and_then(|s| s.parse::<u64>().ok());
+        let extension = path.extension().and_then(|extension| extension.to_str());
         if let Some(seq) = seq
-            && path.extension().and_then(|e| e.to_str()) == Some("b64")
+            && matches!(extension, Some("b64" | "bin"))
         {
             files.push((seq, path));
         }
     }
     Ok(files)
+}
+
+fn staged_bytes(dir: &Path, excluding: Option<u64>) -> Result<u64, EngineError> {
+    chunk_files(dir)?
+        .into_iter()
+        .try_fold(0u64, |total, (seq, path)| {
+            if excluding == Some(seq) {
+                return Ok(total);
+            }
+            let len = std::fs::metadata(&path)?.len();
+            let bytes = if path.extension().and_then(|extension| extension.to_str()) == Some("b64")
+            {
+                len.div_ceil(4).saturating_mul(3)
+            } else {
+                len
+            };
+            Ok(total.saturating_add(bytes))
+        })
+}
+
+fn assemble_chunks(parts: &[(u64, PathBuf)], output: &Path) -> Result<String, EngineError> {
+    for (index, (seq, _)) in parts.iter().enumerate() {
+        if *seq != index as u64 {
+            return Err(EngineError::Other("Upload is missing a chunk".into()));
+        }
+    }
+    let base64 = parts
+        .iter()
+        .all(|(_, path)| path.extension().and_then(|extension| extension.to_str()) == Some("b64"));
+    let binary = parts
+        .iter()
+        .all(|(_, path)| path.extension().and_then(|extension| extension.to_str()) == Some("bin"));
+    if !base64 && !binary {
+        return Err(EngineError::Other(
+            "Upload mixes incompatible chunk formats".into(),
+        ));
+    }
+
+    let mut output = std::fs::File::create(output)?;
+    let mut hasher = Sha256::new();
+    let mut written = 0u64;
+    if base64 {
+        let mut carry = Vec::new();
+        for (index, (_, path)) in parts.iter().enumerate() {
+            let encoded = std::fs::read(path)?;
+            carry.extend_from_slice(encoded.trim_ascii());
+            let last = index + 1 == parts.len();
+            let decode_len = if last {
+                carry.len()
+            } else {
+                carry.len() / 4 * 4
+            };
+            let tail = carry.split_off(decode_len);
+            let decoded = crate::simd_base64::decode(&carry).map_err(|error| {
+                EngineError::Other(format!("upload is not valid base64: {error}"))
+            })?;
+            written = written.saturating_add(decoded.len() as u64);
+            if written > MAX_BYTES {
+                return Err(EngineError::Other("Upload too large".into()));
+            }
+            hasher.update(&decoded);
+            output.write_all(&decoded)?;
+            carry = tail;
+        }
+    } else {
+        let mut copy_buffer = vec![0u8; 64 * 1024];
+        for (_, path) in parts {
+            let mut input = std::fs::File::open(path)?;
+            loop {
+                let read = input.read(&mut copy_buffer)?;
+                if read == 0 {
+                    break;
+                }
+                written = written.saturating_add(read as u64);
+                if written > MAX_BYTES {
+                    return Err(EngineError::Other("Upload too large".into()));
+                }
+                hasher.update(&copy_buffer[..read]);
+                output.write_all(&copy_buffer[..read])?;
+            }
+        }
+    }
+    output.flush()?;
+    Ok(hex(&hasher.finalize()))
 }
 
 fn next_free_seq(dir: &Path) -> Result<u64, EngineError> {

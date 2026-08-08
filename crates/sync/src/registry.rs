@@ -4,7 +4,7 @@
 //! reconnect with exponential backoff.
 //!
 //! The client owns no row semantics: everything applies through the shared
-//! [`jolt_doc::RegistryDoc`] under a lock. Wire frames are JSON text —
+//! [`jolt_registry_model::RegistryDoc`] under a lock. Wire frames are JSON text —
 //! byte-compatible with `edge/src/registry-room.ts`.
 //!
 //! Liveness discipline is inherited from `room.rs` and its incidents: the
@@ -25,7 +25,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use jolt_doc::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
+use jolt_registry_model::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
 
 use crate::room::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
@@ -89,7 +89,7 @@ enum ClientFrame<'a> {
     },
     Push {
         batch: &'a str,
-        ops: &'a [jolt_doc::RowOp],
+        ops: &'a [jolt_registry_model::RowOp],
     },
     Presence {
         at: i64,
@@ -464,7 +464,7 @@ impl Actor {
     async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
         let mut ready = Some(ready);
         let mut backoff = BACKOFF_BASE;
-        let mut wake = crate::wake::subscribe();
+        let mut wake = jolt_platform::wake::subscribe();
         loop {
             if *self.shutdown.borrow() {
                 return;

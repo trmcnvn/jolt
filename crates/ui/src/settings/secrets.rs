@@ -5,8 +5,8 @@
 use std::collections::HashSet;
 
 use gpui::{Context, Entity, Render, SharedString, Subscription, Task, div, prelude::*, px};
+use jolt_api::{DeleteHarnessSecret, ListHarnessSecrets, UpsertHarnessSecret, call as call_api};
 use jolt_proto::{HarnessId, HarnessSecretsSnapshot};
-use jolt_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::Loadable;
@@ -27,6 +27,7 @@ pub struct SecretsPage {
     environment_variable: Entity<ComposerInput>,
     value: Entity<ComposerInput>,
     selected_harnesses: HashSet<HarnessId>,
+    form_open: bool,
     busy: bool,
     delete_confirm: Option<String>,
     deleting: Option<String>,
@@ -72,6 +73,7 @@ impl SecretsPage {
             environment_variable,
             value,
             selected_harnesses: HashSet::new(),
+            form_open: false,
             busy: false,
             delete_confirm: None,
             deleting: None,
@@ -94,15 +96,10 @@ impl SecretsPage {
         };
         self.snapshot = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_HARNESS_SECRETS, serde_json::json!({}))
-                .await;
+            let result = call_api(engine.client(), &ListHarnessSecrets::default()).await;
             this.update(cx, |page, cx| {
                 page.snapshot = match result {
-                    Ok(value) => serde_json::from_value(value)
-                        .map(Loadable::Ready)
-                        .unwrap_or_else(|error| Loadable::Error(error.to_string())),
+                    Ok(snapshot) => Loadable::Ready(snapshot),
                     Err(error) => Loadable::Error(error.to_string()),
                 };
                 cx.notify();
@@ -149,30 +146,22 @@ impl SecretsPage {
         };
         self.busy = true;
         self.error = None;
-        let params = serde_json::json!({
-            "label": label,
-            "environmentVariable": environment_variable,
-            "harnesses": harnesses,
-            "value": value,
-        });
+        let request = UpsertHarnessSecret {
+            id: None,
+            label,
+            environment_variable,
+            harnesses,
+            value: Some(value),
+        };
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::UPSERT_HARNESS_SECRET, params)
-                .await;
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |page, cx| {
                 page.busy = false;
-                match result.and_then(|value| {
-                    serde_json::from_value(value)
-                        .map_err(|error| jolt_rpc::RpcError::Failed(error.to_string()))
-                }) {
+                match result {
                     Ok(snapshot) => {
                         page.snapshot = Loadable::Ready(snapshot);
-                        page.label.update(cx, |input, cx| input.set_text("", cx));
-                        page.environment_variable
-                            .update(cx, |input, cx| input.set_text("", cx));
-                        page.value.update(cx, |input, cx| input.set_text("", cx));
-                        page.selected_harnesses.clear();
+                        page.clear_form(cx);
+                        page.form_open = false;
                     }
                     Err(error) => page.error = Some(error.to_string().into()),
                 }
@@ -203,20 +192,11 @@ impl SecretsPage {
         self.deleting = Some(id.clone());
         self.error = None;
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::DELETE_HARNESS_SECRET,
-                    serde_json::json!({ "id": id }),
-                )
-                .await;
+            let result = call_api(engine.client(), &DeleteHarnessSecret { id }).await;
             this.update(cx, |page, cx| {
                 page.deleting = None;
                 page.delete_confirm = None;
-                match result.and_then(|value| {
-                    serde_json::from_value(value)
-                        .map_err(|error| jolt_rpc::RpcError::Failed(error.to_string()))
-                }) {
+                match result {
                     Ok(snapshot) => page.snapshot = Loadable::Ready(snapshot),
                     Err(error) => page.error = Some(error.to_string().into()),
                 }
@@ -225,6 +205,35 @@ impl SecretsPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn clear_form(&mut self, cx: &mut Context<Self>) {
+        self.label.update(cx, |input, cx| input.set_text("", cx));
+        self.environment_variable
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.value.update(cx, |input, cx| input.set_text("", cx));
+        self.selected_harnesses.clear();
+        self.error = None;
+    }
+
+    fn open_form(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        self.form_open = true;
+        cx.notify();
+    }
+
+    fn close_form(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_modal(cx);
+    }
+
+    pub(crate) fn dismiss_modal(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.form_open {
+            return false;
+        }
+        self.clear_form(cx);
+        self.form_open = false;
+        cx.notify();
+        true
     }
 
     fn input_field(
@@ -238,35 +247,167 @@ impl SecretsPage {
             .flex_col()
             .gap(px(7.0))
             .child(widgets::field_label(theme, label))
+            .child(popover::dialog_field(input.into_any_element()))
+    }
+
+    fn render_add_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        storage_available: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.form_open {
+            return None;
+        }
+        let theme = Theme::of(cx).clone();
+        let harnesses = div().flex().flex_row().flex_wrap().gap(px(8.0)).children(
+            HARNESSES
+                .iter()
+                .enumerate()
+                .map(|(index, (harness, name))| {
+                    let harness = *harness;
+                    let selected = self.selected_harnesses.contains(&harness);
+                    widgets::ghost_action(&theme)
+                        .id(("secret-harness", index))
+                        .border_1()
+                        .border_color(if selected {
+                            theme.accent.opacity(0.7)
+                        } else {
+                            theme.border
+                        })
+                        .bg(if selected {
+                            theme.accent.opacity(0.08)
+                        } else {
+                            crate::theme::ink(0.03)
+                        })
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .hover(|style| widgets::ghost_hover(&theme, style))
+                        .on_click(
+                            cx.listener(move |page, _, _, cx| page.toggle_harness(harness, cx)),
+                        )
+                        .when(selected, |button| {
+                            button.child(
+                                icons::icon(icons::CHECK)
+                                    .size(px(13.0))
+                                    .text_color(theme.accent),
+                            )
+                        })
+                        .child(SharedString::from(*name))
+                }),
+        );
+        let card = popover::dialog_card(&theme)
+            .w(px(460.0))
+            .child(popover::dialog_title(&theme, "Add secret"))
+            .child(div().mt(px(5.0)).child(popover::dialog_body(
+                &theme,
+                "The value is write-only and stays in this device’s secure credential store.",
+            )))
             .child(
                 div()
-                    .h(px(38.0))
-                    .px(px(11.0))
-                    .py(px(8.0))
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.bg)
-                    .overflow_hidden()
-                    .child(input),
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(self.input_field(&theme, "Label", self.label.clone()))
+                    .child(self.input_field(
+                        &theme,
+                        "Environment variable",
+                        self.environment_variable.clone(),
+                    ))
+                    .child(self.input_field(&theme, "Secret value", self.value.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(widgets::field_label(&theme, "Available to"))
+                            .child(harnesses),
+                    ),
             )
+            .when_some(self.error.clone(), |card, error| {
+                card.child(
+                    div()
+                        .mt(px(12.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.danger)
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .mt(px(18.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "add-secret-cancel")
+                            .id("add-secret-cancel")
+                            .when(!self.busy, |button| {
+                                button.on_click(cx.listener(|page, _, _, cx| page.close_form(cx)))
+                            })
+                            .when(self.busy, |button| button.opacity(0.5)),
+                    )
+                    .child(
+                        popover::btn_primary(
+                            &theme,
+                            if self.busy { "Saving…" } else { "Add secret" },
+                        )
+                        .id("add-harness-secret")
+                        .when(storage_available && !self.busy, |button| {
+                            button.on_click(cx.listener(|page, _, _, cx| page.submit(cx)))
+                        })
+                        .when(!storage_available || self.busy, |button| {
+                            button.opacity(0.5)
+                        }),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("add-secret-dialog", viewport, card))
     }
 }
 
 impl Render for SecretsPage {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let snapshot = self.snapshot.ready().cloned();
         let storage_available = snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.storage_available);
         let secret_count = snapshot.as_ref().map(|snapshot| snapshot.secrets.len());
+        let dialog = self.render_add_dialog(window.viewport_size(), storage_available, cx);
 
         let mut column = widgets::page_column()
-            .child(widgets::page_header(&theme, "Secrets", secret_count))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(widgets::page_header(&theme, "Secrets", secret_count))
+                    .child(div().flex_1())
+                    .when(snapshot.is_some(), |header| {
+                        header.child(
+                            popover::btn_primary(&theme, "Add secret")
+                                .id("open-add-harness-secret")
+                                .when(storage_available && !self.busy, |button| {
+                                    button.on_click(
+                                        cx.listener(|page, _, _, cx| page.open_form(cx)),
+                                    )
+                                })
+                                .when(!storage_available || self.busy, |button| {
+                                    button.opacity(0.5)
+                                }),
+                        )
+                    }),
+            )
             .child(widgets::page_subtitle(
                 &theme,
-                "Store device-local values in the operating system credential store and expose them only to selected harnesses.",
+                "Device-local credentials shared with only the harnesses you choose. Stored values can’t be viewed after they’re added.",
             ));
 
         match &self.snapshot {
@@ -299,99 +440,50 @@ impl Render for SecretsPage {
                     ));
                 }
 
-                let form = widgets::section_card(&theme)
-                    .child(
-                        div()
-                            .px(px(20.0))
-                            .pt(px(18.0))
-                            .pb(px(8.0))
-                            .child(widgets::row_title(&theme, "Add secret")),
-                    )
-                    .child(
-                        div()
-                            .px(px(20.0))
-                            .py(px(12.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(14.0))
-                            .child(self.input_field(&theme, "Label", self.label.clone()))
-                            .child(self.input_field(
-                                &theme,
-                                "Environment variable",
-                                self.environment_variable.clone(),
-                            ))
-                            .child(self.input_field(&theme, "Value", self.value.clone()))
-                            .child(widgets::field_label(&theme, "Harness access"))
-                            .child(
-                                div().flex().flex_row().flex_wrap().gap(px(8.0)).children(
-                                    HARNESSES
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(index, (harness, name))| {
-                                            let harness = *harness;
-                                            let selected =
-                                                self.selected_harnesses.contains(&harness);
-                                            widgets::ghost_action(&theme)
-                                                .id(("secret-harness", index))
-                                                .border_1()
-                                                .border_color(if selected {
-                                                    theme.accent.opacity(0.7)
-                                                } else {
-                                                    theme.border
-                                                })
-                                                .bg(if selected {
-                                                    theme.accent.opacity(0.08)
-                                                } else {
-                                                    theme.bg
-                                                })
-                                                .text_color(if selected {
-                                                    theme.text
-                                                } else {
-                                                    theme.text_muted
-                                                })
-                                                .on_click(cx.listener(move |page, _, _, cx| {
-                                                    page.toggle_harness(harness, cx)
-                                                }))
-                                                .when(selected, |button| {
-                                                    button.child(
-                                                        icons::icon(icons::CHECK)
-                                                            .size(px(13.0))
-                                                            .text_color(theme.accent),
-                                                    )
-                                                })
-                                                .child(SharedString::from(*name))
-                                        }),
-                                ),
-                            )
-                            .child(
-                                div().flex().justify_end().child(
-                                    popover::btn_primary(
-                                        &theme,
-                                        if self.busy { "Saving…" } else { "Add secret" },
-                                    )
-                                    .id("add-harness-secret")
-                                    .when(storage_available && !self.busy, |button| {
-                                        button
-                                            .on_click(cx.listener(|page, _, _, cx| page.submit(cx)))
-                                    })
-                                    .when(!storage_available || self.busy, |button| {
-                                        button.opacity(0.5)
-                                    }),
-                                ),
-                            ),
-                    );
-                column = column.child(form);
-
-                let mut list = widgets::section_card(&theme);
+                let mut list = widgets::section_card(&theme).child(
+                    div()
+                        .px(px(20.0))
+                        .py(px(14.0))
+                        .child(widgets::row_title(&theme, "Saved secrets")),
+                );
                 if snapshot.secrets.is_empty() {
                     list = list.child(
                         div()
+                            .border_t_1()
+                            .border_color(theme.border)
                             .px(px(20.0))
-                            .py(px(28.0))
-                            .text_center()
-                            .text_size(px(13.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from("No secrets configured on this device.")),
+                            .py(px(30.0))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(widgets::row_tile(&theme, icons::KEY))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child("No secrets yet"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .child("Add a credential to make it available to a harness."),
+                            )
+                            .child(
+                                popover::btn_ghost(
+                                    &theme,
+                                    "Add your first secret",
+                                    "empty-add-secret",
+                                )
+                                .id("empty-add-secret")
+                                .when(storage_available, |button| {
+                                    button
+                                        .on_click(cx.listener(|page, _, _, cx| page.open_form(cx)))
+                                })
+                                .when(!storage_available, |button| button.opacity(0.5)),
+                            ),
                     );
                 } else {
                     for (index, secret) in snapshot.secrets.iter().cloned().enumerate() {
@@ -410,7 +502,7 @@ impl Render for SecretsPage {
                             .collect::<Vec<_>>()
                             .join(", ");
                         list = list.child(
-                            widgets::card_row(&theme, index == 0)
+                            widgets::card_row(&theme, false)
                                 .child(widgets::row_tile(&theme, icons::KEY))
                                 .child(
                                     div()
@@ -421,6 +513,7 @@ impl Render for SecretsPage {
                                             &theme,
                                             vec![
                                                 div()
+                                                    .font_family(theme.font_mono.clone())
                                                     .child(SharedString::from(
                                                         secret.environment_variable,
                                                     ))
@@ -455,7 +548,9 @@ impl Render for SecretsPage {
             }
         }
 
-        if let Some(error) = &self.error {
+        if !self.form_open
+            && let Some(error) = &self.error
+        {
             column = column.child(widgets::error_strip(&theme, error.clone()));
         }
         column = column.child(widgets::warning_strip(
@@ -468,5 +563,6 @@ impl Render for SecretsPage {
             .size_full()
             .overflow_y_scroll()
             .child(column)
+            .children(dialog)
     }
 }

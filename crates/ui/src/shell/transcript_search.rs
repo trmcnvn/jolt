@@ -3,7 +3,8 @@
 use std::ops::Range;
 
 use gpui::{StyledText, TextRun, font};
-use jolt_doc::{MessageRole, TranscriptSearchResult};
+use jolt_api::{SearchTranscript, call as call_api};
+use jolt_session_doc::{MessageRole, TranscriptSearchResult};
 
 use super::*;
 use crate::settings::{ShortcutId, display_combo};
@@ -97,13 +98,15 @@ impl Shell {
             cx.background_executor()
                 .timer(Duration::from_millis(SEARCH_DEBOUNCE_MS))
                 .await;
-            let result = engine
-                .client()
-                .call_as::<Vec<TranscriptSearchResult>>(
-                    methods::SEARCH_TRANSCRIPT,
-                    serde_json::json!({ "chatId": request_chat, "query": request_query }),
-                )
-                .await;
+            let result = call_api(
+                engine.client(),
+                &SearchTranscript {
+                    chat_id: request_chat,
+                    query: request_query,
+                    target_device_id: None,
+                },
+            )
+            .await;
             this.update(cx, |shell, cx| {
                 let Some(flow) = shell.transcript_search.as_mut() else {
                     return;

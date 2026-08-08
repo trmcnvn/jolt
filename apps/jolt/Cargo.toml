@@ -23,11 +23,13 @@ path = "src/cli.rs"
 required-features = ["cli"]
 
 [dependencies]
+jolt-api.workspace = true
 jolt-engine.workspace = true
 jolt-rpc.workspace = true
 jolt-ui = { workspace = true, optional = true }
 jolt-update.workspace = true
 tokio.workspace = true
+futures.workspace = true
 clap.workspace = true
 mimalloc.workspace = true
 anyhow.workspace = true

@@ -9,8 +9,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use jolt_api::methods;
 use jolt_engine::{Auth, AuthConfig, AuthState, EngineConfig, EngineSupervisor, HarnessId};
-use jolt_rpc::{connect_ws, methods};
+use jolt_rpc::connect_ws;
 
 // ---------------------------------------------------------------------------
 // Fake JWTs

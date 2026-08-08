@@ -50,7 +50,7 @@ pub fn ascii_jolt_mark(
 ) -> impl IntoElement {
     AsciiJoltMark {
         size_px,
-        color: theme.code_text,
+        colors: [theme.accent, theme.code_text, theme.busy],
         motion: mode,
         phase: motion::pulse_delta(&JOLT_PULSE, view, cx),
         font_family: theme.font_mono.clone(),
@@ -59,7 +59,7 @@ pub fn ascii_jolt_mark(
 
 struct AsciiJoltMark {
     size_px: f32,
-    color: Hsla,
+    colors: [Hsla; 3],
     motion: AsciiMarkMotion,
     phase: f32,
     font_family: SharedString,
@@ -120,7 +120,12 @@ impl Element for AsciiJoltMark {
             .into_iter()
             .enumerate()
             .map(|(row, text)| {
-                let mut color = self.color;
+                let position = row as f32 / (ROWS - 1) as f32;
+                let mut color = if position < 0.5 {
+                    crate::theme::mix(self.colors[0], self.colors[1], position * 2.0)
+                } else {
+                    crate::theme::mix(self.colors[1], self.colors[2], (position - 0.5) * 2.0)
+                };
                 color.a *= row_opacity(self.phase, self.motion, row);
                 let runs = [TextRun {
                     len: text.len(),
@@ -205,7 +210,7 @@ fn ascii_frame(phase: f32, motion: AsciiMarkMotion) -> Vec<String> {
                 } else if motion == AsciiMarkMotion::Splash
                     && spark_at(canvas_x, canvas_y, phase, col, row)
                 {
-                    if (col + row + tick as usize) % 3 == 0 {
+                    if (col + row + tick as usize).is_multiple_of(3) {
                         '+'
                     } else {
                         '.'
@@ -231,8 +236,8 @@ fn interior_character(col: usize, row: usize, tick: u32, phase: f32, energy: f32
 fn row_opacity(phase: f32, motion: AsciiMarkMotion, row: usize) -> f32 {
     let travel = (phase * TAU * 2.0 - row as f32 * 0.42).sin() * 0.5 + 0.5;
     match motion {
-        AsciiMarkMotion::Splash => 0.72 + travel * 0.28,
-        AsciiMarkMotion::Idle => 0.32 + travel * 0.20,
+        AsciiMarkMotion::Splash => 0.82 + travel * 0.18,
+        AsciiMarkMotion::Idle => 0.54 + travel * 0.24,
     }
 }
 
@@ -296,7 +301,7 @@ fn spark_at(x: f32, y: f32, phase: f32, col: usize, row: usize) -> bool {
         let radius_y = 164.0 - index as f32 * 5.0;
         let spark_x = CENTER + orbit.cos() * radius_x;
         let spark_y = CENTER + (orbit * 1.4).sin() * radius_y;
-        let threshold = if (col + row + index) % 2 == 0 {
+        let threshold = if (col + row + index).is_multiple_of(2) {
             12.0
         } else {
             8.0

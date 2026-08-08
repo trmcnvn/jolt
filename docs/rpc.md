@@ -38,15 +38,17 @@ Stream response:
 {"id": 1, "done": true}
 ```
 
-Every transport reaches the same `RpcService::handle(method, params)` dispatcher. In-process mode also serializes and deserializes the RPC envelopes.
+Bulk client payloads use a versioned binary unary request: `JRPB`, version, opcode, request ID, method/params lengths, UTF-8 method, JSON params, then raw bytes. Server binary streams use the same magic/version with a stream-item opcode and request ID. Limits are 8 MiB per application frame, 1 MiB per binary payload, 64 KiB of binary params, and 256 bytes per method name.
+
+Every transport reaches the same `RpcService::handle(method, params)` or `handle_binary(method, params, bytes)` dispatcher. In-process mode uses the same serialized envelopes and binary codecs.
 
 ## Transports
 
-- **In-memory:** bounded string channels between embedded desktop UI and engine supervisor.
+- **In-memory:** bounded text/binary frame channels between embedded desktop UI and engine supervisor.
 - **Local IPC:** WebSocket at `ws://127.0.0.1:<JOLT_IPC_PORT>`.
 - **Device relay:** virtual sockets tunneled through a device's Durable Object room.
 
-Local IPC binds loopback and is authenticated by the local machine trust boundary rather than a separate IPC credential.
+Local IPC binds loopback and is authenticated by the local machine trust boundary rather than a separate IPC credential. Device-relay headers and payloads are capped at 4 KiB and 8 MiB respectively. A client advertises compressed-response support with the optional `z` header field; the host then zlib-compresses JSON responses of at least 16 KiB as `rpc-zlib`. Older clients and edges continue using uncompressed `rpc` frames.
 
 ## Device routing
 
@@ -74,6 +76,9 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | Method | Reply | Remote target | Purpose |
 | --- | --- | --- | --- |
 | `ListHarnesses` | unary | yes | Static harness descriptors without forcing CLI discovery |
+| `WatchHarnessUpdates` | stream | yes | Device-local installed/latest versions and maintenance state |
+| `CheckHarnessUpdates` | unary | yes | Trigger an immediate background release check |
+| `ApplyHarnessUpdate` | unary | yes | Start a typed, user-approved harness update |
 | `ListModels` | unary | yes | Models from one installed harness |
 | `ListCommands` | unary | yes | Jolt composer commands for the target session context |
 | `QueueCommand` | unary | yes | Append a durable run/queue/bash/steer/interrupt/respond-input command |
@@ -90,9 +95,10 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 
 | Method | Reply | Remote target | Purpose |
 | --- | --- | --- | --- |
-| `WatchChats` | stream | no | Current chat rows |
+| `WatchChats` | stream | no | Active-chat bootstrap followed by changed-row upsert/remove deltas |
+| `QueryChats` | unary | no | Cursor-paged archived rows and server-side title search |
 | `WatchDevices` | stream | no | Current device rows |
-| `WatchSessions` | stream | no | Local + registry live session rows |
+| `WatchSessions` | stream | no | Live-status bootstrap followed by changed-row upsert/remove deltas |
 | `WatchSpaces` | stream | no | Current space rows |
 | `WatchThemes` / `ListThemes` | stream / unary | no | Account-registry copies of installation-level custom theme files |
 | `UpsertThemes` / `DeleteTheme` | unary | no | Reconcile custom theme files without syncing active appearance settings |
@@ -102,7 +108,7 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | `SyncStatus` | unary | no | Per-room push/ack/rejoin/probe/resync diagnostics |
 | `LocalDevice` | unary | no | Identity of the directly connected engine |
 
-`Mutate` operations are tagged by `op`. Current operations include `createChat`, `createSpace`, `renameSpace`, `deleteSpace`, `renameChat`, `setChatBranch`, `setChatCwd`, `setChatActivity`, `setChatHost`, `setChatArchived`, `setChatConfig`, `deleteChat`, `renameDevice`, and `markChatSeen`.
+`Mutate` operations are tagged by `op`. Current operations include `createChat`, `createSpace`, `renameSpace`, `deleteSpace`, `renameChat`, `setChatBranch`, `setChatCwd`, `setChatActivity`, `setChatHost`, `setChatPinned`, `setChatArchived`, `setChatConfig`, `deleteChat`, `renameDevice`, and `markChatSeen`.
 
 ### Authentication
 
@@ -183,12 +189,16 @@ Responses contain metadata only. Values are accepted over direct local IPC/in-pr
 
 | Method | Reply | Remote target |
 | --- | --- | --- |
-| `UploadChunk`, `UploadCommit` | unary | yes |
-| `ReadAttachmentChunk` | unary | yes |
+| `GetTransportCapabilities` | unary | yes |
+| `UploadBinaryChunk` | binary unary | yes |
+| `UploadChunk` | unary | yes (legacy fallback) |
+| `UploadCommit`, `ReadAttachmentChunk` | unary | yes |
+| `WatchHarnessUpdates` | stream | yes |
+| `CheckHarnessUpdates`, `ApplyHarnessUpdate` | unary | yes |
 | `UpdateStatus` | stream | yes |
 | `ApplyUpdate` | unary | yes |
 
-Uploads are staged and committed on the chat's host device. Attachment reads are path-jailed by the host implementation.
+Uploads are staged and committed on the chat's host device. Clients probe `GetTransportCapabilities`, send raw binary chunks when supported, and retain `UploadChunk` as a rolling-upgrade fallback for older hosts. Host assembly and edge mirroring stream from disk rather than materializing a whole-file base64 buffer. Attachment reads are path-jailed by the host implementation.
 
 ## Durable command payloads
 
@@ -210,7 +220,7 @@ A `RunRequest` carries prompt, concrete model/reasoning/options, cwd, sandbox, a
 
 A subscription receiver drop sends cancellation to the server. Bounded channels apply backpressure instead of allowing an unbounded slow-consumer queue.
 
-Watch streams generally emit the current value first. `WatchTranscriptV2` opens atomically with a compact manifest and enough trailing pages to cover at least 64 messages, then emits sequenced deltas for the mutable live page. A sequence/page mismatch resubscribes for another tail-sized bootstrap. Historical pages come from `GetTranscriptPage`; opaque IDs and page revisions make cached pages safe across reconnects. `SearchTranscript` searches the authoritative document on its host and returns page-backed message anchors, so selecting a cold result loads only its containing page.
+Watch streams generally emit the current value first. `WatchChats` opens with active rows only, then emits changed chat rows and removals; archived history and title matches load through cursor-paged `QueryChats`. `WatchSessions` similarly opens with merged live-status rows and then emits only changed rows and removals. `WatchTranscriptV2` opens atomically with a compact manifest and enough trailing pages to cover at least 64 messages, then emits sequenced deltas for the mutable live page. A sequence/page mismatch resubscribes for another tail-sized bootstrap. Historical pages come from `GetTranscriptPage`; opaque IDs and page revisions make cached pages safe across reconnects. `SearchTranscript` searches the authoritative document on its host and returns page-backed message anchors, so selecting a cold result loads only its containing page.
 
 ## Contract guidance
 
@@ -222,9 +232,10 @@ Watch streams generally emit the current value first. `WatchTranscriptV2` opens 
 
 ## Source map
 
-- Contract and method constants: `crates/rpc/src/lib.rs`
+- Product contracts and method constants: `crates/api/src/`
+- Generic wire envelopes/codecs: `crates/rpc/src/lib.rs`
 - Client: `crates/rpc/src/client.rs`
 - Server: `crates/rpc/src/server.rs`
 - Engine dispatch and routing: `crates/engine/src/rpc.rs`
-- Relay transport: `crates/rpc/src/device_room.rs`
+- Relay transport: `crates/relay/src/lib.rs`
 - Shared wire types: `crates/proto/src/`

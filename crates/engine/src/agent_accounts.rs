@@ -34,9 +34,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,8 +43,8 @@ use jolt_proto::{
     AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
 };
 
-use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
+use jolt_vcs::home_dir;
 
 // Claude Code's public OAuth client (the one the CLI itself uses for the manual
 // "paste the code" flow — no secret involved, PKCE carries the proof).
@@ -531,8 +528,9 @@ impl AgentAccounts {
             .chain(uuid::Uuid::new_v4().as_bytes())
             .copied()
             .collect();
-        let verifier = BASE64_URL.encode(&raw);
-        let challenge = BASE64_URL.encode(Sha256::digest(verifier.as_bytes()));
+        let verifier = crate::simd_base64::encode_url_safe_no_pad(&raw);
+        let challenge =
+            crate::simd_base64::encode_url_safe_no_pad(&Sha256::digest(verifier.as_bytes()));
         let url = format!(
             "https://claude.ai/oauth/authorize?code=true&client_id={CLAUDE_CLIENT_ID}\
              &response_type=code&redirect_uri={}&scope={}&code_challenge={challenge}\
@@ -1007,7 +1005,7 @@ impl AgentAccounts {
         }
         #[cfg(target_os = "macos")]
         {
-            return keychain::read_credentials().await;
+            keychain::read_credentials().await
         }
         #[cfg(not(target_os = "macos"))]
         (None, None)
@@ -1385,16 +1383,15 @@ fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
 /// token the user's own CLI already trusts.
 fn jwt_claims(jwt: &str) -> Option<serde_json::Value> {
     let payload = jwt.split('.').nth(1)?;
-    let bytes = BASE64_URL
-        .decode(payload)
-        .or_else(|_| BASE64.decode(payload))
+    let bytes = crate::simd_base64::decode_url_safe(payload.as_bytes())
+        .or_else(|_| crate::simd_base64::decode(payload.as_bytes()))
         .ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
 fn slot_id_for(harness: HarnessId, account_key: &str) -> String {
     let digest = Sha256::digest(format!("{}:{account_key}", harness_slug(harness)).as_bytes());
-    crate::repos::hex(&digest)[..16].to_string()
+    jolt_vcs::hex(&digest)[..16].to_string()
 }
 
 /// Pretty plan label from Claude's org type + rate-limit tier ("Max 20×").
@@ -1475,7 +1472,7 @@ fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
         .rev()
         .collect();
     Some(Detected {
-        account_key: format!("api-key:{}", &crate::repos::hex(&digest)[..12]),
+        account_key: format!("api-key:{}", &jolt_vcs::hex(&digest)[..12]),
         profile: SlotProfile {
             email: format!("API key ·…{tail}"),
             display_name: None,

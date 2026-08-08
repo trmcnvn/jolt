@@ -1405,6 +1405,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "convert_case"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "affbf0190ed2caf063e3def54ff444b449371d55c58e513a95ab98eca50adb49"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1833,7 +1842,7 @@ version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
 dependencies = [
- "convert_case",
+ "convert_case 0.10.0",
  "proc-macro2",
  "quote",
  "rustc_version",
@@ -2939,6 +2948,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-task",
+ "backtrace",
  "bindgen",
  "bitflags 2.13.1",
  "block",
@@ -2982,6 +2992,7 @@ dependencies = [
  "pollster 0.4.0",
  "postage",
  "profiling",
+ "proptest",
  "rand 0.9.5",
  "raw-window-handle",
  "refineable",
@@ -3775,7 +3786,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
 dependencies = [
  "byteorder-lite",
- "quick-error",
+ "quick-error 2.0.1",
 ]
 
 [[package]]
@@ -4019,10 +4030,12 @@ dependencies = [
 
 [[package]]
 name = "jolt"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
+ "jolt-api",
  "jolt-engine",
  "jolt-rpc",
  "jolt-ui",
@@ -4037,44 +4050,54 @@ dependencies = [
 ]
 
 [[package]]
-name = "jolt-doc"
-version = "0.1.7"
+name = "jolt-api"
+version = "0.1.8"
 dependencies = [
- "chrono",
+ "bytes",
  "jolt-proto",
- "loro",
+ "jolt-rpc",
+ "jolt-session-doc",
+ "jolt-update",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
- "tracing",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
 name = "jolt-engine"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "futures",
- "ignore",
- "jolt-doc",
+ "jolt-api",
  "jolt-harness",
+ "jolt-harness-claude",
+ "jolt-harness-codex",
+ "jolt-harness-pi",
+ "jolt-mcp",
+ "jolt-platform",
  "jolt-proto",
+ "jolt-registry-model",
+ "jolt-relay",
  "jolt-rpc",
+ "jolt-session-doc",
+ "jolt-store",
  "jolt-sync",
+ "jolt-terminal",
  "jolt-update",
+ "jolt-vcs",
  "keyring",
  "keyring-core",
  "libc",
  "loro",
  "memchr",
  "notify",
- "portable-pty",
  "reqwest",
- "rmcp",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4083,32 +4106,110 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-tungstenite",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "jolt-harness"
-version = "0.1.7"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "futures",
- "jolt-proto",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
  "tokio-util",
  "tracing",
  "uuid",
 ]
 
 [[package]]
+name = "jolt-harness"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "futures",
+ "jolt-proto",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "jolt-harness-claude"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "futures",
+ "jolt-harness",
+ "jolt-platform",
+ "jolt-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jolt-harness-codex"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "futures",
+ "jolt-harness",
+ "jolt-platform",
+ "jolt-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jolt-harness-pi"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "futures",
+ "jolt-harness",
+ "jolt-harness-claude",
+ "jolt-harness-codex",
+ "jolt-platform",
+ "jolt-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jolt-mcp"
+version = "0.1.8"
+dependencies = [
+ "axum",
+ "futures",
+ "jolt-harness",
+ "jolt-proto",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jolt-platform"
+version = "0.1.8"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "jolt-proto"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "chrono",
  "serde",
@@ -4116,12 +4217,43 @@ dependencies = [
 ]
 
 [[package]]
-name = "jolt-rpc"
-version = "0.1.7"
+name = "jolt-registry-model"
+version = "0.1.8"
+dependencies = [
+ "chrono",
+ "jolt-proto",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "jolt-relay"
+version = "0.1.8"
 dependencies = [
  "async-trait",
+ "bytes",
+ "flate2",
  "futures",
- "jolt-sync",
+ "jolt-api",
+ "jolt-platform",
+ "jolt-rpc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jolt-rpc"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -4132,16 +4264,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "jolt-session-doc"
+version = "0.1.8"
+dependencies = [
+ "chrono",
+ "jolt-proto",
+ "loro",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "jolt-store"
+version = "0.1.8"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "jolt-sync"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "chrono",
  "futures",
- "jolt-doc",
+ "jolt-platform",
  "jolt-proto",
+ "jolt-registry-model",
+ "jolt-session-doc",
+ "jolt-store",
  "loro",
  "loro-protocol",
- "rusqlite",
  "rustls",
  "serde",
  "serde_json",
@@ -4154,22 +4310,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "jolt-terminal"
+version = "0.1.8"
+dependencies = [
+ "base64 0.23.1",
+ "jolt-proto",
+ "jolt-session-doc",
+ "portable-pty",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "jolt-ui"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
- "async-trait",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "futures",
  "gpui",
  "gpui_platform",
  "gpui_tokio",
  "image",
- "jolt-doc",
+ "jolt-api",
  "jolt-engine",
  "jolt-proto",
  "jolt-rpc",
+ "jolt-session-doc",
  "jolt-update",
  "libghostty-vt",
  "merman",
@@ -4192,7 +4363,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-update"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "futures",
@@ -4201,6 +4372,23 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "jolt-vcs"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "ignore",
+ "jolt-platform",
+ "jolt-proto",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
@@ -6310,6 +6498,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.10.0"
+source = "git+https://github.com/proptest-rs/proptest?rev=3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b#3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b"
+dependencies = [
+ "bit-set 0.8.0",
+ "bit-vec 0.8.0",
+ "bitflags 2.13.1",
+ "num-traits",
+ "proptest-macro",
+ "rand 0.9.5",
+ "rand_chacha 0.9.0",
+ "rand_xorshift",
+ "regex-syntax",
+ "rusty-fork",
+ "tempfile",
+ "unarray",
+]
+
+[[package]]
+name = "proptest-macro"
+version = "0.5.0"
+source = "git+https://github.com/proptest-rs/proptest?rev=3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b#3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b"
+dependencies = [
+ "convert_case 0.11.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "psm"
 version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6388,6 +6606,12 @@ checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "quick-error"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-error"
@@ -6589,6 +6813,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xorshift"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
+dependencies = [
+ "rand_core 0.9.5",
+]
+
+[[package]]
 name = "rand_xoshiro"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6761,7 +6994,7 @@ dependencies = [
  "avif-serialize",
  "imgref",
  "loop9",
- "quick-error",
+ "quick-error 2.0.1",
  "rav1e",
  "rayon",
  "rgb",
@@ -7283,6 +7516,18 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rusty-fork"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2"
+dependencies = [
+ "fnv",
+ "quick-error 1.2.3",
+ "tempfile",
+ "wait-timeout",
+]
 
 [[package]]
 name = "rustybuzz"
@@ -8425,7 +8670,7 @@ dependencies = [
  "fax",
  "flate2",
  "half",
- "quick-error",
+ "quick-error 2.0.1",
  "weezl",
  "zune-jpeg",
 ]
@@ -8856,6 +9101,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+
+[[package]]
 name = "unicase"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9104,6 +9355,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb067e4cbd1ff067d1df46c9194b5de0e98efd2810bbc95c5d5e5f25a3231150"
 dependencies = [
  "cc",
+ "libc",
+]
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
  "libc",
 ]
 

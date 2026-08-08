@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
+use memchr::memchr;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -35,9 +36,9 @@ use crate::EngineError;
 use crate::diff_projection::DiffProjection;
 use crate::doc_host::EdgeConfig;
 use crate::pinned_diffs::PinnedDiffStore;
-use crate::repos::{CheckoutIdentity, Repos};
-use crate::vcs::compose_command_path;
 use crate::workspace_host::WorkspaceHost;
+use jolt_vcs::compose_command_path;
+use jolt_vcs::{CheckoutIdentity, Repos};
 
 /// Hard cap on the unified patch (plus untracked hunks) — "Partial snapshot".
 pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
@@ -657,6 +658,7 @@ async fn sync_entry_locked(
 /// lock. Opening the Changes pane must never wait for authentication, network
 /// latency, or R2 writes. Jobs serialize per checkout and stale jobs are
 /// discarded before upload so a late task cannot replace a newer manifest.
+#[allow(clippy::too_many_arguments)] // detached publish job carries one projection snapshot
 async fn publish_edge_sidecars(
     inner: Arc<DiffSyncInner>,
     entry: Arc<CheckoutEntry>,
@@ -1331,7 +1333,7 @@ fn turn_snapshot(
         additions,
         deletions,
         truncated,
-        checksum: crate::repos::hex(&hasher.finalize()),
+        checksum: jolt_vcs::hex(&hasher.finalize()),
     }
 }
 
@@ -1454,7 +1456,10 @@ async fn capture_git_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
         } else {
             match tokio::fs::read(&full).await {
                 Ok(bytes) => {
-                    binary = bytes.contains(&0);
+                    // Untracked files can approach the full patch cap. On the
+                    // 3.146 MiB release fixture, runtime-SIMD memchr measured
+                    // 36 µs versus 123 µs for the slice scan.
+                    binary = memchr(0, &bytes).is_some();
                     if !binary {
                         let text = String::from_utf8_lossy(&bytes).to_string();
                         additions = if text.is_empty() {
@@ -1499,7 +1504,7 @@ async fn capture_git_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
     hasher.update([0u8]);
     hasher.update(files_json.as_bytes());
     hasher.update(if truncated { b"1" } else { b"0" });
-    let checksum = crate::repos::hex(&hasher.finalize());
+    let checksum = jolt_vcs::hex(&hasher.finalize());
 
     Ok(DiffSnapshot {
         vcs: VcsKind::Git,
@@ -1614,7 +1619,7 @@ async fn capture_jj_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, Eng
 
     let identity = String::from_utf8_lossy(&identity.stdout);
     let (change_id, commit_id) = identity.trim().split_once('\t').unwrap_or(("@", ""));
-    let label = format!("Working copy · {change_id}");
+    let label = change_id.to_string();
     let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
     let truncated = tracked.truncated || listed.truncated;
     if tracked.truncated {
@@ -1648,7 +1653,7 @@ async fn capture_jj_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, Eng
         additions,
         deletions,
         truncated,
-        checksum: crate::repos::hex(&hasher.finalize()),
+        checksum: jolt_vcs::hex(&hasher.finalize()),
     })
 }
 
@@ -1658,7 +1663,7 @@ mod turn_diff_tests {
     use std::process::Command;
 
     use super::{capture_scoped_turn_diff, capture_turn_diff, capture_turn_diff_baseline};
-    use crate::repos::Repos;
+    use jolt_vcs::Repos;
 
     fn git(root: &std::path::Path, args: &[&str]) -> String {
         let output = Command::new("git")

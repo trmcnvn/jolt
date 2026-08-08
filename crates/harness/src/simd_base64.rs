@@ -8,7 +8,7 @@ fn engine() -> &'static base64::engine::Simd {
     })
 }
 
-pub(crate) fn encode(bytes: &[u8]) -> String {
+pub fn encode(bytes: &[u8]) -> String {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     return engine().encode(bytes);
 

@@ -40,9 +40,8 @@ const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2 * 6
 const CHECK_RETRY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// First check waits out engine boot (room joins, doc re-sync).
 const CHECK_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
-/// While an auto-apply is deferred behind active sessions, re-probe idleness
-/// this often.
-const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// While a user-approved apply waits behind active work, re-probe idleness.
+const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Release metadata
@@ -647,6 +646,9 @@ pub struct UpdateStatus {
     pub latest_version: Option<String>,
     #[serde(default)]
     pub update_available: bool,
+    /// Whether this engine can apply the release through its managed install.
+    #[serde(default)]
+    pub can_apply: bool,
     /// Epoch ms of the last successful check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<i64>,
@@ -660,17 +662,11 @@ impl UpdateStatus {
             current_version: current_version().to_string(),
             latest_version: None,
             update_available: false,
+            can_apply: matches!(detect_install(), InstallKind::Managed { .. }),
             checked_at: None,
             error: None,
         }
     }
-}
-
-/// `JOLT_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
-fn auto_update_enabled() -> bool {
-    std::env::var("JOLT_AUTO_UPDATE")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
 }
 
 /// "Nothing would be interrupted by a restart right now" — wired by the engine
@@ -678,10 +674,8 @@ fn auto_update_enabled() -> bool {
 pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Background release checker: polls `{edge}/releases` on a 2h cadence and
-/// publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
-/// stream). Managed installs with `JOLT_AUTO_UPDATE` set stage + apply + service
-/// restart on their own — but only in a quiet window: while `quiescent` reports
-/// activity, the apply defers and re-probes every [`IDLE_RECHECK`].
+/// publishes [`UpdateStatus`] over a watch channel. Checks only report release
+/// availability; installation always requires an explicit `ApplyUpdate` call.
 #[derive(Clone)]
 pub struct Updater {
     edge_url: String,
@@ -734,49 +728,7 @@ impl Updater {
         tokio::time::sleep(CHECK_INITIAL_DELAY).await;
         loop {
             let ok = self.check_once().await;
-            if ok && self.status_tx.borrow().update_available && auto_update_enabled() {
-                if let InstallKind::Managed { .. } = detect_install() {
-                    self.auto_apply_when_idle().await;
-                }
-            }
             tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }).await;
-        }
-    }
-
-    /// Sessions must never die to an update: pre-stage the download now
-    /// (harmless while busy), wait for a quiet window (no live runs, no open
-    /// terminals), then apply — which re-fetches the manifest (so a long defer
-    /// lands on whatever is newest) and reuses the staged dir, keeping the
-    /// idle→restart gap to well under a second.
-    async fn auto_apply_when_idle(&self) {
-        if let InstallKind::Managed { app_root } = detect_install() {
-            match fetch_latest(&self.edge_url).await {
-                Ok(manifest) if version_newer(&manifest.version, current_version()) => {
-                    if let Err(err) = stage_headless(&self.edge_url, &manifest, &app_root).await {
-                        tracing::warn!(error = %err, "auto-update staging failed");
-                        return;
-                    }
-                }
-                Ok(_) => return,
-                Err(err) => {
-                    tracing::warn!(error = %err, "auto-update staging fetch failed");
-                    return;
-                }
-            }
-        }
-        let mut deferred = false;
-        while !self.quiescent_now() {
-            if !deferred {
-                deferred = true;
-                tracing::info!("auto-update deferred: sessions or terminals active");
-            }
-            tokio::time::sleep(IDLE_RECHECK).await;
-        }
-        match self.apply().await {
-            Ok(version) => {
-                tracing::info!(%version, "auto-update applied; service restarting")
-            }
-            Err(err) => tracing::warn!(error = %err, "auto-update failed"),
         }
     }
 
@@ -787,6 +739,7 @@ impl Updater {
                 let status = UpdateStatus {
                     current_version: current_version().to_string(),
                     update_available: version_newer(&manifest.version, current_version()),
+                    can_apply: matches!(detect_install(), InstallKind::Managed { .. }),
                     latest_version: Some(manifest.version),
                     checked_at: Some(now_ms()),
                     error: None,
@@ -825,6 +778,14 @@ impl Updater {
             bail!("already up to date ({})", current_version());
         }
         stage_headless(&self.edge_url, &manifest, &app_root).await?;
+        let mut deferred = false;
+        while !self.quiescent_now() {
+            if !deferred {
+                deferred = true;
+                tracing::info!("user-approved update waiting for sessions and terminals to finish");
+            }
+            tokio::time::sleep(IDLE_RECHECK).await;
+        }
         apply_headless(&app_root, &manifest.version)?;
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;

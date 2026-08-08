@@ -8,11 +8,11 @@
 //! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
 //! - `ExtractQuestions {chatId, sourceMessageId}` → extracted prose questions
 //!   re-emitted on every doc change
-//! - `WatchChats` / `WatchDevices` → streams of the workspace doc's entity rows
-//! - `WatchSessions` → stream of `Session[]`: this engine's live statuses merged with
-//!   remote devices' workspace session rows
+//! - `WatchChats` → active-row bootstrap plus changed-row deltas; `QueryChats` pages/searches history
+//! - `WatchDevices` → stream of the workspace doc's device rows
+//! - `WatchSessions` → merged live-status bootstrap plus changed-row deltas
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
-//!   setChatArchived, deleteChat, renameDevice, markChatSeen)
+//!   setChatPinned, setChatArchived, deleteChat, renameDevice, markChatSeen)
 //! - `RegenerateChatTitle {chatId}` → `{ok}` — replace a session name using the
 //!   host harness's economy model
 //! - `LocalDevice` → `{deviceId}` — this engine's identity (never forwarded)
@@ -33,8 +33,9 @@
 //!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →
 //!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
 //!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
-//! - Uploads: `UploadChunk {uploadId, data, seq?}`,
-//!   `UploadCommit {uploadId, fileName, chatId}` → `{path, sha256}`,
+//! - Uploads: binary `UploadBinaryChunk {uploadId, seq?}` (legacy base64
+//!   `UploadChunk` remains for rolling upgrades), `UploadCommit {uploadId,
+//!   fileName, chatId}` → `{path, sha256}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
 //!   done}` (path-jailed to the uploads dir + workspace-known chat cwds).
 //!
@@ -50,113 +51,61 @@
 //! built-in catalog supported by the device that will host the chat.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use serde::Deserialize;
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::watch;
 
-use jolt_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, join_continuation_entries,
+use jolt_api::{
+    ActivateAgentAccount, ApplyHarnessUpdate, CancelAgentLogin, CancelQueuedPrompt, ChatPage,
+    ChatSection, ChatWatchFrame, CloseTerminal, CompleteAgentLogin, CreateWorktree,
+    DeleteHarnessSecret, DeleteReviewDraft, DeleteTheme, ExtractQuestions, ForgetAgentAccount,
+    GetCheckoutDiffPage, GetCheckoutReview, GetReviewDraft, GetTranscriptPage,
+    GetTransportCapabilities, GetTurnDiffPage, ListAgentAccounts, ListCommands, ListFolders,
+    ListHarnessSecrets, ListModels, ListRefs, Mutate, OpenTerminal, PinDiffDocument,
+    PollAgentLogin, PutReviewDraft, QueryChats, QueueCommand, ReadAttachmentChunk,
+    RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal, SearchFiles, SearchTranscript,
+    SessionWatchFrame, SetVcsBackend, StartAgentLogin, SubscribeTerminal, SwitchRef,
+    UploadBinaryChunk, UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes,
+    UsageBreakdownRequest, WatchChatUsage, WatchCheckoutDiff, WatchQueuedPrompts, WatchTranscript,
+    WriteTerminal, methods,
 };
+#[cfg(test)]
+use jolt_proto::HarnessId;
 use jolt_proto::{
-    AgentCommand, AgentCommandSource, ChatConfig, ExtractQuestionsResult, HarnessId, SessionStatus,
+    AgentCommand, AgentCommandSource, Chat, ExtractQuestionsResult, Session, SessionStatus,
     ToolCall,
 };
-use jolt_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
+use jolt_relay::LinkCache;
+use jolt_rpc::{RpcError, RpcReply, RpcService, parse_params};
+use jolt_session_doc::{MessagePart, MessageRole, MessageStatus, join_continuation_entries};
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
+use crate::harness_updates::HarnessUpdater;
 use crate::registry::HarnessRegistry;
-use crate::repos::{Repos, home_dir};
 use crate::review_store::ReviewStore;
 use crate::secrets::HarnessSecrets;
 use crate::sessions::SessionsEngine;
-use crate::terminals::{TerminalOutput, Terminals};
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
+use jolt_terminal::{TerminalOutput, Terminals};
+use jolt_vcs::{Repos, home_dir};
+
+mod routing;
+
+#[cfg(test)]
+use routing::local_only;
+use routing::{forwardable, is_binary_stream_method, is_stream_method};
+pub(crate) use routing::{relay_service, theme_sync_method};
 
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChatParams {
-    chat_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TranscriptPageParams {
-    chat_id: String,
-    page_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchTranscriptParams {
-    chat_id: String,
-    query: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DiffPageParams {
-    chat_id: String,
-    catalog_revision: String,
-    page_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TurnDiffPageParams {
-    chat_id: String,
-    assistant_message_id: String,
-    catalog_revision: String,
-    page_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReviewKeyParams {
-    review_key: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PutReviewDraftParams {
-    draft: jolt_proto::ReviewDraft,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PinDiffParams {
-    chat_id: String,
-    catalog_revision: String,
-    review_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReleaseDiffParams {
-    catalog_revision: String,
-    review_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ListModelsParams {
-    harness: HarnessId,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ListCommandsParams {
-    harness: HarnessId,
-}
 
 const ANSWER_QUESTIONS_COMMAND: &str = "answer";
 const BRO_COMMAND: &str = "bro";
@@ -187,58 +136,10 @@ fn jolt_commands() -> Vec<AgentCommand> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct QueueCommandParams {
-    chat_id: String,
-    command: SessionCommandPayload,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CancelQueuedPromptParams {
-    chat_id: String,
-    command_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageBreakdownParams {
-    #[serde(default = "default_breakdown_days")]
-    days: u16,
-}
-
-fn default_breakdown_days() -> u16 {
-    30
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExtractQuestionsParams {
-    chat_id: String,
-    source_message_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct RepoPathParams {
     /// `repoPath` per §3.5 (the §2.1 shorthand `repo` is accepted as an alias).
     #[serde(alias = "repo")]
     repo_path: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SwitchRefParams {
-    /// The checkout to switch — a session's cwd (main folder or worktree).
-    repo_path: String,
-    ref_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateWorktreeParams {
-    #[serde(alias = "repo")]
-    repo_path: String,
-    branch: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,27 +149,6 @@ struct DeleteWorktreeParams {
     repo_path: String,
     #[serde(alias = "path")]
     worktree_path: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ListFoldersParams {
-    #[serde(default)]
-    path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FileSearchParams {
-    query: String,
-    #[serde(default)]
-    chat_id: Option<String>,
-    #[serde(default)]
-    space_id: Option<String>,
-    /// Existing linked worktree selected for a new chat. The engine accepts it
-    /// only after verifying it against the space repository's worktree list.
-    #[serde(default)]
-    path: Option<String>,
 }
 
 fn tool_file_path(call: &ToolCall) -> Option<&str> {
@@ -291,217 +171,6 @@ fn tool_file_path(call: &ToolCall) -> Option<&str> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpenTerminalParams {
-    chat_id: String,
-    cols: u16,
-    rows: u16,
-    #[serde(default)]
-    command: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TerminalIdParams {
-    terminal_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SubscribeTerminalParams {
-    terminal_id: String,
-    #[serde(default)]
-    after_seq: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WriteTerminalParams {
-    terminal_id: String,
-    /// Base64 input bytes (plain UTF-8 accepted leniently).
-    data: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ResizeTerminalParams {
-    terminal_id: String,
-    cols: u16,
-    rows: u16,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ListAgentAccountsParams {
-    #[serde(default)]
-    force_usage: Option<bool>,
-    #[serde(default)]
-    usage_only: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentAccountParams {
-    harness: HarnessId,
-    account_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StartAgentLoginParams {
-    harness: HarnessId,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LoginIdParams {
-    login_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CompleteAgentLoginParams {
-    login_id: String,
-    code: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpsertHarnessSecretParams {
-    #[serde(default)]
-    id: Option<String>,
-    label: String,
-    environment_variable: String,
-    harnesses: Vec<HarnessId>,
-    #[serde(default)]
-    value: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeleteHarnessSecretParams {
-    id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UploadChunkParams {
-    upload_id: String,
-    /// Base64 payload chunk.
-    data: String,
-    #[serde(default)]
-    seq: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UploadCommitParams {
-    upload_id: String,
-    file_name: String,
-    chat_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReadAttachmentChunkParams {
-    path: String,
-    #[serde(default)]
-    offset: u64,
-}
-
-/// The workspace mutation surface, tagged by `op`.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "camelCase")]
-enum MutateParams {
-    #[serde(rename_all = "camelCase")]
-    CreateChat {
-        chat_id: String,
-        /// The space the chat is created in — fixes host device + base cwd.
-        space_id: String,
-        #[serde(default)]
-        config: Option<ChatConfig>,
-        /// The picked ref, named on the row from the first frame (the footer
-        /// read "Select ref" until the diff reconciler stamped it).
-        #[serde(default)]
-        branch: Option<String>,
-        /// Cwd override (isolated-worktree path); default = the space's folder.
-        #[serde(default)]
-        cwd: Option<String>,
-    },
-    /// Create a space (device + folder pair). Idempotent by id; a live
-    /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
-    /// picker's FolderEntry — the owning device's SpacesSync re-verifies.
-    #[serde(rename_all = "camelCase")]
-    CreateSpace {
-        space_id: String,
-        device_id: String,
-        path: String,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        git_detected: bool,
-    },
-    /// LWW display-name set; `name: None` clears back to basename(path).
-    #[serde(rename_all = "camelCase")]
-    RenameSpace {
-        space_id: String,
-        #[serde(default)]
-        name: Option<String>,
-    },
-    /// Hard delete: cascades to every chat (and session row) in the space.
-    /// Live runs hosted here are interrupted best-effort.
-    #[serde(rename_all = "camelCase")]
-    DeleteSpace { space_id: String },
-    #[serde(rename_all = "camelCase")]
-    RenameChat { chat_id: String, title: String },
-    /// Set the chat's checkout branch label — the sidebar's
-    /// "project · branch" sub-line.
-    #[serde(rename_all = "camelCase")]
-    SetChatBranch { chat_id: String, branch: String },
-    /// Retarget a chat onto another folder — mid-session switch to an
-    /// EXISTING worktree (the picked ref's checkout). Next run starts a
-    /// fresh harness conversation there (resume is cwd-scoped).
-    #[serde(rename_all = "camelCase")]
-    SetChatCwd { chat_id: String, cwd: String },
-    /// Backdate a chat's activity timestamps (epoch ms) — the sidebar's
-    /// relative-time column. Used by tooling/seeds; the doc fold sets these on
-    /// real message traffic.
-    #[serde(rename_all = "camelCase")]
-    SetChatActivity {
-        chat_id: String,
-        #[serde(default)]
-        last_message_at: Option<i64>,
-        #[serde(default)]
-        created_at: Option<i64>,
-    },
-    /// Re-home a chat to another device (tooling/seeds; device migration later).
-    #[serde(rename_all = "camelCase")]
-    SetChatHost { chat_id: String, device_id: String },
-    #[serde(rename_all = "camelCase")]
-    SetChatArchived { chat_id: String, archived: bool },
-    /// Full-config replace on the chat row (jolt `SetChatConfig`): the
-    /// composer's mid-session model / reasoning / options changes, LWW-synced
-    /// so they survive restarts and reach every device.
-    #[serde(rename_all = "camelCase")]
-    SetChatConfig { chat_id: String, config: ChatConfig },
-    /// Tombstone: removes the chats-map row; the session doc remains.
-    #[serde(rename_all = "camelCase")]
-    DeleteChat { chat_id: String },
-    #[serde(rename_all = "camelCase")]
-    RenameDevice { device_id: String, name: String },
-    /// Remove a device and cascade through its spaces and sessions.
-    #[serde(rename_all = "camelCase")]
-    DeleteDevice { device_id: String },
-    /// Synced seen marker (LWW + monotonic guard): clears the "completed"
-    /// badge on every device. `at` is epoch ms; default = now.
-    #[serde(rename_all = "camelCase")]
-    MarkChatSeen {
-        chat_id: String,
-        #[serde(default)]
-        at: Option<i64>,
-    },
-}
-
 pub struct EngineRpc {
     sessions: SessionsEngine,
     doc_host: DocHost,
@@ -518,6 +187,7 @@ pub struct EngineRpc {
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<jolt_update::Updater>,
+    harness_updater: Option<HarnessUpdater>,
 }
 
 impl EngineRpc {
@@ -552,6 +222,7 @@ impl EngineRpc {
             auth: None,
             links: None,
             updater: None,
+            harness_updater: None,
         }
     }
 
@@ -573,6 +244,11 @@ impl EngineRpc {
         self
     }
 
+    pub fn with_harness_updater(mut self, updater: HarnessUpdater) -> Self {
+        self.harness_updater = Some(updater);
+        self
+    }
+
     fn auth(&self) -> Result<&Auth, RpcError> {
         self.auth
             .as_ref()
@@ -585,10 +261,16 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("updates unavailable".into()))
     }
 
+    fn harness_updater(&self) -> Result<&HarnessUpdater, RpcError> {
+        self.harness_updater
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("harness updates unavailable".into()))
+    }
+
     /// Resolve a mention-search root from synced workspace rows. A client may
     /// name an existing linked worktree for a new chat, but it is verified
     /// against the space repository before any filesystem walk begins.
-    async fn file_search_root(&self, p: &FileSearchParams) -> Result<std::path::PathBuf, RpcError> {
+    async fn file_search_root(&self, p: &SearchFiles) -> Result<std::path::PathBuf, RpcError> {
         let local_device = self.doc_host.device_id();
         match (&p.chat_id, &p.space_id) {
             (Some(_), Some(_)) | (None, None) => Err(RpcError::BadParams(
@@ -760,10 +442,34 @@ impl EngineRpc {
         }
     }
 
-    fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
+    async fn forward_binary(
+        &self,
+        target: &str,
+        method: &str,
+        params: serde_json::Value,
+        payload: Bytes,
+    ) -> Result<RpcReply, RpcError> {
+        let Some(links) = &self.links else {
+            return Err(RpcError::Failed(format!(
+                "cannot reach device {target}: remote routing unavailable (offline)"
+            )));
+        };
+        let client = links.client(target).await?;
+        match client.call_binary(method, params, payload).await {
+            Ok(value) => Ok(RpcReply::Value(value)),
+            Err(err) => {
+                if matches!(err, RpcError::Closed | RpcError::Transport(_)) {
+                    links.invalidate(target);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn mutate(&self, params: Mutate) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
-            MutateParams::CreateChat {
+            Mutate::CreateChat {
                 chat_id,
                 space_id,
                 config,
@@ -780,7 +486,7 @@ impl EngineRpc {
                 }
                 Ok(())
             }
-            MutateParams::CreateSpace {
+            Mutate::CreateSpace {
                 space_id,
                 device_id,
                 path,
@@ -790,12 +496,12 @@ impl EngineRpc {
                 .workspace
                 .create_space(&space_id, &device_id, &path, name, git_detected)
                 .map_err(failed),
-            MutateParams::RenameSpace { space_id, name } => self
+            Mutate::RenameSpace { space_id, name } => self
                 .workspace
                 .rename_space(&space_id, name.as_deref())
                 .map_err(failed)
                 .map(drop),
-            MutateParams::DeleteSpace { space_id } => {
+            Mutate::DeleteSpace { space_id } => {
                 let deleted = self.workspace.delete_space(&space_id).map_err(failed)?;
                 // Best-effort teardown of live runs we host for the deleted chats
                 // (the doc rows are already tombstoned; a straggler run would only
@@ -813,22 +519,22 @@ impl EngineRpc {
                 });
                 Ok(())
             }
-            MutateParams::RenameChat { chat_id, title } => self
+            Mutate::RenameChat { chat_id, title } => self
                 .workspace
                 .rename_chat(&chat_id, &title)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatBranch { chat_id, branch } => self
+            Mutate::SetChatBranch { chat_id, branch } => self
                 .workspace
                 .set_chat_branch(&chat_id, &branch)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatCwd { chat_id, cwd } => self
+            Mutate::SetChatCwd { chat_id, cwd } => self
                 .workspace
                 .set_chat_cwd(&chat_id, &cwd)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatActivity {
+            Mutate::SetChatActivity {
                 chat_id,
                 last_message_at,
                 created_at,
@@ -837,32 +543,37 @@ impl EngineRpc {
                 .set_chat_activity(&chat_id, last_message_at, created_at)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatHost { chat_id, device_id } => self
+            Mutate::SetChatHost { chat_id, device_id } => self
                 .workspace
                 .set_chat_host(&chat_id, &device_id)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatArchived { chat_id, archived } => self
+            Mutate::SetChatPinned { chat_id, pinned } => self
+                .workspace
+                .set_chat_pinned(&chat_id, pinned)
+                .map_err(failed)
+                .map(drop),
+            Mutate::SetChatArchived { chat_id, archived } => self
                 .workspace
                 .set_chat_archived(&chat_id, archived)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatConfig { chat_id, config } => self
+            Mutate::SetChatConfig { chat_id, config } => self
                 .workspace
                 .set_chat_config(&chat_id, &config)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::DeleteChat { chat_id } => {
+            Mutate::DeleteChat { chat_id } => {
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
                 Ok(())
             }
-            MutateParams::RenameDevice { device_id, name } => self
+            Mutate::RenameDevice { device_id, name } => self
                 .workspace
                 .rename_device(&device_id, &name)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::DeleteDevice { device_id } => {
+            Mutate::DeleteDevice { device_id } => {
                 let deleted = self.workspace.delete_device(&device_id).map_err(failed)?;
                 let sessions = self.sessions.clone();
                 let doc_host = self.doc_host.clone();
@@ -876,7 +587,7 @@ impl EngineRpc {
                 });
                 Ok(())
             }
-            MutateParams::MarkChatSeen { chat_id, at } => {
+            Mutate::MarkChatSeen { chat_id, at } => {
                 let at = at
                     .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
                     .unwrap_or_else(chrono::Utc::now);
@@ -887,129 +598,6 @@ impl EngineRpc {
             }
         }
     }
-}
-
-fn local_only(method: &str) -> bool {
-    matches!(
-        method,
-        methods::GET_REVIEW_DRAFT
-            | methods::PUT_REVIEW_DRAFT
-            | methods::DELETE_REVIEW_DRAFT
-            | methods::LIST_HARNESS_SECRETS
-            | methods::UPSERT_HARNESS_SECRET
-            | methods::DELETE_HARNESS_SECRET
-            | methods::WATCH_THEMES
-            | methods::LIST_THEMES
-            | methods::UPSERT_THEMES
-            | methods::DELETE_THEME
-    )
-}
-
-struct RelayRpc {
-    inner: std::sync::Arc<EngineRpc>,
-}
-
-#[async_trait]
-impl RpcService for RelayRpc {
-    async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
-        if local_only(method) {
-            return Err(RpcError::UnknownMethod(method.to_owned()));
-        }
-        self.inner.handle(method, params).await
-    }
-}
-
-pub(crate) fn relay_service(inner: std::sync::Arc<EngineRpc>) -> std::sync::Arc<dyn RpcService> {
-    std::sync::Arc::new(RelayRpc { inner })
-}
-
-/// ControlRpc methods that honor `targetDeviceId`. Extend this
-/// list (plus [`is_stream_method`] for streams) to make more of the surface
-/// device-addressable — the handlers themselves need no changes.
-pub(crate) fn theme_sync_method(method: &str) -> bool {
-    matches!(
-        method,
-        methods::WATCH_THEMES
-            | methods::LIST_THEMES
-            | methods::UPSERT_THEMES
-            | methods::DELETE_THEME
-    )
-}
-
-fn forwardable(method: &str) -> bool {
-    matches!(
-        method,
-        methods::LIST_HARNESSES
-            | methods::LIST_MODELS
-            | methods::LIST_COMMANDS
-            | methods::QUEUE_COMMAND
-            | methods::WATCH_TRANSCRIPT_V2
-            | methods::GET_TRANSCRIPT_PAGE
-            | methods::SEARCH_TRANSCRIPT
-            | methods::EXTRACT_QUESTIONS
-            | methods::WATCH_CHAT_USAGE
-            | methods::USAGE_BREAKDOWN
-            | methods::REGENERATE_CHAT_TITLE
-            // Repos/worktrees/folders are device-local filesystem state.
-            | methods::LIST_REPOS
-            | methods::ADD_REPO
-            | methods::CLONE_REPO
-            | methods::CREATE_REPO
-            | methods::LIST_BRANCHES
-            | methods::LIST_REFS
-            | methods::GET_CHECKOUT_REVIEW
-            | methods::SWITCH_REF
-            | methods::LIST_FOLDERS
-            | methods::SEARCH_FILES
-            | methods::CREATE_WORKTREE
-            | methods::DELETE_WORKTREE
-            | methods::VCS_SETTINGS
-            | methods::SET_VCS_BACKEND
-            // Checkout diffs are produced on the device holding the checkout.
-            | methods::WATCH_CHECKOUT_DIFF_V2
-            | methods::GET_CHECKOUT_DIFF_PAGE
-            | methods::GET_TURN_DIFF_PAGE
-            | methods::PIN_DIFF_DOCUMENT
-            | methods::RELEASE_DIFF_DOCUMENT
-            // Terminals live on the chat's host device.
-            | methods::OPEN_TERMINAL
-            | methods::SUBSCRIBE_TERMINAL_V2
-            | methods::WRITE_TERMINAL
-            | methods::RESIZE_TERMINAL
-            | methods::CLOSE_TERMINAL
-            // Agent accounts are per-device CLI logins (the device switcher
-            // retargets which device's logins are shown).
-            | methods::LIST_AGENT_ACCOUNTS
-            | methods::ACTIVATE_AGENT_ACCOUNT
-            | methods::FORGET_AGENT_ACCOUNT
-            | methods::START_AGENT_LOGIN
-            | methods::COMPLETE_AGENT_LOGIN
-            | methods::POLL_AGENT_LOGIN
-            | methods::CANCEL_AGENT_LOGIN
-            // Uploads/attachments target the chat's host device (the agent reads
-            // the committed file from that device's disk).
-            | methods::UPLOAD_CHUNK
-            | methods::UPLOAD_COMMIT
-            | methods::READ_ATTACHMENT_CHUNK
-            // Updates report/apply on the device whose binary they concern.
-            | methods::UPDATE_STATUS
-            | methods::APPLY_UPDATE
-    )
-}
-
-/// Forwardable methods whose reply is a stream (proxied item-by-item).
-fn is_stream_method(method: &str) -> bool {
-    matches!(
-        method,
-        methods::WATCH_TRANSCRIPT_V2
-            | methods::WATCH_CHAT_USAGE
-            | methods::WATCH_CHECKOUT_DIFF_V2
-            | methods::UPDATE_STATUS
-    )
-}
-
-fn is_binary_stream_method(method: &str) -> bool {
-    method == methods::SUBSCRIBE_TERMINAL_V2
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -1030,34 +618,210 @@ where
     .boxed()
 }
 
-/// The transcript watch as delta frames (`jolt_doc::transcript_delta`): a
+/// Active rows bootstrap once; subsequent frames contain only changed rows.
+/// The previous full registry view stays server-side so a slow subscriber may
+/// safely coalesce workspace watch updates without missing the resulting diff.
+fn chat_stream(rx: watch::Receiver<Vec<Chat>>) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold(
+        (rx, None::<HashMap<String, Chat>>),
+        |(mut rx, previous)| async move {
+            let mut previous = previous;
+            loop {
+                if previous.is_some() {
+                    rx.changed().await.ok()?;
+                }
+                let current: Vec<Chat> = rx.borrow_and_update().clone();
+                let current_by_id: HashMap<_, _> = current
+                    .iter()
+                    .cloned()
+                    .map(|chat| (chat.id.clone(), chat))
+                    .collect();
+                let frame = if let Some(old) = previous.replace(current_by_id.clone()) {
+                    let upserts: Vec<_> = current
+                        .into_iter()
+                        .filter(|chat| old.get(&chat.id) != Some(chat))
+                        .collect();
+                    let removed_ids: Vec<_> = old
+                        .keys()
+                        .filter(|id| !current_by_id.contains_key(*id))
+                        .cloned()
+                        .collect();
+                    if upserts.is_empty() && removed_ids.is_empty() {
+                        continue;
+                    }
+                    ChatWatchFrame::Delta {
+                        upserts,
+                        removed_ids,
+                    }
+                } else {
+                    ChatWatchFrame::Bootstrap {
+                        chats: current.into_iter().filter(|chat| !chat.archived).collect(),
+                    }
+                };
+                let value = serde_json::to_value(frame).ok()?;
+                return Some((value, (rx, previous)));
+            }
+        },
+    )
+    .boxed()
+}
+
+fn session_stream(rx: watch::Receiver<Vec<Session>>) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold(
+        (rx, None::<HashMap<String, Session>>),
+        |(mut rx, previous)| async move {
+            let mut previous = previous;
+            loop {
+                if previous.is_some() {
+                    rx.changed().await.ok()?;
+                }
+                let current: Vec<Session> = rx.borrow_and_update().clone();
+                let current_by_chat: HashMap<_, _> = current
+                    .iter()
+                    .cloned()
+                    .map(|session| (session.chat_id.clone(), session))
+                    .collect();
+                let frame = if let Some(old) = previous.replace(current_by_chat.clone()) {
+                    let upserts: Vec<_> = current
+                        .into_iter()
+                        .filter(|session| old.get(&session.chat_id) != Some(session))
+                        .collect();
+                    let removed_chat_ids: Vec<_> = old
+                        .keys()
+                        .filter(|id| !current_by_chat.contains_key(*id))
+                        .cloned()
+                        .collect();
+                    if upserts.is_empty() && removed_chat_ids.is_empty() {
+                        continue;
+                    }
+                    SessionWatchFrame::Delta {
+                        upserts,
+                        removed_chat_ids,
+                    }
+                } else {
+                    SessionWatchFrame::Bootstrap { sessions: current }
+                };
+                let value = serde_json::to_value(frame).ok()?;
+                return Some((value, (rx, previous)));
+            }
+        },
+    )
+    .boxed()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatCursor {
+    archived: bool,
+    pinned: bool,
+    activity_ms: i64,
+    id: String,
+}
+
+fn chat_activity_ms(chat: &Chat) -> i64 {
+    chat.last_message_at
+        .unwrap_or(chat.created_at)
+        .timestamp_millis()
+}
+
+fn chat_cursor(chat: &Chat) -> ChatCursor {
+    ChatCursor {
+        archived: chat.archived,
+        pinned: !chat.archived && chat.pinned,
+        activity_ms: chat_activity_ms(chat),
+        id: chat.id.clone(),
+    }
+}
+
+fn compare_chat_cursor(left: &ChatCursor, right: &ChatCursor) -> std::cmp::Ordering {
+    left.archived
+        .cmp(&right.archived)
+        .then_with(|| right.pinned.cmp(&left.pinned))
+        .then_with(|| right.activity_ms.cmp(&left.activity_ms))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn query_chats(chats: Vec<Chat>, request: &QueryChats) -> Result<ChatPage, RpcError> {
+    let query = request.query.trim().to_lowercase();
+    let mut chats: Vec<_> = chats
+        .into_iter()
+        .filter(|chat| match request.section {
+            ChatSection::Active => !chat.archived,
+            ChatSection::Archived => chat.archived,
+            ChatSection::Any => true,
+        })
+        .filter(|chat| {
+            request
+                .space_id
+                .as_deref()
+                .is_none_or(|space_id| chat.space_id.as_deref() == Some(space_id))
+        })
+        .filter(|chat| {
+            query.is_empty()
+                || chat
+                    .title
+                    .as_deref()
+                    .unwrap_or("New session")
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .collect();
+    chats.sort_by(|left, right| compare_chat_cursor(&chat_cursor(left), &chat_cursor(right)));
+    let total = chats.len();
+    let start = match request.cursor.as_deref() {
+        Some(cursor) => {
+            let cursor: ChatCursor = serde_json::from_str(cursor)
+                .map_err(|_| RpcError::BadParams("invalid chat cursor".into()))?;
+            chats
+                .iter()
+                .position(|chat| compare_chat_cursor(&chat_cursor(chat), &cursor).is_gt())
+                .unwrap_or(chats.len())
+        }
+        None => 0,
+    };
+    let limit = usize::from(if request.limit == 0 {
+        50
+    } else {
+        request.limit
+    })
+    .min(100);
+    let end = (start + limit).min(chats.len());
+    let page = chats[start..end].to_vec();
+    let next_cursor = (end < chats.len())
+        .then(|| page.last())
+        .flatten()
+        .and_then(|chat| serde_json::to_string(&chat_cursor(chat)).ok());
+    Ok(ChatPage {
+        chats: page,
+        next_cursor,
+        total,
+    })
+}
+
+/// The transcript watch as delta frames (`jolt_session_doc::transcript_delta`): a
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
 fn transcript_stream(
-    bootstrap: jolt_doc::TranscriptBootstrap,
-    rx: tokio::sync::broadcast::Receiver<jolt_doc::TranscriptWatchFrame>,
+    bootstrap: jolt_session_doc::TranscriptBootstrap,
+    rx: tokio::sync::broadcast::Receiver<jolt_session_doc::TranscriptWatchFrame>,
 ) -> BoxStream<'static, serde_json::Value> {
     futures::stream::unfold((Some(bootstrap), rx), |(opening, mut rx)| async move {
         if let Some(bootstrap) = opening {
-            let frame = jolt_doc::TranscriptWatchFrame::Bootstrap { bootstrap };
+            let frame = jolt_session_doc::TranscriptWatchFrame::Bootstrap { bootstrap };
             return serde_json::to_value(frame)
                 .ok()
                 .map(|value| (value, (None, rx)));
         }
-        loop {
-            match rx.recv().await {
-                Ok(frame) => {
-                    return serde_json::to_value(frame)
-                        .ok()
-                        .map(|value| (value, (None, rx)));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Ending forces the client to resubscribe for an atomic
-                    // bootstrap instead of applying deltas across a gap.
-                    return None;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        match rx.recv().await {
+            Ok(frame) => serde_json::to_value(frame)
+                .ok()
+                .map(|value| (value, (None, rx))),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // Ending forces the client to resubscribe for an atomic
+                // bootstrap instead of applying deltas across a gap.
+                None
             }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
         }
     })
     .boxed()
@@ -1187,8 +951,22 @@ impl RpcService for EngineRpc {
         }
         match method {
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::WATCH_HARNESS_UPDATES => Ok(RpcReply::Stream(watch_stream(
+                self.harness_updater()?.watch(),
+            ))),
+            methods::CHECK_HARNESS_UPDATES => {
+                self.harness_updater()?.check_now();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::APPLY_HARNESS_UPDATE => {
+                let p: ApplyHarnessUpdate = parse_params(params)?;
+                self.harness_updater()?
+                    .apply(p.harness)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::LIST_MODELS => {
-                let p: ListModelsParams = parse_params(params)?;
+                let p: ListModels = parse_params(params)?;
                 let harness = self
                     .registry
                     .resolve(p.harness)
@@ -1200,22 +978,33 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
-                let p: ListCommandsParams = parse_params(params)?;
+                let p: ListCommands = parse_params(params)?;
                 self.registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&jolt_commands())
             }
             methods::QUEUE_COMMAND => {
-                let p: QueueCommandParams = parse_params(params)?;
+                let p: QueueCommand = parse_params(params)?;
+                let restores_chat = matches!(
+                    &p.command,
+                    jolt_session_doc::SessionCommandPayload::Run { .. }
+                        | jolt_session_doc::SessionCommandPayload::Queue { .. }
+                        | jolt_session_doc::SessionCommandPayload::Steer { .. }
+                );
                 let command_id = self
                     .doc_host
                     .queue_command(&p.chat_id, p.command)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if restores_chat
+                    && let Err(error) = self.workspace.set_chat_archived(&p.chat_id, false)
+                {
+                    tracing::warn!(chat = %p.chat_id, %error, "sent archived chat could not be restored");
+                }
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
             methods::CANCEL_QUEUED_PROMPT => {
-                let p: CancelQueuedPromptParams = parse_params(params)?;
+                let p: CancelQueuedPrompt = parse_params(params)?;
                 let cancelled = self
                     .doc_host
                     .cancel_queued_prompt(&p.chat_id, &p.command_id)
@@ -1223,7 +1012,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "cancelled": cancelled }))
             }
             methods::WATCH_QUEUED_PROMPTS => {
-                let p: ChatParams = parse_params(params)?;
+                let p: WatchQueuedPrompts = parse_params(params)?;
                 let handle = self
                     .doc_host
                     .open(&p.chat_id)
@@ -1231,7 +1020,7 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(watch_stream(handle.watch_queue())))
             }
             methods::WATCH_TRANSCRIPT_V2 => {
-                let p: ChatParams = parse_params(params)?;
+                let p: WatchTranscript = parse_params(params)?;
                 let handle = self
                     .doc_host
                     .open(&p.chat_id)
@@ -1242,7 +1031,7 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(transcript_stream(bootstrap, rx)))
             }
             methods::GET_TRANSCRIPT_PAGE => {
-                let p: TranscriptPageParams = parse_params(params)?;
+                let p: GetTranscriptPage = parse_params(params)?;
                 let handle = self
                     .doc_host
                     .open(&p.chat_id)
@@ -1260,7 +1049,7 @@ impl RpcService for EngineRpc {
             }
             methods::SEARCH_TRANSCRIPT => {
                 const RESULT_LIMIT: usize = 100;
-                let p: SearchTranscriptParams = parse_params(params)?;
+                let p: SearchTranscript = parse_params(params)?;
                 let handle = self
                     .doc_host
                     .open(&p.chat_id)
@@ -1271,7 +1060,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&results)
             }
             methods::WATCH_CHAT_USAGE => {
-                let p: ChatParams = parse_params(params)?;
+                let p: WatchChatUsage = parse_params(params)?;
                 let usage = self
                     .sessions
                     .watch_usage(&p.chat_id)
@@ -1279,7 +1068,7 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(watch_stream(usage)))
             }
             methods::USAGE_BREAKDOWN => {
-                let p: UsageBreakdownParams = parse_params(params)?;
+                let p: UsageBreakdownRequest = parse_params(params)?;
                 if !matches!(p.days, 7 | 30 | 90) {
                     return Err(RpcError::BadParams("days must be 7, 30, or 90".into()));
                 }
@@ -1290,7 +1079,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&breakdown)
             }
             methods::EXTRACT_QUESTIONS => {
-                let p: ExtractQuestionsParams = parse_params(params)?;
+                let p: ExtractQuestions = parse_params(params)?;
                 let status = self.sessions.session_status(&p.chat_id);
                 if status.is_some_and(|session| {
                     matches!(
@@ -1412,8 +1201,14 @@ impl RpcService for EngineRpc {
                     "chats": chats,
                 }))
             }
-            methods::WATCH_CHATS => {
-                Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
+            methods::WATCH_CHATS => Ok(RpcReply::Stream(chat_stream(self.workspace.watch_chats()))),
+            methods::QUERY_CHATS => {
+                let request: QueryChats = parse_params(params)?;
+                let chats = self
+                    .workspace
+                    .read_chats()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&query_chats(chats, &request)?)
             }
             methods::WATCH_DEVICES => Ok(RpcReply::Stream(watch_stream(
                 self.workspace.watch_devices(),
@@ -1431,22 +1226,14 @@ impl RpcService for EngineRpc {
                     .map_err(|err| RpcError::Failed(err.to_string()))?,
             ),
             methods::UPSERT_THEMES => {
-                #[derive(Deserialize)]
-                struct Params {
-                    themes: Vec<jolt_proto::ThemeFileRecord>,
-                }
-                let params: Params = parse_params(params)?;
+                let params: UpsertThemes = parse_params(params)?;
                 self.workspace
                     .upsert_themes(&params.themes)
                     .map_err(|err| RpcError::Failed(err.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::DELETE_THEME => {
-                #[derive(Deserialize)]
-                struct Params {
-                    id: String,
-                }
-                let params: Params = parse_params(params)?;
+                let params: DeleteTheme = parse_params(params)?;
                 self.workspace
                     .delete_theme(&params.id)
                     .map_err(|err| RpcError::Failed(err.to_string()))?;
@@ -1457,7 +1244,7 @@ impl RpcService for EngineRpc {
                 let merged = self
                     .workspace
                     .merged_sessions_watch(self.sessions.watch_sessions());
-                Ok(RpcReply::Stream(watch_stream(merged)))
+                Ok(RpcReply::Stream(session_stream(merged)))
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
@@ -1472,12 +1259,12 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true, "version": version }))
             }
             methods::MUTATE => {
-                let p: MutateParams = parse_params(params)?;
+                let p: Mutate = parse_params(params)?;
                 self.mutate(p)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::REGENERATE_CHAT_TITLE => {
-                let p: ChatParams = parse_params(params)?;
+                let p: RegenerateChatTitle = parse_params(params)?;
                 self.sessions
                     .regenerate_title(&p.chat_id)
                     .await
@@ -1485,7 +1272,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::PIN_DIFF_DOCUMENT => {
-                let p: PinDiffParams = parse_params(params)?;
+                let p: PinDiffDocument = parse_params(params)?;
                 self.diff_sync
                     .pin_diff(&p.chat_id, &p.catalog_revision, &p.review_id)
                     .await
@@ -1493,7 +1280,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::RELEASE_DIFF_DOCUMENT => {
-                let p: ReleaseDiffParams = parse_params(params)?;
+                let p: ReleaseDiffDocument = parse_params(params)?;
                 self.diff_sync
                     .release_diff(&p.catalog_revision, &p.review_id)
                     .await
@@ -1501,7 +1288,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::GET_REVIEW_DRAFT => {
-                let p: ReviewKeyParams = parse_params(params)?;
+                let p: GetReviewDraft = parse_params(params)?;
                 let draft = self
                     .review_store
                     .get(&p.review_key)
@@ -1509,21 +1296,21 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&draft)
             }
             methods::PUT_REVIEW_DRAFT => {
-                let p: PutReviewDraftParams = parse_params(params)?;
+                let p: PutReviewDraft = parse_params(params)?;
                 self.review_store
                     .put(&p.draft)
                     .map_err(|error| RpcError::Failed(format!("review draft write: {error}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::DELETE_REVIEW_DRAFT => {
-                let p: ReviewKeyParams = parse_params(params)?;
+                let p: DeleteReviewDraft = parse_params(params)?;
                 self.review_store
                     .delete(&p.review_key)
                     .map_err(|error| RpcError::Failed(format!("review draft delete: {error}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFF_V2 => {
-                let p: ChatParams = parse_params(params)?;
+                let p: WatchCheckoutDiff = parse_params(params)?;
                 let (bootstrap, receiver) = self
                     .diff_sync
                     .watch_diff(&p.chat_id)
@@ -1532,7 +1319,7 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(diff_stream(bootstrap, receiver)))
             }
             methods::GET_CHECKOUT_DIFF_PAGE => {
-                let p: DiffPageParams = parse_params(params)?;
+                let p: GetCheckoutDiffPage = parse_params(params)?;
                 match self
                     .diff_sync
                     .diff_page(&p.chat_id, &p.catalog_revision, &p.page_id)
@@ -1546,7 +1333,7 @@ impl RpcService for EngineRpc {
                 }
             }
             methods::GET_TURN_DIFF_PAGE => {
-                let p: TurnDiffPageParams = parse_params(params)?;
+                let p: GetTurnDiffPage = parse_params(params)?;
                 match self
                     .sessions
                     .turn_diff_page(
@@ -1567,11 +1354,7 @@ impl RpcService for EngineRpc {
             }
             methods::VCS_SETTINGS => RpcReply::value(&self.repos.vcs_settings()),
             methods::SET_VCS_BACKEND => {
-                #[derive(Deserialize)]
-                struct P {
-                    backend: jolt_proto::VcsKind,
-                }
-                let p: P = parse_params(params)?;
+                let p: SetVcsBackend = parse_params(params)?;
                 let snapshot = self
                     .repos
                     .set_vcs(p.backend)
@@ -1631,7 +1414,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&branches)
             }
             methods::LIST_REFS => {
-                let p: RepoPathParams = parse_params(params)?;
+                let p: ListRefs = parse_params(params)?;
                 let refs = self
                     .repos
                     .refs(std::path::Path::new(&p.repo_path))
@@ -1640,7 +1423,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&refs)
             }
             methods::GET_CHECKOUT_REVIEW => {
-                let p: ChatParams = parse_params(params)?;
+                let p: GetCheckoutReview = parse_params(params)?;
                 let chat = self
                     .workspace
                     .chat(&p.chat_id)
@@ -1652,12 +1435,11 @@ impl RpcService for EngineRpc {
                 let cwd = chat
                     .cwd
                     .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
-                let review =
-                    crate::forge_reviews::detect(&self.repos, std::path::Path::new(&cwd)).await;
+                let review = jolt_vcs::detect_review(&self.repos, std::path::Path::new(&cwd)).await;
                 RpcReply::value(&review)
             }
             methods::SWITCH_REF => {
-                let p: SwitchRefParams = parse_params(params)?;
+                let p: SwitchRef = parse_params(params)?;
                 let branch = self
                     .repos
                     .switch_ref(std::path::Path::new(&p.repo_path), &p.ref_name)
@@ -1666,7 +1448,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "branch": branch }))
             }
             methods::LIST_FOLDERS => {
-                let p: ListFoldersParams = parse_params(params)?;
+                let p: ListFolders = parse_params(params)?;
                 let listing = self
                     .repos
                     .list_folders(p.path)
@@ -1675,7 +1457,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&listing)
             }
             methods::SEARCH_FILES => {
-                let p: FileSearchParams = parse_params(params)?;
+                let p: SearchFiles = parse_params(params)?;
                 if p.query.chars().count() > 256 {
                     return Err(RpcError::BadParams(
                         "SearchFiles query must not exceed 256 characters".into(),
@@ -1699,7 +1481,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&matches)
             }
             methods::CREATE_WORKTREE => {
-                let p: CreateWorktreeParams = parse_params(params)?;
+                let p: CreateWorktree = parse_params(params)?;
                 let worktree = self
                     .repos
                     .create_worktree(std::path::Path::new(&p.repo_path), &p.branch)
@@ -1719,7 +1501,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::OPEN_TERMINAL => {
-                let p: OpenTerminalParams = parse_params(params)?;
+                let p: OpenTerminal = parse_params(params)?;
                 // The terminal runs in the chat's checkout; a chat with no cwd (or
                 // no row yet) gets the home directory.
                 let cwd = self
@@ -1736,7 +1518,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&session)
             }
             methods::SUBSCRIBE_TERMINAL_V2 => {
-                let p: SubscribeTerminalParams = parse_params(params)?;
+                let p: SubscribeTerminal = parse_params(params)?;
                 let rx = self
                     .terminals
                     .subscribe_output(&p.terminal_id, p.after_seq)
@@ -1767,28 +1549,28 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::BinaryStream(stream.boxed()))
             }
             methods::WRITE_TERMINAL => {
-                let p: WriteTerminalParams = parse_params(params)?;
+                let p: WriteTerminal = parse_params(params)?;
                 self.terminals
                     .write(&p.terminal_id, &p.data)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::RESIZE_TERMINAL => {
-                let p: ResizeTerminalParams = parse_params(params)?;
+                let p: ResizeTerminal = parse_params(params)?;
                 self.terminals
                     .resize(&p.terminal_id, p.cols, p.rows)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::CLOSE_TERMINAL => {
-                let p: TerminalIdParams = parse_params(params)?;
+                let p: CloseTerminal = parse_params(params)?;
                 self.terminals
                     .close(&p.terminal_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::LIST_AGENT_ACCOUNTS => {
-                let p: ListAgentAccountsParams = parse_params(params)?;
+                let p: ListAgentAccounts = parse_params(params)?;
                 let snapshot = if p.usage_only {
                     self.agent_accounts
                         .usage_snapshot(p.force_usage.unwrap_or(false))
@@ -1802,7 +1584,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::ACTIVATE_AGENT_ACCOUNT => {
-                let p: AgentAccountParams = parse_params(params)?;
+                let p: ActivateAgentAccount = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
                     .activate(p.harness, &p.account_id)
@@ -1811,7 +1593,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::FORGET_AGENT_ACCOUNT => {
-                let p: AgentAccountParams = parse_params(params)?;
+                let p: ForgetAgentAccount = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
                     .forget(p.harness, &p.account_id)
@@ -1820,7 +1602,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::START_AGENT_LOGIN => {
-                let p: StartAgentLoginParams = parse_params(params)?;
+                let p: StartAgentLogin = parse_params(params)?;
                 let start = self
                     .agent_accounts
                     .start_login(p.harness)
@@ -1829,7 +1611,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&start)
             }
             methods::COMPLETE_AGENT_LOGIN => {
-                let p: CompleteAgentLoginParams = parse_params(params)?;
+                let p: CompleteAgentLogin = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
                     .complete_login(&p.login_id, &p.code)
@@ -1838,7 +1620,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::POLL_AGENT_LOGIN => {
-                let p: LoginIdParams = parse_params(params)?;
+                let p: PollAgentLogin = parse_params(params)?;
                 let poll = self
                     .agent_accounts
                     .poll_login(&p.login_id)
@@ -1847,13 +1629,16 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&poll)
             }
             methods::CANCEL_AGENT_LOGIN => {
-                let p: LoginIdParams = parse_params(params)?;
+                let p: CancelAgentLogin = parse_params(params)?;
                 self.agent_accounts.cancel_login(&p.login_id);
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::LIST_HARNESS_SECRETS => RpcReply::value(&self.secrets.snapshot().await),
+            methods::LIST_HARNESS_SECRETS => {
+                let _: ListHarnessSecrets = parse_params(params)?;
+                RpcReply::value(&self.secrets.snapshot().await)
+            }
             methods::UPSERT_HARNESS_SECRET => {
-                let p: UpsertHarnessSecretParams = parse_params(params)?;
+                let p: UpsertHarnessSecret = parse_params(params)?;
                 let snapshot = self
                     .secrets
                     .upsert(
@@ -1868,7 +1653,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::DELETE_HARNESS_SECRET => {
-                let p: DeleteHarnessSecretParams = parse_params(params)?;
+                let p: DeleteHarnessSecret = parse_params(params)?;
                 let snapshot = self
                     .secrets
                     .delete(&p.id)
@@ -1876,15 +1661,19 @@ impl RpcService for EngineRpc {
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&snapshot)
             }
+            methods::GET_TRANSPORT_CAPABILITIES => {
+                let _: GetTransportCapabilities = parse_params(params)?;
+                RpcReply::value(&jolt_api::TransportCapabilities { binary_unary: true })
+            }
             methods::UPLOAD_CHUNK => {
-                let p: UploadChunkParams = parse_params(params)?;
+                let p: UploadChunk = parse_params(params)?;
                 self.uploads
                     .append(&p.upload_id, &p.data, p.seq)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::UPLOAD_COMMIT => {
-                let p: UploadCommitParams = parse_params(params)?;
+                let p: UploadCommit = parse_params(params)?;
                 let committed = self
                     .uploads
                     .commit(&p.upload_id, &p.file_name, &p.chat_id)
@@ -1893,7 +1682,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&committed)
             }
             methods::READ_ATTACHMENT_CHUNK => {
-                let p: ReadAttachmentChunkParams = parse_params(params)?;
+                let p: ReadAttachmentChunk = parse_params(params)?;
                 // Path jail: the uploads dir plus every workspace-known chat cwd.
                 let roots: Vec<std::path::PathBuf> = self
                     .workspace
@@ -1912,17 +1701,194 @@ impl RpcService for EngineRpc {
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
     }
+
+    async fn handle_binary(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        payload: Bytes,
+    ) -> Result<RpcReply, RpcError> {
+        if forwardable(method)
+            && let Some(target) = params
+                .get("targetDeviceId")
+                .and_then(|value| value.as_str())
+            && target != self.doc_host.device_id()
+        {
+            let target = target.to_owned();
+            return self.forward_binary(&target, method, params, payload).await;
+        }
+        match method {
+            methods::UPLOAD_BINARY_CHUNK => {
+                let request: UploadBinaryChunk = parse_params(params)?;
+                self.uploads
+                    .append_bytes(&request.upload_id, &payload, request.seq)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            other => Err(RpcError::UnknownMethod(other.to_owned())),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn chat(id: &str, title: &str, archived: bool, minutes_ago: i64) -> Chat {
+        let created_at = chrono::Utc::now() - chrono::TimeDelta::minutes(minutes_ago);
+        Chat {
+            id: id.into(),
+            device_id: "device".into(),
+            title: Some(title.into()),
+            archived,
+            pinned: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: Some(created_at),
+            created_at,
+            harness_session_id: None,
+            harness_session_cwd: None,
+            harness_conversations: Vec::new(),
+            space_id: Some("space".into()),
+            last_seen_at: None,
+            goal: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_watch_bootstraps_active_rows_then_sends_only_changes() {
+        let active = chat("active", "Active", false, 1);
+        let archived = chat("archived", "Archived", true, 2);
+        let (tx, rx) = watch::channel(vec![active.clone(), archived.clone()]);
+        let mut stream = chat_stream(rx);
+        let opening: ChatWatchFrame = serde_json::from_value(stream.next().await.unwrap()).unwrap();
+        match opening {
+            ChatWatchFrame::Bootstrap { chats } => {
+                assert_eq!(
+                    chats
+                        .iter()
+                        .map(|chat| chat.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["active"]
+                );
+            }
+            ChatWatchFrame::Delta { .. } => panic!("expected bootstrap"),
+        }
+
+        let mut changed = archived;
+        changed.title = Some("Renamed".into());
+        tx.send_replace(vec![active, changed]);
+        let delta: ChatWatchFrame = serde_json::from_value(stream.next().await.unwrap()).unwrap();
+        match delta {
+            ChatWatchFrame::Delta {
+                upserts,
+                removed_ids,
+            } => {
+                assert_eq!(
+                    upserts
+                        .iter()
+                        .map(|chat| chat.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["archived"]
+                );
+                assert!(removed_ids.is_empty());
+            }
+            ChatWatchFrame::Bootstrap { .. } => panic!("expected delta"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_watch_sends_only_changed_status_rows() {
+        let now = chrono::Utc::now();
+        let idle = Session {
+            chat_id: "chat".into(),
+            device_id: "device".into(),
+            status: SessionStatus::Idle,
+            compacting: false,
+            started_at: None,
+            updated_at: now,
+        };
+        let (tx, rx) = watch::channel(vec![idle.clone()]);
+        let mut stream = session_stream(rx);
+        let opening: SessionWatchFrame =
+            serde_json::from_value(stream.next().await.unwrap()).unwrap();
+        assert!(matches!(opening, SessionWatchFrame::Bootstrap { .. }));
+
+        let mut working = idle;
+        working.status = SessionStatus::Working;
+        tx.send_replace(vec![working]);
+        let delta: SessionWatchFrame =
+            serde_json::from_value(stream.next().await.unwrap()).unwrap();
+        match delta {
+            SessionWatchFrame::Delta {
+                upserts,
+                removed_chat_ids,
+            } => {
+                assert_eq!(upserts.len(), 1);
+                assert_eq!(upserts[0].status, SessionStatus::Working);
+                assert!(removed_chat_ids.is_empty());
+            }
+            SessionWatchFrame::Bootstrap { .. } => panic!("expected delta"),
+        }
+    }
+
+    #[test]
+    fn chat_query_searches_active_and_archived_with_stable_pages() {
+        let chats = vec![
+            chat("active", "Navigation work", false, 1),
+            chat("new", "Navigation polish", true, 2),
+            chat("old", "Navigation history", true, 3),
+            chat("other", "Composer", true, 0),
+        ];
+        let first = query_chats(
+            chats.clone(),
+            &QueryChats {
+                section: ChatSection::Any,
+                query: "NAVIGATION".into(),
+                limit: 2,
+                ..QueryChats::default()
+            },
+        )
+        .expect("first page");
+        assert_eq!(first.total, 3);
+        assert_eq!(
+            first
+                .chats
+                .iter()
+                .map(|chat| chat.id.as_str())
+                .collect::<Vec<_>>(),
+            ["active", "new"]
+        );
+        let second = query_chats(
+            chats,
+            &QueryChats {
+                section: ChatSection::Any,
+                query: "navigation".into(),
+                cursor: first.next_cursor,
+                limit: 2,
+                ..QueryChats::default()
+            },
+        )
+        .expect("second page");
+        assert_eq!(
+            second
+                .chats
+                .iter()
+                .map(|chat| chat.id.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
+        assert!(second.next_cursor.is_none());
+    }
+
     /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional
     /// `targetDeviceId`); the extra fields must be tolerated, `accountId` wins.
     #[test]
     fn agent_account_params_accept_ui_shape() {
-        let p: AgentAccountParams = parse_params(serde_json::json!({
+        let p: ActivateAgentAccount = parse_params(serde_json::json!({
             "id": "acct-1",
             "accountId": "acct-1",
             "harness": "claude-code",
@@ -1945,6 +1911,8 @@ mod tests {
         assert!(forwardable(methods::GET_TURN_DIFF_PAGE));
         assert!(forwardable(methods::PIN_DIFF_DOCUMENT));
         assert!(forwardable(methods::SUBSCRIBE_TERMINAL_V2));
+        assert!(forwardable(methods::GET_TRANSPORT_CAPABILITIES));
+        assert!(forwardable(methods::UPLOAD_BINARY_CHUNK));
         assert!(is_binary_stream_method(methods::SUBSCRIBE_TERMINAL_V2));
         assert!(!forwardable(methods::GET_REVIEW_DRAFT));
         assert!(local_only(methods::GET_REVIEW_DRAFT));

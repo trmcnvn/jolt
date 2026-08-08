@@ -1,9 +1,9 @@
 // Device-room relay RPC client — dials a device's room on the edge as a
 // `client` peer and speaks ControlRpc to the HOST engine over a virtual
-// socket (crates/rpc/src/device_room.rs + edge/src/device-room.ts).
+// socket (crates/relay/src/lib.rs + edge/src/device-room.ts).
 //
 // Frame codec (binary WS messages): uleb128(headerLen) ‖ headerJSON ‖ payload.
-// Header key order MUST be {"s","k","to","from"} (byte parity with both
+// Header key order MUST be {"s","k","to","from","z"} (byte parity with both
 // implementations); clients never set `to`/`from` — the DO stamps `from`.
 // RPC payloads are ndjson ControlRpc frames: {id, method, params} out,
 // {id, ok|err|item|done} back. Relay control frames (kind " relay" — leading
@@ -118,10 +118,40 @@ actor DeviceRelayClient {
     /// commit 150s to outlast cross-device assembly.
     func call<Response: Decodable>(method: String, params: [String: Any],
                                    timeoutSeconds: UInt64 = 10) async throws -> Response {
+        try await callWithRetries(
+            method: method,
+            params: params,
+            binaryPayload: nil,
+            timeoutSeconds: timeoutSeconds
+        )
+    }
+
+    /// Unary call with bulk bytes carried outside JSON/base64.
+    func callBinary<Response: Decodable>(method: String, params: [String: Any],
+                                         payload: Data,
+                                         timeoutSeconds: UInt64 = 10) async throws -> Response {
+        try await callWithRetries(
+            method: method,
+            params: params,
+            binaryPayload: payload,
+            timeoutSeconds: timeoutSeconds
+        )
+    }
+
+    private func callWithRetries<Response: Decodable>(
+        method: String,
+        params: [String: Any],
+        binaryPayload: Data?,
+        timeoutSeconds: UInt64
+    ) async throws -> Response {
         for attempt in 0..<3 {
             do {
-                return try await callOnce(method: method, params: params,
-                                          timeoutSeconds: timeoutSeconds)
+                return try await callOnce(
+                    method: method,
+                    params: params,
+                    binaryPayload: binaryPayload,
+                    timeoutSeconds: timeoutSeconds
+                )
             } catch let error as RelayError {
                 guard attempt < 2 else { throw error }
                 switch error {
@@ -139,16 +169,31 @@ actor DeviceRelayClient {
     private func callOnce<Response: Decodable>(
         method: String,
         params: [String: Any],
+        binaryPayload: Data?,
         timeoutSeconds: UInt64 = 10
     ) async throws -> Response {
         try await connect()
         let id = nextId
         nextId += 1
-        // Always send a params object — the engine's serde rejects a missing
-        // field even when every param is optional (ListFolders home listing).
-        let frame: [String: Any] = ["id": id, "method": method, "params": params]
-        let payload = try JSONSerialization.data(withJSONObject: frame)
-        let data = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: payload)
+        let data: Data
+        if let binaryPayload {
+            let payload = try Self.encodeBinaryRequest(
+                id: id,
+                method: method,
+                params: params,
+                payload: binaryPayload
+            )
+            data = Self.encodeFrame(
+                header: #"{"s":"rpc-bin","k":"rpc-bin"}"#,
+                payload: payload
+            )
+        } else {
+            // Always send a params object — the engine's serde rejects a missing
+            // field even when every param is optional (ListFolders home listing).
+            let frame: [String: Any] = ["id": id, "method": method, "params": params]
+            let payload = try JSONSerialization.data(withJSONObject: frame)
+            data = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: payload)
+        }
 
         // Install the waiter before sending. URLSession's async send may yield
         // long enough for a fast host reply to reach handleInbound; registering
@@ -237,10 +282,50 @@ actor DeviceRelayClient {
     // MARK: Frame codec
 
     struct FrameHeader: Decodable {
-        var s: String?
-        var k: String?
+        var s: String
+        var k: String
         var to: String?
         var from: String?
+        var z: Bool?
+
+        var isValid: Bool {
+            (s.isEmpty ? k == " relay" : s.utf8.count <= 256) &&
+                !k.isEmpty && k.utf8.count <= 256 &&
+                (to.map { $0.utf8.count <= 256 } ?? true) &&
+                (from.map { $0.utf8.count <= 256 } ?? true)
+        }
+    }
+
+    private static func encodeBinaryRequest(
+        id: UInt64,
+        method: String,
+        params: [String: Any],
+        payload: Data
+    ) throws -> Data {
+        let methodBytes = Data(method.utf8)
+        let paramsBytes = try JSONSerialization.data(withJSONObject: params)
+        guard !methodBytes.isEmpty,
+              methodBytes.count <= 256,
+              paramsBytes.count <= 64 * 1024,
+              payload.count <= 1024 * 1024 else {
+            throw RelayError.rpc("Binary RPC request is too large")
+        }
+        var encoded = Data("JRPB".utf8)
+        encoded.append(contentsOf: [1, 2])
+        appendLittleEndian(id, to: &encoded)
+        appendLittleEndian(UInt16(methodBytes.count), to: &encoded)
+        appendLittleEndian(UInt32(paramsBytes.count), to: &encoded)
+        encoded.append(methodBytes)
+        encoded.append(paramsBytes)
+        encoded.append(payload)
+        return encoded
+    }
+
+    private static func appendLittleEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var value = value.littleEndian
+        Swift.withUnsafeBytes(of: &value) { bytes in
+            data.append(contentsOf: bytes)
+        }
     }
 
     static func encodeFrame(header: String, payload: Data) -> Data {
@@ -262,18 +347,26 @@ actor DeviceRelayClient {
         var offset = 0
         var length: UInt64 = 0
         var shift: UInt64 = 0
+        var complete = false
         let bytes = [UInt8](data)
         while offset < bytes.count {
             let byte = bytes[offset]
             offset += 1
             length |= UInt64(byte & 0x7f) << shift
-            if byte & 0x80 == 0 { break }
+            if byte & 0x80 == 0 {
+                complete = true
+                break
+            }
             shift += 7
             if shift > 28 { return nil }
         }
-        guard offset + Int(length) <= bytes.count else { return nil }
+        guard complete,
+              length <= 4 * 1024,
+              offset + Int(length) <= bytes.count,
+              bytes.count - offset - Int(length) <= 8 * 1024 * 1024 else { return nil }
         let headerData = Data(bytes[offset..<offset + Int(length)])
-        guard let header = try? JSONDecoder().decode(FrameHeader.self, from: headerData) else { return nil }
+        guard let header = try? JSONDecoder().decode(FrameHeader.self, from: headerData),
+              header.isValid else { return nil }
         let payload = Data(bytes[(offset + Int(length))...])
         return (header, payload)
     }

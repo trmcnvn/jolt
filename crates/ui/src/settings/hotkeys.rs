@@ -11,9 +11,7 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::settings::{
-    KeymapConfig, ShortcutId, combo_from_keystroke, display_combo, hotkeys_can_overlap,
-};
+use crate::settings::{KeymapConfig, ShortcutId, combo_from_keystroke, display_combo};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -47,7 +45,7 @@ pub enum HotkeysEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum HotkeyCategory {
     SessionActions,
-    TabSwitching,
+    SessionSwitching,
     NavigationLayout,
     AppWindow,
     Developer,
@@ -56,7 +54,7 @@ enum HotkeyCategory {
 impl HotkeyCategory {
     const ALL: [Self; 5] = [
         Self::SessionActions,
-        Self::TabSwitching,
+        Self::SessionSwitching,
         Self::NavigationLayout,
         Self::AppWindow,
         Self::Developer,
@@ -64,8 +62,8 @@ impl HotkeyCategory {
 
     fn label(self) -> &'static str {
         match self {
-            Self::SessionActions => "Session actions",
-            Self::TabSwitching => "Tab switching",
+            Self::SessionActions => "Thread actions",
+            Self::SessionSwitching => "Thread switching",
             Self::NavigationLayout => "Navigation & layout",
             Self::AppWindow => "App & window",
             Self::Developer => "Developer",
@@ -75,7 +73,7 @@ impl HotkeyCategory {
     fn index(self) -> usize {
         match self {
             Self::SessionActions => 0,
-            Self::TabSwitching => 1,
+            Self::SessionSwitching => 1,
             Self::NavigationLayout => 2,
             Self::AppWindow => 3,
             Self::Developer => 4,
@@ -86,23 +84,22 @@ impl HotkeyCategory {
         match id {
             ShortcutId::NewSession
             | ShortcutId::ClearInput
-            | ShortcutId::CloseTab
             | ShortcutId::PreviousTranscriptTurn
             | ShortcutId::NextTranscriptTurn
             | ShortcutId::SearchTranscript => Self::SessionActions,
-            ShortcutId::SelectTab1
-            | ShortcutId::SelectTab2
-            | ShortcutId::SelectTab3
-            | ShortcutId::SelectTab4
-            | ShortcutId::SelectTab5
-            | ShortcutId::SelectTab6
-            | ShortcutId::SelectTab7
-            | ShortcutId::SelectTab8
-            | ShortcutId::SelectLastTab => Self::TabSwitching,
+            ShortcutId::SelectSession1
+            | ShortcutId::SelectSession2
+            | ShortcutId::SelectSession3
+            | ShortcutId::SelectSession4
+            | ShortcutId::SelectSession5
+            | ShortcutId::SelectSession6
+            | ShortcutId::SelectSession7
+            | ShortcutId::SelectSession8
+            | ShortcutId::SelectSession9 => Self::SessionSwitching,
             ShortcutId::OpenSettings
             | ShortcutId::OpenSpacesDropdown
             | ShortcutId::AddSpace
-            | ShortcutId::SearchSessions
+            | ShortcutId::SearchThreads
             | ShortcutId::ToggleSidebar
             | ShortcutId::ToggleChanges
             | ShortcutId::ToggleTerminal
@@ -119,7 +116,7 @@ impl HotkeyCategory {
 }
 
 fn default_collapsed_categories() -> HashSet<HotkeyCategory> {
-    HashSet::from([HotkeyCategory::TabSwitching])
+    HashSet::from([HotkeyCategory::SessionSwitching])
 }
 
 pub struct HotkeysPage {
@@ -209,41 +206,40 @@ impl HotkeysPage {
 pub fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Option<ShortcutId> {
     ShortcutId::all()
         .into_iter()
-        .find(|&other| other != id && !hotkeys_can_overlap(id, other) && keymap.get(other) == combo)
+        .find(|&other| other != id && keymap.get(other) == combo)
 }
 
 /// One-line purpose copy per hotkey.
 fn description(id: ShortcutId) -> &'static str {
     match id {
-        ShortcutId::NewSession => "Open the new session page.",
+        ShortcutId::NewSession => "Open the new thread page.",
         ShortcutId::ClearInput => "Clear the current composer input.",
-        ShortcutId::CloseTab => "Close the current local tab without archiving its session.",
         ShortcutId::PreviousTranscriptTurn => "Scroll to the previous user prompt.",
         ShortcutId::NextTranscriptTurn => "Scroll to the next user prompt.",
         ShortcutId::SearchTranscript => "Find text in the current transcript.",
         ShortcutId::OpenSettings => "Open the settings page.",
         ShortcutId::OpenSpacesDropdown => "Open the sidebar space filter.",
         ShortcutId::AddSpace => "Open the folder browser to add a space.",
-        ShortcutId::SearchSessions => "Find a session by title.",
-        ShortcutId::ToggleSidebar => "Show or hide sessions and settings navigation.",
-        ShortcutId::ToggleChanges => "Show or hide changes for the current session.",
-        ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
+        ShortcutId::SearchThreads => "Find a thread by title.",
+        ShortcutId::ToggleSidebar => "Show or hide threads and settings navigation.",
+        ShortcutId::ToggleChanges => "Show or hide changes for the current thread.",
+        ShortcutId::ToggleTerminal => "Show or hide the terminal for the current thread.",
         ShortcutId::NewTerminalTab => "Open another tab in the focused terminal pane.",
         ShortcutId::CloseTerminalTab => "Close the active tab in the focused terminal pane.",
-        ShortcutId::SelectTab1
-        | ShortcutId::SelectTab2
-        | ShortcutId::SelectTab3
-        | ShortcutId::SelectTab4
-        | ShortcutId::SelectTab5
-        | ShortcutId::SelectTab6
-        | ShortcutId::SelectTab7
-        | ShortcutId::SelectTab8
-        | ShortcutId::SelectLastTab => "Select this open tab; Mod+9 always selects the last tab.",
+        ShortcutId::SelectSession1
+        | ShortcutId::SelectSession2
+        | ShortcutId::SelectSession3
+        | ShortcutId::SelectSession4
+        | ShortcutId::SelectSession5
+        | ShortcutId::SelectSession6
+        | ShortcutId::SelectSession7
+        | ShortcutId::SelectSession8
+        | ShortcutId::SelectSession9 => "Select this thread in the active sidebar order.",
         ShortcutId::Quit => "Quit Jolt.",
         ShortcutId::Hide => "Hide Jolt.",
         ShortcutId::HideOthers => "Hide every application except Jolt.",
         ShortcutId::Minimize => "Minimize the current window.",
-        ShortcutId::CloseWindow => "Close the current window while Settings is open.",
+        ShortcutId::CloseWindow => "Close the current window.",
         ShortcutId::PerformanceHud => "Show or hide developer performance metrics.",
     }
 }
@@ -525,15 +521,15 @@ mod tests {
             HotkeyCategory::SessionActions
         );
         assert_eq!(
-            HotkeyCategory::for_hotkey(ShortcutId::SelectLastTab),
-            HotkeyCategory::TabSwitching
+            HotkeyCategory::for_hotkey(ShortcutId::SelectSession9),
+            HotkeyCategory::SessionSwitching
         );
         assert_eq!(
             HotkeyCategory::for_hotkey(ShortcutId::ToggleTerminal),
             HotkeyCategory::NavigationLayout
         );
         assert_eq!(
-            HotkeyCategory::for_hotkey(ShortcutId::SearchSessions),
+            HotkeyCategory::for_hotkey(ShortcutId::SearchThreads),
             HotkeyCategory::NavigationLayout
         );
         assert_eq!(
@@ -550,7 +546,7 @@ mod tests {
         );
         assert_eq!(
             default_collapsed_categories(),
-            HashSet::from([HotkeyCategory::TabSwitching])
+            HashSet::from([HotkeyCategory::SessionSwitching])
         );
     }
 
@@ -612,16 +608,6 @@ mod tests {
         assert_eq!(
             conflict_owner(&keymap, ShortcutId::ToggleSidebar, "mod-,"),
             Some(ShortcutId::OpenSettings)
-        );
-        // Close Tab and Close Window deliberately share Cmd+W. Chat mode
-        // consumes it; Settings propagates to the native window action.
-        assert_eq!(
-            conflict_owner(
-                &keymap,
-                ShortcutId::CloseTab,
-                keymap.get(ShortcutId::CloseWindow)
-            ),
-            None
         );
     }
 }

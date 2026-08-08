@@ -1,11 +1,10 @@
-use jolt_doc::GoalOperation;
 use jolt_proto::{Goal, GoalPauseSource, GoalStatus};
+use jolt_session_doc::GoalOperation;
 
 use crate::{EngineError, new_id, now_ms};
 
 pub(crate) const MAX_OBJECTIVE_CHARS: usize = 4_000;
 const MAX_STATUS_CHARS: usize = 2_000;
-const MAX_BLOCKER_KEY_CHARS: usize = 200;
 
 pub(crate) enum AgentGoalAction {
     Update { summary: String },
@@ -183,23 +182,6 @@ pub(crate) fn apply_agent_action(
     goal.revision = goal.revision.saturating_add(1);
     goal.updated_at_ms = now;
     Ok(goal)
-}
-
-pub(crate) fn validate_blocker_key(value: &str) -> Result<String, EngineError> {
-    let key = value.trim();
-    if key.is_empty() {
-        return Err(EngineError::Other("blocker key must not be empty".into()));
-    }
-    if key.chars().count() > MAX_BLOCKER_KEY_CHARS {
-        return Err(EngineError::Other(format!(
-            "blocker key exceeds the {MAX_BLOCKER_KEY_CHARS} character limit"
-        )));
-    }
-    Ok(key.to_string())
-}
-
-pub(crate) fn validate_blocker_summary(value: &str) -> Result<String, EngineError> {
-    validate_status(value, "blocker summary")
 }
 
 fn require_active(goal: &Goal) -> Result<(), EngineError> {

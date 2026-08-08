@@ -21,16 +21,17 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use tokio::sync::{broadcast, watch};
 
-use jolt_doc::{
+use jolt_harness::{BashRequest, BashResult};
+use jolt_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
+use jolt_session_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
     GoalOperation, MessagePart, MessageRole, MessageStatus, QueuedPrompt, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
     TranscriptBootstrap, TranscriptCatalog, TranscriptPage, TranscriptWatchFrame,
     can_composer_cancel, evaluate_command, queued_prompts,
 };
-use jolt_harness::{BashRequest, BashResult};
-use jolt_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
-use jolt_sync::{DocsStore, RoomClient};
+use jolt_store::DocsStore;
+use jolt_sync::RoomClient;
 
 use crate::sessions::{SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
@@ -40,7 +41,7 @@ use crate::{EngineError, new_id, now_ms};
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 
 /// Warm-doc LRU: how many unwatched, run-less docs stay fully open. Everything
-/// beyond this (and beyond [`jolt_doc::DOC_LRU_BYTE_BUDGET`]) is evicted
+/// beyond this (and beyond [`jolt_session_doc::DOC_LRU_BYTE_BUDGET`]) is evicted
 /// oldest-access-first — reopening from the SQLite snapshot measured within
 /// ~11ms of a warm doc, so the cap trades no perceptible open latency.
 const WARM_DOC_CAP: usize = 12;
@@ -61,14 +62,14 @@ const EVICT_MIN_IDLE_MS: i64 = 30_000;
 /// Edge connection config. The bearer is a **provider**, never a snapshot:
 /// every room (re)connect and HTTP request re-reads it, so WorkOS access-token
 /// refreshes (~1h expiry) take effect without an engine restart. Dev bearers
-/// (which never expire) ride the same seam as a [`jolt_rpc::StaticToken`].
+/// (which never expire) ride the same seam as a [`jolt_relay::StaticToken`].
 #[derive(Clone)]
 pub struct EdgeConfig {
     /// Edge base URL (`http(s)://…`); rewritten to `ws(s)` for the room socket.
     pub url: String,
     /// Fresh-bearer provider (the relay's `TokenSource`), consulted per
     /// connect/request. `None` from the provider = signed out.
-    pub token: Arc<dyn jolt_rpc::TokenSource>,
+    pub token: Arc<dyn jolt_relay::TokenSource>,
     /// This engine's device id, carried on room dials (`&device=`) so the
     /// edge can attribute sockets in logs. Debugging the 2026-08-04 deaf
     /// socket meant reverse-engineering devices from rotating IPv6 privacy
@@ -86,7 +87,7 @@ impl std::fmt::Debug for EdgeConfig {
 }
 
 impl EdgeConfig {
-    pub fn new(url: impl Into<String>, token: Arc<dyn jolt_rpc::TokenSource>) -> Self {
+    pub fn new(url: impl Into<String>, token: Arc<dyn jolt_relay::TokenSource>) -> Self {
         Self {
             url: url.into(),
             token,
@@ -102,7 +103,7 @@ impl EdgeConfig {
 
     /// Fixed bearer — dev mode and tests, where tokens never expire.
     pub fn with_static_token(url: impl Into<String>, token: impl Into<String>) -> Self {
-        Self::new(url, Arc::new(jolt_rpc::StaticToken(token.into())))
+        Self::new(url, Arc::new(jolt_relay::StaticToken(token.into())))
     }
 
     /// The current bearer, refreshed by the provider if stale. `None` = signed out.
@@ -125,7 +126,7 @@ impl EdgeConfig {
 
 struct EdgeRoomUrl {
     base: String,
-    token: Arc<dyn jolt_rpc::TokenSource>,
+    token: Arc<dyn jolt_relay::TokenSource>,
     device_id: String,
 }
 
@@ -294,7 +295,7 @@ impl ChatDocHandle {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<jolt_doc::TranscriptSearchResult>, DocError> {
+    ) -> Result<Vec<jolt_session_doc::TranscriptSearchResult>, DocError> {
         self.touch();
         let mut projection = lock(&self.transcript_projection);
         if projection.is_none() {
@@ -354,7 +355,7 @@ impl ChatDocHandle {
             state.live_page = current;
             return;
         };
-        let frame = jolt_doc::diff_transcript(&previous.messages, &current.messages);
+        let frame = jolt_session_doc::diff_transcript(&previous.messages, &current.messages);
         if frame.is_empty_delta() {
             return;
         }
@@ -394,6 +395,40 @@ impl ChatDocHandle {
             parts: vec![MessagePart::Text {
                 id: "t0".into(),
                 text: text.to_string(),
+            }],
+            created_at,
+            device_id: self.device_id.clone(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+    }
+
+    /// Insert a durable harness-transition boundary immediately before the
+    /// user message that caused it. The derived id makes command retries
+    /// idempotent without hiding later switches back to the same harness.
+    pub fn write_harness_switch(
+        &self,
+        next_message_id: &str,
+        from: HarnessId,
+        to: HarnessId,
+        created_at: i64,
+    ) -> Result<(), DocError> {
+        let marker_id = format!("{next_message_id}#harness");
+        if self
+            .doc
+            .read_entries()?
+            .iter()
+            .any(|entry| entry.id == marker_id)
+        {
+            return Ok(());
+        }
+        self.doc.push_message(&SessionMessageEntry {
+            id: marker_id,
+            role: MessageRole::System,
+            parts: vec![MessagePart::HarnessSwitch {
+                id: "h0".into(),
+                from,
+                to,
             }],
             created_at,
             device_id: self.device_id.clone(),
@@ -588,7 +623,7 @@ impl DocHost {
             let chat = chat_id.to_string();
             let weak = Arc::downgrade(&handle);
             tokio::spawn(async move {
-                let mut wake = jolt_sync::wake::subscribe();
+                let mut wake = jolt_platform::wake::subscribe();
                 let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
                 loop {
                     if weak.upgrade().is_none() {
@@ -663,7 +698,7 @@ impl DocHost {
                         .sum::<usize>(),
                 )
             };
-            if count <= WARM_DOC_CAP && estimate <= jolt_doc::DOC_LRU_BYTE_BUDGET {
+            if count <= WARM_DOC_CAP && estimate <= jolt_session_doc::DOC_LRU_BYTE_BUDGET {
                 return;
             }
             let evicted = {
@@ -819,6 +854,15 @@ impl DocHost {
         tokio::spawn(async move { host.drain_commands(&handle).await });
     }
 
+    /// Re-evaluate every open command ledger after a device-level maintenance
+    /// fence is lifted. Commands were deliberately left pending, not rejected.
+    pub(crate) fn kick_all_commands(&self) {
+        let chat_ids: Vec<_> = lock(&self.inner.handles).keys().cloned().collect();
+        for chat_id in chat_ids {
+            self.kick_commands(&chat_id);
+        }
+    }
+
     fn nudge_remote_host(&self, chat_id: &str) {
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
@@ -887,6 +931,71 @@ impl DocHost {
             .unwrap_or(self.inner.config.default_harness)
     }
 
+    /// Harness selected by the request's command-plane snapshot, falling back
+    /// to the workspace row and then the engine default.
+    pub(crate) fn harness_for_request(
+        &self,
+        chat_id: &str,
+        request: &jolt_proto::RunRequest,
+    ) -> HarnessId {
+        request.harness.unwrap_or_else(|| self.harness_for(chat_id))
+    }
+
+    fn command_waits_for_harness_maintenance(
+        &self,
+        sessions: &SessionsEngine,
+        chat_id: &str,
+        payload: &SessionCommandPayload,
+    ) -> bool {
+        let harness = match payload {
+            SessionCommandPayload::Run { request, .. }
+            | SessionCommandPayload::HiddenPrompt { request }
+            | SessionCommandPayload::Queue { request, .. } => {
+                Some(self.harness_for_request(chat_id, request))
+            }
+            SessionCommandPayload::Bash { .. } | SessionCommandPayload::Steer { .. } => {
+                Some(self.harness_for(chat_id))
+            }
+            SessionCommandPayload::Goal {
+                operation:
+                    GoalOperation::Create { .. }
+                    | GoalOperation::Edit { .. }
+                    | GoalOperation::Resume { .. },
+            } => Some(self.harness_for(chat_id)),
+            SessionCommandPayload::ResumeQueue {}
+            | SessionCommandPayload::Interrupt {}
+            | SessionCommandPayload::RespondInput { .. }
+            | SessionCommandPayload::Goal { .. } => None,
+        };
+        harness.is_some_and(|harness| sessions.harness_in_maintenance(harness))
+    }
+
+    /// Record the config this request actually dispatches with when a racing
+    /// claim created a row before `createChat` reached the registry.
+    fn backfill_request_config(
+        &self,
+        chat_id: &str,
+        harness: HarnessId,
+        request: &jolt_proto::RunRequest,
+    ) {
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+        if workspace.chat_config(chat_id).is_some() {
+            return;
+        }
+        let config = jolt_proto::ChatConfig {
+            harness,
+            model: request.model.clone(),
+            reasoning: request.reasoning,
+            model_options: request.model_options.clone(),
+            sandbox: request.sandbox,
+        };
+        if let Err(error) = workspace.set_chat_config(chat_id, &config) {
+            tracing::warn!(chat = %chat_id, %error, "run-config backfill failed");
+        }
+    }
+
     /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
     /// execute → write the outcome as the sole outcome writer.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
@@ -914,6 +1023,11 @@ impl DocHost {
                     c.status == SessionCommandStatus::Pending
                         && !skipped.contains(&c.id)
                         && !is_processed(&c.id)
+                        && !self.command_waits_for_harness_maintenance(
+                            sessions,
+                            &handle.chat_id,
+                            &c.payload,
+                        )
                         && (!matches!(c.payload, SessionCommandPayload::Queue { .. })
                             || sessions.queued_turn_ready(&handle.chat_id))
                 })
@@ -1028,7 +1142,8 @@ impl DocHost {
                 if let Some(ws) = self.workspace() {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
                 }
-                let harness = self.harness_for(chat_id);
+                let harness = self.harness_for_request(chat_id, request);
+                self.backfill_request_config(chat_id, harness, request);
                 let context = if sessions.bash_context_is_native(harness)? {
                     None
                 } else {
@@ -1055,7 +1170,8 @@ impl DocHost {
                 if let Some(ws) = self.workspace() {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
                 }
-                let harness = self.harness_for(chat_id);
+                let harness = self.harness_for_request(chat_id, request);
+                self.backfill_request_config(chat_id, harness, request);
                 let context = if sessions.bash_context_is_native(harness)? {
                     None
                 } else {
@@ -1082,7 +1198,8 @@ impl DocHost {
                 if let Some(ws) = self.workspace() {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
                 }
-                let harness = self.harness_for(chat_id);
+                let harness = self.harness_for_request(chat_id, request);
+                self.backfill_request_config(chat_id, harness, request);
                 let context = if sessions.bash_context_is_native(harness)? {
                     None
                 } else {
@@ -1155,7 +1272,13 @@ impl DocHost {
                     bash_context_before(handle, &entry.id)?
                 };
                 match sessions
-                    .steer_with_context(chat_id, prompt, message_id.clone(), context.clone())
+                    .steer_with_context(
+                        chat_id,
+                        prompt,
+                        message_id.clone(),
+                        context.clone(),
+                        Some(harness),
+                    )
                     .await?
                 {
                     SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
@@ -1169,6 +1292,7 @@ impl DocHost {
                         // resume then reattaches the prior harness conversation.
                         let request = sessions
                             .last_request(chat_id)
+                            .filter(|request| self.harness_for_request(chat_id, request) == harness)
                             .or_else(|| self.request_from_chat_row(chat_id, prompt));
                         let Some(mut request) = request else {
                             return Ok((
@@ -1177,11 +1301,13 @@ impl DocHost {
                             ));
                         };
                         request.prompt = prompt.clone();
+                        request.harness = Some(harness);
                         request.resume = None; // dispatch re-derives the harness session
                         // A reused config must not re-inline the PREVIOUS
                         // turn's images; this steer's own refs (if any) already
                         // ride the prompt text.
                         request.attachments = Vec::new();
+                        let harness = self.harness_for_request(chat_id, &request);
                         sessions
                             .dispatch_with_context(
                                 chat_id,
@@ -1224,7 +1350,7 @@ impl DocHost {
                     request.prompt = "Begin or resume work toward the active Jolt goal now.".into();
                     request.resume = None;
                     request.attachments.clear();
-                    let harness = self.harness_for(chat_id);
+                    let harness = self.harness_for_request(chat_id, &request);
                     sessions
                         .dispatch_hidden_with_context(chat_id, harness, request, None)
                         .await?;
@@ -1290,7 +1416,7 @@ impl DocHost {
                     tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
                         "orphaned input resolve failed");
                 }
-                let harness = self.harness_for(chat_id);
+                let harness = self.harness_for_request(chat_id, &request);
                 let context = if sessions.bash_context_is_native(harness)? {
                     None
                 } else {
@@ -1328,6 +1454,7 @@ impl DocHost {
         let config = chat.config;
         Some(jolt_proto::RunRequest {
             prompt: prompt.to_string(),
+            harness: config.as_ref().map(|c| c.harness),
             model: config.as_ref().and_then(|c| c.model.clone()),
             reasoning: config.as_ref().and_then(|c| c.reasoning),
             model_options: config

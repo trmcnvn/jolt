@@ -14,16 +14,16 @@ The first releasable Android build must match the complete current iOS capabilit
 
 - Sign in to the existing WorkOS account and apply the zero/one/multiple-organization rule.
 - Register a persistent viewer device with `platform: "android"`, publish presence, show host online state, and explain queued offline runs.
-- Show attention-sorted sessions across all devices with a searchable space filter and filtered space deep links.
+- Show attention-sorted threads across all devices with a searchable space filter and filtered space deep links.
 - Add spaces by selecting a host and browsing its folders.
-- Start sessions on a selected host with live harness/model/reasoning discovery and Git/Jujutsu ref, reuse, or isolated-checkout planning.
-- Open cached sessions offline and stream tail-first transcript projections while foregrounded.
+- Start threads on a selected host with live harness/model/reasoning discovery and Git/Jujutsu ref, reuse, or isolated-checkout planning.
+- Open cached threads offline and stream tail-first transcript projections while foregrounded.
 - Render equivalent Markdown, code highlighting, grouped tools, errors, structured input, turn-change summaries, TeX, and Mermaid.
 - Send, queue, steer, interrupt, answer structured questions, and recover durable commands after process death.
 - Support `/answer`, `/bro`, `!command`, `!!command`, and verified `@` file/directory mentions.
 - Pick or paste images where Android supports it, upload them on the first or later turns, and read them back through R2 or host relay.
 - Change model, reasoning, and ref for later turns.
-- Archive, delete with confirmation, rename where iOS exposes it, copy, and use native context actions.
+- Close, delete with confirmation, rename where iOS exposes it, copy, and use native context actions.
 
 The app does not run harnesses, terminals, checkout or historical diff viewers, agent-account switching, secrets, or desktop settings locally. Android viewer rows must remain excluded from engine-host, space-owner, harness, VCS, usage-fan-out, and relay-host selectors.
 
@@ -114,7 +114,7 @@ apps/android/
     src/main/kotlin/dev/trmcnvn/jolt/android/
       app/                     # JoltApplication, AppContainer, lifecycle wiring
       auth/                    # sign-in route and session state
-      home/                    # sessions and searchable space filter
+      home/                    # threads and searchable space filter
       session/                 # transcript, composer, input requests
       newsession/              # host catalogs, refs, checkout plan
       spaces/                  # space list and remote folder browser
@@ -180,19 +180,19 @@ Keep the refresh token encrypted with an AES-GCM key generated in Android Keysto
 
 | Desktop | Android |
 | --- | --- |
-| Searchable sidebar and session list | Sessions-first home screen with searchable space filter |
-| Device-local tabs | Navigation stack on compact screens; list-detail on wide screens |
-| Global New Session canvas | Global New Session destination with space sheet/pane |
+| Searchable sidebar and thread list | Threads-first home screen with searchable space filter |
+| Sidebar thread selection and history | Navigation stack on compact screens; list-detail on wide screens |
+| Global New Thread canvas | Global New Thread destination with space sheet/pane |
 | Add-space palette | Host selector and remote folder browser |
 | Model/reasoning popovers | Modal bottom sheets |
 | Hover actions | Long-press context menus and explicit overflow actions |
-| Archive/Delete actions | Swipe actions with undo for archive and confirmation for delete |
+| Close/Delete actions | Swipe actions with undo for close and confirmation for delete |
 | Virtual transcript list | Compose `LazyColumn` with stable row keys and unloaded-page placeholders |
 | Turn diff viewer | Collapsed changed-files summary only |
 
 Reuse the Geist fonts and Jolt mark already shipped with iOS, subject to confirming their redistribution metadata. Use Jolt design tokens rather than default dynamic color; support light/dark only when the product palette defines both.
 
-The transcript renderer needs immutable row models and content fingerprints so streaming updates recompose only the mutable tail. Parse Markdown and highlight code on `Dispatchers.Default`, cache results by message/part revision, preserve the user's scroll anchor when an older page is inserted, and follow the tail only when already near the bottom.
+The transcript renderer needs immutable row models and content fingerprints. Keep buffered assistant text out of the row projection until a `textReveal` marker arrives, then parse and highlight the completed chunk on `Dispatchers.Default`; tools remain live. Cache results by message/part revision, preserve the user's scroll anchor when an older page is inserted, and follow the tail only when already near the bottom.
 
 Use the system Photo Picker and `content://` streams; request no broad media-storage permission. Sniff image bytes, transcode unsupported formats, enforce the existing count/size limits before retaining full buffers, and avoid decoding full-resolution images merely to show thumbnails.
 
@@ -246,10 +246,10 @@ Use API 26 and the current stable API in CI, plus at least one physical-device p
 ### 1. Read-only vertical slice
 
 - Sign in, organization setup, persistent Android viewer registration, and registry sync.
-- Sessions home, space filtering, presence, and cached offline reopen.
+- Threads home, space filtering, presence, and cached offline reopen.
 - Transcript bootstrap/live socket, historical page loading, basic Markdown/code/tool rendering.
 
-**Gate:** a production account can open the same long session on desktop, iOS, and Android with matching ordering and reconnect behavior.
+**Gate:** a production account can open the same long thread on desktop, iOS, and Android with matching ordering and reconnect behavior.
 
 ### 2. Durable control plane
 
@@ -259,16 +259,16 @@ Use API 26 and the current stable API in CI, plus at least one physical-device p
 
 **Gate:** killing the app at each enqueue/submission step causes neither command loss nor duplicate host execution.
 
-### 3. Session and space creation
+### 3. Thread and space creation
 
 - Device relay client and RPC catalogs.
 - Add-space folder browser.
-- New-session flow, harness/model/reasoning selection, refs, existing/isolated checkout plans, and file mentions.
+- New-thread flow, harness/model/reasoning selection, refs, existing/isolated checkout plans, and file mentions.
 
 ### 4. Attachments and interaction parity
 
 - System photo picker, bounded staging, chunked relay upload, R2-first readback, and cache eviction.
-- Archive/delete/rename, copy/context actions, syntax-language parity, accessibility, and wide-screen layout.
+- Close/delete/rename, copy/context actions, syntax-language parity, accessibility, and wide-screen layout.
 
 ### 5. Release hardening
 

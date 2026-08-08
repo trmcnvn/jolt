@@ -25,12 +25,15 @@ use gpui::{
     Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
+use jolt_api::{
+    CloseTerminal, OpenTerminal, ResizeTerminal, SubscribeTerminal, WriteTerminal,
+    call as call_api, subscribe_binary as subscribe_binary_api,
+};
+#[cfg(test)]
 use jolt_proto::TerminalSession;
-use jolt_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
-use crate::shell::CloseCurrentTab;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
@@ -113,18 +116,6 @@ pub fn active_after_reorder(active: usize, from: usize, to: usize) -> usize {
     }
 }
 
-/// Merge the `targetDeviceId` passthrough into RPC params (no-op for chats on
-/// the connected engine's own device).
-fn with_target(mut params: serde_json::Value, target: &Option<String>) -> serde_json::Value {
-    if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
-        object.insert(
-            "targetDeviceId".into(),
-            serde_json::Value::String(target.clone()),
-        );
-    }
-    params
-}
-
 /// Active index after closing `closed` (given the new, shorter length).
 pub fn active_after_close(active: usize, closed: usize, len_after: usize) -> usize {
     let shifted = if closed < active { active - 1 } else { active };
@@ -187,7 +178,7 @@ pub struct GridGeometry {
 enum PanelTerminalEvent {
     Data {
         seq: u64,
-        data: Vec<u8>,
+        data: bytes::Bytes,
     },
     Exit,
     ReplayGap {
@@ -196,7 +187,7 @@ enum PanelTerminalEvent {
     },
 }
 
-fn decode_terminal_event(bytes: &[u8]) -> Result<PanelTerminalEvent, String> {
+fn decode_terminal_event(bytes: bytes::Bytes) -> Result<PanelTerminalEvent, String> {
     jolt_rpc::terminal_wire::decode(bytes)
         .map(|event| match event {
             jolt_rpc::terminal_wire::TerminalBinaryEvent::Data { seq, data } => {
@@ -465,21 +456,17 @@ impl TerminalPanel {
                 })
                 .unwrap_or((80, 24));
 
-            let opened = engine
-                .client()
-                .call_as::<TerminalSession>(
-                    methods::OPEN_TERMINAL,
-                    with_target(
-                        serde_json::json!({
-                            "chatId": chat,
-                            "cols": cols,
-                            "rows": rows,
-                            "command": command,
-                        }),
-                        &target,
-                    ),
-                )
-                .await;
+            let opened = call_api(
+                engine.client(),
+                &OpenTerminal {
+                    chat_id: chat.clone(),
+                    cols,
+                    rows,
+                    command: (!command.is_empty()).then_some(command),
+                    target_device_id: target.clone(),
+                },
+            )
+            .await;
             let session = match opened {
                 Ok(session) => session,
                 Err(err) => {
@@ -511,16 +498,14 @@ impl TerminalPanel {
                 .unwrap_or(false);
             if !attached {
                 // Tab was closed before the open completed — release the PTY.
-                let _ = engine
-                    .client()
-                    .call(
-                        methods::CLOSE_TERMINAL,
-                        with_target(
-                            serde_json::json!({ "terminalId": terminal_id }),
-                            &target,
-                        ),
-                    )
-                    .await;
+                let _ = call_api(
+                    engine.client(),
+                    &CloseTerminal {
+                        terminal_id,
+                        target_device_id: target.clone(),
+                    },
+                )
+                .await;
                 return;
             }
 
@@ -533,14 +518,12 @@ impl TerminalPanel {
                 };
                 let Some(after_seq) = after_seq else { return }; // tab closed
 
-                let params = with_target(
-                    serde_json::json!({ "terminalId": terminal_id, "afterSeq": after_seq }),
-                    &target,
-                );
-                let mut rx = match engine
-                    .client()
-                    .subscribe_binary(methods::SUBSCRIBE_TERMINAL_V2, params)
-                    .await
+                let request = SubscribeTerminal {
+                    terminal_id: terminal_id.clone(),
+                    after_seq: Some(after_seq),
+                    target_device_id: target.clone(),
+                };
+                let mut rx = match subscribe_binary_api(engine.client(), &request).await
                 {
                     Ok(rx) => rx,
                     Err(err) => {
@@ -554,7 +537,7 @@ impl TerminalPanel {
                 };
 
                 while let Some(bytes) = rx.recv().await {
-                    let event = match decode_terminal_event(&bytes) {
+                    let event = match decode_terminal_event(bytes) {
                         Ok(event) => event,
                         Err(err) => {
                             tracing::warn!(%err, "terminal: malformed stream frame");
@@ -612,16 +595,15 @@ impl TerminalPanel {
                     let engine = engine.clone();
                     let data = encode_base64(&responses);
                     cx.spawn(async move |_, _| {
-                        let _ = engine
-                            .client()
-                            .call(
-                                methods::WRITE_TERMINAL,
-                                with_target(
-                                    serde_json::json!({ "terminalId": id, "data": data }),
-                                    &target,
-                                ),
-                            )
-                            .await;
+                        let _ = call_api(
+                            engine.client(),
+                            &WriteTerminal {
+                                terminal_id: id,
+                                data,
+                                target_device_id: target,
+                            },
+                        )
+                        .await;
                     })
                     .detach();
                 }
@@ -656,16 +638,14 @@ impl TerminalPanel {
                 if let Some(terminal_id) = terminal_id {
                     let engine = engine.clone();
                     cx.spawn(async move |_, _| {
-                        let _ = engine
-                            .client()
-                            .call(
-                                methods::CLOSE_TERMINAL,
-                                with_target(
-                                    serde_json::json!({ "terminalId": terminal_id }),
-                                    &target,
-                                ),
-                            )
-                            .await;
+                        let _ = call_api(
+                            engine.client(),
+                            &CloseTerminal {
+                                terminal_id,
+                                target_device_id: target,
+                            },
+                        )
+                        .await;
                     })
                     .detach();
                 }
@@ -737,16 +717,15 @@ impl TerminalPanel {
         };
         let data = encode_base64(&tab.coalescer.take());
         cx.spawn(async move |_, _| {
-            let _ = engine
-                .client()
-                .call(
-                    methods::WRITE_TERMINAL,
-                    with_target(
-                        serde_json::json!({ "terminalId": id, "data": data }),
-                        &target,
-                    ),
-                )
-                .await;
+            let _ = call_api(
+                engine.client(),
+                &WriteTerminal {
+                    terminal_id: id,
+                    data,
+                    target_device_id: target,
+                },
+            )
+            .await;
         })
         .detach();
     }
@@ -833,16 +812,19 @@ impl TerminalPanel {
                     return;
                 };
                 let Some(id) = stored_id.or(id) else { return };
-                let _ = engine
-                    .client()
-                    .call(
-                        methods::RESIZE_TERMINAL,
-                        with_target(
-                            serde_json::json!({ "terminalId": id, "cols": cols, "rows": rows }),
-                            &target,
-                        ),
-                    )
-                    .await;
+                let (Ok(cols), Ok(rows)) = (u16::try_from(cols), u16::try_from(rows)) else {
+                    return;
+                };
+                let _ = call_api(
+                    engine.client(),
+                    &ResizeTerminal {
+                        terminal_id: id,
+                        cols,
+                        rows,
+                        target_device_id: target,
+                    },
+                )
+                .await;
             }));
         }
         // Deliberately no cx.notify(): this runs during prepaint of the
@@ -1059,13 +1041,14 @@ impl TerminalPanel {
         }
         if let (Some(engine), Some(id)) = (engine, terminal_id) {
             cx.spawn(async move |_, _| {
-                let _ = engine
-                    .client()
-                    .call(
-                        methods::CLOSE_TERMINAL,
-                        with_target(serde_json::json!({ "terminalId": id }), &target),
-                    )
-                    .await;
+                let _ = call_api(
+                    engine.client(),
+                    &CloseTerminal {
+                        terminal_id: id,
+                        target_device_id: target,
+                    },
+                )
+                .await;
             })
             .detach();
         }
@@ -1396,9 +1379,6 @@ impl Render for TerminalPanel {
                         this.open_selected_tab(cx);
                     }))
                     .on_action(cx.listener(|this, _: &CloseTerminalTab, window, cx| {
-                        this.close_active_tab(window, cx);
-                    }))
-                    .on_action(cx.listener(|this, _: &CloseCurrentTab, window, cx| {
                         this.close_active_tab(window, cx);
                     }))
                     .on_key_down(cx.listener(Self::on_key_down))

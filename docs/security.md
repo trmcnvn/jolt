@@ -92,7 +92,9 @@ Jolt also caches encoded/decoded images locally for transcript rendering. Signin
 
 Detailed harness usage is written to `{identity_dir}/usage.sqlite` on the host device. It is not embedded in Loro messages or workspace rows.
 
-A viewport can request summaries from reachable devices and merge them for **Usage breakdown**. That RPC includes aggregate token, model, harness, cwd/space, call, session, and provider-reported cost data; it does not transfer the underlying event database.
+A viewport can request summaries from reachable devices and merge them for **Usage breakdown**. That RPC includes aggregate token, model, harness, cwd/space, call, session, and estimated API-equivalent cost data; it does not transfer the underlying event database.
+
+The engine refreshes LiteLLM's public pricing JSON through jsDelivr or raw GitHub and caches it under the device data directory. No usage records or model selections are sent with that request.
 
 Jolt's update checker contacts the configured edge release endpoint.
 

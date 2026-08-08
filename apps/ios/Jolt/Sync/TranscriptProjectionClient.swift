@@ -132,6 +132,8 @@ private struct WireMessagePart: Decodable {
     let questions: [UserInputQuestion]?
     let resolved: Bool?
     let message: String?
+    let from: String?
+    let to: String?
     let diff: TurnDiffSummary?
 }
 
@@ -149,6 +151,8 @@ private struct WireMessageEntry: Decodable {
             switch part.kind {
             case "text":
                 return .text(id: part.id, text: part.text ?? "")
+            case "textReveal":
+                return .textReveal(id: part.id)
             case "tool":
                 guard let call = part.call else { return nil }
                 let tag: String
@@ -164,6 +168,9 @@ private struct WireMessageEntry: Decodable {
                               questions: part.questions ?? [], resolved: part.resolved ?? false)
             case "error":
                 return .error(id: part.id, message: part.message ?? "")
+            case "harnessSwitch":
+                guard let from = part.from, let to = part.to else { return nil }
+                return .harnessSwitch(id: part.id, from: from, to: to)
             case "changes":
                 guard let diff = part.diff else { return nil }
                 return .changes(id: part.id, diff: diff)

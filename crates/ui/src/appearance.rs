@@ -541,7 +541,7 @@ pub fn apply(cx: &mut App) {
     // that keeps macOS vibrancy alive. gpui's macOS backend removes the
     // `NSVisualEffectView` from the window the moment the background appearance
     // is anything but `Blurred`, and nothing puts it back on its own — so a
-    // single missed re-apply leaves the sidebar and tab strip permanently
+    // single missed re-apply leaves the sidebar and titlebar permanently
     // opaque, which is exactly how the frost died. zed runs the same loop on
     // every settings change (`crates/zed/src/main.rs`).
     reapply_window_background(cx);
@@ -557,6 +557,7 @@ pub fn apply(cx: &mut App) {
 /// to a name there too would freeze the chrome across OS sunset switches
 /// until our own notification round-trip repainted it.
 #[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)] // objc 0.2 macros probe the legacy `cargo-clippy` feature
 fn sync_ns_appearance(mode: AppearanceMode) {
     use objc::runtime::Object;
     use objc::{class, msg_send, sel, sel_impl};

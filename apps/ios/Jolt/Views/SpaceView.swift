@@ -1,4 +1,4 @@
-// Space detail remains a filtered mobile deep link. Sessions use native
+// Space detail remains a filtered mobile deep link. Threads use native
 // navigation, explicit swipe actions, and "+" starts in this space.
 
 import SwiftUI
@@ -26,6 +26,8 @@ struct SpaceView: View {
             if chats.isEmpty {
                 emptyState
             }
+            let firstUnpinnedId = chats.firstIndex(where: { !$0.pinned })
+                .flatMap { $0 > 0 ? chats[$0].id : nil }
             ForEach(chats) { chat in
                 Button {
                     path.append(.chat(chat.id))
@@ -33,6 +35,14 @@ struct SpaceView: View {
                     ChatRow(chat: chat, showLocation: true)
                 }
                 .buttonStyle(PressWashButtonStyle())
+                .overlay(alignment: .top) {
+                    if chat.id == firstUnpinnedId {
+                        Rectangle()
+                            .fill(Theme.textFaint.opacity(0.35))
+                            .frame(height: 0.5)
+                            .allowsHitTesting(false)
+                    }
+                }
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
@@ -48,11 +58,19 @@ struct SpaceView: View {
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button {
+                        model.setPinned(chatId: chat.id, pinned: !chat.pinned)
+                    } label: {
+                        TablerLabel(chat.pinned ? "Unpin" : "Pin", icon: .pin)
+                    }
+                    .tint(Theme.textMuted)
+                    Button {
                         model.archive(chatId: chat.id)
                     } label: {
-                        TablerLabel("Archive", icon: .archive)
+                        TablerLabel("Close", icon: .messageCircleX)
                     }
                     .tint(Theme.surfaceRaised)
+                    .disabled(model.indicator(for: chat) == .working
+                              || model.indicator(for: chat) == .awaitingInput)
                 }
             }
         }
@@ -62,7 +80,7 @@ struct SpaceView: View {
         .scrollEdgeEffectStyle(.soft, for: .top)
         .background(Theme.surface.ignoresSafeArea())
         .confirmationDialog(
-            "Delete session?",
+            "Delete thread?",
             isPresented: deleteConfirmationPresented,
             titleVisibility: .visible,
             presenting: sessionToDelete
@@ -101,7 +119,7 @@ struct SpaceView: View {
                 } label: {
                     TablerIconView(.plus, size: 16)
                 }
-                .accessibilityLabel("New session")
+                .accessibilityLabel("New thread")
             }
         }
         .onAppear {
@@ -116,13 +134,13 @@ struct SpaceView: View {
         VStack(spacing: 14) {
             TablerIconView(.messages, size: 28)
                 .foregroundStyle(Theme.textFaint)
-            Text("No sessions in this space")
+            Text("No threads in this space")
                 .font(Theme.sans(13))
                 .foregroundStyle(Theme.textFaint)
             Button {
                 path.append(.newSession(spaceId: spaceId))
             } label: {
-                Text("Start a session")
+                Text("Start a thread")
                     .font(Theme.sans(13, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .padding(.horizontal, 16)

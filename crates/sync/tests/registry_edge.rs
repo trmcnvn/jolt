@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use jolt_doc::RegistryDoc;
 use jolt_proto::{Chat, Session, SessionStatus};
+use jolt_registry_model::RegistryDoc;
 use jolt_sync::RegistryClient;
 
 fn ts(ms: i64) -> DateTime<Utc> {
@@ -28,6 +28,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         device_id: device_id.into(),
         title: Some("live chat".into()),
         archived: false,
+        pinned: false,
         cwd: Some("/tmp".into()),
         branch: None,
         checkout_id: None,
@@ -37,6 +38,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         created_at: ts(2_000),
         harness_session_id: None,
         harness_session_cwd: None,
+        harness_conversations: Vec::new(),
         space_id: None,
         last_seen_at: None,
         goal: None,

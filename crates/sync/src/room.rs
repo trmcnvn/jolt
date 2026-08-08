@@ -54,7 +54,7 @@ const MAX_FRAGMENT_COUNT: u64 = 16 * 1024;
 const EPHEMERAL_TIMEOUT_MS: i64 = 30_000;
 /// Text `"ping"` keepalive interval — answered by the DO's hibernation-safe
 /// auto-response pair without waking it. 15s for the same reason as the
-/// device relay's (crates/rpc/src/device_room.rs): an idle-flow reaper on a
+/// device relay's (`crates/relay/src/lib.rs`): an idle-flow reaper on a
 /// laptop's uplink can fire inside a minute, and a 30s keepalive races it.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Silence lease (TRANSPORT level): every ping elicits an auto-pong, so a
@@ -611,7 +611,7 @@ impl RoomActor {
         // System wake is an EVENT: it ends the (half-open) session immediately
         // and cancels any pending backoff, so the room is redialing within a
         // second of the lid opening instead of waiting out a silence lease.
-        let mut wake = crate::wake::subscribe();
+        let mut wake = jolt_platform::wake::subscribe();
         loop {
             if *self.shutdown.borrow() {
                 return;

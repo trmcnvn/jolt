@@ -2,16 +2,13 @@
 //! transcript — one gpui [`Entity`] the whole shell renders from.
 //!
 //! ## EngineHandle
-//! The UI talks the same typed RPC whether the engine is in-process or a separate
-//! daemon (docs/architecture.md). [`EngineHandle::bootstrap`] dials the localhost IPC
-//! port: if an engine completes the WebSocket handshake it connects
-//! ([`RemoteEngine`]); otherwise it embeds one via [`EngineCore::assemble`] and an
-//! in-memory RPC transport ([`InProcessEngine`]) — same envelopes, same dispatch.
+//! The application composition root supplies an [`EngineConnector`] that either
+//! dials the localhost daemon or embeds an engine. The UI owns only the resulting
+//! [`EngineHandle`] and product RPC client.
 //!
 //! ## Async bridging
-//! `bootstrap` runs on tokio via `gpui_tokio::Tokio::spawn`. Once an [`RpcClient`]
-//! exists, its `call`/`subscribe` futures are runtime-agnostic (tokio channels),
-//! so subscription pumps run on gpui's own executor via `cx.spawn` and fold each
+//! Connector startup runs through `gpui_tokio::Tokio::spawn`. RPC futures are
+//! runtime-agnostic, so subscription pumps run on gpui's executor and fold each
 //! frame into the entity with `this.update(...)` + `cx.notify()`.
 //!
 //! Pure logic (sort order, staleness, gate phase) lives in free functions with
@@ -19,215 +16,35 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
-use serde::de::DeserializeOwned;
-
-use jolt_doc::{
+use jolt_api::{
+    ApplyUpdate, ChatWatchFrame, DeleteTheme, GetLocalDevice, GetTranscriptPage, ListThemes,
+    Mutate, ProbeSync, ScopeKind, ScopeStatus, SessionWatchFrame, StreamRequest, UpsertThemes,
+    WatchAuthStatus, WatchChatUsage, WatchChats, WatchDevices, WatchHarnessUpdates,
+    WatchQueuedPrompts, WatchScopeStatus, WatchSessions, WatchSpaces, WatchTranscript,
+    WatchUpdateStatus, call as call_api, subscribe as subscribe_api,
+};
+#[cfg(test)]
+use jolt_api::{ListHarnesses, SwitchScope};
+#[cfg(test)]
+use jolt_proto::HarnessId;
+use jolt_proto::{
+    AuthState, Chat, ChatIndicator, Device, HarnessUpdateStatus, Session, Space, ThemeFileRecord,
+    UsageSummary,
+};
+use jolt_session_doc::{
     QueuedPrompt, SessionMessageEntry, TranscriptDesync, TranscriptManifest, TranscriptPage,
     TranscriptWatchFrame,
 };
-use jolt_engine::{Engine, EngineConfig, EngineSupervisor, ScopeKind, ScopeStatus};
-use jolt_proto::{
-    AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space, ThemeFileRecord,
-    UsageSummary,
-};
-use jolt_rpc::{RpcClient, connect_ws, memory_client, methods};
 
-// ---------------------------------------------------------------------------
-// Engine handle
-// ---------------------------------------------------------------------------
+mod engine;
 
-/// Everything needed to reach (or start) an engine.
-#[derive(Debug, Clone)]
-pub struct EngineBootConfig {
-    /// Data directory for the embedded engine (`~/.jolt`).
-    pub data_dir: PathBuf,
-    /// Localhost IPC port to dial / serve.
-    pub ipc_port: u16,
-    /// Edge base URL for the embedded engine.
-    pub edge_url: String,
-    /// Development bearer for authenticated edge room joins. Update checks use
-    /// the public edge release endpoint even when this is `None`.
-    pub edge_token: Option<String>,
-    /// Workspace org override for explicit dev-mode runs.
-    pub org_id: Option<String>,
-    /// WorkOS client id for production authentication.
-    pub workos_client_id: Option<String>,
-    /// Harness for doc-command runs until per-chat config lands (M4).
-    pub default_harness: HarnessId,
-}
-
-/// How this UI reached its engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EngineMode {
-    /// Engine embedded in this process (in-memory RPC transport).
-    InProcess,
-    /// Connected to a separate daemon over localhost WebSocket.
-    Remote { url: String },
-}
-
-/// One of the two ways to own an engine connection. Both end at an [`RpcClient`]
-/// speaking the identical protocol — the trait only differs in provenance and
-/// teardown.
-#[async_trait]
-trait EngineBackend: Send + Sync {
-    fn client(&self) -> &RpcClient;
-    fn mode(&self) -> EngineMode;
-    /// Graceful teardown (drains runs / flushes docs for the in-process engine).
-    async fn shutdown(&self);
-}
-
-/// Embedded engine: owns the [`EngineCore`] and an in-memory RPC loop.
-struct InProcessEngine {
-    supervisor: Arc<EngineSupervisor>,
-    boot_task: tokio::task::JoinHandle<()>,
-    refresh_task: tokio::task::JoinHandle<()>,
-    /// Serves this engine to other viewports over the IPC port. `None` when the
-    /// port was already taken — the window still works over its own transport.
-    ipc_task: Option<tokio::task::JoinHandle<()>>,
-    client: RpcClient,
-}
-
-#[async_trait]
-impl EngineBackend for InProcessEngine {
-    fn client(&self) -> &RpcClient {
-        &self.client
-    }
-    fn mode(&self) -> EngineMode {
-        EngineMode::InProcess
-    }
-    async fn shutdown(&self) {
-        self.boot_task.abort();
-        // Stop accepting first: a viewport must not connect midway through the
-        // drain and queue work against stores that are closing.
-        if let Some(ipc) = &self.ipc_task {
-            ipc.abort();
-        }
-        self.supervisor.shutdown().await;
-        self.refresh_task.abort();
-    }
-}
-
-/// External daemon over `ws://127.0.0.1:{port}`.
-struct RemoteEngine {
-    client: RpcClient,
-    url: String,
-}
-
-#[async_trait]
-impl EngineBackend for RemoteEngine {
-    fn client(&self) -> &RpcClient {
-        &self.client
-    }
-    fn mode(&self) -> EngineMode {
-        EngineMode::Remote {
-            url: self.url.clone(),
-        }
-    }
-    async fn shutdown(&self) {
-        // The daemon outlives this viewport; nothing to tear down.
-    }
-}
-
-/// Cheaply clonable handle to whichever backend won bootstrap.
-#[derive(Clone)]
-pub struct EngineHandle {
-    inner: Arc<dyn EngineBackend>,
-}
-
-impl EngineHandle {
-    /// Dial the IPC port and connect (daemon listening) or embed (nothing there).
-    /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
-    /// tokio tasks.
-    pub async fn bootstrap(config: EngineBootConfig) -> anyhow::Result<EngineHandle> {
-        let url = format!("ws://127.0.0.1:{}", config.ipc_port);
-        // Dial WebSocket directly. A separate TCP probe is redundant and makes
-        // the engine log a protocol warning when the probe disconnects without
-        // completing a WebSocket handshake.
-        match connect_ws(&url).await {
-            Ok(client) => {
-                tracing::info!(%url, "connected to engine daemon");
-                return Ok(EngineHandle {
-                    inner: Arc::new(RemoteEngine { client, url }),
-                });
-            }
-            // Nothing is listening, or the process on the port is not a usable
-            // engine. Fall through and embed so it cannot hang this viewport.
-            Err(err) => tracing::debug!(%url, error = %err, "engine daemon unavailable"),
-        }
-
-        tracing::info!(data_dir = %config.data_dir.display(), "embedding engine");
-        let engine_config = EngineConfig {
-            data_dir: config.data_dir,
-            edge_url: config.edge_url,
-            edge_token: config.edge_token,
-            ipc_port: config.ipc_port,
-            default_harness: config.default_harness,
-            org_id: config.org_id,
-            workos_client_id: config.workos_client_id,
-        };
-        let auth = Engine::build_auth(&engine_config).await;
-        let refresh_task = auth.spawn_refresh_loop();
-        let supervisor = EngineSupervisor::new(engine_config.clone(), auth);
-        let client = memory_client(supervisor.clone());
-
-        // Serve the same service on the IPC port so a terminal viewport can
-        // attach to this window's engine with no setup. Deliberately the
-        // *deferred* service, not the assembled one: a viewport that connects
-        // before sign-in gets AuthRpc (so it can show its own gate) and its
-        // data subscriptions wait exactly as this window's do.
-        //
-        // Best-effort — losing the bind race with another engine costs other
-        // viewports, not this one.
-        let ipc_task =
-            match jolt_engine::serve_ipc(engine_config.ipc_port, supervisor.clone()).await {
-                Ok(task) => Some(task),
-                Err(err) => {
-                    tracing::warn!(
-                        port = engine_config.ipc_port,
-                        error = %err,
-                        "IPC port unavailable; other viewports cannot attach to this window"
-                    );
-                    None
-                }
-            };
-        let boot_task = supervisor.spawn_when_ready();
-        if let Err(error) = supervisor.wait_ready().await {
-            boot_task.abort();
-            if let Some(ipc_task) = &ipc_task {
-                ipc_task.abort();
-            }
-            refresh_task.abort();
-            return Err(error);
-        }
-        Ok(EngineHandle {
-            inner: Arc::new(InProcessEngine {
-                supervisor,
-                boot_task,
-                refresh_task,
-                ipc_task,
-                client,
-            }),
-        })
-    }
-
-    pub fn client(&self) -> &RpcClient {
-        self.inner.client()
-    }
-
-    pub fn mode(&self) -> EngineMode {
-        self.inner.mode()
-    }
-
-    pub async fn shutdown(&self) {
-        self.inner.shutdown().await;
-    }
-}
+pub use engine::{EngineBackend, EngineBootConfig, EngineConnector, EngineHandle, EngineMode};
 
 // ---------------------------------------------------------------------------
 // Pure state + reducers
@@ -240,7 +57,7 @@ impl EngineHandle {
 pub use jolt_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces,
 };
 
 // ---------------------------------------------------------------------------
@@ -255,6 +72,30 @@ pub const PENDING_SEND_TTL_MS: i64 = 30_000;
 struct PendingSend {
     message_id: String,
     started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RemoteJoltUpdateAction {
+    Applying {
+        target_version: String,
+    },
+    Verifying {
+        target_version: String,
+    },
+    Failed {
+        target_version: String,
+        message: String,
+    },
+}
+
+impl RemoteJoltUpdateAction {
+    pub fn target_version(&self) -> &str {
+        match self {
+            Self::Applying { target_version }
+            | Self::Verifying { target_version }
+            | Self::Failed { target_version, .. } => target_version,
+        }
+    }
 }
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
@@ -274,15 +115,13 @@ pub struct AppState {
     pub sessions: Vec<Session>,
     /// Live cumulative usage for the selected chat, streamed from its host.
     pub selected_usage: Option<UsageSummary>,
-    /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
-    /// when the row vanishes; selecting a chat implies its space.
+    /// The active space for session context and new-session defaults. Healed by
+    /// [`Self::apply_spaces`] when the row vanishes; selecting a chat implies
+    /// its space.
     pub selected_space: Option<String>,
     pub selected_chat: Option<String>,
-    /// Boot auto-select happened (or a manual selection superseded it).
-    pub auto_selected: bool,
-    /// Initial registry frames have landed. Device-local tab/filter state must
-    /// not reconcile against the empty pre-sync collections.
-    pub chats_synced: bool,
+    /// The initial spaces frame has landed. Device-local filter state must not
+    /// reconcile against the empty pre-sync collection.
     pub spaces_synced: bool,
     /// Loaded transcript window, flattened for composer derivations. Historical
     /// unloaded pages live as compact descriptors in `transcript_manifest`.
@@ -305,6 +144,15 @@ pub struct AppState {
     pub local_device_id: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<jolt_update::UpdateStatus>,
+    /// Jolt release status reported by remote engine-host devices.
+    pub remote_updates: HashMap<String, jolt_update::UpdateStatus>,
+    /// Explicit remote Jolt update actions and their reconnect/error state.
+    pub remote_update_actions: HashMap<String, RemoteJoltUpdateAction>,
+    /// Coding-harness release and apply states for this device.
+    pub harness_updates: Vec<HarnessUpdateStatus>,
+    /// Coding-harness states streamed from reachable engine-host devices.
+    pub remote_harness_updates: HashMap<String, Vec<HarnessUpdateStatus>>,
+    pub remote_harness_update_device_names: HashMap<String, String>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -313,6 +161,10 @@ pub struct AppState {
     watch_tasks: Vec<Task<()>>,
     /// Auth, update, and scope watches survive runtime switches.
     global_tasks: Vec<Task<()>>,
+    /// Device-targeted harness watches; dropping one cancels its retry loop.
+    remote_harness_update_tasks: HashMap<String, Task<()>>,
+    remote_update_tasks: HashMap<String, Task<()>>,
+    remote_update_action_tasks: HashMap<String, Task<()>>,
     transcript_task: Option<Task<()>>,
     queue_task: Option<Task<()>>,
     usage_task: Option<Task<()>>,
@@ -349,16 +201,22 @@ impl AppState {
             queued_prompts: Vec::new(),
             local_device_id: None,
             update: None,
+            remote_updates: HashMap::new(),
+            remote_update_actions: HashMap::new(),
+            harness_updates: Vec::new(),
+            remote_harness_updates: HashMap::new(),
+            remote_harness_update_device_names: HashMap::new(),
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
             global_tasks: Vec::new(),
+            remote_harness_update_tasks: HashMap::new(),
+            remote_update_tasks: HashMap::new(),
+            remote_update_action_tasks: HashMap::new(),
             transcript_task: None,
             queue_task: None,
             usage_task: None,
             theme_sync_task: None,
-            auto_selected: false,
-            chats_synced: false,
             spaces_synced: false,
         }
     }
@@ -368,7 +226,6 @@ impl AppState {
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
-        self.chats_synced = true;
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
         {
@@ -383,8 +240,75 @@ impl AppState {
         }
     }
 
+    pub fn apply_chat_watch_frame(&mut self, frame: ChatWatchFrame) {
+        match frame {
+            ChatWatchFrame::Bootstrap { chats } => {
+                let mut merged: Vec<_> = self
+                    .chats
+                    .iter()
+                    .filter(|chat| chat.archived)
+                    .cloned()
+                    .collect();
+                merged.extend(chats);
+                self.apply_chats(merged);
+            }
+            ChatWatchFrame::Delta {
+                upserts,
+                removed_ids,
+            } => {
+                let removed: HashSet<_> = removed_ids.into_iter().collect();
+                self.chats.retain(|chat| !removed.contains(&chat.id));
+                for chat in upserts {
+                    if let Some(existing) = self.chats.iter_mut().find(|row| row.id == chat.id) {
+                        *existing = chat;
+                    } else {
+                        self.chats.push(chat);
+                    }
+                }
+                let chats = std::mem::take(&mut self.chats);
+                self.apply_chats(chats);
+            }
+        }
+    }
+
+    pub fn merge_chat_page(&mut self, chats: Vec<Chat>) {
+        for chat in chats {
+            if let Some(existing) = self.chats.iter_mut().find(|row| row.id == chat.id) {
+                *existing = chat;
+            } else {
+                self.chats.push(chat);
+            }
+        }
+        sort_chats(&mut self.chats);
+    }
+
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
         self.sessions = sessions;
+    }
+
+    pub fn apply_session_watch_frame(&mut self, frame: SessionWatchFrame) {
+        match frame {
+            SessionWatchFrame::Bootstrap { sessions } => self.apply_sessions(sessions),
+            SessionWatchFrame::Delta {
+                upserts,
+                removed_chat_ids,
+            } => {
+                let removed: HashSet<_> = removed_chat_ids.into_iter().collect();
+                self.sessions
+                    .retain(|session| !removed.contains(&session.chat_id));
+                for session in upserts {
+                    if let Some(existing) = self
+                        .sessions
+                        .iter_mut()
+                        .find(|row| row.chat_id == session.chat_id)
+                    {
+                        *existing = session;
+                    } else {
+                        self.sessions.push(session);
+                    }
+                }
+            }
+        }
     }
 
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
@@ -419,11 +343,131 @@ impl AppState {
         self.devices = devices;
     }
 
+    fn reconcile_remote_harness_update_watches(&mut self, cx: &mut Context<Self>) {
+        if self.scope.as_ref().map(|scope| scope.active) != Some(ScopeKind::Account) {
+            return;
+        }
+        let (Some(handle), Some(local_device_id)) =
+            (self.engine.clone(), self.local_device_id.as_deref())
+        else {
+            return;
+        };
+        let desired: HashMap<String, String> = self
+            .devices
+            .iter()
+            .filter(|device| device.is_engine_host() && device.id != local_device_id)
+            .map(|device| (device.id.clone(), device.name.clone()))
+            .collect();
+        self.remote_harness_update_tasks
+            .retain(|device_id, _| desired.contains_key(device_id));
+        self.remote_update_tasks
+            .retain(|device_id, _| desired.contains_key(device_id));
+        self.remote_update_action_tasks
+            .retain(|device_id, _| desired.contains_key(device_id));
+        self.remote_harness_updates
+            .retain(|device_id, _| desired.contains_key(device_id));
+        self.remote_updates
+            .retain(|device_id, _| desired.contains_key(device_id));
+        self.remote_update_actions
+            .retain(|device_id, _| desired.contains_key(device_id));
+        self.remote_harness_update_device_names = desired.clone();
+        for device_id in desired.into_keys() {
+            self.remote_harness_update_tasks
+                .entry(device_id.clone())
+                .or_insert_with(|| {
+                    spawn_remote_harness_update_watch(cx, handle.clone(), device_id.clone())
+                });
+            self.remote_update_tasks
+                .entry(device_id.clone())
+                .or_insert_with(|| {
+                    spawn_remote_update_watch(cx, handle.clone(), device_id.clone())
+                });
+        }
+    }
+
     pub fn apply_update(&mut self, status: jolt_update::UpdateStatus) {
         self.update = Some(status);
     }
 
+    fn apply_remote_update(&mut self, device_id: String, status: jolt_update::UpdateStatus) {
+        if let Some(action) = self.remote_update_actions.get(&device_id)
+            && !jolt_update::version_newer(action.target_version(), &status.current_version)
+        {
+            self.remote_update_actions.remove(&device_id);
+            self.remote_update_action_tasks.remove(&device_id);
+        }
+        self.remote_updates.insert(device_id, status);
+    }
+
+    pub fn begin_remote_jolt_update(
+        &mut self,
+        device_id: String,
+        target_version: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .remote_update_actions
+            .get(&device_id)
+            .is_some_and(|action| !matches!(action, RemoteJoltUpdateAction::Failed { .. }))
+        {
+            return;
+        }
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        self.remote_update_actions.insert(
+            device_id.clone(),
+            RemoteJoltUpdateAction::Applying {
+                target_version: target_version.clone(),
+            },
+        );
+        let request = ApplyUpdate {
+            target_device_id: Some(device_id.clone()),
+        };
+        let task_device_id = device_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = call_api(handle.client(), &request).await;
+            this.update(cx, |state, cx| {
+                let already_updated = state.remote_updates.get(&device_id).is_some_and(|status| {
+                    !jolt_update::version_newer(&target_version, &status.current_version)
+                });
+                if already_updated {
+                    state.remote_update_actions.remove(&device_id);
+                } else {
+                    let action = match result {
+                        Ok(_)
+                        | Err(jolt_rpc::RpcError::Closed | jolt_rpc::RpcError::Transport(_)) => {
+                            RemoteJoltUpdateAction::Verifying { target_version }
+                        }
+                        Err(error) => RemoteJoltUpdateAction::Failed {
+                            target_version,
+                            message: error.to_string(),
+                        },
+                    };
+                    state.remote_update_actions.insert(device_id, action);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.remote_update_action_tasks.insert(task_device_id, task);
+        cx.notify();
+    }
+
+    pub fn apply_harness_updates(&mut self, statuses: Vec<HarnessUpdateStatus>) {
+        self.harness_updates = statuses;
+    }
+
     pub fn apply_auth(&mut self, auth: AuthState) {
+        if !matches!(&auth, AuthState::SignedIn { .. }) {
+            self.remote_harness_updates.clear();
+            self.remote_harness_update_device_names.clear();
+            self.remote_harness_update_tasks.clear();
+            self.remote_updates.clear();
+            self.remote_update_actions.clear();
+            self.remote_update_tasks.clear();
+            self.remote_update_action_tasks.clear();
+        }
         self.auth = Some(auth);
     }
 
@@ -527,7 +571,7 @@ impl AppState {
                         "live page {page_id} is not loaded"
                     )));
                 };
-                jolt_doc::apply_transcript_frame(&mut page.messages, frame)?;
+                jolt_session_doc::apply_transcript_frame(&mut page.messages, frame)?;
                 page.revision = page_revision.clone();
                 self.transcript_sequence = sequence;
                 if let Some(manifest) = self.transcript_manifest.as_mut()
@@ -566,13 +610,12 @@ impl AppState {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let mut result = handle
-                .client()
-                .call_as::<TranscriptPage>(
-                    methods::GET_TRANSCRIPT_PAGE,
-                    serde_json::json!({ "chatId": chat_id, "pageId": page_id }),
-                )
-                .await;
+            let request = GetTranscriptPage {
+                chat_id: chat_id.clone(),
+                page_id: page_id.clone(),
+                target_device_id: None,
+            };
+            let mut result = call_api(handle.client(), &request).await;
             for delay in [250u64, 1_000] {
                 if result.is_ok() {
                     break;
@@ -580,13 +623,7 @@ impl AppState {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(delay))
                     .await;
-                result = handle
-                    .client()
-                    .call_as::<TranscriptPage>(
-                        methods::GET_TRANSCRIPT_PAGE,
-                        serde_json::json!({ "chatId": chat_id, "pageId": page_id }),
-                    )
-                    .await;
+                result = call_api(handle.client(), &request).await;
             }
             this.update(cx, |state, cx| {
                 state.transcript_loading_pages.remove(&page_id);
@@ -751,15 +788,12 @@ impl AppState {
         self.space_row(chat.space_id.as_deref()?)
     }
 
-    /// Non-archived chats of a space in tab (creation) order. Chats with a
-    /// dangling/missing `space_id` are invisible by construction.
+    /// Non-archived chats of a space. Chats with a dangling/missing `space_id`
+    /// are invisible by construction.
     pub fn chats_in_space(&self, space_id: &str) -> Vec<&Chat> {
-        let mut chats: Vec<&Chat> = self
-            .visible_chats()
-            .filter(|c| c.space_id.as_deref() == Some(space_id))
-            .collect();
-        sort_tabs(&mut chats);
-        chats
+        self.visible_chats()
+            .filter(|chat| chat.space_id.as_deref() == Some(space_id))
+            .collect()
     }
 
     pub fn device_name(&self, device_id: &str) -> Option<&str> {
@@ -791,8 +825,9 @@ impl AppState {
         }
     }
 
-    /// Space provenance shared by filter rows, new-session chips, and tab
-    /// tooltips. Returns the rendered tag and whether the host is offline.
+    /// Space provenance shared by filter rows, session headers, and
+    /// new-session chips. Returns the rendered tag and whether the host is
+    /// offline.
     pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
         let offline =
             self.active_scope() != ScopeKind::Local && !self.device_online(&space.device_id, now);
@@ -813,8 +848,8 @@ impl AppState {
         self.selected_space_row().is_some_and(|s| s.git_detected)
     }
 
-    /// Full display status for a chat (tab dots, Active list). A pending send
-    /// reads as Working only while its host is reachable; offline sends remain
+    /// Full display status for a chat (session header and Active list). A
+    /// pending send reads as Working only while its host is reachable; offline sends remain
     /// queued without impersonating active work.
     pub fn display_status_for(&self, chat: &Chat, now: DateTime<Utc>) -> ChatIndicator {
         if self.queued_send_offline_host_name(&chat.id, now).is_none()
@@ -825,9 +860,9 @@ impl AppState {
         display_status(chat, self.session_for(&chat.id), now)
     }
 
-    /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
-    /// on any device — idle included — in pure recency order (status drives
-    /// the dot, never the position; see [`sort_active`]).
+    /// The sidebar's Threads list: every non-archived chat of a LIVE space,
+    /// on any device — idle included — pinned first, then in pure recency
+    /// order (status drives the dot, never the position; see [`sort_active`]).
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
@@ -882,14 +917,19 @@ impl AppState {
 
     /// Kick off (or retry) the engine bootstrap: dial → connect-or-embed on
     /// tokio, then attach subscriptions. Safe to call again after `Failed`.
-    pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
+    pub fn bootstrap(
+        state: Entity<AppState>,
+        config: EngineBootConfig,
+        connector: EngineConnector,
+        cx: &mut App,
+    ) {
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
             s.data_dir = Some(data_dir);
             cx.notify();
         });
-        let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
+        let boot = Tokio::spawn(cx, connector(config));
         cx.spawn(async move |cx| {
             let outcome = match boot.await {
                 Ok(Ok(handle)) => Ok(handle),
@@ -924,8 +964,14 @@ impl AppState {
             spawn_watch(
                 cx,
                 handle.clone(),
-                methods::UPDATE_STATUS,
+                WatchUpdateStatus::default(),
                 AppState::apply_update,
+            ),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                WatchHarnessUpdates::default(),
+                AppState::apply_harness_updates,
             ),
         ];
         // Re-subscribe selected-chat projections after reconnect.
@@ -964,27 +1010,15 @@ impl AppState {
         self.queue_task = None;
         self.usage_task = None;
         self.local_device_id = None;
-        self.chats_synced = false;
         self.spaces_synced = false;
-        self.auto_selected = false;
         self.watch_tasks = vec![
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::WATCH_SESSIONS,
-                AppState::apply_sessions,
-            ),
+            spawn_sessions_watch(cx, handle.clone()),
             spawn_chats_watch(cx, handle.clone()),
+            spawn_devices_watch(cx, handle.clone()),
             spawn_watch(
                 cx,
                 handle.clone(),
-                methods::WATCH_DEVICES,
-                AppState::apply_devices,
-            ),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::WATCH_SPACES,
+                WatchSpaces::default(),
                 AppState::apply_spaces,
             ),
             spawn_local_device_probe(cx, handle),
@@ -994,7 +1028,7 @@ impl AppState {
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
     /// dropping the old task drops its stream receiver, which cancels the doc
     /// watch server-side. Selecting a chat also lands in its space and marks it
-    /// seen (a global-list click must switch the tab strip too).
+    /// seen.
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
         if self.selected_chat == chat_id {
             // Re-selecting still clears a fresh "completed" badge.
@@ -1004,7 +1038,6 @@ impl AppState {
             return;
         }
         self.selected_chat = chat_id.clone();
-        self.auto_selected = true;
         self.clear_transcript_projection();
         self.transcript_task = None;
         self.queued_prompts.clear();
@@ -1058,8 +1091,7 @@ impl AppState {
             return;
         };
         cx.spawn(async move |_, _| {
-            let params = serde_json::json!({});
-            if let Err(err) = handle.client().call(methods::PROBE_SYNC, params).await {
+            if let Err(err) = call_api(handle.client(), &ProbeSync::default()).await {
                 tracing::debug!(error = %err, "probe sync failed");
             }
         })
@@ -1080,8 +1112,11 @@ impl AppState {
         };
         let chat_id = chat_id.to_string();
         cx.spawn(async move |_, _| {
-            let params = serde_json::json!({ "op": "markChatSeen", "chatId": chat_id });
-            if let Err(err) = handle.client().call(methods::MUTATE, params).await {
+            let request = Mutate::MarkChatSeen {
+                chat_id: chat_id.clone(),
+                at: None,
+            };
+            if let Err(err) = call_api(handle.client(), &request).await {
                 tracing::warn!(chat = %chat_id, error = %err, "markChatSeen failed");
             }
         })
@@ -1113,14 +1148,7 @@ fn spawn_theme_file_sync(
                 .iter()
                 .map(|record| (record.id.clone(), record.contents.clone()))
                 .collect();
-            let initial_remote = match handle
-                .client()
-                .call(methods::LIST_THEMES, serde_json::json!({}))
-                .await
-                .and_then(|value| {
-                    serde_json::from_value::<Vec<ThemeFileRecord>>(value)
-                        .map_err(|err| jolt_rpc::RpcError::Failed(err.to_string()))
-                }) {
+            let initial_remote = match call_api(handle.client(), &ListThemes::default()).await {
                 Ok(records) => records,
                 Err(err) => {
                     tracing::debug!(error = %err, "theme sync unavailable; retrying");
@@ -1139,13 +1167,13 @@ fn spawn_theme_file_sync(
             };
             let mut mutated = false;
             if !plan.upserts.is_empty() {
-                if let Err(err) = handle
-                    .client()
-                    .call(
-                        methods::UPSERT_THEMES,
-                        serde_json::json!({ "themes": &plan.upserts }),
-                    )
-                    .await
+                if let Err(err) = call_api(
+                    handle.client(),
+                    &UpsertThemes {
+                        themes: plan.upserts.clone(),
+                    },
+                )
+                .await
                 {
                     tracing::debug!(error = %err, "theme upload interrupted; retrying");
                     cx.background_executor().timer(INTERVAL).await;
@@ -1156,11 +1184,7 @@ fn spawn_theme_file_sync(
             }
             let mut deletion_failed = false;
             for id in &plan.deletes {
-                if let Err(err) = handle
-                    .client()
-                    .call(methods::DELETE_THEME, serde_json::json!({ "id": id }))
-                    .await
-                {
+                if let Err(err) = call_api(handle.client(), &DeleteTheme { id: id.clone() }).await {
                     tracing::debug!(error = %err, "theme deletion interrupted; retrying");
                     deletion_failed = true;
                     break;
@@ -1175,16 +1199,7 @@ fn spawn_theme_file_sync(
                 known = plan.project_onto(&initial_remote);
             }
             let remote = if mutated {
-                let Ok(value) = handle
-                    .client()
-                    .call(methods::LIST_THEMES, serde_json::json!({}))
-                    .await
-                else {
-                    cx.background_executor().timer(INTERVAL).await;
-                    continue;
-                };
-                let Ok(records) = serde_json::from_value(value) else {
-                    tracing::warn!("dropping malformed theme list response");
+                let Ok(records) = call_api(handle.client(), &ListThemes::default()).await else {
                     cx.background_executor().timer(INTERVAL).await;
                     continue;
                 };
@@ -1214,15 +1229,40 @@ fn spawn_theme_file_sync(
     })
 }
 
-/// Chats watch. Boot selection belongs to the shell because restored tabs are
-/// device-local state unavailable to AppState.
+fn spawn_sessions_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        let mut rx = match subscribe_api(handle.client(), &WatchSessions::default()).await {
+            Ok(rx) => rx,
+            Err(err) => {
+                tracing::debug!(error = %err, "sessions watch unavailable");
+                return;
+            }
+        };
+        while let Some(value) = rx.recv().await {
+            let frame: SessionWatchFrame = match serde_json::from_value(value) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    tracing::warn!(error = %err, "dropping malformed sessions frame");
+                    continue;
+                }
+            };
+            if this
+                .update(cx, |state, cx| {
+                    state.apply_session_watch_frame(frame);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+/// Chats watch. Session selection remains viewport-local in the shell.
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
-            .await
-        {
+        let mut rx = match subscribe_api(handle.client(), &WatchChats::default()).await {
             Ok(rx) => rx,
             Err(err) => {
                 tracing::debug!(error = %err, "chats watch unavailable");
@@ -1230,15 +1270,15 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
             }
         };
         while let Some(value) = rx.recv().await {
-            let parsed: Vec<Chat> = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
+            let frame: ChatWatchFrame = match serde_json::from_value(value) {
+                Ok(frame) => frame,
                 Err(err) => {
                     tracing::warn!(error = %err, "dropping malformed chats frame");
                     continue;
                 }
             };
             let alive = this.update(cx, |state, cx| {
-                state.apply_chats(parsed);
+                state.apply_chat_watch_frame(frame);
                 cx.notify();
             });
             if alive.is_err() {
@@ -1251,11 +1291,7 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
 /// Pump authentication state frames.
 fn spawn_auth_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
-            .await
-        {
+        let mut rx = match subscribe_api(handle.client(), &WatchAuthStatus::default()).await {
             Ok(rx) => rx,
             Err(err) => {
                 tracing::debug!(error = %err, "auth watch unavailable");
@@ -1282,11 +1318,7 @@ fn spawn_auth_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()
 
 fn spawn_scope_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::SCOPE_STATUS, serde_json::json!({}))
-            .await
-        {
+        let mut rx = match subscribe_api(handle.client(), &WatchScopeStatus::default()).await {
             Ok(rx) => rx,
             Err(err) => {
                 tracing::warn!(error = %err, "scope watch unavailable");
@@ -1338,29 +1370,28 @@ fn spawn_scope_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
     })
 }
 
-fn spawn_watch<T: DeserializeOwned + 'static>(
+fn spawn_watch<R>(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
-    method: &'static str,
-    apply: fn(&mut AppState, T),
-) -> Task<()> {
+    request: R,
+    apply: fn(&mut AppState, R::Item),
+) -> Task<()>
+where
+    R: StreamRequest + Send + 'static,
+{
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(method, serde_json::json!({}))
-            .await
-        {
+        let mut rx = match subscribe_api(handle.client(), &request).await {
             Ok(rx) => rx,
             Err(err) => {
-                tracing::debug!(method, error = %err, "watch unavailable");
+                tracing::debug!(method = R::METHOD, error = %err, "watch unavailable");
                 return;
             }
         };
         while let Some(value) = rx.recv().await {
-            let parsed: T = match serde_json::from_value(value) {
+            let parsed: R::Item = match serde_json::from_value(value) {
                 Ok(parsed) => parsed,
                 Err(err) => {
-                    tracing::warn!(method, error = %err, "dropping malformed watch frame");
+                    tracing::warn!(method = R::METHOD, error = %err, "dropping malformed watch frame");
                     continue;
                 }
             };
@@ -1375,30 +1406,150 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     })
 }
 
+fn spawn_devices_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        let request = WatchDevices::default();
+        let mut rx = match subscribe_api(handle.client(), &request).await {
+            Ok(rx) => rx,
+            Err(error) => {
+                tracing::debug!(%error, "devices watch unavailable");
+                return;
+            }
+        };
+        while let Some(value) = rx.recv().await {
+            let devices: Vec<Device> = match serde_json::from_value(value) {
+                Ok(devices) => devices,
+                Err(error) => {
+                    tracing::warn!(%error, "dropping malformed devices watch frame");
+                    continue;
+                }
+            };
+            if this
+                .update(cx, |state, cx| {
+                    state.apply_devices(devices);
+                    state.reconcile_remote_harness_update_watches(cx);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_remote_update_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    device_id: String,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+        loop {
+            let request = WatchUpdateStatus {
+                target_device_id: Some(device_id.clone()),
+            };
+            let mut rx = match subscribe_api(handle.client(), &request).await {
+                Ok(rx) => rx,
+                Err(error) => {
+                    tracing::debug!(%device_id, %error, "remote Jolt update watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let status: jolt_update::UpdateStatus = match serde_json::from_value(value) {
+                    Ok(status) => status,
+                    Err(error) => {
+                        tracing::warn!(%device_id, %error, "dropping malformed remote Jolt update frame");
+                        continue;
+                    }
+                };
+                if this
+                    .update(cx, |state, cx| {
+                        state.apply_remote_update(device_id.clone(), status);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
+fn spawn_remote_harness_update_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    device_id: String,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+        loop {
+            let request = WatchHarnessUpdates {
+                target_device_id: Some(device_id.clone()),
+            };
+            let mut rx = match subscribe_api(handle.client(), &request).await {
+                Ok(rx) => rx,
+                Err(error) => {
+                    tracing::debug!(%device_id, %error, "remote harness update watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let statuses: Vec<HarnessUpdateStatus> = match serde_json::from_value(value) {
+                    Ok(statuses) => statuses,
+                    Err(error) => {
+                        tracing::warn!(%device_id, %error, "dropping malformed remote harness update frame");
+                        continue;
+                    }
+                };
+                if this
+                    .update(cx, |state, cx| {
+                        state
+                            .remote_harness_updates
+                            .insert(device_id.clone(), statuses);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
 /// Best-effort `LocalDevice` probe: fills `local_device_id` for the "This
 /// device" badge. Engines that don't serve the method leave it `None`.
 fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let Ok(value) = handle
-            .client()
-            .call("LocalDevice", serde_json::json!({}))
-            .await
-        else {
+        let Ok(device) = call_api(handle.client(), &GetLocalDevice::default()).await else {
             tracing::debug!("LocalDevice unavailable; skipping this-device badge");
             return;
         };
-        let id = value
-            .get("id")
-            .or_else(|| value.get("deviceId"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        if let Some(id) = id {
-            this.update(cx, |state, cx| {
-                state.local_device_id = Some(id);
-                cx.notify();
-            })
-            .ok();
-        }
+        this.update(cx, |state, cx| {
+            state.local_device_id = Some(device.device_id);
+            state.reconcile_remote_harness_update_watches(cx);
+            cx.notify();
+        })
+        .ok();
     })
 }
 
@@ -1411,18 +1562,11 @@ fn spawn_usage_watch(
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         loop {
-            let mut params = serde_json::json!({ "chatId": chat_id });
-            if let (Some(target), Some(object)) = (&target_device_id, params.as_object_mut()) {
-                object.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(target.clone()),
-                );
-            }
-            let mut rx = match handle
-                .client()
-                .subscribe(methods::WATCH_CHAT_USAGE, params)
-                .await
-            {
+            let request = WatchChatUsage {
+                chat_id: chat_id.clone(),
+                target_device_id: target_device_id.clone(),
+            };
+            let mut rx = match subscribe_api(handle.client(), &request).await {
                 Ok(rx) => rx,
                 Err(error) => {
                     tracing::debug!(%chat_id, %error, "usage watch unavailable; retrying");
@@ -1466,12 +1610,10 @@ fn spawn_queue_watch(
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         loop {
-            let params = serde_json::json!({ "chatId": chat_id });
-            let mut rx = match handle
-                .client()
-                .subscribe(methods::WATCH_QUEUED_PROMPTS, params)
-                .await
-            {
+            let request = WatchQueuedPrompts {
+                chat_id: chat_id.clone(),
+            };
+            let mut rx = match subscribe_api(handle.client(), &request).await {
                 Ok(rx) => rx,
                 Err(error) => {
                     tracing::warn!(%chat_id, %error, "queue watch failed; retrying");
@@ -1523,12 +1665,10 @@ fn spawn_transcript_watch(
         // deselected or deleted, so retrying can't outlive relevance.
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
-            let params = serde_json::json!({ "chatId": chat_id });
-            let mut rx = match handle
-                .client()
-                .subscribe(methods::WATCH_TRANSCRIPT_V2, params)
-                .await
-            {
+            let request = WatchTranscript {
+                chat_id: chat_id.clone(),
+            };
+            let mut rx = match subscribe_api(handle.client(), &request).await {
                 Ok(rx) => rx,
                 Err(err) => {
                     tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
@@ -1612,12 +1752,10 @@ mod tests {
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
         // Same protocol over the in-memory transport: a real engine answers.
-        let harnesses = handle
-            .client()
-            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+        let harnesses = call_api(handle.client(), &ListHarnesses::default())
             .await
             .unwrap();
-        assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+        assert!(!harnesses.is_empty());
         handle.shutdown().await;
     }
 
@@ -1642,14 +1780,13 @@ mod tests {
         assert_eq!(handle.mode(), EngineMode::InProcess);
 
         // Attach the way an external viewport would, and speak the same protocol.
-        let attached = connect_ws(&format!("ws://127.0.0.1:{port}"))
+        let attached = jolt_rpc::connect_ws(&format!("ws://127.0.0.1:{port}"))
             .await
             .expect("a second viewport must be able to attach");
-        let harnesses = attached
-            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+        let harnesses = call_api(&attached, &ListHarnesses::default())
             .await
             .unwrap();
-        assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+        assert!(!harnesses.is_empty());
 
         // Shutting the window down stops accepting, so the next viewport
         // starts its own engine rather than talking to closing stores.
@@ -1685,9 +1822,7 @@ mod tests {
         .expect("a taken port must not fail the boot");
         assert_eq!(handle.mode(), EngineMode::InProcess);
         assert!(
-            handle
-                .client()
-                .call(methods::LIST_HARNESSES, serde_json::json!({}))
+            call_api(handle.client(), &ListHarnesses::default())
                 .await
                 .is_ok(),
             "the window still works over its own transport"
@@ -1711,9 +1846,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut auth = handle
-            .client()
-            .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
+        let mut auth = subscribe_api(handle.client(), &WatchAuthStatus::default())
             .await
             .unwrap();
         assert_eq!(
@@ -1722,24 +1855,19 @@ mod tests {
         );
         let harnesses = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            handle
-                .client()
-                .call(methods::LIST_HARNESSES, serde_json::json!({})),
+            call_api(handle.client(), &ListHarnesses::default()),
         )
         .await
         .expect("Local runtime assembled")
         .expect("Local runtime is available while signed out");
-        assert!(harnesses.as_array().is_some_and(|rows| !rows.is_empty()));
-        let scope: jolt_engine::ScopeStatus = serde_json::from_value(
-            handle
-                .client()
-                .call(
-                    methods::SWITCH_SCOPE,
-                    serde_json::json!({ "scope": "local" }),
-                )
-                .await
-                .unwrap(),
+        assert!(!harnesses.is_empty());
+        let scope = call_api(
+            handle.client(),
+            &SwitchScope {
+                scope: ScopeKind::Local,
+            },
         )
+        .await
         .unwrap();
         assert_eq!(scope.active, ScopeKind::Local);
         assert!(dir.path().join("scopes/local/current").exists());
@@ -1783,12 +1911,10 @@ mod tests {
                 url: format!("ws://127.0.0.1:{port}")
             }
         );
-        let harnesses = handle
-            .client()
-            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+        let harnesses = call_api(handle.client(), &ListHarnesses::default())
             .await
             .unwrap();
-        assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+        assert!(!harnesses.is_empty());
     }
 
     fn chat(id: &str, created_min: i64, last_msg_min: Option<i64>) -> Chat {
@@ -1800,6 +1926,7 @@ mod tests {
             device_id: "dev".into(),
             title: None,
             archived: false,
+            pinned: false,
             cwd: None,
             branch: None,
             checkout_id: None,
@@ -1809,6 +1936,7 @@ mod tests {
             created_at: base + TimeDelta::minutes(created_min),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_conversations: Vec::new(),
             space_id: None,
             last_seen_at: None,
             goal: None,
@@ -1818,7 +1946,7 @@ mod tests {
     fn user_entry(id: &str) -> SessionMessageEntry {
         SessionMessageEntry {
             id: id.into(),
-            role: jolt_doc::MessageRole::User,
+            role: jolt_session_doc::MessageRole::User,
             parts: Vec::new(),
             created_at: 0,
             device_id: "dev".into(),
@@ -1870,6 +1998,32 @@ mod tests {
         sort_chats(&mut chats);
         let order: Vec<&str> = chats.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(order, ["d", "c", "a", "b"]);
+    }
+
+    #[test]
+    fn chat_watch_merges_active_bootstrap_and_changed_rows() {
+        let mut state = AppState::new();
+        let mut archived = chat("archived", 0, Some(1));
+        archived.archived = true;
+        state.merge_chat_page(vec![archived]);
+        state.apply_chat_watch_frame(ChatWatchFrame::Bootstrap {
+            chats: vec![chat("active", 0, Some(2))],
+        });
+        assert_eq!(state.chats.len(), 2);
+
+        let mut restored = state
+            .chats
+            .iter()
+            .find(|chat| chat.id == "archived")
+            .unwrap()
+            .clone();
+        restored.archived = false;
+        state.apply_chat_watch_frame(ChatWatchFrame::Delta {
+            upserts: vec![restored],
+            removed_ids: vec!["active".into()],
+        });
+        assert_eq!(state.chats.len(), 1);
+        assert!(!state.chats[0].archived);
     }
 
     #[test]
@@ -1963,11 +2117,13 @@ mod tests {
     }
 
     #[test]
-    fn active_list_sorts_by_recency_only_status_never_moves_rows() {
+    fn active_list_sorts_pins_first_then_recency_status_never_moves_rows() {
         let a = chat("a", 0, Some(10)); // Completed (older)
         let b = chat("b", 0, Some(20)); // Completed (newer)
-        let c = chat("c", 0, Some(5)); // AwaitingInput
-        let d = chat("d", 0, Some(1)); // Working
+        let mut c = chat("c", 0, Some(5)); // AwaitingInput, pinned
+        c.pinned = true;
+        let mut d = chat("d", 0, Some(1)); // Working, pinned
+        d.pinned = true;
         let mut rows = vec![
             (ChatIndicator::Completed, &a),
             (ChatIndicator::Completed, &b),
@@ -1976,7 +2132,11 @@ mod tests {
         ];
         sort_active(&mut rows);
         let order: Vec<&str> = rows.iter().map(|(_, c)| c.id.as_str()).collect();
-        assert_eq!(order, ["b", "a", "c", "d"], "recency desc, status ignored");
+        assert_eq!(
+            order,
+            ["c", "d", "b", "a"],
+            "pins first, then recency desc; status ignored"
+        );
 
         // Opening a completed session (completed → seen → idle) must NOT
         // change its position (user report: rows jumped under the pointer).
@@ -1989,16 +2149,6 @@ mod tests {
         sort_active(&mut seen);
         let order_after: Vec<&str> = seen.iter().map(|(_, c)| c.id.as_str()).collect();
         assert_eq!(order, order_after);
-    }
-
-    #[test]
-    fn tabs_order_by_creation_not_activity() {
-        let a = chat("a", 5, Some(100)); // created later, very active
-        let b = chat("b", 1, Some(2));
-        let mut tabs = vec![&a, &b];
-        sort_tabs(&mut tabs);
-        let order: Vec<&str> = tabs.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(order, ["b", "a"]);
     }
 
     #[test]
@@ -2035,7 +2185,7 @@ mod tests {
     }
 
     #[test]
-    fn chats_in_space_filters_and_orders() {
+    fn chats_in_space_filters_visible_sessions() {
         let mut state = AppState::new();
         state.apply_spaces(vec![space("s1", "dev", "/a", 1)]);
         let mut in_space_new = chat("new", 5, None);
@@ -2078,6 +2228,31 @@ mod tests {
         state.selected_chat = Some("b".into());
         state.apply_chats(vec![chat("b", 1, None), chat("c", 2, None)]);
         assert_eq!(state.selected_chat.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn remote_jolt_update_clears_after_the_target_version_reconnects() {
+        let mut state = AppState::new();
+        state.remote_update_actions.insert(
+            "device-2".into(),
+            RemoteJoltUpdateAction::Verifying {
+                target_version: "0.2.0".into(),
+            },
+        );
+        state.apply_remote_update(
+            "device-2".into(),
+            jolt_update::UpdateStatus {
+                current_version: "0.2.0".into(),
+                latest_version: Some("0.2.0".into()),
+                update_available: false,
+                can_apply: true,
+                checked_at: Some(1),
+                error: None,
+            },
+        );
+
+        assert!(!state.remote_update_actions.contains_key("device-2"));
+        assert_eq!(state.remote_updates["device-2"].current_version, "0.2.0");
     }
 
     #[test]
@@ -2220,7 +2395,7 @@ mod tests {
         state.selected_chat = Some("c1".into());
         let echo = SessionMessageEntry {
             id: "m1".into(),
-            role: jolt_doc::MessageRole::User,
+            role: jolt_session_doc::MessageRole::User,
             parts: vec![],
             created_at: 0,
             device_id: "local".into(),

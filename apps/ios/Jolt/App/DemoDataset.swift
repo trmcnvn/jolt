@@ -63,7 +63,7 @@ final class DemoDataset {
                  lastMessageAt: now - 900_000, createdAt: now - 86_400_000,
                  spaceId: jolt.id, lastSeenAt: now - 3_600_000),
             Chat(id: "chat-deploy", deviceId: "dev-vps", title: "Wrangler deploy hygiene",
-                 archived: false, cwd: edge.path, branch: nil, checkoutId: nil,
+                 archived: false, pinned: true, cwd: edge.path, branch: nil, checkoutId: nil,
                  config: claude, lastMessagePreview: "Hibernation-safe flush timer",
                  lastMessageAt: now - 86_400_000, createdAt: now - 86_400_000 * 2,
                  spaceId: edge.id, lastSeenAt: now - 86_400_000),

@@ -130,7 +130,7 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
 fn lease_name(review_id: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(review_id.as_bytes());
-    format!("{}-lease", crate::repos::hex(&hash.finalize()))
+    format!("{}-lease", jolt_vcs::hex(&hash.finalize()))
 }
 
 fn is_digest(value: &str) -> bool {

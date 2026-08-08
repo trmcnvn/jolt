@@ -359,21 +359,52 @@ pub fn modal(
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
 ) -> AnyElement {
+    modal_with_scrim(id, viewport, card, |scrim| scrim.into_any_element())
+}
+
+/// Full-window modal that dismisses when its background scrim is clicked.
+/// Clicks inside the card do not reach the scrim.
+pub fn dismissible_modal(
+    id: impl Into<SharedString>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    on_dismiss: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let id = id.into();
+    let card_id = format!("{id}-card");
+    let scrim_id = format!("{id}-scrim");
+    let card = div()
+        .id(card_id)
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .child(card)
+        .into_any_element();
+    modal_with_scrim(id, viewport, card, |scrim| {
+        scrim.id(scrim_id).on_click(on_dismiss).into_any_element()
+    })
+}
+
+fn modal_with_scrim(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    decorate_scrim: impl FnOnce(gpui::Div) -> AnyElement,
+) -> AnyElement {
     let card = crate::frost::frosted(12.0, 16.0, card).into_any_element();
+    let scrim = decorate_scrim(
+        div()
+            .occlude()
+            .w(viewport.width)
+            .h(viewport.height)
+            .bg(scrim_alpha(0.6))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(motion::dialog_in(id, div().child(card))),
+    );
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
-            .child(
-                div()
-                    .occlude()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .bg(scrim_alpha(0.6))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(motion::dialog_in(id, div().child(card))),
-            ),
+            .child(scrim),
     )
     .priority(2)
     .into_any_element()

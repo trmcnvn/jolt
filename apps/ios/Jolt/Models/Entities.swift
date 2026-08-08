@@ -70,6 +70,7 @@ struct Chat: Identifiable, Hashable {
     var deviceId: String
     var title: String?
     var archived: Bool
+    var pinned: Bool = false
     var cwd: String?
     var branch: String?
     var checkoutId: String?
@@ -83,7 +84,7 @@ struct Chat: Identifiable, Hashable {
 
     var displayTitle: String {
         if let title, !title.isEmpty { return title }
-        return "New session"
+        return "New thread"
     }
 
     /// entities.rs:123 — unseen when a message arrived after the last seen mark.
@@ -146,8 +147,9 @@ func chatIndicator(chat: Chat, live: SessionStatus?) -> ChatIndicator {
     }
 }
 
-/// The Sessions list order: PURE RECENCY, id tiebreak — a port of state.rs
-/// `sort_active`. Status drives the dot, never the position.
+/// The Threads list order: pinned first, then pure recency with an id
+/// tiebreak — a port of state.rs `sort_active`. Status drives the dot, never
+/// the position.
 ///
 /// This used to bucket by attention first, which is what the desktop did
 /// before 55e1845: opening a completed session marks it seen (completed →
@@ -155,6 +157,7 @@ func chatIndicator(chat: Chat, live: SessionStatus?) -> ChatIndicator {
 /// dots carry urgency instead, so the order never moves on its own.
 func sortActive(_ chats: [Chat]) -> [Chat] {
     chats.sorted { a, b in
+        if a.pinned != b.pinned { return a.pinned }
         let ta = a.lastMessageAt ?? a.createdAt, tb = b.lastMessageAt ?? b.createdAt
         if ta != tb { return ta > tb }
         return a.id < b.id
@@ -216,15 +219,19 @@ struct TurnDiffSummary: Codable, Hashable {
 
 enum MessagePart: Hashable, Identifiable {
     case text(id: String, text: String)
+    /// Reveals all preceding buffered text at a stable presentation boundary.
+    case textReveal(id: String)
     case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool)
     case input(id: String, requestId: String, questions: [UserInputQuestion], resolved: Bool)
     case error(id: String, message: String)
+    case harnessSwitch(id: String, from: String, to: String)
     case changes(id: String, diff: TurnDiffSummary)
 
     var id: String {
         switch self {
-        case .text(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _),
-             .error(let id, _), .changes(let id, _):
+        case .text(let id, _), .textReveal(let id), .tool(let id, _, _, _),
+             .input(let id, _, _, _), .error(let id, _), .harnessSwitch(let id, _, _),
+             .changes(let id, _):
             return id
         }
     }
@@ -314,6 +321,8 @@ let commandDefaultTtlMs: Int64 = 86_400_000
 /// kebab-case ("claude-code").
 struct RunRequest: Codable {
     var prompt: String
+    /// Harness picked at send time, independent of workspace-row sync.
+    var harness: String?
     var model: String?
     var reasoning: String?
     var modelOptions: [String: JSONValue] = [:]

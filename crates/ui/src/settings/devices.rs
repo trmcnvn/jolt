@@ -9,11 +9,11 @@ use gpui::{
 };
 use std::time::Duration;
 
-use jolt_rpc::methods;
+use jolt_api::{Mutate, call as call_api};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
-use crate::state::AppState;
+use crate::state::{AppState, RemoteJoltUpdateAction};
 use crate::theme::Theme;
 
 /// A device that pinged within this window shows a presence dot (engines
@@ -26,7 +26,7 @@ pub fn device_online(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bo
         .is_some_and(|at| now.signed_duration_since(at).num_seconds() <= DEVICE_ONLINE_WINDOW_SECS)
 }
 
-fn device_row_online(
+pub(super) fn device_row_online(
     device_id: &str,
     local_device_id: Option<&str>,
     last_seen: Option<DateTime<Utc>>,
@@ -121,13 +121,12 @@ impl DevicesPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = serde_json::json!({
-            "op": "renameDevice",
-            "deviceId": dialog.device_id,
-            "name": name,
-        });
+        let request = Mutate::RenameDevice {
+            device_id: dialog.device_id,
+            name,
+        };
         self.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::MUTATE, params).await;
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |page, cx| {
                 if let Err(err) = result {
                     page.error = Some(format!("Rename failed: {err}").into());
@@ -146,12 +145,9 @@ impl DevicesPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = serde_json::json!({
-            "op": "deleteDevice",
-            "deviceId": device_id,
-        });
+        let request = Mutate::DeleteDevice { device_id };
         self.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::MUTATE, params).await;
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |page, cx| {
                 if let Err(err) = result {
                     page.error = Some(format!("Remove failed: {err}").into());
@@ -187,6 +183,16 @@ impl DevicesPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    pub(crate) fn dismiss_modal(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_open = self.rename.is_some() || self.delete_confirm.is_some();
+        if was_open {
+            self.rename = None;
+            self.delete_confirm = None;
+            cx.notify();
+        }
+        was_open
     }
 
     fn render_rename_dialog(
@@ -260,9 +266,9 @@ impl DevicesPage {
             if spaces.len() == 1 { "space" } else { "spaces" },
             session_count,
             if session_count == 1 {
-                "session"
+                "thread"
             } else {
-                "sessions"
+                "threads"
             },
         );
         let card = popover::dialog_card(&theme)
@@ -350,9 +356,14 @@ impl Render for DevicesPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
-        let (devices, local_id) = {
+        let (devices, local_id, remote_updates, remote_update_actions) = {
             let state = self.state.read(cx);
-            (state.devices.clone(), state.local_device_id.clone())
+            (
+                state.devices.clone(),
+                state.local_device_id.clone(),
+                state.remote_updates.clone(),
+                state.remote_update_actions.clone(),
+            )
         };
         let copied = self.copied.clone();
         let rename_dialog = self.render_rename_dialog(window.viewport_size(), cx);
@@ -382,7 +393,7 @@ impl Render for DevicesPage {
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.7))
                                     .child(SharedString::from(
-                                        "Run Jolt’s engine in the background and start it when you sign in, so agents and remote sessions continue after you quit Jolt. Changing this setting restarts the app.",
+                                        "Run Jolt’s engine in the background and start it when you sign in, so agents and remote threads continue after you quit Jolt. Changing this setting restarts the app.",
                                     )),
                             ),
                     )
@@ -402,6 +413,9 @@ impl Render for DevicesPage {
                 let rename_id = device.id.clone();
                 let rename_name = device.name.clone();
                 let delete_id = device.id.clone();
+                let remote_update = remote_updates.get(&device.id).cloned();
+                let remote_update_action = remote_update_actions.get(&device.id).cloned();
+                let update_state = self.state.clone();
                 let platform_icon = match device.platform.as_str() {
                     "macos" | "darwin" => crate::icons::DEVICE_LAPTOP,
                     "web" => crate::icons::WORLD,
@@ -492,6 +506,131 @@ impl Render for DevicesPage {
                         .into_any_element(),
                 );
 
+                let (update_action, update_detail): (Option<AnyElement>, Option<SharedString>) =
+                    if is_local {
+                        (None, None)
+                    } else if let Some(action) = remote_update_action {
+                        match action {
+                            RemoteJoltUpdateAction::Applying { target_version } => (
+                                Some(widgets::badge_active(&theme, "Updating…").into_any_element()),
+                                Some(
+                                    format!(
+                                        "Preparing Jolt v{target_version}; active work can finish"
+                                    )
+                                    .into(),
+                                ),
+                            ),
+                            RemoteJoltUpdateAction::Verifying { target_version } => (
+                                Some(widgets::badge(&theme, "Reconnecting…").into_any_element()),
+                                Some(format!("Verifying Jolt v{target_version}").into()),
+                            ),
+                            RemoteJoltUpdateAction::Failed {
+                                target_version,
+                                message,
+                            } => {
+                                let device_id = device.id.clone();
+                                let retry_version = target_version.clone();
+                                (
+                                    Some(
+                                        widgets::ghost_action(&theme)
+                                            .id(("device-update-retry", ix))
+                                            .text_color(theme.danger)
+                                            .hover(|style| {
+                                                style
+                                                    .bg(theme.danger.opacity(0.08))
+                                                    .text_color(theme.danger)
+                                            })
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                update_state.update(cx, |state, cx| {
+                                                    state.begin_remote_jolt_update(
+                                                        device_id.clone(),
+                                                        retry_version.clone(),
+                                                        cx,
+                                                    );
+                                                });
+                                            }))
+                                            .child(SharedString::from("Retry"))
+                                            .into_any_element(),
+                                    ),
+                                    Some(message.into()),
+                                )
+                            }
+                        }
+                    } else if let Some(status) = remote_update {
+                        if status.update_available {
+                            let target_version = status.latest_version.unwrap_or_default();
+                            if status.can_apply && online {
+                                let device_id = device.id.clone();
+                                let requested_version = target_version.clone();
+                                (
+                                    Some(
+                                        widgets::ghost_action(&theme)
+                                            .id(("device-update", ix))
+                                            .text_color(theme.success_muted)
+                                            .hover(|style| {
+                                                style
+                                                    .bg(theme.success.opacity(0.08))
+                                                    .text_color(theme.success_muted)
+                                            })
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                update_state.update(cx, |state, cx| {
+                                                    state.begin_remote_jolt_update(
+                                                        device_id.clone(),
+                                                        requested_version.clone(),
+                                                        cx,
+                                                    );
+                                                });
+                                            }))
+                                            .child(SharedString::from("Update"))
+                                            .into_any_element(),
+                                    ),
+                                    Some(
+                                        format!(
+                                            "Jolt {} → {target_version}",
+                                            status.current_version
+                                        )
+                                        .into(),
+                                    ),
+                                )
+                            } else {
+                                (
+                                    Some(
+                                        widgets::badge(
+                                            &theme,
+                                            if status.can_apply {
+                                                "Update available"
+                                            } else {
+                                                "Manual update"
+                                            },
+                                        )
+                                        .into_any_element(),
+                                    ),
+                                    Some(
+                                        format!(
+                                            "Jolt {} → {target_version}{}",
+                                            status.current_version,
+                                            if status.can_apply {
+                                                " · device offline"
+                                            } else {
+                                                " · unmanaged install"
+                                            }
+                                        )
+                                        .into(),
+                                    ),
+                                )
+                            }
+                        } else {
+                            (
+                                None,
+                                status
+                                    .error
+                                    .map(|error| format!("Update check failed: {error}").into()),
+                            )
+                        }
+                    } else {
+                        (None, None)
+                    };
+
                 widgets::card_row(&theme, ix == 0)
                     .child(tile)
                     .child(
@@ -501,11 +640,21 @@ impl Render for DevicesPage {
                             .flex()
                             .flex_col()
                             .child(widgets::row_title(&theme, device.name.clone()))
-                            .child(widgets::meta_line(&theme, meta)),
+                            .child(widgets::meta_line(&theme, meta))
+                            .when_some(update_detail, |el, detail| {
+                                el.child(
+                                    div()
+                                        .mt(px(3.0))
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .child(detail),
+                                )
+                            }),
                     )
                     .when(is_local, |el| {
                         el.child(widgets::badge(&theme, "This device"))
                     })
+                    .when_some(update_action, |el, action| el.child(action))
                     .child(
                         // `opacity-70 hover:opacity-100` (jolt: also rises on
                         // row hover — gpui has no group-hover, so the button's
@@ -583,7 +732,7 @@ impl Render for DevicesPage {
                     ))
                     .child(widgets::page_subtitle(
                         &theme,
-                        "Manage device availability, names, and synced metadata.",
+                        "Manage availability, versions, updates, names, and synced metadata.",
                     ))
                     .when_some(background_service_card, |el, card| el.child(card))
                     .when_some(self.error.clone(), |el, message| {

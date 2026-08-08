@@ -112,8 +112,10 @@ private func parseAttachmentSHA256(_ line: String) -> String? {
 let maxComposerAttachments = 8
 /// Maximum staged attachment size.
 let maxAttachmentBytes = 24 * 1024 * 1024
-/// Base64 chars per `UploadChunk` — sized for the relay link.
-let uploadChunkB64Chars = 60_000
+/// Raw bytes per binary upload request, below the RPC payload ceiling.
+let uploadChunkBytes = 60_000
+/// Legacy base64 slice used when the host predates binary upload requests.
+private let legacyUploadChunkB64Chars = 60_000
 
 /// An image staged in the composer, before upload. Bytes are what uploads;
 /// the decoded UIImage feeds thumbnails, the lightbox, and the post-send
@@ -212,32 +214,108 @@ private func pastedImageData(from provider: NSItemProvider) async -> Data? {
 
 // MARK: - Upload (attachments.rs upload_attachment)
 
-/// Chunked upload straight to the host device's relay room: base64 the bytes,
-/// `UploadChunk {uploadId, seq, data}` per 60k-char slice (positional `seq`
-/// makes retries idempotent), then `UploadCommit {uploadId, fileName, chatId}`
-/// → the durable host path and edge content address.
+private struct UploadAcknowledgement: Decodable { var ok: Bool? }
+private struct TransportCapabilities: Decodable { var binaryUnary: Bool }
+private struct UploadCommitReply: Decodable {
+    var path: String
+    var sha256: String?
+}
+
+private func commitAttachmentUpload(relay: DeviceRelayClient, chatId: String,
+                                    name: String, data: Data,
+                                    uploadId: String) async throws -> UploadedAttachment {
+    let reply: UploadCommitReply = try await relay.call(
+        method: "UploadCommit",
+        params: ["uploadId": uploadId, "fileName": name, "chatId": chatId],
+        timeoutSeconds: 150
+    )
+    let localHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    return UploadedAttachment(path: reply.path, sha256: reply.sha256 ?? localHash)
+}
+
+/// Chunked binary upload to the host. Hosts predating binary unary requests
+/// fall back to the legacy base64 method after the first short probe.
 func uploadAttachmentChunked(relay: DeviceRelayClient, chatId: String,
                              name: String, data: Data) async throws -> UploadedAttachment {
-    struct OkReply: Decodable { var ok: Bool? }
-    struct CommitReply: Decodable {
-        var path: String
-        var sha256: String?
+    guard let capabilities: TransportCapabilities = try? await relay.call(
+        method: "GetTransportCapabilities",
+        params: [:],
+        timeoutSeconds: 30
+    ), capabilities.binaryUnary else {
+        return try await uploadAttachmentBase64(
+            relay: relay,
+            chatId: chatId,
+            name: name,
+            data: data
+        )
     }
-
-    let b64 = data.base64EncodedString()
     let uploadId = UUID().uuidString.lowercased()
-    var start = b64.startIndex
+    var offset = 0
     var seq: UInt64 = 0
-    while start < b64.endIndex {
-        let end = b64.index(start, offsetBy: uploadChunkB64Chars, limitedBy: b64.endIndex) ?? b64.endIndex
-        let params: [String: Any] = ["uploadId": uploadId, "seq": seq, "data": String(b64[start..<end])]
-        // One transient blip must not abort a long upload; `seq` slots are
-        // idempotent engine-side, so a blind re-send is safe.
+    while offset < data.count {
+        let end = min(offset + uploadChunkBytes, data.count)
+        let payload = data.subdata(in: offset..<end)
+        let params: [String: Any] = ["uploadId": uploadId, "seq": seq]
         var attempt = 0
         while true {
             do {
-                let _: OkReply = try await relay.call(method: "UploadChunk", params: params,
-                                                      timeoutSeconds: seq == 0 ? 90 : 30)
+                let _: UploadAcknowledgement = try await relay.callBinary(
+                    method: "UploadBinaryChunk",
+                    params: params,
+                    payload: payload,
+                    timeoutSeconds: seq == 0 ? 10 : 30
+                )
+                break
+            } catch {
+                if seq == 0 {
+                    return try await uploadAttachmentBase64(
+                        relay: relay,
+                        chatId: chatId,
+                        name: name,
+                        data: data
+                    )
+                }
+                attempt += 1
+                if attempt > 2 { throw error }
+            }
+        }
+        offset = end
+        seq += 1
+    }
+    return try await commitAttachmentUpload(
+        relay: relay,
+        chatId: chatId,
+        name: name,
+        data: data,
+        uploadId: uploadId
+    )
+}
+
+private func uploadAttachmentBase64(relay: DeviceRelayClient, chatId: String,
+                                    name: String, data: Data) async throws -> UploadedAttachment {
+    let encoded = data.base64EncodedString()
+    let uploadId = UUID().uuidString.lowercased()
+    var start = encoded.startIndex
+    var seq: UInt64 = 0
+    while start < encoded.endIndex {
+        let end = encoded.index(
+            start,
+            offsetBy: legacyUploadChunkB64Chars,
+            limitedBy: encoded.endIndex
+        ) ?? encoded.endIndex
+        let params: [String: Any] = [
+            "uploadId": uploadId,
+            "seq": seq,
+            "data": String(encoded[start..<end])
+        ]
+        var attempt = 0
+        while true {
+            do {
+                let _: UploadAcknowledgement = try await relay.call(
+                    method: "UploadChunk",
+                    params: params,
+                    timeoutSeconds: seq == 0 ? 90 : 30
+                )
                 break
             } catch {
                 attempt += 1
@@ -247,13 +325,13 @@ func uploadAttachmentChunked(relay: DeviceRelayClient, chatId: String,
         start = end
         seq += 1
     }
-    // Commit outlasts assembly plus the required account-scope edge mirror.
-    let reply: CommitReply = try await relay.call(
-        method: "UploadCommit",
-        params: ["uploadId": uploadId, "fileName": name, "chatId": chatId],
-        timeoutSeconds: 150)
-    let localHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    return UploadedAttachment(path: reply.path, sha256: reply.sha256 ?? localHash)
+    return try await commitAttachmentUpload(
+        relay: relay,
+        chatId: chatId,
+        name: name,
+        data: data,
+        uploadId: uploadId
+    )
 }
 
 // MARK: - Transcript image cache (attachments.rs image cache)
@@ -410,7 +488,7 @@ final class AttachmentImageCache {
             var done: Bool
         }
         var name = ""
-        var b64 = ""
+        var bytes = Data()
         var offset: UInt64 = 0
         var done = false
         for _ in 0..<maxReadChunks {
@@ -418,17 +496,16 @@ final class AttachmentImageCache {
                 method: "ReadAttachmentChunk",
                 params: ["path": path, "offset": offset],
                 timeoutSeconds: 20) else { return nil }
+            guard let decoded = Data(base64Encoded: chunk.data) else { return nil }
             name = chunk.name
-            b64 += chunk.data
+            bytes.append(decoded)
             done = chunk.done
             if done { break }
             guard chunk.nextOffset > offset else { return nil }
             offset = chunk.nextOffset
         }
-        guard done, let data = Data(base64Encoded: b64), let image = UIImage(data: data) else {
-            return nil
-        }
-        return (name.isEmpty ? nameFromPath(path) : name, image, data.count)
+        guard done, let image = UIImage(data: bytes) else { return nil }
+        return (name.isEmpty ? nameFromPath(path) : name, image, bytes.count)
     }
 }
 

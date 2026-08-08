@@ -11,16 +11,18 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
-    px,
+    AnyElement, ClipboardItem, Context, Entity, Hsla, SharedString, Subscription, Task, Window,
+    div, prelude::*, px,
 };
 use std::time::Duration;
 
-use jolt_proto::{
-    AgentAccount, AgentAccountsSnapshot, AgentLoginPoll, AgentLoginStart, AgentLoginStatus,
-    HarnessId,
+use jolt_api::{
+    ActivateAgentAccount, CancelAgentLogin, CompleteAgentLogin, ForgetAgentAccount,
+    ListAgentAccounts, PollAgentLogin, StartAgentLogin, call as call_api,
 };
-use jolt_rpc::methods;
+use jolt_proto::{
+    AgentAccount, AgentAccountsSnapshot, AgentLoginStart, AgentLoginStatus, HarnessId,
+};
 
 use super::device_switcher::{DeviceSelected, DeviceSwitcher};
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -135,6 +137,12 @@ pub fn provider_accounts(
 // Entity
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
+enum AccountAction {
+    Activate,
+    Forget,
+}
+
 enum LoginFlow {
     /// StartAgentLogin in flight.
     Starting { harness: HarnessId },
@@ -184,6 +192,8 @@ pub struct AccountsPage {
     load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
+    copied_login_code: bool,
+    copy_task: Option<Task<()>>,
     _observe: Subscription,
     _code_events: Subscription,
     _device_switcher_events: Subscription,
@@ -217,6 +227,8 @@ impl AccountsPage {
             load_task: None,
             action_task: None,
             poll_task: None,
+            copied_login_code: false,
+            copy_task: None,
             _observe: observe,
             _code_events: code_events,
             _device_switcher_events: device_switcher_events,
@@ -243,18 +255,11 @@ impl AccountsPage {
         // login/action state and reload with a forced usage probe (the new
         // device's cache is cold).
         self.login = None;
+        self.copied_login_code = false;
+        self.copy_task = None;
         self.busy_account = None;
         self.error = None;
         self.load(force_usage_for(LoadTrigger::Mount), cx);
-    }
-
-    /// Params with the `targetDeviceId` passthrough merged in.
-    fn params(&self, value: serde_json::Value) -> serde_json::Value {
-        let mut value = value;
-        if let (Some(target), Some(object)) = (&self.target_device, value.as_object_mut()) {
-            object.insert("targetDeviceId".into(), serde_json::json!(target));
-        }
-        value
     }
 
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
@@ -263,18 +268,16 @@ impl AccountsPage {
             return;
         };
         self.snapshot = Loadable::Loading;
-        let params = self.params(serde_json::json!({ "forceUsage": force_usage }));
+        let request = ListAgentAccounts {
+            force_usage: Some(force_usage),
+            usage_only: false,
+            target_device_id: self.target_device.clone(),
+        };
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_AGENT_ACCOUNTS, params)
-                .await;
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |page, cx| {
                 page.snapshot = match result {
-                    Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
-                        Ok(snapshot) => Loadable::Ready(snapshot),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
+                    Ok(snapshot) => Loadable::Ready(snapshot),
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 cx.notify();
@@ -287,7 +290,7 @@ impl AccountsPage {
     /// Switch / Forget an account.
     fn account_action(
         &mut self,
-        method: &'static str,
+        action: AccountAction,
         account: &AgentAccount,
         cx: &mut Context<Self>,
     ) {
@@ -296,14 +299,34 @@ impl AccountsPage {
         };
         self.busy_account = Some(account.id.clone());
         self.error = None;
-        // Tolerant param shape: both `id` and `accountId` plus the harness.
-        let params = self.params(serde_json::json!({
-            "id": account.id,
-            "accountId": account.id,
-            "harness": account.harness,
-        }));
+        let harness = account.harness;
+        let account_id = account.id.clone();
+        let target_device_id = self.target_device.clone();
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine.client().call(method, params).await;
+            let result = match action {
+                AccountAction::Activate => {
+                    call_api(
+                        engine.client(),
+                        &ActivateAgentAccount {
+                            harness,
+                            account_id,
+                            target_device_id,
+                        },
+                    )
+                    .await
+                }
+                AccountAction::Forget => {
+                    call_api(
+                        engine.client(),
+                        &ForgetAgentAccount {
+                            harness,
+                            account_id,
+                            target_device_id,
+                        },
+                    )
+                    .await
+                }
+            };
             this.update(cx, |page, cx| {
                 page.busy_account = None;
                 match result {
@@ -324,18 +347,17 @@ impl AccountsPage {
             return;
         };
         self.login = Some(LoginFlow::Starting { harness });
+        self.copied_login_code = false;
+        self.copy_task = None;
         self.error = None;
-        let params = self.params(serde_json::json!({ "harness": harness }));
+        let request = StartAgentLogin {
+            harness,
+            target_device_id: self.target_device.clone(),
+        };
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::START_AGENT_LOGIN, params)
-                .await;
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |page, cx| {
-                match result.and_then(|value| {
-                    serde_json::from_value::<AgentLoginStart>(value)
-                        .map_err(|e| jolt_rpc::RpcError::Failed(e.to_string()))
-                }) {
+                match result {
                     Ok(AgentLoginStart::PasteCode { login_id, url }) => {
                         cx.open_url(&url);
                         page.code_input
@@ -395,12 +417,13 @@ impl AccountsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = self.params(serde_json::json!({ "loginId": login_id, "code": code }));
+        let request = CompleteAgentLogin {
+            login_id,
+            code,
+            target_device_id: self.target_device.clone(),
+        };
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::COMPLETE_AGENT_LOGIN, params)
-                .await;
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |page, cx| {
                 match result {
                     Ok(_) => {
@@ -433,23 +456,21 @@ impl AccountsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = self.params(serde_json::json!({ "loginId": login_id }));
+        let request = PollAgentLogin {
+            login_id,
+            target_device_id: self.target_device.clone(),
+        };
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(1500))
                     .await;
-                let result = engine
-                    .client()
-                    .call(methods::POLL_AGENT_LOGIN, params.clone())
-                    .await;
+                let result = call_api(engine.client(), &request).await;
                 let outcome = this.update(cx, |page, cx| {
                     let Some(LoginFlow::DeviceCode { message, error, .. }) = &mut page.login else {
                         return true; // dialog dismissed — stop polling
                     };
-                    match result.as_ref().ok().and_then(|value| {
-                        serde_json::from_value::<AgentLoginPoll>(value.clone()).ok()
-                    }) {
+                    match result.as_ref().ok() {
                         Some(poll) => match poll.status {
                             AgentLoginStatus::Done => {
                                 page.login = None;
@@ -460,6 +481,7 @@ impl AccountsPage {
                             AgentLoginStatus::Error => {
                                 *error = Some(
                                     poll.message
+                                        .clone()
                                         .unwrap_or_else(|| "Login failed".to_string())
                                         .into(),
                                 );
@@ -467,8 +489,8 @@ impl AccountsPage {
                                 true
                             }
                             AgentLoginStatus::Pending => {
-                                if let Some(text) = poll.message {
-                                    *message = Some(text.into());
+                                if let Some(text) = &poll.message {
+                                    *message = Some(text.clone().into());
                                 }
                                 cx.notify();
                                 false
@@ -493,6 +515,23 @@ impl AccountsPage {
         }));
     }
 
+    fn copy_login_code(&mut self, code: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(code));
+        self.copied_login_code = true;
+        self.copy_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            this.update(cx, |page, cx| {
+                page.copied_login_code = false;
+                page.copy_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
         let login_id = match &self.login {
             Some(LoginFlow::PasteCode { login_id, .. })
@@ -500,20 +539,30 @@ impl AccountsPage {
             _ => None,
         };
         self.login = None;
+        self.action_task = None;
         self.poll_task = None;
+        self.copied_login_code = false;
+        self.copy_task = None;
         if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).engine().cloned()) {
-            let params = self.params(serde_json::json!({ "loginId": login_id }));
+            let request = CancelAgentLogin {
+                login_id,
+                target_device_id: self.target_device.clone(),
+            };
             self.action_task = Some(cx.spawn(async move |_, _| {
-                if let Err(err) = engine
-                    .client()
-                    .call(methods::CANCEL_AGENT_LOGIN, params)
-                    .await
-                {
+                if let Err(err) = call_api(engine.client(), &request).await {
                     tracing::debug!(error = %err, "CancelAgentLogin failed (best-effort)");
                 }
             }));
         }
         cx.notify();
+    }
+
+    pub(crate) fn dismiss_modal(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.login.is_none() {
+            return false;
+        }
+        self.cancel_login(cx);
+        true
     }
 
     // ---- render pieces ----
@@ -645,7 +694,7 @@ impl AccountsPage {
                         .when(is_busy, |el| el.opacity(0.5))
                         .hover(|s| s.bg(crate::theme::ink(0.06)).text_color(theme.text))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.account_action(methods::FORGET_AGENT_ACCOUNT, &forget_account, cx);
+                            this.account_action(AccountAction::Forget, &forget_account, cx);
                         }))
                         .child(
                             crate::icons::icon(crate::icons::TRASH)
@@ -666,11 +715,7 @@ impl AccountsPage {
                         .text_size(px(11.5))
                         .when(is_busy, |el| el.opacity(0.5))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.account_action(
-                                methods::ACTIVATE_AGENT_ACCOUNT,
-                                &switch_account,
-                                cx,
-                            );
+                            this.account_action(AccountAction::Activate, &switch_account, cx);
                         })),
                     )
                 })
@@ -742,6 +787,7 @@ impl AccountsPage {
         let red_text = theme.danger_muted.opacity(0.9); // red-300
         let login = self.login.as_ref()?;
         let title = login.title();
+        let copied_login_code = self.copied_login_code;
         let url_link =
             |id: &'static str, label: &'static str, url: &str, cx: &mut Context<Self>| {
                 let open_url = url.to_string();
@@ -856,10 +902,35 @@ impl AccountsPage {
                     .child(
                         div()
                             .mt(px(10.0))
-                            .font_family(theme.font_mono.clone())
-                            .text_size(px(16.0))
-                            .text_color(theme.text)
-                            .child(SharedString::from(user_code.clone())),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_size(px(16.0))
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(user_code.clone())),
+                            )
+                            .child(
+                                popover::btn_ghost(
+                                    &theme,
+                                    if copied_login_code {
+                                        "Copied"
+                                    } else {
+                                        "Copy code"
+                                    },
+                                    "login-copy-code",
+                                )
+                                .id("login-copy-code")
+                                .on_click({
+                                    let code = user_code.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.copy_login_code(code.clone(), cx);
+                                    })
+                                }),
+                            ),
                     )
                     .child(url_link(
                         "login-open-url-browser",

@@ -19,16 +19,16 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use jolt_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionDoc, SessionMessageEntry,
-};
 use jolt_engine::{EngineCore, HarnessRegistry, RunJournal};
 use jolt_harness::{Harness, HarnessError, RunControls};
 use jolt_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
+    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SteeringMode,
 };
-use jolt_sync::DocsStore;
+use jolt_session_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionDoc, SessionMessageEntry,
+};
+use jolt_store::DocsStore;
 
 const CHAT: &str = "chat-restart";
 
@@ -37,6 +37,7 @@ type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
 fn run_request(prompt: &str, cwd: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: Default::default(),
@@ -118,6 +119,140 @@ impl Harness for RecordingHarness {
                 ]
             };
         Ok(futures::stream::iter(events).boxed())
+    }
+}
+
+struct SwitchingHarness {
+    id: HarnessId,
+    requests: RequestLog,
+    session_id: String,
+}
+
+struct DelayedInterruptHarness {
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Harness for DelayedInterruptHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Delayed interrupt"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let release = self.release.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: request.cwd,
+                    session_id: "delayed-source".into(),
+                    assistant_message_id: "delayed-source-a1".into(),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(AgentEvent::TextDelta {
+                    text: "source still settling".into(),
+                }))
+                .await;
+            release.notified().await;
+            let _ = tx
+                .send(Ok(AgentEvent::Done {
+                    status: DoneStatus::Interrupted,
+                    result: None,
+                    error: None,
+                    session_id: Some("delayed-source".into()),
+                }))
+                .await;
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+#[async_trait]
+impl Harness for SwitchingHarness {
+    fn id(&self) -> HarnessId {
+        self.id
+    }
+
+    fn display_name(&self) -> &str {
+        "Switching"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.requests
+            .lock()
+            .expect("request log")
+            .push(request.clone());
+        Ok(futures::stream::iter(vec![
+            Ok(AgentEvent::SessionStarted {
+                harness: self.id,
+                model: format!("{:?}-model", self.id),
+                tools: vec![],
+                cwd: request.cwd,
+                session_id: self.session_id.clone(),
+                assistant_message_id: uuid::Uuid::new_v4().to_string(),
+            }),
+            Ok(AgentEvent::TextDelta {
+                text: "switching harness response".into(),
+            }),
+            Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some(self.session_id.clone()),
+            }),
+        ])
+        .boxed())
     }
 }
 
@@ -422,6 +557,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
 /// reuses one child across turns instead of respawning.
 struct PersistentHarness {
     runs_started: Arc<Mutex<usize>>,
+    steers_received: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 #[async_trait]
@@ -452,6 +588,8 @@ impl Harness for PersistentHarness {
         *self.runs_started.lock().unwrap() += 1;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(32);
         let mut steering = controls.steering;
+        let interrupt = controls.interrupt;
+        let steers_received = self.steers_received.clone();
         tokio::spawn(async move {
             let turn = |n: usize, prompt: &str| {
                 vec![
@@ -482,7 +620,17 @@ impl Harness for PersistentHarness {
             // Parked: serve follow-up turns from the mailbox until the
             // engine hangs up (idle reap / interrupt / shutdown).
             let mut n = 1usize;
-            while let Some(steer) = steering.recv().await {
+            loop {
+                let steer = tokio::select! {
+                    _ = interrupt.cancelled() => return,
+                    steer = steering.recv() => match steer {
+                        Some(steer) => steer,
+                        None => return,
+                    },
+                };
+                if let Some(log) = &steers_received {
+                    log.lock().unwrap().push(steer.prompt.clone());
+                }
                 n += 1;
                 let boundary = AgentEvent::Steered {
                     assistant_message_id: None,
@@ -516,6 +664,7 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(PersistentHarness {
         runs_started: runs_started.clone(),
+        steers_received: None,
     }));
     let core = EngineCore::assemble(&dir, Arc::new(registry), HarnessId::Mock, None)
         .expect("engine core assembles");
@@ -718,6 +867,262 @@ async fn resume_is_cwd_scoped() {
 }
 
 #[tokio::test]
+async fn steer_command_switches_instead_of_entering_the_previous_harness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_runs = Arc::new(Mutex::new(0usize));
+    let source_steers = Arc::new(Mutex::new(Vec::new()));
+    let pi_requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(PersistentHarness {
+        runs_started: source_runs.clone(),
+        steers_received: Some(source_steers.clone()),
+    }));
+    registry.register(Arc::new(SwitchingHarness {
+        id: HarnessId::Pi,
+        requests: pi_requests.clone(),
+        session_id: "pi-session".into(),
+    }));
+    let core = EngineCore::assemble(
+        &tmp.path().join("data"),
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .expect("engine core assembles");
+    pre_title(&core);
+
+    queue_run(&core, "first mock turn", "/tmp", "switch-steer-u1");
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "source harness turn",
+    )
+    .await;
+    assert_eq!(*source_runs.lock().unwrap(), 1);
+
+    core.workspace
+        .set_chat_config(
+            CHAT,
+            &ChatConfig {
+                harness: HarnessId::Pi,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+            },
+        )
+        .expect("select target harness");
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Steer {
+                prompt: "pi takes this turn".into(),
+                message_id: Some("switch-steer-u2".into()),
+            },
+        )
+        .expect("queue steer command");
+    wait_for(
+        || complete_assistant_count(&core) == 2,
+        "cross-harness steer fallback",
+    )
+    .await;
+
+    assert!(
+        source_steers.lock().unwrap().is_empty(),
+        "the target harness's prompt must never enter the source steering mailbox"
+    );
+    {
+        let pi = pi_requests.lock().unwrap();
+        assert_eq!(pi.len(), 1);
+        assert!(pi[0].prompt.contains("(full)"));
+        assert!(pi[0].prompt.contains("first mock turn"));
+        assert!(pi[0].prompt.ends_with("pi takes this turn"));
+    }
+
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn harness_switch_marker_precedes_source_settlement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let pi_requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(DelayedInterruptHarness {
+        release: release.clone(),
+    }));
+    registry.register(Arc::new(SwitchingHarness {
+        id: HarnessId::Pi,
+        requests: pi_requests.clone(),
+        session_id: "pi-session".into(),
+    }));
+    let core = EngineCore::assemble(
+        &tmp.path().join("data"),
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .expect("engine core assembles");
+    pre_title(&core);
+
+    let queue = |prompt: &str, harness: HarnessId, message_id: &str| {
+        let mut request = run_request(prompt, "/tmp");
+        request.harness = Some(harness);
+        core.doc_host
+            .queue_command(
+                CHAT,
+                SessionCommandPayload::Run {
+                    request,
+                    message_id: message_id.into(),
+                },
+            )
+            .unwrap();
+    };
+
+    queue("source turn", HarnessId::Mock, "instant-switch-u1");
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Streaming)
+            })
+        },
+        "source harness to stream",
+    )
+    .await;
+
+    queue("pi takes over", HarnessId::Pi, "instant-switch-u2");
+    wait_for_within(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                matches!(
+                    entry.parts.as_slice(),
+                    [MessagePart::HarnessSwitch {
+                        from: HarnessId::Mock,
+                        to: HarnessId::Pi,
+                        ..
+                    }]
+                )
+            })
+        },
+        "harness switch marker before source settlement",
+        Duration::from_millis(500),
+    )
+    .await;
+    assert!(
+        pi_requests.lock().unwrap().is_empty(),
+        "the target run must still be waiting for source settlement"
+    );
+
+    release.notify_one();
+    wait_for(
+        || !pi_requests.lock().unwrap().is_empty(),
+        "target harness to start",
+    )
+    .await;
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn switching_harnesses_preserves_native_sessions_and_uses_delta_handoffs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock_requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let pi_requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(SwitchingHarness {
+        id: HarnessId::Mock,
+        requests: mock_requests.clone(),
+        session_id: "mock-session".into(),
+    }));
+    registry.register(Arc::new(SwitchingHarness {
+        id: HarnessId::Pi,
+        requests: pi_requests.clone(),
+        session_id: "pi-session".into(),
+    }));
+    let core = EngineCore::assemble(
+        &tmp.path().join("data"),
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .expect("engine core assembles");
+    pre_title(&core);
+
+    let queue = |prompt: &str, harness: HarnessId, message_id: &str| {
+        let mut request = run_request(prompt, "/tmp");
+        request.harness = Some(harness);
+        core.doc_host
+            .queue_command(
+                CHAT,
+                SessionCommandPayload::Run {
+                    request,
+                    message_id: message_id.into(),
+                },
+            )
+            .unwrap();
+    };
+
+    queue("first mock turn", HarnessId::Mock, "switch-u1");
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "first harness turn",
+    )
+    .await;
+    queue("pi takes over", HarnessId::Pi, "switch-u2");
+    wait_for(
+        || complete_assistant_count(&core) == 2,
+        "second harness turn",
+    )
+    .await;
+    queue("mock returns", HarnessId::Mock, "switch-u3");
+    wait_for(
+        || complete_assistant_count(&core) == 3,
+        "return harness turn",
+    )
+    .await;
+
+    {
+        let pi = pi_requests.lock().unwrap();
+        assert_eq!(pi.len(), 1);
+        assert_eq!(pi[0].resume, None);
+        assert!(pi[0].prompt.contains("(full)"));
+        assert!(pi[0].prompt.contains("first mock turn"));
+        assert!(pi[0].prompt.ends_with("pi takes over"));
+
+        let mock = mock_requests.lock().unwrap();
+        assert_eq!(mock.len(), 2);
+        assert_eq!(mock[1].resume.as_deref(), Some("mock-session"));
+        assert!(mock[1].prompt.contains("(delta)"));
+        assert!(mock[1].prompt.contains("pi takes over"));
+        assert!(!mock[1].prompt.contains("first mock turn"));
+        assert!(mock[1].prompt.ends_with("mock returns"));
+    }
+
+    let entries = entries_now(&core);
+    assert!(matches!(
+        entries[2].parts.as_slice(),
+        [MessagePart::HarnessSwitch {
+            from: HarnessId::Mock,
+            to: HarnessId::Pi,
+            ..
+        }]
+    ));
+    assert_eq!(entries[3].id, "switch-u2");
+    assert!(matches!(
+        entries[5].parts.as_slice(),
+        [MessagePart::HarnessSwitch {
+            from: HarnessId::Pi,
+            to: HarnessId::Mock,
+            ..
+        }]
+    ));
+    assert_eq!(entries[6].id, "switch-u3");
+
+    let chat = core.workspace.chat(CHAT).unwrap().unwrap();
+    assert_eq!(chat.harness_conversations.len(), 2);
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn rejected_resume_retries_as_fresh_session() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("data");
@@ -748,7 +1153,11 @@ async fn rejected_resume_retries_as_fresh_session() {
         assert_eq!(log.len(), 3, "one failed resume attempt + one fresh retry");
         assert_eq!(log[1].resume.as_deref(), Some("hs-dead"));
         assert_eq!(log[2].resume, None);
-        assert_eq!(log[2].prompt, "second turn");
+        assert!(
+            log[2].prompt.contains("<jolt_harness_handoff")
+                && log[2].prompt.ends_with("second turn"),
+            "fresh fallback receives a full handoff before the original prompt"
+        );
     }
     // The retry reused the same user entry — no duplicates, no error turn.
     let entries = entries_now(&core);
@@ -783,6 +1192,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
 
     let real_request = |prompt: &str| RunRequest {
         prompt: prompt.into(),
+        harness: Some(HarnessId::ClaudeCode),
         model: Some("haiku".into()),
         reasoning: None,
         model_options: Default::default(),

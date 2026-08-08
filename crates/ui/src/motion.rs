@@ -207,8 +207,7 @@ pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
 pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
 /// Sidebar resort glide — CSS `cubic-bezier(0.22, 1, 0.36, 1)` (used from M3b).
 pub const EASE_RESORT: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
-/// CSS `ease-in-out` — the transcript scroll glide (browser smooth-scroll
-/// shape: gentle start, cruise, gentle landing).
+/// CSS `ease-in-out` — gentle start, cruise, and landing.
 pub const EASE_IN_OUT: CubicBezier = CubicBezier::new(0.42, 0.0, 0.58, 1.0);
 
 // ---------------------------------------------------------------------------
@@ -290,8 +289,9 @@ pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_OUT);
 /// Diff-pane chevron rotate: 200ms (§1.11; approximated as a crossfade — gpui
 /// divs have no rotation transform at the pinned rev, same caveat as scale).
 pub const CHEVRON: MotionSpec = MotionSpec::new(200, EASE);
-/// Rail-tick / scroll-to-row glide: 500ms ease-in-out over the whole distance.
-pub const SCROLL_GLIDE: MotionSpec = MotionSpec::new(500, EASE_IN_OUT);
+/// Pointer-driven rail/search glide: quick response with a gentle landing.
+/// Keyboard transcript navigation snaps instead of using this animation.
+pub const SCROLL_GLIDE: MotionSpec = MotionSpec::new(180, EASE_OUT);
 /// Tailwind's default transition curve — CSS `cubic-bezier(0.4, 0, 0.2, 1)`
 /// (`transition-colors` and related properties carry it unless overridden).
 pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);

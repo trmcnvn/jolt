@@ -5,21 +5,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use serde::{Deserialize, Serialize};
-
+pub use jolt_api::HarnessDescriptor;
 use jolt_harness::{Harness, HarnessError, mock::MockHarness};
+use jolt_harness_claude::ClaudeHarness;
+use jolt_harness_codex::CodexHarness;
+use jolt_harness_pi::PiHarness;
 use jolt_proto::{AgentEvent, DoneStatus, HarnessId, ReasoningLevel, SteeringMode};
-
-/// What `ListHarnesses` reports per harness.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HarnessDescriptor {
-    pub id: HarnessId,
-    pub name: String,
-    pub supports_steering: bool,
-    pub steering_mode: SteeringMode,
-    pub reasoning_levels: Vec<ReasoningLevel>,
-}
 
 fn describe(harness: &dyn Harness) -> HarnessDescriptor {
     HarnessDescriptor {
@@ -135,7 +126,7 @@ impl HarnessRegistry {
 pub fn default_registry() -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
     // claude/codex resolve doesn't pay the shell-startup latency inline.
-    jolt_harness::shell_env::prewarm();
+    jolt_platform::shell_env::prewarm();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(MockHarness {
         script: vec![
@@ -144,6 +135,9 @@ pub fn default_registry() -> HarnessRegistry {
             },
             AgentEvent::TextDelta {
                 text: "1. **Doc command** — the composer queues a durable `run` entry\n2. **Host executor** — the chat's host device marks it processed, then dispatches\n3. **Fold** — events fold into parts and diff into the Loro doc every 120ms\n\n".into(),
+            },
+            AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "mock-message-1".into(),
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-1".into(),
@@ -168,6 +162,9 @@ pub fn default_registry() -> HarnessRegistry {
             },
             AgentEvent::TextDelta {
                 text: "The `SegmentWriter` appends into `LoroText` so the oplog stays RLE-merged:\n\n```rust\nfolded = fold_event_into_parts(&folded, &event);\nwriter.sync(&folded)?; // 120ms coalesced commits\n```\n\nSynced to every device through the session room. *Mock harness reporting in.*".into(),
+            },
+            AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "mock-message-2".into(),
             },
             AgentEvent::Done {
                 status: DoneStatus::Completed,
@@ -195,9 +192,10 @@ pub fn default_registry() -> HarnessRegistry {
             ],
         },
         Box::new(move || {
-            Ok(Arc::new(
-                jolt_harness::ClaudeHarness::new().with_environment(claude_environment.clone()),
-            ) as Arc<dyn Harness>)
+            Ok(
+                Arc::new(ClaudeHarness::new().with_environment(claude_environment.clone()))
+                    as Arc<dyn Harness>,
+            )
         }),
     );
     // Codex uses the same lazy pattern: the static descriptor mirrors
@@ -224,9 +222,10 @@ pub fn default_registry() -> HarnessRegistry {
             ],
         },
         Box::new(move || {
-            Ok(Arc::new(
-                jolt_harness::CodexHarness::new().with_environment(codex_environment.clone()),
-            ) as Arc<dyn Harness>)
+            Ok(
+                Arc::new(CodexHarness::new().with_environment(codex_environment.clone()))
+                    as Arc<dyn Harness>,
+            )
         }),
     );
     let pi_environment = registry.environment.clone();
@@ -247,7 +246,7 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(move || {
             Ok(
-                Arc::new(jolt_harness::PiHarness::new().with_environment(pi_environment.clone()))
+                Arc::new(PiHarness::new().with_environment(pi_environment.clone()))
                     as Arc<dyn Harness>,
             )
         }),

@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::EngineError;
 use crate::diff_projection::DiffProjection;
 use crate::diff_sync::{TurnDiffBaseline, capture_scoped_turn_diff, capture_turn_diff_baseline};
-use crate::repos::Repos;
+use jolt_vcs::Repos;
 
 #[derive(Clone)]
 pub struct TurnDiffStore {
@@ -171,7 +171,7 @@ fn digest(parts: &[&[u8]]) -> String {
         hash.update(part);
         hash.update([0]);
     }
-    crate::repos::hex(&hash.finalize())
+    jolt_vcs::hex(&hash.finalize())
 }
 
 fn is_digest(value: &str) -> bool {

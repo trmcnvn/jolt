@@ -6,7 +6,7 @@
  * a WebRTC fast path could slot in under the same frames).
  *
  * Frame encoding (binary): uleb128 header-length ‖ UTF-8 JSON header ‖ payload.
- * Header: { s: streamId, k: kind, to?: connId, from?: connId }.
+ * Header: { s: streamId, k: kind, to?: connId, from?: connId, z?: true }.
  * - client → DO: DO stamps `from = connId` and forwards to the host socket.
  * - host → DO: must carry `to = connId`; DO strips routing keys and delivers.
  *
@@ -14,7 +14,7 @@
  * snapshot for instant new-chat pickers §8.1; capability metadata) so pickers
  * render last-known state while the live RPC happens at confirm time.
  */
-import { BytesReader, BytesWriter } from "loro-protocol";
+import { BytesWriter } from "loro-protocol";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { AUTH_USER_HEADER, type Env } from "./env";
 
@@ -27,11 +27,60 @@ export interface DeviceFrameHeader {
   to?: string;
   /** Routing: client→host origin (stamped by the relay). */
   from?: string;
+  /** Peer can receive selectively compressed `rpc-zlib` frames. */
+  z?: boolean;
 }
 
+const MAX_DEVICE_HEADER_BYTES = 4 * 1024;
+const MAX_DEVICE_HEADER_FIELD_BYTES = 256;
+const MAX_DEVICE_PAYLOAD_BYTES = 8 * 1024 * 1024;
+
+const parseDeviceFrameHeader = (input: unknown): DeviceFrameHeader => {
+  if (typeof input !== "object" || input === null || !("s" in input) || !("k" in input)) {
+    throw new Error("Invalid device frame header");
+  }
+  const { s, k } = input;
+  const to = "to" in input ? input.to : undefined;
+  const from = "from" in input ? input.from : undefined;
+  const z = "z" in input ? input.z : undefined;
+  const encoder = new TextEncoder();
+  if (
+    typeof s !== "string" ||
+    encoder.encode(s).length > MAX_DEVICE_HEADER_FIELD_BYTES ||
+    typeof k !== "string" ||
+    k.length === 0 ||
+    (s.length === 0 && k !== " relay") ||
+    encoder.encode(k).length > MAX_DEVICE_HEADER_FIELD_BYTES ||
+    (to !== undefined &&
+      (typeof to !== "string" || encoder.encode(to).length > MAX_DEVICE_HEADER_FIELD_BYTES)) ||
+    (from !== undefined &&
+      (typeof from !== "string" || encoder.encode(from).length > MAX_DEVICE_HEADER_FIELD_BYTES)) ||
+    (z !== undefined && typeof z !== "boolean")
+  ) {
+    throw new Error("Invalid device frame header fields");
+  }
+  return {
+    s,
+    k,
+    ...(to === undefined ? {} : { to }),
+    ...(from === undefined ? {} : { from }),
+    ...(z === undefined ? {} : { z })
+  };
+};
+
+const validateDeviceFrameSize = (headerBytes: number, payloadBytes: number): void => {
+  if (headerBytes > MAX_DEVICE_HEADER_BYTES || payloadBytes > MAX_DEVICE_PAYLOAD_BYTES) {
+    throw new Error("Device frame is too large");
+  }
+};
+
 export const encodeDeviceFrame = (header: DeviceFrameHeader, payload: Uint8Array): Uint8Array => {
+  const validated = parseDeviceFrameHeader(header);
+  const headerJson = JSON.stringify(validated);
+  const headerBytes = new TextEncoder().encode(headerJson).length;
+  validateDeviceFrameSize(headerBytes, payload.length);
   const writer = new BytesWriter();
-  writer.pushVarString(JSON.stringify(header));
+  writer.pushVarString(headerJson);
   writer.pushBytes(payload);
   return writer.finalize();
 };
@@ -39,10 +88,33 @@ export const encodeDeviceFrame = (header: DeviceFrameHeader, payload: Uint8Array
 export const decodeDeviceFrame = (
   bytes: Uint8Array
 ): { header: DeviceFrameHeader; payload: Uint8Array } => {
-  const reader = new BytesReader(bytes);
-  const header = JSON.parse(reader.readVarString()) as DeviceFrameHeader;
-  const payload = reader.readBytes(reader.remaining);
-  return { header, payload };
+  let offset = 0;
+  let headerBytes = 0;
+  let shift = 0;
+  let complete = false;
+  while (offset < bytes.length) {
+    const byte = bytes[offset];
+    offset += 1;
+    headerBytes += (byte & 0x7f) * 2 ** shift;
+    if ((byte & 0x80) === 0) {
+      complete = true;
+      break;
+    }
+    shift += 7;
+    if (shift > 28) throw new Error("Device frame header length overflow");
+  }
+  if (!complete || headerBytes > MAX_DEVICE_HEADER_BYTES) {
+    throw new Error("Invalid device frame header length");
+  }
+  const headerEnd = offset + headerBytes;
+  if (headerEnd > bytes.length) throw new Error("Truncated device frame header");
+  validateDeviceFrameSize(headerBytes, bytes.length - headerEnd);
+  const headerJson = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+    bytes.subarray(offset, headerEnd)
+  );
+  const parsed: unknown = JSON.parse(headerJson);
+  const header = parseDeviceFrameHeader(parsed);
+  return { header, payload: bytes.subarray(headerEnd) };
 };
 
 interface SocketState {
@@ -68,7 +140,7 @@ const clientTag = (connId: string) => `client:${connId}`;
  * clients hung to their own timeouts because a non-empty host list also
  * suppressed the `host_offline` bounce.
  *
- * Hosts ping every 15s (crates/rpc/src/device_room.rs PING_INTERVAL) and the
+ * Hosts ping every 15s (crates/relay/src/lib.rs PING_INTERVAL) and the
  * DO's auto-response stamps a timestamp without waking us, so liveness is free
  * to read. The window is sized for the 30s of older builds still in the fleet
  * — 2.5 of their intervals — so upgrading engines is never a prerequisite. */
@@ -268,7 +340,16 @@ export class DeviceRoom implements DurableObject {
         this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_offline"));
         return;
       }
-      this.deliver(host, { s: frame.header.s, k: frame.header.k, from: state.connId }, frame.payload);
+      this.deliver(
+        host,
+        {
+          s: frame.header.s,
+          k: frame.header.k,
+          from: state.connId,
+          ...(frame.header.z === undefined ? {} : { z: frame.header.z })
+        },
+        frame.payload
+      );
       return;
     }
     // Host frame: route by `to`.
@@ -279,7 +360,15 @@ export class DeviceRoom implements DurableObject {
       this.deliver(ws, { s: frame.header.s, k: RELAY_KIND, to }, encodeRelayError("client_gone"));
       return;
     }
-    this.deliver(target, { s: frame.header.s, k: frame.header.k }, frame.payload);
+    this.deliver(
+      target,
+      {
+        s: frame.header.s,
+        k: frame.header.k,
+        ...(frame.header.z === undefined ? {} : { z: frame.header.z })
+      },
+      frame.payload
+    );
   }
 
   webSocketClose(ws: WebSocket): void {

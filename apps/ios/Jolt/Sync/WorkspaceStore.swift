@@ -243,6 +243,7 @@ final class WorkspaceStore {
             return Chat(id: f["id"]?.stringValue ?? row.id, deviceId: deviceId,
                         title: f["title"]?.stringValue,
                         archived: f["archived"]?.boolValue ?? false,
+                        pinned: f["pinned"]?.boolValue ?? false,
                         cwd: f["cwd"]?.stringValue,
                         branch: f["branch"]?.stringValue,
                         checkoutId: f["checkoutId"]?.stringValue,
@@ -273,19 +274,15 @@ final class WorkspaceStore {
     // MARK: Derived views
 
     /// state.rs `overview_chats`: every non-archived chat of a live space,
-    /// attention-sorted.
+    /// pinned first, then sorted by recency.
     var overviewChats: [Chat] {
         let liveSpaceIds = Set(spaces.map(\.id))
         let live = chats.filter { !$0.archived && $0.spaceId.map(liveSpaceIds.contains) == true }
         return sortActive(live)
     }
 
-    /// A space's sessions, in the sidebar's Sessions order (recency).
-    ///
-    /// NOT desktop's `chats_in_space`, which is creation order because there
-    /// the rows are TABS and activity must never reorder tabs. The phone has
-    /// no tabs — a space opens into the same list, with the same rows, as the
-    /// Sessions section — so it follows that list's ordering instead.
+    /// A space's sessions in the same pinned-first, recency order as the
+    /// Threads list.
     func chats(in spaceId: String) -> [Chat] {
         sortActive(chats.filter { !$0.archived && $0.spaceId == spaceId })
     }
@@ -431,6 +428,7 @@ final class WorkspaceStore {
             "id": .string(chatId),
             "deviceId": .string(space.deviceId),
             "archived": .bool(false),
+            "pinned": .bool(false),
             "cwd": .string(cwd ?? space.path),
             "spaceId": .string(space.id),
             "createdAt": .int(nowMs()),
@@ -478,6 +476,10 @@ final class WorkspaceStore {
         }
         afterLocalWrite()
         return spaceId
+    }
+
+    func setPinned(chatId: String, pinned: Bool) {
+        updateChat(chatId, set: ["pinned": .bool(pinned)])
     }
 
     func setArchived(chatId: String, archived: Bool) {

@@ -13,6 +13,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 
+use jolt_api::methods;
 use jolt_engine::{
     AgentAccounts, AgentAccountsConfig, EngineCore, HarnessRegistry, Repos, Uploads,
     worktree_branch_from_title,
@@ -21,7 +22,6 @@ use jolt_harness::mock::MockHarness;
 use jolt_proto::{
     AgentAccountsSnapshot, AgentEvent, AgentLoginStart, DoneStatus, HarnessId, SandboxLevel,
 };
-use jolt_rpc::methods;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -470,6 +470,21 @@ async fn uploads_chunk_commit_readback_and_jail() {
     assert_eq!(committed.sha256.len(), 64);
     assert_eq!(std::fs::read(&path).expect("committed file"), payload);
 
+    // Binary chunks avoid base64 inflation and retain positional retry semantics.
+    for (seq, chunk) in payload.chunks(60_000).enumerate().rev() {
+        uploads
+            .append_bytes("up-bin", chunk, Some(seq as u64))
+            .expect("binary chunk");
+    }
+    uploads
+        .append_bytes("up-bin", &payload[..60_000], Some(0))
+        .expect("binary retry is idempotent");
+    let binary = uploads
+        .commit("up-bin", "binary.png", "chat-1")
+        .await
+        .expect("binary commit");
+    assert_eq!(std::fs::read(binary.path).expect("binary file"), payload);
+
     // Readback: chunked reassembly round-trips.
     let mut assembled = Vec::new();
     let mut offset = 0u64;
@@ -587,6 +602,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
 
     let request = jolt_proto::RunRequest {
         prompt: "please fix the login flow".into(),
+        harness: Some(HarnessId::Mock),
         model: None,
         reasoning: None,
         model_options: serde_json::Map::new(),
@@ -630,6 +646,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .expect("rename");
     let request = jolt_proto::RunRequest {
         prompt: "another request".into(),
+        harness: Some(HarnessId::Mock),
         model: None,
         reasoning: None,
         model_options: serde_json::Map::new(),

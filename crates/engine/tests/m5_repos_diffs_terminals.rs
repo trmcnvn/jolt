@@ -8,9 +8,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use jolt_api::methods;
 use jolt_engine::doc_host::EdgeConfig;
 use jolt_engine::{EngineCore, HarnessRegistry, Repos, TerminalOutput, Terminals, capture_diff};
-use jolt_rpc::methods;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1089,7 +1089,7 @@ async fn rpc_dispatch_for_m5_methods() {
             .expect("terminal output before timeout")
             .expect("stream alive");
         if let jolt_rpc::terminal_wire::TerminalBinaryEvent::Data { data, .. } =
-            jolt_rpc::terminal_wire::decode(&bytes).expect("valid terminal frame")
+            jolt_rpc::terminal_wire::decode(bytes).expect("valid terminal frame")
         {
             transcript.extend(data);
         }

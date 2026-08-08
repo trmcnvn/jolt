@@ -19,16 +19,16 @@ Both apps must provide:
 
 - WorkOS sign-in, token refresh, the single-organization setup rule, sign-out cleanup, and development auth;
 - persistent viewer-device registration, presence, host online state, and queued-offline messaging;
-- attention-sorted sessions across devices, searchable space filtering, and filtered space deep links;
+- attention-sorted threads across devices, searchable space filtering, and filtered space deep links;
 - add-space host selection and remote folder browsing;
-- new-session creation with host harness/model/reasoning discovery and Git/Jujutsu ref, reuse, or isolated-checkout planning;
+- new-thread creation with host harness/model/reasoning discovery and Git/Jujutsu ref, reuse, or isolated-checkout planning;
 - tail-first transcript manifests/pages/live updates, offline page caching, unloaded-history placeholders, and sequence-gap recovery;
 - equivalent Markdown, code-language highlighting, grouped tools, errors, structured input, turn-change summaries, TeX, and Mermaid behavior;
 - send, queue, steer, interrupt, answer, and durable process-death-safe command submission;
 - `/answer`, `/bro`, `!command`, `!!command`, and verified `@` file/directory mentions;
 - image selection/paste where the OS supports it, bounded staging, host upload, R2-first readback, and cache cleanup;
 - model, reasoning, and ref changes for later turns;
-- archive, delete with confirmation, rename where exposed, copy, and context actions;
+- close, delete with confirmation, rename where exposed, copy, and context actions;
 - equivalent accessibility labels, dynamic text behavior, loading/empty/error states, and demo/test coverage.
 
 Desktop-only terminals, checkout/historical diff viewers, agent-account switching, harness secrets, and desktop settings remain absent from both mobile apps unless deliberately added to both.

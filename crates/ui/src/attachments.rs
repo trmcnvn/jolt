@@ -20,12 +20,16 @@ use gpui::{
 
 use crate::state::EngineHandle;
 use crate::theme::ink;
-use jolt_rpc::methods;
+use jolt_api::{
+    BinaryUnaryRequest, GetTransportCapabilities, ReadAttachmentChunk, UnaryRequest,
+    UploadBinaryChunk, UploadChunk, UploadCommit, call as call_api, call_binary as call_binary_api,
+};
 
 /// Maximum staged attachment size.
 pub const MAX_ATTACHMENT_BYTES: u64 = 24 * 1024 * 1024;
-/// Base64 characters per `UploadChunk`, sized for remote-device relay.
-pub const UPLOAD_CHUNK_B64_CHARS: usize = 60_000;
+/// Raw bytes per binary upload call, sized below the RPC binary payload ceiling.
+pub const UPLOAD_CHUNK_BYTES: usize = 60_000;
+const LEGACY_UPLOAD_CHUNK_B64_CHARS: usize = 60_000;
 /// Maximum chunks accepted by the read-back loop.
 const MAX_READ_CHUNKS: usize = 1_000;
 
@@ -281,13 +285,6 @@ pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
 // Upload and read-back
 // ---------------------------------------------------------------------------
 
-fn with_target(mut params: serde_json::Value, target_device_id: Option<&str>) -> serde_json::Value {
-    if let (Some(target), Some(map)) = (target_device_id, params.as_object_mut()) {
-        map.insert("targetDeviceId".into(), target.into());
-    }
-    params
-}
-
 /// Per-call deadlines: a stalled-but-open relay link never
 /// fails an RPC on its own, so every attachment call races a timer. The first
 /// chunk gets 90s (a cold dial to a remote device), later chunks 30s; commit
@@ -299,26 +296,78 @@ const READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Race an RPC against `timeout` on the gpui background executor (these
 /// futures run under `cx.spawn`, so tokio's timer reactor isn't available).
-async fn call_with_timeout(
+async fn call_with_timeout<R: UnaryRequest>(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
-    method: &str,
-    params: serde_json::Value,
+    request: &R,
     timeout: Duration,
-) -> Result<serde_json::Value, String> {
-    let call = engine.client().call(method, params);
+) -> Result<R::Response, String> {
+    let call = call_api(engine.client(), request);
     let timer = executor.timer(timeout);
     futures::pin_mut!(call);
     match futures::future::select(call, timer).await {
         futures::future::Either::Left((result, _)) => result.map_err(|e| e.to_string()),
-        futures::future::Either::Right(_) => Err(format!("{method} timed out")),
+        futures::future::Either::Right(_) => Err(format!("{} timed out", R::METHOD)),
     }
 }
 
-/// Chunked upload: base64 the bytes, `UploadChunk{uploadId,seq,data}` per 60KB
-/// slice (positional `seq` makes the cheap retry idempotent), then
-/// `UploadCommit{uploadId,fileName,chatId}` → the durable host path and edge
-/// content address. Errors return the raw cause (the composer shows friendly copy).
+async fn call_binary_with_timeout<R: BinaryUnaryRequest>(
+    engine: &EngineHandle,
+    executor: &BackgroundExecutor,
+    request: &R,
+    payload: bytes::Bytes,
+    timeout: Duration,
+) -> Result<R::Response, String> {
+    let call = call_binary_api(engine.client(), request, payload);
+    let timer = executor.timer(timeout);
+    futures::pin_mut!(call);
+    match futures::future::select(call, timer).await {
+        futures::future::Either::Left((result, _)) => result.map_err(|error| error.to_string()),
+        futures::future::Either::Right(_) => Err(format!("{} timed out", R::METHOD)),
+    }
+}
+
+async fn stage_legacy_upload(
+    engine: &EngineHandle,
+    executor: &BackgroundExecutor,
+    target_device_id: &str,
+    attachment: &StagedAttachment,
+) -> Result<String, String> {
+    let encoded = crate::simd_base64::encode(attachment.bytes());
+    let upload_id = uuid::Uuid::new_v4().to_string();
+    for (seq, start) in (0..encoded.len())
+        .step_by(LEGACY_UPLOAD_CHUNK_B64_CHARS)
+        .enumerate()
+    {
+        let end = (start + LEGACY_UPLOAD_CHUNK_B64_CHARS).min(encoded.len());
+        let request = UploadChunk {
+            upload_id: upload_id.clone(),
+            data: encoded[start..end].to_owned(),
+            seq: Some(seq as u64),
+            target_device_id: Some(target_device_id.to_owned()),
+        };
+        let timeout = if seq == 0 {
+            FIRST_CHUNK_TIMEOUT
+        } else {
+            CHUNK_TIMEOUT
+        };
+        let mut attempt = 0;
+        loop {
+            match call_with_timeout(engine, executor, &request, timeout).await {
+                Ok(_) => break,
+                Err(error) if attempt < 2 => {
+                    attempt += 1;
+                    tracing::debug!(%error, seq, "legacy upload chunk retry");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(upload_id)
+}
+
+/// Chunked binary upload with positional sequence numbers for idempotent retries,
+/// followed by commit to the durable host path and edge content address.
 pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
@@ -326,76 +375,83 @@ pub async fn upload_attachment(
     chat_id: &str,
     attachment: &StagedAttachment,
 ) -> Result<UploadedAttachment, String> {
-    let b64 = crate::simd_base64::encode(attachment.bytes());
-    let upload_id = uuid::Uuid::new_v4().to_string();
-    let mut start = 0usize;
-    let mut seq = 0u64;
-    loop {
-        let end = (start + UPLOAD_CHUNK_B64_CHARS).min(b64.len());
-        let params = with_target(
-            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": &b64[start..end] }),
-            target_device_id,
-        );
-        let timeout = if seq == 0 {
-            FIRST_CHUNK_TIMEOUT
-        } else {
-            CHUNK_TIMEOUT
+    let binary_supported = if let Some(target_device_id) = target_device_id {
+        let request = GetTransportCapabilities {
+            target_device_id: Some(target_device_id.to_owned()),
         };
-        // One transient blip must not abort a ~400-chunk upload; `seq` slots
-        // are idempotent engine-side, so a blind re-send is safe (timeouts
-        // retry too, with up to two retries per chunk).
-        let mut attempt = 0u32;
-        loop {
-            match call_with_timeout(
-                engine,
-                executor,
-                methods::UPLOAD_CHUNK,
-                params.clone(),
-                timeout,
-            )
+        call_with_timeout(engine, executor, &request, FIRST_CHUNK_TIMEOUT)
             .await
-            {
-                Ok(_) => break,
-                Err(err) if attempt < 2 => {
-                    attempt += 1;
-                    tracing::debug!(error = %err, seq, "upload chunk retry");
+            .is_ok_and(|capabilities| capabilities.binary_unary)
+    } else {
+        true
+    };
+    let mut upload_id = if binary_supported {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        stage_legacy_upload(
+            engine,
+            executor,
+            target_device_id.expect("remote capability probe has a target"),
+            attachment,
+        )
+        .await?
+    };
+    let mut seq = 0u64;
+    if binary_supported {
+        'chunks: for chunk in attachment.bytes().chunks(UPLOAD_CHUNK_BYTES) {
+            let request = UploadBinaryChunk {
+                upload_id: upload_id.clone(),
+                seq: Some(seq),
+                target_device_id: target_device_id.map(str::to_owned),
+            };
+            let payload = bytes::Bytes::copy_from_slice(chunk);
+            let timeout = if seq == 0 && target_device_id.is_some() {
+                Duration::from_secs(10)
+            } else if seq == 0 {
+                FIRST_CHUNK_TIMEOUT
+            } else {
+                CHUNK_TIMEOUT
+            };
+            // One transient blip must not abort a ~400-chunk upload; `seq` slots
+            // are idempotent engine-side, so a blind re-send is safe (timeouts
+            // retry too, with up to two retries per chunk).
+            let mut attempt = 0u32;
+            loop {
+                match call_binary_with_timeout(engine, executor, &request, payload.clone(), timeout)
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error) if seq == 0 && target_device_id.is_some() => {
+                        tracing::info!(%error, "binary upload unsupported; using legacy transport");
+                        upload_id = stage_legacy_upload(
+                            engine,
+                            executor,
+                            target_device_id.expect("checked remote target"),
+                            attachment,
+                        )
+                        .await?;
+                        break 'chunks;
+                    }
+                    Err(err) if attempt < 2 => {
+                        attempt += 1;
+                        tracing::debug!(error = %err, seq, "upload chunk retry");
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
             }
-        }
-        start = end;
-        seq += 1;
-        if start >= b64.len() {
-            break;
+            seq += 1;
         }
     }
-    let params = with_target(
-        serde_json::json!({
-            "uploadId": upload_id,
-            "fileName": attachment.name,
-            "chatId": chat_id,
-        }),
-        target_device_id,
-    );
-    let reply = call_with_timeout(
-        engine,
-        executor,
-        methods::UPLOAD_COMMIT,
-        params,
-        COMMIT_TIMEOUT,
-    )
-    .await?;
-    let path = reply
-        .get("path")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "upload commit returned no path".to_string())?;
-    let sha256 = reply
-        .get("sha256")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "upload commit returned no content hash".to_string())?;
+    let request = UploadCommit {
+        upload_id,
+        file_name: attachment.name.clone(),
+        chat_id: chat_id.to_string(),
+        target_device_id: target_device_id.map(str::to_owned),
+    };
+    let reply = call_with_timeout(engine, executor, &request, COMMIT_TIMEOUT).await?;
     Ok(UploadedAttachment {
-        path: path.to_string(),
-        sha256: sha256.to_string(),
+        path: reply.path,
+        sha256: reply.sha256,
     })
 }
 
@@ -405,8 +461,8 @@ pub struct LoadedAttachmentImage {
     pub image: Arc<Image>,
 }
 
-/// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done`, bounded and
-/// protected against a stuck offset.
+/// `ReadAttachmentChunk` loop: decode each independent 45KB chunk immediately,
+/// bounded and protected against a stuck offset.
 pub async fn read_attachment_image(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
@@ -415,40 +471,35 @@ pub async fn read_attachment_image(
 ) -> Option<LoadedAttachmentImage> {
     let mut name = String::new();
     let mut mime = String::new();
-    let mut b64 = String::new();
+    let mut bytes = Vec::new();
     let mut offset = 0u64;
     let mut done = false;
     for _ in 0..MAX_READ_CHUNKS {
-        let params = with_target(
-            serde_json::json!({ "path": path, "offset": offset }),
-            target_device_id,
-        );
-        let chunk = call_with_timeout(
-            engine,
-            executor,
-            methods::READ_ATTACHMENT_CHUNK,
-            params,
-            READ_CHUNK_TIMEOUT,
-        )
-        .await
-        .ok()?;
-        name = chunk.get("name")?.as_str()?.to_string();
-        mime = chunk.get("mimeType")?.as_str()?.to_string();
-        b64.push_str(chunk.get("data")?.as_str()?);
-        done = chunk.get("done")?.as_bool()?;
+        let request = ReadAttachmentChunk {
+            path: path.to_string(),
+            offset,
+            target_device_id: target_device_id.map(str::to_owned),
+        };
+        let chunk = call_with_timeout(engine, executor, &request, READ_CHUNK_TIMEOUT)
+            .await
+            .ok()?;
+        name = chunk.name;
+        mime = chunk.mime_type;
+        let decoded = crate::simd_base64::decode(chunk.data.as_bytes()).ok()?;
+        bytes.extend_from_slice(&decoded);
+        done = chunk.done;
         if done {
             break;
         }
-        let next = chunk.get("nextOffset")?.as_u64()?;
+        let next = chunk.next_offset;
         if next <= offset {
             return None;
         }
         offset = next;
     }
-    if !done || b64.is_empty() {
+    if !done || bytes.is_empty() {
         return None;
     }
-    let bytes = crate::simd_base64::decode(b64.as_bytes()).ok()?;
     let format = ImageFormat::from_mime_type(&mime).unwrap_or(ImageFormat::Png);
     Some(LoadedAttachmentImage {
         name: if name.is_empty() {

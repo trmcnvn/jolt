@@ -43,7 +43,7 @@ struct SessionView: View {
             } else {
                 VStack(spacing: 12) {
                     ActivitySpinner(size: 32)
-                    Text("Opening session…")
+                    Text("Opening thread…")
                         .font(Theme.sans(12))
                         .foregroundStyle(Theme.textFaint)
                 }
@@ -51,7 +51,7 @@ struct SessionView: View {
                 .background(Theme.bg)
             }
         }
-        .navigationTitle(chat?.displayTitle ?? "Session")  // feeds the back menu
+        .navigationTitle(chat?.displayTitle ?? "Thread")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar {

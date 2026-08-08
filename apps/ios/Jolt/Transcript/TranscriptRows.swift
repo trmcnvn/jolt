@@ -1,11 +1,10 @@
 // Transcript row model — a port of crates/ui/src/shell/transcript.rs
 // rows_for_entry. One row = one markdown top-level block / tool group / chip,
-// never one message: streamed tokens re-render one row, and SwiftUI's lazy
-// stack only re-measures what changed.
+// never one message. Buffered prose creates no rows until its semantic reveal
+// marker; live tool updates remeasure only their group.
 //
 // Stable ids: markdown rows are "{entryId}#{partId}.{blockIx}", tool groups
-// "{entryId}#g{groupIx}", chips "{entryId}#{partId}". Live and completed parts
-// split identically, so the live→complete handoff never changes row identity.
+// "{entryId}#g{groupIx}", chips "{entryId}#{partId}".
 
 import Foundation
 
@@ -15,6 +14,7 @@ enum RowKind {
     case toolGroup(tools: [ToolItem], active: Bool)
     case inputChip(header: String, resolved: Bool)
     case errorChip(message: String)
+    case harnessSwitch(from: String, to: String)
     case changes(diff: TurnDiffSummary)
 }
 
@@ -127,6 +127,7 @@ enum TranscriptRowBuilder {
             return
         }
 
+        let entryRowStart = rows.count
         var first = true
         let hasSuccessfulFileMutation = entry.parts.contains { part in
             guard case .tool(_, let call, let isError, let resolved) = part else { return false }
@@ -138,11 +139,18 @@ enum TranscriptRowBuilder {
         }
         var pendingTools: [ToolItem] = []
         var groupIx = 0
-        let lastPartIx = entry.parts.indices.last
+        let lastRevealIx = entry.parts.lastIndex { part in
+            if case .textReveal = part { return true }
+            return false
+        }
+        let lastContentIx = entry.parts.lastIndex { part in
+            if case .textReveal = part { return false }
+            return true
+        }
 
         func flushTools(lastIx: Int?) {
             guard !pendingTools.isEmpty else { return }
-            let active = streaming && lastIx == lastPartIx
+            let active = streaming && lastIx == lastContentIx
             let id = "\(entry.id)#g\(groupIx)"
             var version = toolFingerprint(pendingTools)
             if active { version ^= 1 }
@@ -162,31 +170,26 @@ enum TranscriptRowBuilder {
                 // remain visible because they still explain the turn.
                 if showChanges, resolved, !isError, isFileMutation(call) { continue }
                 pendingTools.append(ToolItem(call: call, isError: isError, resolved: resolved))
-                if ix == lastPartIx { flushTools(lastIx: ix) }
+                if ix == lastContentIx { flushTools(lastIx: ix) }
 
             case .text(let partId, let text):
                 flushTools(lastIx: ix - 1)
-                guard !text.isEmpty else { continue }
+                let revealed = !streaming || (lastRevealIx.map { ix < $0 } ?? false)
+                guard revealed, !text.isEmpty else { continue }
                 let key = "\(entry.id)#\(partId)"
                 live.insert(key)
-                let isLiveTail = streaming && ix == lastPartIx
-                let blocks = parse(text: text, key: key, streaming: isLiveTail,
+                let blocks = parse(text: text, key: key, streaming: false,
                                    parsers: &parsers, completed: &completed)
                 for (blockIx, top) in blocks.enumerated() {
-                    var version = (top.fingerprint << 1) | (isLiveTail && blockIx == blocks.count - 1 ? 1 : 0)
-                    if settled, ix == lastPartIx, blockIx == blocks.count - 1 {
-                        version ^= 1 << 62  // timestamp attach keeps the diff key honest
-                    }
                     rows.append(TranscriptRow(
-                        id: "\(key).\(blockIx)", version: version, turnStart: first,
-                        kind: .markdown(block: top.block,
-                                        streaming: isLiveTail && blockIx == blocks.count - 1),
-                        entryId: entry.id,
-                        timestamp: settled && ix == lastPartIx && blockIx == blocks.count - 1
-                            ? entry.createdAt : nil,
-                        partKey: key))
+                        id: "\(key).\(blockIx)", version: top.fingerprint << 1,
+                        turnStart: first, kind: .markdown(block: top.block, streaming: false),
+                        entryId: entry.id, timestamp: nil, partKey: key))
                     first = false
                 }
+
+            case .textReveal:
+                break
 
             case .input(let partId, _, let questions, let resolved):
                 flushTools(lastIx: ix - 1)
@@ -206,6 +209,15 @@ enum TranscriptRowBuilder {
                                           entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
 
+            case .harnessSwitch(let partId, let from, let to):
+                flushTools(lastIx: ix - 1)
+                rows.append(TranscriptRow(id: "\(entry.id)#\(partId)",
+                                          version: fnv1a("\(from):\(to)"),
+                                          turnStart: first,
+                                          kind: .harnessSwitch(from: from, to: to),
+                                          entryId: entry.id, timestamp: nil, partKey: nil))
+                first = false
+
             case .changes(let partId, let diff):
                 guard showChanges else { continue }
                 flushTools(lastIx: ix - 1)
@@ -216,7 +228,11 @@ enum TranscriptRowBuilder {
                 first = false
             }
         }
-        flushTools(lastIx: lastPartIx)
+        flushTools(lastIx: lastContentIx)
+        if settled, rows.count > entryRowStart {
+            rows[rows.count - 1].timestamp = entry.createdAt
+            rows[rows.count - 1].version ^= 1 << 62
+        }
     }
 
     private static func isFileMutation(_ call: RenderToolCall) -> Bool {

@@ -9,14 +9,16 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use jolt_doc::{CommandBasedOn, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
+use jolt_api::methods;
 use jolt_engine::{EngineCore, HarnessRegistry};
 use jolt_harness::{Harness, HarnessError, RunControls};
 use jolt_proto::{
     AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SessionStatus, SteeringMode,
 };
-use jolt_rpc::methods;
+use jolt_session_doc::{
+    CommandBasedOn, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus,
+};
 
 const VIEWER: &str = "viewer-device";
 
@@ -142,6 +144,7 @@ where
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: Default::default(),
@@ -155,6 +158,22 @@ fn run_request(prompt: &str) -> RunRequest {
 
 /// Queue a run command into a chat doc the way a remote viewer would (ledger rule 1).
 fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &str) {
+    queue_run_with(
+        core,
+        chat_id,
+        command_id,
+        message_id,
+        run_request("go do it"),
+    );
+}
+
+fn queue_run_with(
+    core: &EngineCore,
+    chat_id: &str,
+    command_id: &str,
+    message_id: &str,
+    request: RunRequest,
+) {
     let handle = core.doc_host.open(chat_id).expect("open chat");
     let now = chrono::Utc::now().timestamp_millis();
     handle
@@ -162,7 +181,7 @@ fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &st
         .queue_command(&SessionCommandEntry {
             id: command_id.into(),
             payload: SessionCommandPayload::Run {
-                request: run_request("go do it"),
+                request,
                 message_id: message_id.into(),
             },
             issued_by: VIEWER.into(),
@@ -311,7 +330,7 @@ async fn two_engines_share_a_workspace() {
     )
     .await;
 
-    // Rename + archive from B (LWW from any device) become visible on A.
+    // Rename + pin + archive from B (LWW from any device) become visible on A.
     client_b
         .call(
             methods::MUTATE,
@@ -322,19 +341,24 @@ async fn two_engines_share_a_workspace() {
     client_b
         .call(
             methods::MUTATE,
+            serde_json::json!({ "op": "setChatPinned", "chatId": "chat-1", "pinned": true }),
+        )
+        .await
+        .expect("pin chat");
+    client_b
+        .call(
+            methods::MUTATE,
             serde_json::json!({ "op": "setChatArchived", "chatId": "chat-1", "archived": true }),
         )
         .await
         .expect("archive chat");
     wait_for(
         || {
-            a.workspace
-                .chat("chat-1")
-                .ok()
-                .flatten()
-                .is_some_and(|c| c.title.as_deref() == Some("Renamed from B") && c.archived)
+            a.workspace.chat("chat-1").ok().flatten().is_some_and(|c| {
+                c.title.as_deref() == Some("Renamed from B") && c.pinned && c.archived
+            })
         },
-        "rename + archive on A",
+        "rename + pin + archive on A",
     )
     .await;
 
@@ -388,6 +412,82 @@ async fn claim_on_first_command_creates_the_chat_row() {
     drop(link);
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test]
+async fn claim_resolves_worktree_cwd_to_repo_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+    let client = jolt_rpc::memory_client(core.rpc_service());
+
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().join("project");
+    let worktree = repo.path().join("clever-ember");
+    std::fs::create_dir_all(root.join(".git/worktrees/clever-ember")).unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            root.join(".git/worktrees/clever-ember").display()
+        ),
+    )
+    .unwrap();
+
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createSpace", "spaceId": "space-project", "deviceId": "dev-a",
+                "path": root.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect("create project space");
+
+    let request = RunRequest {
+        cwd: worktree.to_string_lossy().into_owned(),
+        ..run_request("go do it")
+    };
+    queue_run_with(&core, "chat-worktree", "cmd-worktree", "m-1", request);
+    wait_for(
+        || {
+            core.workspace
+                .chat("chat-worktree")
+                .ok()
+                .flatten()
+                .is_some_and(|chat| chat.space_id.as_deref() == Some("space-project"))
+        },
+        "worktree chat attributed to project space",
+    )
+    .await;
+    assert_eq!(core.workspace.read_spaces().unwrap().len(), 1);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn claimed_chat_records_request_harness() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+    let request = RunRequest {
+        harness: Some(HarnessId::Pi),
+        ..run_request("go do it")
+    };
+
+    queue_run_with(&core, "chat-harness", "cmd-harness", "m-1", request);
+    wait_for(
+        || {
+            core.workspace
+                .chat("chat-harness")
+                .ok()
+                .flatten()
+                .and_then(|chat| chat.config)
+                .is_some_and(|config| config.harness == HarnessId::Pi)
+        },
+        "claimed chat request harness",
+    )
+    .await;
+    core.shutdown().await;
 }
 
 #[tokio::test]
@@ -460,7 +560,7 @@ async fn chat_config_selects_the_run_harness() {
                 .iter()
                 .any(|e| {
                     e.parts.iter().any(
-                    |p| matches!(p, jolt_doc::MessagePart::Text { text, .. } if text == "From Pi"),
+                    |p| matches!(p, jolt_session_doc::MessagePart::Text { text, .. } if text == "From Pi"),
                 )
                 })
         },

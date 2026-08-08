@@ -86,29 +86,20 @@ pub fn attention_rank(status: ChatIndicator) -> u8 {
 // Sort orders
 // ---------------------------------------------------------------------------
 
-/// Active-list order: pure recency (`last_message_at` desc, `created_at`
-/// fallback), id tiebreak so the sort is total. Deliberately NOT
-/// attention-bucketed: status drives the DOT, never the position — bucketing
-/// meant that merely OPENING a completed session (completed → seen → idle)
-/// dropped its row under the pointer (user report: "their position in the
-/// scrollbar changes"). Recency determines order while dots carry urgency;
-/// [`attention_rank`] still
+/// Active-list order: pinned first, then pure recency (`last_message_at` desc,
+/// `created_at` fallback) within each bucket, with an id tiebreak so the sort
+/// is total. Deliberately NOT attention-bucketed: status drives the DOT, never
+/// the position — bucketing meant that merely OPENING a completed session
+/// (completed → seen → idle) dropped its row under the pointer (user report:
+/// "their position in the scrollbar changes"). [`attention_rank`] still
 /// aggregates the space rows' urgency dot.
 pub fn sort_active(rows: &mut Vec<(ChatIndicator, &Chat)>) {
     rows.sort_by(|(_, a), (_, b)| {
-        let ka = a.last_message_at.unwrap_or(a.created_at);
-        let kb = b.last_message_at.unwrap_or(b.created_at);
-        kb.cmp(&ka).then_with(|| a.id.cmp(&b.id))
-    });
-}
-
-/// Session-tab order for a space: creation order (activity never reorders
-/// tabs), id tiebreak. Pure.
-pub fn sort_tabs(chats: &mut [&Chat]) {
-    chats.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.id.cmp(&b.id))
+        b.pinned.cmp(&a.pinned).then_with(|| {
+            let ka = a.last_message_at.unwrap_or(a.created_at);
+            let kb = b.last_message_at.unwrap_or(b.created_at);
+            kb.cmp(&ka).then_with(|| a.id.cmp(&b.id))
+        })
     });
 }
 

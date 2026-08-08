@@ -28,8 +28,10 @@ enum TablerIcon {
     case listCheck
     case logout
     case messageCircle
+    case messageCircleX
     case messages
     case pencil
+    case pin
     case photoExclamation
     case plus
     case search
@@ -138,6 +140,12 @@ enum TablerIcon {
             ]
         case .messageCircle:
             return ["M3 20l1.3 -3.9c-2.324 -3.437 -1.426 -7.872 2.1 -10.374c3.526 -2.501 8.59 -2.296 11.845 .48c3.255 2.777 3.695 7.266 1.029 10.501c-2.666 3.235 -7.615 4.215 -11.574 2.293l-4.7 1"]
+        case .messageCircleX:
+            return [
+                "M13.593 19.855a9.96 9.96 0 0 1 -5.893 -.855l-4.7 1l1.3 -3.9c-2.324 -3.437 -1.426 -7.872 2.1 -10.374c3.526 -2.501 8.59 -2.296 11.845 .48c2.128 1.816 3.053 4.363 2.693 6.813",
+                "M22 22l-5 -5",
+                "M17 22l5 -5",
+            ]
         case .messages:
             return [
                 "M21 14l-3 -3h-7a1 1 0 0 1 -1 -1v-6a1 1 0 0 1 1 -1h9a1 1 0 0 1 1 1v10",
@@ -147,6 +155,12 @@ enum TablerIcon {
             return [
                 "M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4",
                 "M13.5 6.5l4 4",
+            ]
+        case .pin:
+            return [
+                "M15 4.5l-4 4l-4 1.5l-1.5 1.5l7 7l1.5 -1.5l1.5 -4l4 -4",
+                "M9 15l-4.5 4.5",
+                "M14.5 4l5.5 5.5",
             ]
         case .photoExclamation:
             return [

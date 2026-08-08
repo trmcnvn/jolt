@@ -14,6 +14,39 @@ pub enum HarnessId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum HarnessUpdateState {
+    Unknown,
+    Checking,
+    UpToDate,
+    UpdateAvailable,
+    WaitingForIdle,
+    Updating,
+    Updated,
+    Failed,
+    NotInstalled,
+    Manual,
+}
+
+/// Device-local update state for one installed coding harness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessUpdateStatus {
+    pub harness: HarnessId,
+    pub state: HarnessUpdateState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(default)]
+    pub can_apply: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum AgentCommandSource {
     Jolt,
     Extension,
@@ -108,6 +141,10 @@ pub struct ModelOptionChoice {
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
     pub prompt: String,
+    /// Harness picked at send time. It rides the command plane so dispatch
+    /// does not depend on the separately synced workspace row arriving first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessId>,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     /// Harness-specific option selections (option id -> choice id), JSON round-tripped.
@@ -247,6 +284,14 @@ pub struct ExtractQuestionsResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum CostProvenance {
+    ProviderReported,
+    ModelEstimated,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DoneStatus {
     Completed,
     Interrupted,
@@ -300,6 +345,8 @@ pub enum AgentEvent {
         cache_write_input_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_provenance: Option<CostProvenance>,
         /// Current prompt/context size for this call, when reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_tokens: Option<u64>,
@@ -385,17 +432,20 @@ mod tests {
         // Old-wire JSON without the field parses (additive compat)…
         let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
         let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(req.harness.is_none());
         assert!(req.attachments.is_empty());
         // …and an empty list serializes away (old readers never see it).
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("attachments").is_none());
         // Populated lists round-trip.
         let req = RunRequest {
+            harness: Some(HarnessId::Pi),
             attachments: vec!["/tmp/a.png".into()],
             ..req
         };
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
+        assert_eq!(round.harness, Some(HarnessId::Pi));
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
     }
 

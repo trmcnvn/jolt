@@ -74,7 +74,7 @@ impl Render for TerminalPage {
                                                 .text_size(px(11.5))
                                                 .text_color(theme.text_muted.opacity(0.7))
                                                 .child(SharedString::from(
-                                                    "Runs in the session directory through your login shell.",
+                                                    "Runs in the thread directory through your login shell.",
                                                 )),
                                         ),
                                 )

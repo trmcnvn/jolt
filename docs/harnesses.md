@@ -32,11 +32,21 @@ JOLT_PI_EXECUTABLE=/absolute/path/to/pi Jolt
 
 Version-control executable overrides are documented in [Environment variables](environment-variables.md).
 
+## Harness updates
+
+Each device checks its installed Claude Code, Codex, and Pi versions in the background and publishes device-local update status over RPC. A signed-in desktop also watches the other engine-host devices in its account, including headless machines, and labels their notices with the device name. Offline device watches retry when the device becomes reachable. Jolt notifies once per device and harness release through the configured in-app or system-notification destination. An **Update** action is offered only when Jolt can prove a supported install path; executable overrides and other unmanaged installs receive manual instructions instead.
+
+Jolt never applies a harness update from a background check. Installation starts only when the user chooses **Update** in that device's notification; for a remote device the action sends a typed request to that device's engine.
+
+An accepted update fences new durable commands for only that harness. Persistent processes already parked between turns retire immediately and keep their native resume metadata. Active turns and input requests are never interrupted: the updater waits for them to reach a clean idle boundary, retires the old process, runs the provider-owned updater, verifies `--version`, then releases pending commands against the new executable. Other harnesses and open terminals remain available.
+
+Jolt invokes `claude update` for managed native/npm installs, `codex update`, and `pi update --self`; detected Homebrew installs use `brew upgrade --cask` with a forced cask-API metadata refresh. Update commands are selected by the host engine from the resolved executable; clients never submit arbitrary shell commands. Bounded updater stdout/stderr is recorded in `{data_dir}/logs/jolt-headed.log` or `jolt-headless.log`; failures also include a concise output tail in the notification.
+
 ## Claude Code
 
 Jolt launches Claude Code with streaming JSON input/output and keeps stdin open for steering. It normalizes text and reasoning deltas, tool calls/results, usage, rate-limit events, and final status. Claude's `AskUserQuestion` control request becomes Jolt's question panel. Coding tools are auto-approved for unattended full-access operation.
 
-Harness session IDs are stored on the chat row and resumed only from the same working directory. Interrupt begins with the CLI's control path and escalates process termination if the child does not exit.
+Harness session IDs are retained independently per harness and working directory on the chat row. Interrupt begins with the CLI's control path and escalates process termination if the child does not exit.
 
 **Accounts:** **Settings → Accounts** can detect, save, activate, forget, and add Claude Code login slots on a selected device. Claude login uses a browser flow with a pasted code. Account quota windows are CLI/provider reports, not Jolt token accounting.
 
@@ -75,15 +85,17 @@ Pi extension UI requests are bridged into Jolt's input surface. Native Pi bash h
 
 Model catalogs are fetched from the device that will run the session, so every viewport presents the host's installed models.
 
-The composer persists a concrete model, reasoning level, and harness-specific option map on the chat. Jolt defaults coding harnesses to unattended full access; Pi can additionally expose a read-only tool set. Harness-specific examples include context-window, service-tier, tool-access, or project-trust choices. Unsupported or newly added wire fields are treated as additive where possible.
+The composer persists a concrete model, reasoning level, and harness-specific option map on the chat. Existing chats may change harness as well as model. Jolt defaults coding harnesses to unattended full access; Pi can additionally expose a read-only tool set. Harness-specific examples include context-window, service-tier, tool-access, or project-trust choices. Unsupported or newly added wire fields are treated as additive where possible.
 
-## Steering and continuation
+## Steering, switching, and continuation
 
-A non-empty composer during a live steerable run sends a durable `steer` command. The host routes it into the active harness mailbox at the harness's supported boundary. If no live run can accept it, the engine can turn it into the next turn rather than discarding user intent.
+A non-empty composer during a live steerable run sends a durable `steer` command only when the selected harness matches the active run. A different harness settles the current run before starting the replacement; it is never steered into the old process. The host otherwise routes steering into the active harness mailbox at the harness's supported boundary. If no live run can accept it, the engine can turn it into the next turn rather than discarding user intent.
 
 Cmd+Enter on macOS (Ctrl+Enter elsewhere) instead adds a distinct turn to Jolt's engine-owned queue. Queued turns stay outside the transcript until dispatched, drain together in FIFO order at the next clean turn boundary, and can be cancelled while pending. An interruption or error pauses the queue so it cannot restart work unexpectedly; the composer can resume it explicitly. Because dispatch happens between turns, this behavior is identical across Claude Code, Codex, and Pi.
 
-The harness-native session ID is updated after successful runs. Resume is scoped to the working directory where the CLI conversation was created.
+The harness-native session ID and transcript-coverage cursor are updated after settled turns. Resume is scoped to the harness, host device, and working directory where the CLI conversation was created.
+
+On a first switch, Jolt injects a bounded structured handoff compiled from the privacy-safe synced transcript, active goal, rendered commands, and immutable turn-diff manifests. Returning to a previously used harness resumes its original native conversation and sends only the turns missed since its coverage cursor. Raw tool output and native protocol data remain device-local and never enter the handoff. A rejected native resume invalidates only that harness/cwd generation and retries fresh with a full handoff.
 
 When compaction finishes, Jolt arms a hidden continuation. Any subsequent user or agent message cancels it; if the harness instead settles without resuming, Jolt sends the continuation into the same live session. This guard uses the normalized compaction lifecycle and therefore applies equally to Claude Code, Codex, and Pi.
 

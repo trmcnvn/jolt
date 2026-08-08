@@ -2,8 +2,8 @@
 
 use gpui::{Context, Entity, Render, SharedString, Subscription, Task, div, prelude::*, px};
 
+use jolt_api::{SetVcsBackend, VcsSettings, call as call_api};
 use jolt_proto::{VcsKind, VcsSettingsSnapshot};
-use jolt_rpc::methods;
 
 use super::device_switcher::{DeviceSelected, DeviceSwitcher};
 use crate::popover::Loadable;
@@ -49,13 +49,6 @@ impl VcsPage {
         page
     }
 
-    fn params(&self, mut value: serde_json::Value) -> serde_json::Value {
-        if let (Some(target), Some(object)) = (&self.target_device, value.as_object_mut()) {
-            object.insert("targetDeviceId".into(), serde_json::json!(target));
-        }
-        value
-    }
-
     fn select_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
         if self.target_device == target {
             return;
@@ -71,14 +64,14 @@ impl VcsPage {
             return;
         };
         self.snapshot = Loadable::Loading;
-        let params = self.params(serde_json::json!({}));
+        let request = VcsSettings {
+            target_device_id: self.target_device.clone(),
+        };
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::VCS_SETTINGS, params).await;
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |page, cx| {
                 page.snapshot = match result {
-                    Ok(value) => serde_json::from_value(value)
-                        .map(Loadable::Ready)
-                        .unwrap_or_else(|err| Loadable::Error(err.to_string())),
+                    Ok(snapshot) => Loadable::Ready(snapshot),
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 cx.notify();
@@ -105,15 +98,16 @@ impl VcsPage {
             return;
         };
         self.busy = Some(kind);
-        let params = self.params(serde_json::json!({ "backend": kind }));
+        let request = SetVcsBackend {
+            backend: kind,
+            target_device_id: self.target_device.clone(),
+        };
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::SET_VCS_BACKEND, params).await;
+            let result = call_api(engine.client(), &request).await;
             this.update(cx, |page, cx| {
                 page.busy = None;
                 page.snapshot = match result {
-                    Ok(value) => serde_json::from_value(value)
-                        .map(Loadable::Ready)
-                        .unwrap_or_else(|err| Loadable::Error(err.to_string())),
+                    Ok(snapshot) => Loadable::Ready(snapshot),
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 cx.notify();

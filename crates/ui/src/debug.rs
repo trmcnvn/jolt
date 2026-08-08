@@ -88,7 +88,7 @@ impl PerformanceHud {
             backend: "Metal",
             driver: None,
             software_emulated: false,
-            allocated_bytes: Some(device.current_allocated_size() as u64),
+            allocated_bytes: Some(device.current_allocated_size()),
         });
         #[cfg(not(target_os = "macos"))]
         let gpu = None;
@@ -151,7 +151,7 @@ impl PerformanceHud {
 
         #[cfg(target_os = "macos")]
         if let (Some(device), Some(gpu)) = (&self.metal_device, &mut self.gpu) {
-            gpu.allocated_bytes = Some(device.current_allocated_size() as u64);
+            gpu.allocated_bytes = Some(device.current_allocated_size());
         }
     }
 
@@ -271,7 +271,7 @@ impl Render for PerformanceHud {
                 .child(metric_row(
                     "Process GPU allocation",
                     gpu.allocated_bytes
-                        .map_or_else(|| "Unavailable".to_owned(), |bytes| format_bytes(bytes)),
+                        .map_or_else(|| "Unavailable".to_owned(), format_bytes),
                     theme,
                 ))
         } else {

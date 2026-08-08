@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::HarnessId;
+use crate::{CostProvenance, HarnessId};
 
 /// Cumulative usage for one Jolt chat on its host device.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -16,6 +16,8 @@ pub struct UsageSummary {
     pub calls: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_provenance: Option<CostProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,6 +58,8 @@ pub struct UsageDay {
     pub calls: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_provenance: Option<CostProvenance>,
 }
 
 /// A harness/model/cwd row in a ranged breakdown.
@@ -73,6 +77,8 @@ pub struct UsageBreakdownRow {
     pub cache_write_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_provenance: Option<CostProvenance>,
 }
 
 impl UsageBreakdownRow {
@@ -99,6 +105,8 @@ pub struct UsageBreakdown {
     pub cache_write_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_provenance: Option<CostProvenance>,
     #[serde(default)]
     pub activity: Vec<UsageDay>,
     #[serde(default)]

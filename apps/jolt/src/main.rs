@@ -3,6 +3,8 @@
 // service-managed `jolt headless` only ever loads saved credentials.
 
 mod auth_cli;
+#[cfg(feature = "desktop")]
+mod desktop_engine;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -215,6 +217,7 @@ fn run_headed() -> anyhow::Result<()> {
         edge_token,
         org_id: std::env::var("JOLT_ORG_ID").ok(),
         default_harness: harness_from_env(),
+        connector: desktop_engine::connector(),
     });
     Ok(())
 }
@@ -290,7 +293,7 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
             anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is jolt running?")
         })?;
     let status = client
-        .call(jolt_rpc::methods::SYNC_STATUS, serde_json::json!({}))
+        .call(jolt_api::methods::SYNC_STATUS, serde_json::json!({}))
         .await
         .map_err(|e| anyhow::anyhow!("SyncStatus failed: {e}"))?;
     let now = status.get("nowMs").and_then(|v| v.as_i64()).unwrap_or(0);

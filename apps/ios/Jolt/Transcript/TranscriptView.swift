@@ -156,10 +156,16 @@ struct TranscriptView: View {
             let show = new > Self.jumpThreshold
             if scroll.showJump != show { scroll.showJump = show }
         }
-        .onChange(of: contentSignature(rows)) {
+        .onChange(of: contentSignature(rows)) { old, _ in
             guard scroll.pinned else { return }
-            if reduceMotion {
-                scrollPosition.scrollTo(edge: .bottom)
+            // The empty → first projection transition is session open. Snap it
+            // to the bottom; only subsequent streamed growth should spring.
+            if reduceMotion || old.isEmpty {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    scrollPosition.scrollTo(edge: .bottom)
+                }
             } else {
                 withAnimation(.spring(duration: 0.3)) {
                     scrollPosition.scrollTo(edge: .bottom)
@@ -263,6 +269,9 @@ struct TranscriptView: View {
             case .errorChip(let message):
                 ErrorChipView(message: message)
 
+            case .harnessSwitch(let from, let to):
+                HarnessSwitchView(from: from, to: to)
+
             case .changes(let diff):
                 TurnChangesView(
                     diff: diff,
@@ -354,10 +363,14 @@ final class TranscriptBuilderCache {
         var jobs: [(key: String, text: String)] = []
         for entry in entries where entry.role != .user {
             let streaming = entry.status == .streaming
-            let lastIx = entry.parts.indices.last
+            let lastRevealIx = entry.parts.lastIndex { part in
+                if case .textReveal = part { return true }
+                return false
+            }
             for (ix, part) in entry.parts.enumerated() {
                 guard case .text(let partId, let text) = part, !text.isEmpty else { continue }
-                if streaming && ix == lastIx { continue }  // live tail: incremental parser's job
+                let revealed = !streaming || (lastRevealIx.map { ix < $0 } ?? false)
+                if !revealed { continue }
                 let key = "\(entry.id)#\(partId)"
                 if completed[key]?.source != text {
                     jobs.append((key, text))
@@ -739,6 +752,46 @@ struct ToolChipRow: View {
             .padding(.leading, 12)
         }
         .frame(height: 38)
+    }
+}
+
+private func harnessLabel(_ harness: String) -> String {
+    switch harness {
+    case "claude-code": return "Claude Code"
+    case "codex": return "Codex"
+    case "pi": return "Pi"
+    default: return "Mock"
+    }
+}
+
+struct HarnessSwitchView: View {
+    let from: String
+    let to: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Rectangle().fill(Theme.border.opacity(0.85)).frame(height: 1)
+            HStack(spacing: 6) {
+                Text("Switched")
+                harnessIdentity(from)
+                Text("→")
+                harnessIdentity(to)
+            }
+            .font(Theme.sans(10))
+            .foregroundStyle(Theme.textMuted.opacity(0.72))
+            .padding(.horizontal, 9)
+            .frame(height: 24)
+            .background(whiteAlpha(0.025), in: Capsule())
+            .overlay(Capsule().strokeBorder(Theme.border, lineWidth: 1))
+            Rectangle().fill(Theme.border.opacity(0.85)).frame(height: 1)
+        }
+    }
+
+    private func harnessIdentity(_ harness: String) -> some View {
+        HStack(spacing: 4) {
+            HarnessBadge(harness: harness, size: 11, neutral: Theme.textMuted)
+            Text(harnessLabel(harness))
+        }
     }
 }
 

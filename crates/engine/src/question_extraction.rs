@@ -66,6 +66,7 @@ pub(crate) async fn extract_questions(
     let prompt = format!("{EXTRACTION_PROMPT}{assistant_text}\n</assistant-response>");
     let request = RunRequest {
         prompt,
+        harness: Some(harness_id),
         model: model.clone(),
         reasoning: Some(ReasoningLevel::Minimal),
         model_options,
@@ -170,6 +171,7 @@ mod tests {
                     cache_read_input_tokens: 4,
                     cache_write_input_tokens: 0,
                     cost_usd: Some(0.02),
+                    cost_provenance: None,
                     context_tokens: Some(16),
                     context_window: Some(200_000),
                 },

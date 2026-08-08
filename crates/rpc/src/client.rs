@@ -4,11 +4,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::{ClientFrame, RpcError, ServerFrame, WireFrame, decode_binary_stream_item};
+use crate::{
+    ClientFrame, MAX_WIRE_FRAME_BYTES, RpcError, ServerFrame, WireFrame, decode_binary_stream_item,
+    encode_binary_request,
+};
 
 /// Per-stream queue depth. Bounded: route_frame awaits a full queue, pausing
 /// the connection reader — transport backpressure instead of unbounded growth
@@ -19,7 +23,7 @@ const STREAM_QUEUE_CAP: usize = 256;
 enum Pending {
     Call(oneshot::Sender<Result<serde_json::Value, RpcError>>),
     Stream(mpsc::Sender<serde_json::Value>),
-    BinaryStream(mpsc::Sender<Vec<u8>>),
+    BinaryStream(mpsc::Sender<Bytes>),
 }
 
 struct Shared {
@@ -54,6 +58,13 @@ impl RpcClient {
             while let Some(payload) = inbound.recv().await {
                 match payload {
                     WireFrame::Text(payload) => {
+                        if payload.len() > MAX_WIRE_FRAME_BYTES {
+                            tracing::warn!(
+                                bytes = payload.len(),
+                                "rpc: dropping oversized server frame"
+                            );
+                            continue;
+                        }
                         for line in payload.lines() {
                             let line = line.trim();
                             if line.is_empty() {
@@ -66,11 +77,22 @@ impl RpcClient {
                                     continue;
                                 }
                             };
+                            if let Err(err) = frame.validate() {
+                                tracing::warn!(error = %err, "rpc: dropping invalid server frame");
+                                continue;
+                            }
                             route_frame(&reader_shared, &reader_out, frame).await;
                         }
                     }
                     WireFrame::Binary(frame) => {
-                        let (id, payload) = match decode_binary_stream_item(&frame) {
+                        if frame.len() > MAX_WIRE_FRAME_BYTES {
+                            tracing::warn!(
+                                bytes = frame.len(),
+                                "rpc: dropping oversized binary frame"
+                            );
+                            continue;
+                        }
+                        let (id, payload) = match decode_binary_stream_item(frame) {
                             Ok(decoded) => decoded,
                             Err(err) => {
                                 tracing::warn!(error = %err, "rpc: dropping malformed binary frame");
@@ -123,6 +145,27 @@ impl RpcClient {
         rx.await.map_err(|_| RpcError::Closed)?
     }
 
+    /// Unary request with an out-of-JSON binary payload.
+    pub async fn call_binary(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        payload: Bytes,
+    ) -> Result<serde_json::Value, RpcError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let frame = encode_binary_request(id, method, &params, payload)?;
+        let (tx, rx) = oneshot::channel();
+        self.shared.lock().insert(id, Pending::Call(tx));
+        self.out
+            .send(WireFrame::Binary(frame))
+            .await
+            .inspect_err(|_| {
+                self.shared.lock().remove(&id);
+            })
+            .map_err(|_| RpcError::Closed)?;
+        rx.await.map_err(|_| RpcError::Closed)?
+    }
+
     /// Typed unary request.
     pub async fn call_as<T: serde::de::DeserializeOwned>(
         &self,
@@ -163,7 +206,7 @@ impl RpcClient {
         &self,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<mpsc::Receiver<Vec<u8>>, RpcError> {
+    ) -> Result<mpsc::Receiver<Bytes>, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
         self.shared.lock().insert(id, Pending::BinaryStream(tx));
@@ -181,6 +224,7 @@ impl RpcClient {
     }
 
     async fn send(&self, frame: ClientFrame) -> Result<(), RpcError> {
+        frame.validate()?;
         let json = serde_json::to_string(&frame)
             .map_err(|e| RpcError::Transport(format!("serialize frame: {e}")))?;
         self.out
@@ -250,14 +294,14 @@ async fn route_binary_frame(
     shared: &Arc<Shared>,
     out: &mpsc::Sender<WireFrame>,
     id: u64,
-    payload: &[u8],
+    payload: Bytes,
 ) {
     let tx = match shared.lock().get(&id) {
         Some(Pending::BinaryStream(tx)) => Some(tx.clone()),
         _ => None,
     };
     let dead = match tx {
-        Some(tx) => tx.send(payload.to_vec()).await.is_err(),
+        Some(tx) => tx.send(payload).await.is_err(),
         None => false,
     };
     if dead {
@@ -283,10 +327,16 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Dial a WebSocket RPC server (`ws://127.0.0.1:{ipc_port}`).
 pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
-    let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
-        .await
-        .map_err(|_| RpcError::Transport(format!("timed out dialing {url}")))?
-        .map_err(|e| RpcError::Transport(e.to_string()))?;
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_WIRE_FRAME_BYTES))
+        .max_frame_size(Some(MAX_WIRE_FRAME_BYTES));
+    let (ws, _) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(url, Some(config), false),
+    )
+    .await
+    .map_err(|_| RpcError::Transport(format!("timed out dialing {url}")))?
+    .map_err(|e| RpcError::Transport(e.to_string()))?;
     let (mut sink, mut stream) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(256);
     let (in_tx, in_rx) = mpsc::channel::<WireFrame>(256);
@@ -300,7 +350,7 @@ pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
                         }
                     }
                     Some(WireFrame::Binary(bytes)) => {
-                        if sink.send(WsMessage::Binary(bytes.into())).await.is_err() {
+                        if sink.send(WsMessage::Binary(bytes)).await.is_err() {
                             break;
                         }
                     }
@@ -316,7 +366,7 @@ pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
                         }
                     }
                     Some(Ok(WsMessage::Binary(bytes))) => {
-                        if in_tx.send(WireFrame::Binary(bytes.to_vec())).await.is_err() {
+                        if in_tx.send(WireFrame::Binary(bytes)).await.is_err() {
                             break;
                         }
                     }

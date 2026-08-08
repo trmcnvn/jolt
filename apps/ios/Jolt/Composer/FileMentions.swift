@@ -276,9 +276,9 @@ final class FileMentionDraft {
         if let relay = error as? RelayError {
             switch relay {
             case .hostOffline, .notConnected, .timeout:
-                return "The session's device is unreachable."
+                return "The thread's device is unreachable."
             case .rpc(let message) where message.hasPrefix("unknown method"):
-                return "Update Jolt on the session's device to search its files."
+                return "Update Jolt on the thread's device to search its files."
             case .rpc:
                 return "File search failed."
             }

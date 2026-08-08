@@ -185,7 +185,7 @@ Treat iOS and Android as two native implementations of one mobile product. Follo
 
 ### Change workspace rows
 
-Keep Rust (`crates/doc/src/registry.rs`), TypeScript (`edge/src/registry-core.ts`), and Swift (`apps/ios/Jolt/Sync/RegistryCore.swift`) semantics aligned. Update shared test vectors and preserve per-field clock behavior.
+Keep Rust (`crates/session-doc/src/registry.rs`), TypeScript (`edge/src/registry-core.ts`), and Swift (`apps/ios/Jolt/Sync/RegistryCore.swift`) semantics aligned. Update shared test vectors and preserve per-field clock behavior.
 
 ### Change session documents
 

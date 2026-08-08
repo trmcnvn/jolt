@@ -5,7 +5,7 @@
  * {@link MSG_INLINE_MAX}. Free, invisible — renderers stitch continuations
  * back onto their parent by `continuationOf`.
  */
-import type { UserInputQuestion } from "./control-types";
+import type { HarnessId, UserInputQuestion } from "./control-types";
 import { MSG_INLINE_MAX } from "./constants";
 import type { RenderToolCall, SessionMessagePart, TurnDiffSummary } from "./render-parts";
 
@@ -21,7 +21,14 @@ export type SessionMessageRole = "user" | "assistant" | "system";
  */
 export interface DocMessagePart {
   readonly id: string;
-  readonly kind: "text" | "tool" | "input" | "error" | "changes";
+  readonly kind:
+    | "text"
+    | "textReveal"
+    | "tool"
+    | "input"
+    | "error"
+    | "harnessSwitch"
+    | "changes";
   /** kind === "text" — LoroText in the doc, string in mirror state. */
   readonly text?: string;
   /** kind === "tool" — render-only (§1.2). */
@@ -32,6 +39,9 @@ export interface DocMessagePart {
   readonly resolved?: boolean;
   /** kind === "error". */
   readonly message?: string;
+  /** kind === "harnessSwitch". */
+  readonly from?: HarnessId;
+  readonly to?: HarnessId;
   /** kind === "changes" — compact metadata only; no patch bodies. */
   readonly diff?: TurnDiffSummary;
 }
@@ -44,6 +54,8 @@ export const toDocParts = (
     switch (p.kind) {
       case "text":
         return { id: p.id, kind: "text", text: p.text };
+      case "textReveal":
+        return { id: p.id, kind: "textReveal" };
       case "tool":
         return {
           id: p.id,
@@ -60,6 +72,8 @@ export const toDocParts = (
         };
       case "error":
         return { id: p.id, kind: "error", message: p.message };
+      case "harnessSwitch":
+        return { id: p.id, kind: "harnessSwitch", from: p.from, to: p.to };
       case "changes":
         return { id: p.id, kind: "changes", diff: p.diff };
     }
@@ -72,6 +86,8 @@ export const fromDocParts = (
 ): ReadonlyArray<SessionMessagePart> =>
   parts.map((p): SessionMessagePart => {
     switch (p.kind) {
+      case "textReveal":
+        return { kind: "textReveal", id: p.id };
       case "tool":
         return p.call
           ? {
@@ -90,6 +106,10 @@ export const fromDocParts = (
         };
       case "error":
         return { kind: "error", id: p.id, message: p.message ?? "" };
+      case "harnessSwitch":
+        return p.from && p.to
+          ? { kind: "harnessSwitch", id: p.id, from: p.from, to: p.to }
+          : { kind: "text", id: p.id, text: "" };
       case "changes":
         return p.diff
           ? { kind: "changes", id: p.id, diff: p.diff }

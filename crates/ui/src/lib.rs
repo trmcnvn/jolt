@@ -14,7 +14,6 @@
 
 pub mod app_menus;
 pub mod appearance;
-pub mod archived;
 pub mod ascii_mark;
 pub mod attachments;
 pub mod background_service;
@@ -94,11 +93,11 @@ fn register_fonts(cx: &App) {
 }
 
 pub use jolt_proto::HarnessId;
-pub use state::EngineBootConfig;
+pub use state::{EngineBackend, EngineBootConfig, EngineConnector, EngineHandle, EngineMode};
 
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/jolt`, not here).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UiConfig {
     /// Data directory — engine stores + `ui-settings.json`.
     pub data_dir: PathBuf,
@@ -115,6 +114,8 @@ pub struct UiConfig {
     pub workos_client_id: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
+    /// Application-owned engine connection/bootstrap implementation.
+    pub connector: EngineConnector,
 }
 
 impl UiConfig {
@@ -136,6 +137,7 @@ impl UiConfig {
 struct ReopenState {
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
+    connector: EngineConnector,
     background_service: background_service::BackgroundServiceController,
 }
 
@@ -153,12 +155,13 @@ pub fn run_app(config: UiConfig) {
         if cx.windows().is_empty()
             && let Some(reopen) = cx.try_global::<ReopenState>()
         {
-            let (state, boot, background_service) = (
+            let (state, boot, connector, background_service) = (
                 reopen.state.clone(),
                 reopen.boot.clone(),
+                reopen.connector.clone(),
                 reopen.background_service.clone(),
             );
-            open_main_window(state, boot, background_service, cx);
+            open_main_window(state, boot, connector, background_service, cx);
         }
     });
     app.run(move |cx: &mut App| {
@@ -187,7 +190,7 @@ pub fn run_app(config: UiConfig) {
         app_menus::init(cx);
 
         let state = cx.new(|_| state::AppState::new());
-        state::AppState::bootstrap(state.clone(), config.boot(), cx);
+        state::AppState::bootstrap(state.clone(), config.boot(), config.connector.clone(), cx);
         let background_service =
             background_service::BackgroundServiceController::new(config.data_dir.clone());
 
@@ -215,9 +218,16 @@ pub fn run_app(config: UiConfig) {
         cx.set_global(ReopenState {
             state: state.clone(),
             boot: config.boot(),
+            connector: config.connector.clone(),
             background_service: background_service.clone(),
         });
-        open_main_window(state, config.boot(), background_service, cx);
+        open_main_window(
+            state,
+            config.boot(),
+            config.connector.clone(),
+            background_service,
+            cx,
+        );
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
         // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
@@ -236,6 +246,7 @@ pub fn run_app(config: UiConfig) {
 fn open_main_window(
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
+    connector: EngineConnector,
     background_service: background_service::BackgroundServiceController,
     cx: &mut App,
 ) {
@@ -286,7 +297,7 @@ fn open_main_window(
             // the subscription lives as long as the window does, and the window
             // owns nothing that would drop it early.
             appearance::observe_window(window, cx).detach();
-            cx.new(|cx| shell::Shell::new(state, boot, background_service, cx))
+            cx.new(|cx| shell::Shell::new(state, boot, connector, background_service, cx))
         },
     )
     .expect("failed to open window");

@@ -29,9 +29,9 @@ use jolt_proto::{
 use crate::EngineError;
 use crate::model_selection::cheap_model_id;
 use crate::registry::HarnessRegistry;
-use crate::repos::Repos;
 use crate::usage::{UsageCapture, UsagePurpose, UsageStore};
 use crate::workspace_host::WorkspaceHost;
+use jolt_vcs::Repos;
 
 /// Throwaway title runs are cheap but still cross a process boundary — retry a
 /// couple of times with a short backoff before falling back.
@@ -236,6 +236,7 @@ impl TitleGenerator {
         for attempt in 0..=RETRY_DELAYS_MS.len() {
             let request = RunRequest {
                 prompt: title_prompt.clone(),
+                harness: Some(harness_id),
                 model: cheap.clone(),
                 reasoning: Some(ReasoningLevel::Minimal),
                 model_options: model_options.clone(),
@@ -360,6 +361,7 @@ mod tests {
                     cache_read_input_tokens: 3,
                     cache_write_input_tokens: 0,
                     cost_usd: Some(0.01),
+                    cost_provenance: None,
                     context_tokens: Some(11),
                     context_window: Some(200_000),
                 },
@@ -376,6 +378,7 @@ mod tests {
         };
         let request = RunRequest {
             prompt: "title this".into(),
+            harness: Some(HarnessId::Mock),
             model: Some("haiku".into()),
             reasoning: Some(ReasoningLevel::Minimal),
             model_options: serde_json::Map::new(),

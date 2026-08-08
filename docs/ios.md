@@ -1,6 +1,6 @@
 # Jolt for iOS
 
-The iOS app is a native SwiftUI viewport onto the same Jolt account. It syncs workspace rows and a tail-first transcript projection from the edge, then sends durable commands to the computer running each session's engine and agent CLI.
+The iOS app is a native SwiftUI viewport onto the same Jolt account. It syncs workspace rows and a tail-first transcript projection from the edge, then sends durable commands to the computer running each thread's engine and agent CLI.
 
 Jolt's native mobile apps follow one [mobile feature parity policy](mobile-parity.md). iOS is the behavioral reference while Android is being ported; after Android scaffolding starts, new mobile capabilities are implemented and released for both apps together rather than advancing either platform independently.
 
@@ -26,7 +26,7 @@ Development mode can connect to an edge running with `AUTH_MODE=dev`, where the 
 
 ## What the mobile viewport can do
 
-- View attention-sorted sessions across all devices, filtered by a searchable space picker.
+- View attention-sorted threads across all devices, filtered by a searchable space picker.
 - Open a space as a filtered deep link when navigating from external context.
 - Add a space by choosing a device and browsing that remote engine's folders.
 - Ask a space's host device to start Claude Code, Codex, or Pi; no harness runs on the phone.
@@ -38,7 +38,7 @@ Development mode can connect to an edge running with `AUTH_MODE=dev`, where the 
 - Search the host checkout with `@` and send file/directory mentions as cross-platform `jolt-file:` links.
 - Use `/answer`, `/bro`, `!command`, and `!!command` from the composer.
 - Change model, reasoning, and ref for later turns.
-- Archive sessions with a left swipe and delete them with a confirmed right swipe.
+- Close threads with a left swipe and delete them with a confirmed right swipe.
 - Use context menus to copy transcript text and code.
 
 The app registers the iPhone as an iOS viewer in the account device list, publishes presence, shows host-device online state, and warns when a run is queued for an offline host.
@@ -47,11 +47,11 @@ The app registers the iPhone as an iOS viewer in the account device list, publis
 
 | Desktop | iOS |
 | --- | --- |
-| Searchable sidebar space filter and session list | Sessions-first Home screen with a searchable space filter |
-| Device-local horizontal tabs | Native navigation stack; no mobile tab strip |
-| Explicit Archive and Delete actions | Swipe left to archive; swipe right to delete with confirmation |
+| Searchable sidebar space filter and thread list | Threads-first Home screen with a searchable space filter |
+| Sidebar thread selection and history | Native navigation stack |
+| Explicit Close and Delete actions | Swipe left to close; swipe right to delete with confirmation |
 | Harness/model popover | Model and effort sheets |
-| Global New Session canvas + space picker | Global New Session route + searchable space sheet |
+| Global New Thread canvas + space picker | Global New Thread route + searchable space sheet |
 | Add-space palette | Device tabs and remote folder browser |
 | gpui virtual list | SwiftUI `LazyVStack` with stable row IDs and estimated unloaded-page placeholders |
 | Hover actions | Context menus |

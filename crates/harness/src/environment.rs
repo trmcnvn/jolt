@@ -61,7 +61,8 @@ impl HarnessEnvironment {
     }
 }
 
-pub(crate) fn apply(command: &mut tokio::process::Command, environment: &[(String, String)]) {
+#[doc(hidden)]
+pub fn apply(command: &mut tokio::process::Command, environment: &[(String, String)]) {
     command.envs(environment.iter().map(|(key, value)| (key, value)));
 }
 

@@ -58,9 +58,10 @@ final class ComposerBehaviorTests: XCTestCase {
     }
 
     func testJujutsuRefPreservesWireRevisionAndKind() throws {
-        let data = Data(#"{"name":"Working copy · abcdef12","revision":"@","kind":"workingCopy","current":true}"#.utf8)
+        let data = Data(#"{"name":"abcdef12","revision":"@","kind":"workingCopy","current":true}"#.utf8)
         let ref = try JSONDecoder().decode(RepoRef.self, from: data)
 
+        XCTAssertEqual(ref.name, "abcdef12")
         XCTAssertEqual(ref.id, "@")
         XCTAssertEqual(ref.kind, .workingCopy)
         XCTAssertTrue(ref.isJujutsu)

@@ -95,7 +95,7 @@ messages  [ { id, role, parts, createdAt, deviceId, status?, continuationOf? } ]
 commands  [ { id, payload, issuedBy, issuedAt, status, ... } ]
 ```
 
-Text bodies use `LoroText`, allowing streamed appends to merge efficiently. Large entries split into continuation records at part/code-point boundaries and join during projection.
+Text bodies use `LoroText`, allowing streamed appends to merge efficiently. `textReveal` part markers expose stable prose before tool, provider-message, input, and terminal boundaries while later text remains durably synced but unpainted; terminal recovery reveals preserved partial output. Large entries split into continuation records at part/code-point boundaries and join during projection.
 
 The host engine writes transcript entries and command outcomes. Authorized viewers submit their own idempotent command entries through the edge. Synced tool projections deliberately omit sensitive or bulky inputs that are not needed for rendering.
 
@@ -196,11 +196,20 @@ Scope-isolated stores prevent Local data from entering edge synchronization and 
 | Path | Responsibility |
 | --- | --- |
 | `crates/proto` | Shared entities, agent events, usage, secrets, and pure view derivations |
-| `crates/doc` | Session schema, command ledger, render parts, transcript deltas, workspace registry model |
-| `crates/sync` | Loro room client, registry client, local SQLite snapshots, liveness |
-| `crates/harness` | Claude Code, Codex, Pi, and mock adapters |
-| `crates/engine` | Runtime assembly, sessions, docs, registry host, repos, terminals, diffs, accounts, secrets, usage |
-| `crates/rpc` | Envelopes, clients/servers, in-memory transport, device relay |
+| `crates/platform` | Login-shell process environment and suspend/wake detection |
+| `crates/session-doc` | Session schema, command ledger, render parts, and transcript projections |
+| `crates/registry-model` | Workspace registry rows, HLC operations, and optimistic local state |
+| `crates/store` | Local SQLite document snapshots and processed-command ledger |
+| `crates/sync` | Loro session-room and workspace-registry network clients |
+| `crates/harness` | Common harness trait, controls, environment provider, and test mock |
+| `crates/harness-{claude,codex,pi}` | Isolated production CLI adapters and protocol tests |
+| `crates/mcp` | Loopback MCP host, bearer leases, tool schemas, and backend contract |
+| `crates/vcs` | Device-local repositories, VCS commands, workspaces, and forge review lookup |
+| `crates/terminal` | Engine-side PTY ownership, replay, and lifecycle |
+| `crates/rpc` | Generic envelopes, clients/servers, and in-memory/WebSocket transports |
+| `crates/api` | Product RPC methods, shared models, and typed unary/JSON-stream/binary-stream contracts |
+| `crates/relay` | DeviceRoom frame codec, host relay, and peer link cache |
+| `crates/engine` | Runtime assembly, sessions, document hosts, capability coordination, accounts, secrets, and usage |
 | `crates/update` | Release checks, downloads, verification, swaps, and restart support |
 | `crates/ui` | gpui desktop shell and views |
 | `apps/jolt` | Binary, CLI auth, daemon management, and environment resolution |

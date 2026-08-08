@@ -340,7 +340,7 @@ final class AppModel {
     /// Mid-session ref switch: retarget onto an existing isolated checkout,
     /// or switch the session's cwd through the host VCS. Returns an error or nil.
     func switchSessionRef(chat: Chat, ref: RepoRef) async -> String? {
-        guard let cwd = chat.cwd else { return "Session has no working folder" }
+        guard let cwd = chat.cwd else { return "Thread has no working folder" }
         if let worktree = ref.worktreePath {
             if worktree == cwd { return nil }  // already here
             if let demo {
@@ -446,7 +446,24 @@ final class AppModel {
         return await workspace?.createSpace(deviceId: deviceId, path: path, gitDetected: gitDetected)
     }
 
+    func setPinned(chatId: String, pinned: Bool) {
+        if let demo {
+            if let ix = demo.chats.firstIndex(where: { $0.id == chatId }) {
+                demo.chats[ix].pinned = pinned
+            }
+            return
+        }
+        workspace?.setPinned(chatId: chatId, pinned: pinned)
+    }
+
     func archive(chatId: String) {
+        guard let chat = chat(id: chatId) else { return }
+        switch indicator(for: chat) {
+        case .working, .awaitingInput:
+            return
+        case .errored, .completed, .idle:
+            break
+        }
         if let demo {
             if let ix = demo.chats.firstIndex(where: { $0.id == chatId }) {
                 demo.chats[ix].archived = true

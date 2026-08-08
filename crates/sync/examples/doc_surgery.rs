@@ -2,8 +2,8 @@
 //! store. Modes:
 //!   inspect-chat <data_dir> <chat_id>
 //!   cut-chat     <data_dir> <chat_id> <from_index>
-use jolt_doc::SessionDoc;
-use jolt_sync::DocsStore;
+use jolt_session_doc::SessionDoc;
+use jolt_store::DocsStore;
 use loro::{LoroDoc, ToJson};
 
 fn load_doc(store: &DocsStore, doc_id: &str) -> LoroDoc {

@@ -7,7 +7,7 @@
 //! - [`panel`] — session-scoped tabs, subscriptions with reconnect backoff,
 //!   drag-reorder, and the Cmd/Ctrl+` toggle action.
 //!
-//! Method names come from `jolt_rpc::methods` and wire types from
+//! Method names come from `jolt_api::methods` and wire types from
 //! `jolt_proto::TerminalSession` plus versioned binary output frames — the same contract the
 //! engine serves.
 

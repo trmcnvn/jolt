@@ -1,6 +1,6 @@
 # Quickstart
 
-This page gets a computer running Jolt and starts a first agent session.
+This page gets a computer running Jolt and starts a first agent thread.
 
 ## 1. Install Jolt
 
@@ -44,7 +44,7 @@ See [Development](development.md) for platform dependencies and packaged builds.
 
 ## 2. Install an agent CLI
 
-Jolt launches agent CLIs on the device that owns the session. Install and authenticate at least one:
+Jolt launches agent CLIs on the device that owns the thread. Install and authenticate at least one:
 
 - **Claude Code:** install `claude` and complete its normal login.
 - **Codex:** install `codex` and complete its normal login.
@@ -56,7 +56,7 @@ See [Agent harnesses](harnesses.md) for details.
 
 ## 3. Choose Local or sign in
 
-The desktop opens without an account in a Local scope stored only on that device. Sign in from the user menu to add synchronized spaces, remote device control, and iOS access. If Local already contains sessions, Jolt asks before moving them into the account and explains which data remains device-local.
+The desktop opens without an account in a Local scope stored only on that device. Sign in from the user menu to add synchronized spaces, remote device control, and iOS access. If Local already contains threads, Jolt asks before moving them into the account and explains which data remains device-local.
 
 For a headless device, an account is required:
 
@@ -70,7 +70,7 @@ Organization setup is automatic: Jolt adopts the sole existing membership or cre
 
 ## 4. Add a space
 
-A **space** is a folder on a specific device. It determines where new sessions run.
+A **space** is a folder on a specific device. It determines where new threads run.
 
 1. Open Jolt on a desktop.
 2. Choose **Add space** or press `Cmd+K` on macOS / `Ctrl+K` elsewhere.
@@ -79,19 +79,19 @@ A **space** is a folder on a specific device. It determines where new sessions r
 
 The device may be local or remote. Folder browsing is executed by that device's engine through the relay.
 
-## 5. Start a session
+## 5. Start a thread
 
 1. Select a space.
-2. Choose **New session**.
+2. Choose **New thread**.
 3. Pick Claude Code, Codex, or Pi; then choose a model and reasoning level.
 4. For a Git or Jujutsu space, choose the current checkout, an existing working copy, or a new isolated worktree/workspace.
 5. Enter a prompt and send it.
 
-The session belongs to the space's device. Closing its tab archives it; it does not stop or migrate the host engine.
+The thread belongs to the space's device. Use **Close** to move it into the **Closed** section after its active run stops; closing does not migrate or stop the host engine.
 
 ## 6. Add another device
 
-Install Jolt and sign in with the same account on another computer. Its engine registers automatically and the workspace index appears on every connected client. Add folders from that device as spaces, then start or control its sessions from any viewport.
+Install Jolt and sign in with the same account on another computer. Its engine registers automatically and the workspace index appears on every connected client. Add folders from that device as spaces, then start or control its threads from any viewport.
 
 For a server, leave `jolt headless` managed by systemd or launchd. For a phone, see [Jolt for iOS](ios.md).
 

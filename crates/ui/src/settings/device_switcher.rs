@@ -2,10 +2,12 @@
 
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use gpui::{
     Context, Entity, EventEmitter, Render, SharedString, Subscription, div, prelude::*, px,
 };
 
+use super::devices::device_row_online;
 use crate::icons::{self, icon};
 use crate::popover;
 use crate::state::AppState;
@@ -66,6 +68,15 @@ impl Render for DeviceSwitcher {
             .iter()
             .find(|device| Some(device.id.as_str()) == effective.as_deref())
             .cloned();
+        let now = Utc::now();
+        let selected_online = selected.as_ref().is_some_and(|device| {
+            device_row_online(&device.id, local_id.as_deref(), device.last_seen_at, now)
+        });
+        let dot = if selected_online {
+            theme.success
+        } else {
+            crate::theme::ink(0.2)
+        };
         let platform_glyph = |platform: &str| match platform {
             "macos" | "darwin" => icons::DEVICE_LAPTOP,
             "ios" | "android" => icons::DEVICE_MOBILE,
@@ -83,62 +94,55 @@ impl Render for DeviceSwitcher {
             .unwrap_or_else(|| SharedString::from("This device"));
         let open = self.menu_open;
 
-        let mut trigger =
-            div()
-                .id("settings-device-switcher")
-                .flex_none()
-                .h(px(28.0))
-                .px(px(8.0))
-                .rounded(px(6.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .cursor_pointer()
-                .bg(if open {
-                    crate::theme::ink(0.06)
-                } else {
-                    gpui::transparent_black()
-                })
-                .when(!open, |element| {
-                    element.hover(|style| style.bg(crate::theme::ink(0.04)))
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let just_dismissed = this
-                        .dismissed_at
-                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                    this.menu_open = !this.menu_open && !just_dismissed;
-                    this.dismissed_at = None;
-                    cx.notify();
-                }))
-                .child(
-                    icon(trigger_glyph)
-                        .size(px(16.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(12.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(trigger_label),
-                )
-                .child(div().size(px(6.0)).rounded_full().flex_none().bg(
-                    if effective == local_id {
-                        theme.success
-                    } else {
-                        crate::theme::ink(0.2)
-                    },
-                ))
-                .child(
-                    icon(icons::SWITCH_VERTICAL)
-                        .size(px(14.0))
-                        .flex_none()
-                        .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
-                );
+        let mut trigger = div()
+            .id("settings-device-switcher")
+            .flex_none()
+            .h(px(28.0))
+            .px(px(8.0))
+            .rounded(px(6.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_pointer()
+            .bg(if open {
+                crate::theme::ink(0.06)
+            } else {
+                gpui::transparent_black()
+            })
+            .when(!open, |element| {
+                element.hover(|style| style.bg(crate::theme::ink(0.04)))
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                let just_dismissed = this
+                    .dismissed_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+                this.menu_open = !this.menu_open && !just_dismissed;
+                this.dismissed_at = None;
+                cx.notify();
+            }))
+            .child(
+                icon(trigger_glyph)
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.5))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(trigger_label),
+            )
+            .child(div().size(px(6.0)).rounded_full().flex_none().bg(dot))
+            .child(
+                icon(icons::SWITCH_VERTICAL)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
+            );
 
         if open {
             let menu = popover::popover_card(&theme)
@@ -155,6 +159,17 @@ impl Render for DeviceSwitcher {
                 .children(devices.into_iter().enumerate().map(|(index, device)| {
                     let active = Some(device.id.as_str()) == effective.as_deref();
                     let local = local_id.as_deref() == Some(device.id.as_str());
+                    let online = device_row_online(
+                        &device.id,
+                        local_id.as_deref(),
+                        device.last_seen_at,
+                        now,
+                    );
+                    let dot = if online {
+                        theme.success
+                    } else {
+                        crate::theme::ink(0.2)
+                    };
                     let glyph = platform_glyph(&device.platform);
                     let name: SharedString = device.name.clone().into();
                     let id = device.id.clone();
@@ -179,11 +194,7 @@ impl Render for DeviceSwitcher {
                                     .child(SharedString::from("You")),
                             )
                         })
-                        .child(div().size(px(6.0)).rounded_full().flex_none().bg(if local {
-                            theme.success
-                        } else {
-                            crate::theme::ink(0.2)
-                        }))
+                        .child(div().size(px(6.0)).rounded_full().flex_none().bg(dot))
                 }))
                 .into_any_element();
             trigger = trigger.child(popover::anchored_menu("settings-device-menu", menu));

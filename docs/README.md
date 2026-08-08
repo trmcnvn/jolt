@@ -4,8 +4,8 @@ Jolt is a native, multi-device ADE for Claude Code, Codex, and Pi. Every compute
 
 ## Start here
 
-- [Quickstart](quickstart.md) — install Jolt, connect an agent CLI, and run a first session.
-- [Using Jolt](using-jolt.md) — spaces, sessions, the composer, terminals, changes, and usage.
+- [Quickstart](quickstart.md) — install Jolt, connect an agent CLI, and run a first thread.
+- [Using Jolt](using-jolt.md) — spaces, threads, the composer, terminals, changes, and usage.
 - [Agent harnesses](harnesses.md) — Claude Code, Codex, Pi, model discovery, trust, and harness secrets.
 - [CLI and headless engines](cli.md) — login, daemon management, updates, and sync diagnostics.
 - [Settings](settings.md) — every desktop settings page, hotkeys, notifications, and local persistence.

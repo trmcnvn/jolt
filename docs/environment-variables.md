@@ -12,7 +12,6 @@ Jolt works without environment configuration in production. Variables are primar
 | `JOLT_CALLBACK_PORT` | `27641` | Preferred headed WorkOS loopback callback port |
 | `JOLT_DEVICE_NAME` | hostname | Display name stamped into this engine's device row |
 | `JOLT_HARNESS` | `claude-code` | Fallback harness for chats without config; supported production values are `claude-code`, `codex`, and `pi` (`mock` is for tests/demo) |
-| `JOLT_AUTO_UPDATE` | disabled | `1`, `true`, or `yes` lets a managed headless install apply updates in a quiet window |
 | `RUST_LOG` | mode-specific | `tracing_subscriber` filter; long-running modes default to info with noisy Loro modules reduced |
 
 Changing `JOLT_DATA_DIR` creates a distinct device identity, auth session, repository registry, and local usage store unless data is copied intentionally.

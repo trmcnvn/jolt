@@ -61,10 +61,17 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &AppearanceDark, cx| appearance::set_mode(AppearanceMode::Dark, cx));
 }
 
-fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {
-    if let Some(window) = cx.active_window() {
-        window.update(cx, |_, window, _| f(window)).ok();
-    }
+fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window) + 'static) {
+    let Some(window) = cx.active_window() else {
+        return;
+    };
+    // Global actions bubble while the active window is already on GPUI's
+    // update stack. Defer the second update until that borrow is released.
+    cx.defer(move |cx| {
+        if let Err(error) = window.update(cx, |_, window, _| f(window)) {
+            tracing::warn!(%error, "window action failed");
+        }
+    });
 }
 
 /// ⌘Q / "Quit Jolt". `cx.quit()` runs the platform's standard quit routine,
@@ -184,7 +191,7 @@ pub fn app_menus() -> Vec<Menu> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Action as _, Keystroke};
+    use gpui::{Action as _, Empty, Keystroke, TestAppContext};
 
     fn action_names(menu: &Menu) -> Vec<&'static str> {
         menu.items
@@ -294,6 +301,19 @@ mod tests {
             })
             .expect("Developer submenu present");
         assert_eq!(action_names(developer), vec![TogglePerformanceHud.name()]);
+    }
+
+    #[gpui::test]
+    fn close_window_action_removes_active_window(cx: &mut TestAppContext) {
+        cx.update(init);
+        let window = cx.add_window(|_, _| Empty);
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+
+        cx.dispatch_action(window.into(), CloseWindow);
+
+        assert!(cx.read(|cx| cx.windows().is_empty()));
     }
 
     #[test]

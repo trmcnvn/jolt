@@ -174,7 +174,7 @@ fn digest_hex(parts: &[&[u8]]) -> String {
     for part in parts {
         hash.update(part);
     }
-    crate::repos::hex(&hash.finalize())
+    jolt_vcs::hex(&hash.finalize())
 }
 
 /// Section offsets found with memchr's runtime-SIMD newline scanner. On the

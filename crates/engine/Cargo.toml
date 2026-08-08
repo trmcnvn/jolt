@@ -7,17 +7,28 @@ publish.workspace = true
 
 [dependencies]
 jolt-proto.workspace = true
-jolt-doc.workspace = true
+jolt-api.workspace = true
+jolt-platform.workspace = true
+jolt-session-doc.workspace = true
+jolt-registry-model.workspace = true
+jolt-store.workspace = true
 jolt-sync.workspace = true
 jolt-harness.workspace = true
+jolt-harness-claude.workspace = true
+jolt-harness-codex.workspace = true
+jolt-harness-pi.workspace = true
+jolt-mcp.workspace = true
+jolt-vcs.workspace = true
+jolt-terminal.workspace = true
 jolt-rpc.workspace = true
+jolt-relay.workspace = true
 jolt-update.workspace = true
 loro.workspace = true
 tokio.workspace = true
-axum.workspace = true
-rmcp.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
@@ -27,13 +38,11 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 notify.workspace = true
-portable-pty.workspace = true
 base64 = "0.23"
 libc.workspace = true
 sha2.workspace = true
 memchr.workspace = true
 reqwest.workspace = true
-ignore.workspace = true
 keyring.workspace = true
 
 [target.'cfg(windows)'.dependencies]

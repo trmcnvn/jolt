@@ -365,7 +365,7 @@ impl Auth {
                 return;
             }
             let mut state_rx = auth.watch_state();
-            let mut wake = jolt_sync::wake::subscribe();
+            let mut wake = jolt_platform::wake::subscribe();
             loop {
                 if !state_rx.borrow().is_signed_in() {
                     if state_rx.changed().await.is_err() {
@@ -867,10 +867,10 @@ fn state_for(user: AuthUser, org_id: Option<String>) -> AuthState {
     }
 }
 
-/// The relay/room token seam: `Auth` IS a [`jolt_rpc::TokenSource`], so the host relay
+/// The relay/room token seam: `Auth` IS a [`jolt_relay::TokenSource`], so the host relay
 /// and link cache always dial with a fresh bearer after refreshes.
 #[async_trait::async_trait]
-impl jolt_rpc::TokenSource for Auth {
+impl jolt_relay::TokenSource for Auth {
     async fn token(&self) -> Option<String> {
         if self.inner.workos.is_some() && !self.state().is_signed_in() {
             return None;
@@ -912,7 +912,7 @@ async fn handle_loopback_conn(
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16 * 1024 {
+        if memchr::memmem::find(&buf, b"\r\n\r\n").is_some() || buf.len() > 16 * 1024 {
             break;
         }
     }
@@ -991,27 +991,9 @@ fn jwt_claims(token: &str) -> Option<JwtClaims> {
 }
 
 fn base64url_decode(input: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    for byte in input.bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
-            b'=' => continue,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
+    crate::simd_base64::decode_url_safe(input.as_bytes())
+        .or_else(|_| crate::simd_base64::decode(input.as_bytes()))
+        .ok()
 }
 
 fn url_encode(input: &str) -> String {

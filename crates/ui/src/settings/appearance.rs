@@ -369,6 +369,14 @@ impl AppearancePage {
         cx.notify();
     }
 
+    pub(crate) fn dismiss_modal(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.theme_editor.is_none() {
+            return false;
+        }
+        self.close_theme_editor(cx);
+        true
+    }
+
     fn set_editor_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
         let Some(editor) = &mut self.theme_editor else {
             return;
@@ -453,10 +461,14 @@ impl AppearancePage {
         let dark_id = definition.id.clone();
         let pair_id = definition.id.clone();
         let edit_id = definition.id.clone();
-        let delete_id = definition.id.clone();
-        let builtin = definition.builtin;
+        let selected_label = match (light_selected, dark_selected) {
+            (true, true) => Some("Light + dark"),
+            (true, false) => Some("Light"),
+            (false, true) => Some("Dark"),
+            (false, false) => None,
+        };
         let preview = div()
-            .h(px(112.0))
+            .h(px(132.0))
             .w_full()
             .flex()
             .flex_row()
@@ -480,7 +492,11 @@ impl AppearancePage {
                         appearance::set_theme(Appearance::Light, &light_id, cx);
                         cx.notify();
                     }))
-                    .child(miniature(&definition.light, Corners::Left))
+                    .child(miniature(
+                        &definition.light,
+                        Corners::Left,
+                        widgets::OPTION_CARD_RADIUS - 2.0,
+                    ))
                     .child(
                         div()
                             .absolute()
@@ -514,7 +530,11 @@ impl AppearancePage {
                         appearance::set_theme(Appearance::Dark, &dark_id, cx);
                         cx.notify();
                     }))
-                    .child(miniature(&definition.dark, Corners::Right))
+                    .child(miniature(
+                        &definition.dark,
+                        Corners::Right,
+                        widgets::OPTION_CARD_RADIUS - 2.0,
+                    ))
                     .child(
                         div()
                             .absolute()
@@ -530,11 +550,15 @@ impl AppearancePage {
                     ),
             );
         div()
-            .w(px(244.0))
+            .w(px(335.0))
             .flex_none()
             .rounded(px(12.0))
             .border_1()
-            .border_color(theme.border)
+            .border_color(if light_selected || dark_selected {
+                theme.border_strong
+            } else {
+                theme.border
+            })
             .bg(theme.surface_card)
             .overflow_hidden()
             .child(preview)
@@ -555,49 +579,28 @@ impl AppearancePage {
                             .text_color(theme.text)
                             .child(SharedString::from(definition.name)),
                     )
+                    .when_some(selected_label, |row, label| {
+                        row.child(widgets::badge(theme, label))
+                    })
+                    .when(!(light_selected && dark_selected), |row| {
+                        row.child(
+                            popover::btn_ghost(theme, "Use both", format!("theme-pair-{pair_id}"))
+                                .id(SharedString::from(format!("theme-pair-{pair_id}")))
+                                .px(px(7.0))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    appearance::set_theme_pair(&pair_id, cx);
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
-                        popover::btn_ghost(theme, "Use both", format!("theme-pair-{pair_id}"))
-                            .id(SharedString::from(format!("theme-pair-{pair_id}")))
-                            .px(px(7.0))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                appearance::set_theme_pair(&pair_id, cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
+                        popover::btn_ghost(theme, "Customize", format!("theme-edit-{edit_id}"))
                             .id(SharedString::from(format!("theme-edit-{edit_id}")))
-                            .p(px(5.0))
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(crate::theme::ink(0.06)))
+                            .px(px(7.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_theme_editor(&edit_id, cx)
-                            }))
-                            .child(
-                                crate::icons::icon(crate::icons::PENCIL)
-                                    .size(px(13.0))
-                                    .text_color(theme.text_muted),
-                            ),
-                    )
-                    .when(!builtin, |row| {
-                        row.child(
-                            div()
-                                .id(SharedString::from(format!("theme-delete-{delete_id}")))
-                                .p(px(5.0))
-                                .rounded(px(6.0))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(crate::theme::ink(0.06)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_theme(&delete_id, cx)
-                                }))
-                                .child(
-                                    crate::icons::icon(crate::icons::TRASH)
-                                        .size(px(13.0))
-                                        .text_color(theme.danger),
-                                ),
-                        )
-                    }),
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -838,11 +841,12 @@ enum Corners {
 /// Rounds itself: the card frame cannot do it for us (see
 /// [`widgets::OPTION_CARD_RADIUS`]). Only this root paints a background that
 /// reaches the corners — the sidebar strip is transparent and the content card is
-/// inset — so rounding here is enough.
-fn miniature(theme: &Theme, corners: Corners) -> AnyElement {
+/// inset — so rounding here is enough. `radius` lets bordered containers match
+/// the miniature to their inner curve.
+fn miniature(theme: &Theme, corners: Corners, radius: f32) -> AnyElement {
     let line = theme.text.opacity(0.22);
     let strong = theme.text.opacity(0.34);
-    let r = px(widgets::OPTION_CARD_RADIUS);
+    let r = px(radius);
     let root = div().size_full().flex().flex_row().bg(theme.surface);
     let root = match corners {
         Corners::All => root.rounded(r),
@@ -898,20 +902,16 @@ fn miniature_split(light: &Theme, dark: &Theme) -> AnyElement {
         .size_full()
         .flex()
         .flex_row()
-        .child(
-            div()
-                .w_1_2()
-                .h_full()
-                .overflow_hidden()
-                .child(miniature(light, Corners::Left)),
-        )
-        .child(
-            div()
-                .w_1_2()
-                .h_full()
-                .overflow_hidden()
-                .child(miniature(dark, Corners::Right)),
-        )
+        .child(div().w_1_2().h_full().overflow_hidden().child(miniature(
+            light,
+            Corners::Left,
+            widgets::OPTION_CARD_RADIUS,
+        )))
+        .child(div().w_1_2().h_full().overflow_hidden().child(miniature(
+            dark,
+            Corners::Right,
+            widgets::OPTION_CARD_RADIUS,
+        )))
         .into_any_element()
 }
 
@@ -922,8 +922,8 @@ fn miniature_split(light: &Theme, dark: &Theme) -> AnyElement {
 fn preview(mode: AppearanceMode, light: &Theme, dark: &Theme) -> AnyElement {
     match mode {
         AppearanceMode::System => miniature_split(light, dark),
-        AppearanceMode::Light => miniature(light, Corners::All),
-        AppearanceMode::Dark => miniature(dark, Corners::All),
+        AppearanceMode::Light => miniature(light, Corners::All, widgets::OPTION_CARD_RADIUS),
+        AppearanceMode::Dark => miniature(dark, Corners::All, widgets::OPTION_CARD_RADIUS),
     }
 }
 
@@ -935,8 +935,7 @@ fn helper(mode: AppearanceMode, system: Appearance) -> SharedString {
         AppearanceMode::System => {
             let resolved = if system.is_dark() { "dark" } else { "light" };
             format!(
-                "Following the system appearance — currently {resolved}. Jolt switches with \
-                 macOS, including scheduled changes."
+                "Following the system appearance — currently {resolved}. Jolt also follows scheduled changes."
             )
             .into()
         }
@@ -1004,8 +1003,7 @@ impl Render for AppearancePage {
                     .child(
                         widgets::page_subtitle(
                             &theme,
-                            "Choose Jolt’s colors and typography. Custom themes are stored as \
-                             files on this device.",
+                            "Choose how Jolt looks on this device. Appearance, themes, and fonts apply immediately.",
                         )
                         .max_w(px(512.0))
                         .line_height(px(20.0)),
@@ -1016,7 +1014,7 @@ impl Render for AppearancePage {
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
-                            .child(widgets::field_label(&theme, "Color scheme"))
+                            .child(widgets::field_label(&theme, "Appearance mode"))
                             .child(widgets::option_card_row().children(cards)),
                     )
                     .child(
@@ -1033,7 +1031,16 @@ impl Render for AppearancePage {
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
-                            .child(widgets::field_label(&theme, "Themes"))
+                            .child(widgets::field_label(&theme, "Theme"))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .line_height(px(18.0))
+                                    .text_color(theme.text_muted)
+                                    .child(
+                                        "Select the light or dark half of a preview, or apply a family to both modes.",
+                                    ),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -1041,14 +1048,6 @@ impl Render for AppearancePage {
                                     .flex_wrap()
                                     .gap(px(14.0))
                                     .children(theme_cards),
-                            )
-                            .child(
-                                div()
-                                    .px(px(4.0))
-                                    .text_size(px(12.0))
-                                    .line_height(px(18.0))
-                                    .text_color(theme.text_muted)
-                                    .child("Choose each half independently, or use both variants together."),
                             ),
                     )
                     .child(
@@ -1057,7 +1056,14 @@ impl Render for AppearancePage {
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
-                            .child(widgets::field_label(&theme, "Typography"))
+                            .child(widgets::field_label(&theme, "Fonts"))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .line_height(px(18.0))
+                                    .text_color(theme.text_muted)
+                                    .child("Choose separate typefaces for the interface, composer, code, and terminal."),
+                            )
                             .child(
                                 widgets::section_card(&theme)
                                     .mt(px(0.0))
@@ -1067,7 +1073,7 @@ impl Render for AppearancePage {
                                                 div()
                                                     .flex_1()
                                                     .min_w_0()
-                                                    .child(widgets::row_title(&theme, "UI font"))
+                                                    .child(widgets::row_title(&theme, "Interface"))
                                                     .child(
                                                         div()
                                                             .mt(px(3.0))
@@ -1091,7 +1097,7 @@ impl Render for AppearancePage {
                                                     .min_w_0()
                                                     .child(widgets::row_title(
                                                         &theme,
-                                                        "Prompt font",
+                                                        "Composer",
                                                     ))
                                                     .child(
                                                         div()
@@ -1114,7 +1120,7 @@ impl Render for AppearancePage {
                                                 div()
                                                     .flex_1()
                                                     .min_w_0()
-                                                    .child(widgets::row_title(&theme, "Code font"))
+                                                    .child(widgets::row_title(&theme, "Code"))
                                                     .child(
                                                         div()
                                                             .mt(px(3.0))
@@ -1138,7 +1144,7 @@ impl Render for AppearancePage {
                                                     .min_w_0()
                                                     .child(widgets::row_title(
                                                         &theme,
-                                                        "Terminal font",
+                                                        "Terminal",
                                                     ))
                                                     .child(
                                                         div()

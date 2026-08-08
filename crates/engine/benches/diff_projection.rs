@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use jolt_engine::{DiffProjection, DiffSnapshot};
 use jolt_proto::{DiffFileSummary, VcsKind};
-use memchr::memchr_iter;
+use memchr::{memchr, memchr_iter};
 
 fn fixture() -> DiffSnapshot {
     let mut patch = String::with_capacity(3 * 1024 * 1024);
@@ -51,6 +51,14 @@ fn simd_newlines(bytes: &[u8]) -> usize {
     memchr_iter(b'\n', bytes).count()
 }
 
+fn slice_contains_nul(bytes: &[u8]) -> bool {
+    bytes.contains(&0)
+}
+
+fn simd_contains_nul(bytes: &[u8]) -> bool {
+    memchr(0, bytes).is_some()
+}
+
 fn measure(mut operation: impl FnMut(), minimum: Duration) -> (u64, Duration) {
     let started = Instant::now();
     let mut iterations = 0;
@@ -74,6 +82,18 @@ fn main() {
     let (simd_n, simd_time) = measure(
         || {
             black_box(simd_newlines(black_box(bytes)));
+        },
+        minimum,
+    );
+    let (slice_nul_n, slice_nul_time) = measure(
+        || {
+            black_box(slice_contains_nul(black_box(bytes)));
+        },
+        minimum,
+    );
+    let (simd_nul_n, simd_nul_time) = measure(
+        || {
+            black_box(simd_contains_nul(black_box(bytes)));
         },
         minimum,
     );
@@ -103,8 +123,17 @@ fn main() {
         simd_time / simd_n as u32
     );
     println!(
+        "slice NUL scan:      {:?}/iteration",
+        slice_nul_time / slice_nul_n as u32
+    );
+    println!(
+        "SIMD NUL scan:       {:?}/iteration",
+        simd_nul_time / simd_nul_n as u32
+    );
+    println!(
         "catalog build:       {:?}/iteration",
         catalog_time / catalog_n as u32
     );
     assert_eq!(scalar_newlines(bytes), simd_newlines(bytes));
+    assert_eq!(slice_contains_nul(bytes), simd_contains_nul(bytes));
 }

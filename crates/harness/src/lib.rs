@@ -1,4 +1,4 @@
-//! jolt-harness — one interface over Claude Code, Codex, and Pi (plus a mock for tests).
+//! jolt-harness — the common interface and runtime controls for agent CLI adapters.
 //!
 //! Integration details (docs/harnesses.md):
 //! - Claude Code: spawn the installed `claude` CLI with
@@ -103,6 +103,11 @@ pub struct RunControls {
 pub trait Harness: Send + Sync {
     fn id(&self) -> HarnessId;
     fn display_name(&self) -> &str;
+    /// Resolve the executable this adapter would launch. Maintenance features
+    /// use the exact same path as model discovery and agent runs.
+    fn executable_path(&self) -> Result<std::path::PathBuf, HarnessError> {
+        Err(HarnessError::NotInstalled(self.display_name().to_string()))
+    }
     fn supports_steering(&self) -> bool;
     /// Whether this harness accepts additive Streamable HTTP MCP configuration.
     fn supports_mcp(&self) -> bool {
@@ -136,90 +141,24 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
 }
 
-pub mod claude;
-pub mod codex;
 pub mod environment;
 pub mod mock;
-pub mod pi;
-pub mod shell_env;
-mod simd_base64;
-
-/// Bin directories where npm-installed CLIs land under Node version managers.
-/// GUI launches never see these on PATH — the managers shape PATH in shell
-/// init (fnm's per-shell multishells, nvm's shell function), which a
-/// Dock/Finder-launched app never runs.
-pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    // fnm: `aliases/default` is a stable symlink to the active default
-    // installation (the multishell PATH entries are ephemeral, per-shell).
-    let mut fnm_roots: Vec<PathBuf> = std::env::var_os("FNM_DIR")
-        .map(PathBuf::from)
-        .into_iter()
-        .collect();
-    if let Some(home) = &home {
-        fnm_roots.push(home.join(".local").join("share").join("fnm"));
-        fnm_roots.push(home.join("Library").join("Application Support").join("fnm"));
-        fnm_roots.push(home.join(".fnm"));
-    }
-    for root in fnm_roots {
-        dirs.push(root.join("aliases").join("default").join("bin"));
-    }
-    if let Some(home) = &home {
-        // volta / bun keep real shims in a fixed bin dir; pnpm has a global bin.
-        dirs.push(home.join(".volta").join("bin"));
-        dirs.push(home.join(".bun").join("bin"));
-        dirs.push(home.join("Library").join("pnpm"));
-        dirs.push(home.join(".local").join("share").join("pnpm"));
-        // nvm: every installed version's bin, newest first.
-        let nvm = home.join(".nvm").join("versions").join("node");
-        if let Ok(entries) = std::fs::read_dir(&nvm) {
-            let mut versions: Vec<PathBuf> =
-                entries.flatten().map(|e| e.path().join("bin")).collect();
-            versions.sort();
-            versions.reverse();
-            dirs.append(&mut versions);
-        }
-    }
-    dirs
-}
-
-/// Compose the child's PATH: the resolved executable's directory first, then
-/// our own PATH, then the login-shell PATH snapshot — deduped. npm-shim CLIs
-/// are `#!/usr/bin/env node` scripts whose `node` lives beside them in the
-/// version manager's bin dir, and the CLIs themselves shell out to tools
-/// (git, rg, node) that a GUI/service launch's own PATH may lack.
-pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::path::Path) {
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) {
-        paths.push(dir.to_path_buf());
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&path));
-    }
-    if let Some(shell_path) = shell_env::login_shell_path() {
-        paths.extend(std::env::split_paths(shell_path));
-    }
-    let mut seen = std::collections::HashSet::new();
-    paths.retain(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()));
-    if let Ok(joined) = std::env::join_paths(paths) {
-        cmd.env("PATH", joined);
-    }
-}
+#[doc(hidden)]
+pub mod simd_base64;
 
 /// Rolling tail of a child's stderr, shared between the reader task and the
 /// crash-message composer: an unexpected exit surfaces "<name> exited
 /// unexpectedly (<status>): <last stderr lines>" instead of a bare shrug —
 /// a useful background-crash message.
 #[derive(Clone, Default)]
-pub(crate) struct StderrTail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+#[doc(hidden)]
+pub struct StderrTail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
 
 impl StderrTail {
     const KEEP_LINES: usize = 6;
     const KEEP_BYTES: usize = 700;
 
-    pub(crate) fn push(&self, line: &str) {
+    pub fn push(&self, line: &str) {
         let line = line.trim();
         if line.is_empty() {
             return;
@@ -235,7 +174,7 @@ impl StderrTail {
     }
 
     /// The captured tail as one display string, `None` when nothing arrived.
-    pub(crate) fn snapshot(&self) -> Option<String> {
+    pub fn snapshot(&self) -> Option<String> {
         let tail = self
             .0
             .lock()
@@ -251,7 +190,8 @@ impl StderrTail {
 
 /// "exit code 137" / "signal 9 (killed)" / "unknown" — the status half of a
 /// crash message, from a `try_wait` result after the stream ended.
-pub(crate) fn describe_exit(status: Option<std::process::ExitStatus>) -> String {
+#[doc(hidden)]
+pub fn describe_exit(status: Option<std::process::ExitStatus>) -> String {
     let Some(status) = status else {
         return "still running".into();
     };
@@ -269,7 +209,8 @@ pub(crate) fn describe_exit(status: Option<std::process::ExitStatus>) -> String 
 }
 
 /// The full crash message: status plus the stderr tail when there is one.
-pub(crate) fn crash_message(
+#[doc(hidden)]
+pub fn crash_message(
     name: &str,
     status: Option<std::process::ExitStatus>,
     stderr: &StderrTail,
@@ -280,7 +221,3 @@ pub(crate) fn crash_message(
         None => format!("{name} exited unexpectedly ({status})"),
     }
 }
-
-pub use claude::ClaudeHarness;
-pub use codex::CodexHarness;
-pub use pi::PiHarness;

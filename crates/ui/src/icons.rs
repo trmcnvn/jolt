@@ -14,6 +14,7 @@
 //!   Jennings, adapted to SVG by Lucas Garron, licensed CC BY 4.0. Its opaque
 //!   app-icon background is removed because gpui renders SVGs as tinted alpha
 //!   masks and would otherwise show only a solid square.
+//!
 //! gpui tints SVGs with the text color, so the Claude mark's brand orange is
 //! applied at the call site
 //!   ([`CLAUDE_BRAND`]).
@@ -99,6 +100,8 @@ icon_assets![
     (BELL, "bell"),
     (PAPERCLIP, "paperclip"),
     (PENCIL, "pencil"),
+    (PIN, "pin"),
+    (PINNED, "pinned"),
     (ARCHIVE, "archive"),
     (TRASH, "trash"),
     (SETTINGS, "settings"),
@@ -115,6 +118,7 @@ icon_assets![
     (INFO_CIRCLE, "info-circle"),
     (ALERT_TRIANGLE, "alert-triangle"),
     (MESSAGE_CIRCLE, "message-circle"),
+    (MESSAGE_CIRCLE_X, "message-circle-x"),
     (TERMINAL_2, "terminal-2"),
     (PLUS, "plus"),
     (X, "x"),

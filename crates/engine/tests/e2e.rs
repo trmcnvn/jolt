@@ -9,10 +9,6 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use jolt_doc::{
-    GoalOperation, MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
-    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
-};
 use jolt_engine::{EngineCore, HarnessRegistry, RunJournal, SteerOutcome};
 use jolt_harness::mock::MockHarness;
 use jolt_harness::{BashRequest, BashResult, Harness, HarnessError, McpServerConfig, RunControls};
@@ -20,7 +16,11 @@ use jolt_proto::{
     AgentEvent, DoneStatus, GoalStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SessionStatus, SteeringMode, ToolCall,
 };
-use jolt_sync::DocsStore;
+use jolt_session_doc::{
+    GoalOperation, MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
+};
+use jolt_store::DocsStore;
 
 const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
@@ -28,6 +28,7 @@ const VIEWER: &str = "viewer-device";
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: Default::default(),
@@ -193,6 +194,7 @@ impl Harness for McpCompletingHarness {
                 cache_read_input_tokens: 0,
                 cache_write_input_tokens: 0,
                 cost_usd: None,
+                cost_provenance: None,
                 context_tokens: None,
                 context_window: None,
             },
@@ -881,14 +883,12 @@ fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
 /// pending entry appended under the viewer's device id (ledger rule 1).
 fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
     let now = chrono::Utc::now().timestamp_millis();
-    let based_on =
-        doc.read_entries()
-            .expect("read entries")
-            .last()
-            .map(|m| jolt_doc::CommandBasedOn {
-                turn_id: Some(m.id.clone()),
-                frontier: None,
-            });
+    let based_on = doc.read_entries().expect("read entries").last().map(|m| {
+        jolt_session_doc::CommandBasedOn {
+            turn_id: Some(m.id.clone()),
+            frontier: None,
+        }
+    });
     doc.queue_command(&SessionCommandEntry {
         id: id.into(),
         payload,
@@ -1606,17 +1606,18 @@ async fn local_bash_fallback_includes_only_single_bang_output_in_next_prompt() {
     )
     .await;
 
-    let requests = seen.lock().unwrap();
-    let request = requests
-        .iter()
-        .find(|request| {
-            request.prompt.contains("included-shell-output")
-                && request.prompt.ends_with("use the shell result")
-        })
-        .expect("agent request");
-    assert!(request.prompt.contains("included-shell-output"));
-    assert!(!request.prompt.contains("excluded-shell-output"));
-    drop(requests);
+    {
+        let requests = seen.lock().unwrap();
+        let request = requests
+            .iter()
+            .find(|request| {
+                request.prompt.contains("included-shell-output")
+                    && request.prompt.ends_with("use the shell result")
+            })
+            .expect("agent request");
+        assert!(request.prompt.contains("included-shell-output"));
+        assert!(!request.prompt.contains("excluded-shell-output"));
+    }
 
     let user = entries(&core)
         .into_iter()
@@ -1713,16 +1714,17 @@ async fn queued_run_command_executes_end_to_end() {
             text: "do the thing".into()
         }]
     );
-    // Assistant entry: folded parts — merged text, then the resolved tool call with the
-    // render-parts privacy policy applied (WriteFile content stripped).
+    // Assistant entry: folded text, its pre-tool reveal boundary, then the resolved
+    // sanitized tool call.
     let assistant = &all[1];
     assert_eq!(assistant.status, Some(MessageStatus::Complete));
-    assert_eq!(assistant.parts.len(), 2);
+    assert_eq!(assistant.parts.len(), 3);
     match &assistant.parts[0] {
         MessagePart::Text { text, .. } => assert_eq!(text, "Hello"),
         other => panic!("unexpected first part {other:?}"),
     }
-    match &assistant.parts[1] {
+    assert!(matches!(assistant.parts[1], MessagePart::TextReveal { .. }));
+    match &assistant.parts[2] {
         MessagePart::Tool {
             call,
             resolved,
@@ -1739,7 +1741,7 @@ async fn queued_run_command_executes_end_to_end() {
                 }
             );
         }
-        other => panic!("unexpected second part {other:?}"),
+        other => panic!("unexpected third part {other:?}"),
     }
 
     // Command outcome written by the host (sole outcome writer).
@@ -2215,9 +2217,9 @@ async fn processed_commands_are_skipped_on_redelivery() {
     let entry = commands.iter().find(|c| c.id == "cmd-crashed").unwrap();
     let is_processed = |id: &str| store.is_processed(id).unwrap_or(false);
     let never_past = |_: &str| false;
-    let verdict = jolt_doc::evaluate_command(
+    let verdict = jolt_session_doc::evaluate_command(
         entry,
-        &jolt_doc::EvaluationContext {
+        &jolt_session_doc::EvaluationContext {
             is_processed: &is_processed,
             now_ms: chrono::Utc::now().timestamp_millis(),
             entries: &commands,
@@ -2225,7 +2227,7 @@ async fn processed_commands_are_skipped_on_redelivery() {
             turn_is_past: &never_past,
         },
     );
-    assert_eq!(verdict, jolt_doc::CommandDisposition::Skip);
+    assert_eq!(verdict, jolt_session_doc::CommandDisposition::Skip);
 }
 
 #[tokio::test]
@@ -2326,13 +2328,13 @@ async fn rpc_surface_over_in_memory_transport() {
 
     // ListHarnesses + ListModels.
     let harnesses = client
-        .call(jolt_rpc::methods::LIST_HARNESSES, serde_json::Value::Null)
+        .call(jolt_api::methods::LIST_HARNESSES, serde_json::Value::Null)
         .await
         .unwrap();
     assert_eq!(harnesses[0]["id"], "mock");
     let models = client
         .call(
-            jolt_rpc::methods::LIST_MODELS,
+            jolt_api::methods::LIST_MODELS,
             serde_json::json!({"harness": "mock"}),
         )
         .await
@@ -2340,7 +2342,7 @@ async fn rpc_surface_over_in_memory_transport() {
     assert_eq!(models[0]["id"], "mock-1");
     let commands = client
         .call(
-            jolt_rpc::methods::LIST_COMMANDS,
+            jolt_api::methods::LIST_COMMANDS,
             serde_json::json!({"harness": "mock", "cwd": "/tmp"}),
         )
         .await
@@ -2369,18 +2371,21 @@ async fn rpc_surface_over_in_memory_transport() {
 
     // Session and paged transcript streams.
     let mut sessions_stream = client
-        .subscribe(jolt_rpc::methods::WATCH_SESSIONS, serde_json::Value::Null)
+        .subscribe(jolt_api::methods::WATCH_SESSIONS, serde_json::Value::Null)
         .await
         .unwrap();
     let first_sessions = tokio::time::timeout(Duration::from_secs(5), sessions_stream.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(first_sessions, serde_json::json!([]));
+    assert!(matches!(
+        serde_json::from_value(first_sessions).unwrap(),
+        jolt_api::SessionWatchFrame::Bootstrap { sessions } if sessions.is_empty()
+    ));
 
     let mut paged_stream = client
         .subscribe(
-            jolt_rpc::methods::WATCH_TRANSCRIPT_V2,
+            jolt_api::methods::WATCH_TRANSCRIPT_V2,
             serde_json::json!({"chatId": CHAT}),
         )
         .await
@@ -2389,9 +2394,9 @@ async fn rpc_surface_over_in_memory_transport() {
         .await
         .unwrap()
         .unwrap();
-    let paged_initial: jolt_doc::TranscriptWatchFrame =
+    let paged_initial: jolt_session_doc::TranscriptWatchFrame =
         serde_json::from_value(paged_initial).unwrap();
-    let jolt_doc::TranscriptWatchFrame::Bootstrap { bootstrap } = paged_initial else {
+    let jolt_session_doc::TranscriptWatchFrame::Bootstrap { bootstrap } = paged_initial else {
         panic!("paged stream must open with a bootstrap");
     };
     assert_eq!(bootstrap.manifest.total_messages, 0);
@@ -2405,7 +2410,7 @@ async fn rpc_surface_over_in_memory_transport() {
     .unwrap();
     let queued = client
         .call(
-            jolt_rpc::methods::QUEUE_COMMAND,
+            jolt_api::methods::QUEUE_COMMAND,
             serde_json::json!({"chatId": CHAT, "command": command}),
         )
         .await
@@ -2420,8 +2425,8 @@ async fn rpc_surface_over_in_memory_transport() {
             .await
             .expect("paged transcript before timeout")
             .expect("paged stream alive");
-        match serde_json::from_value::<jolt_doc::TranscriptWatchFrame>(item).unwrap() {
-            jolt_doc::TranscriptWatchFrame::Bootstrap { bootstrap } => {
+        match serde_json::from_value::<jolt_session_doc::TranscriptWatchFrame>(item).unwrap() {
+            jolt_session_doc::TranscriptWatchFrame::Bootstrap { bootstrap } => {
                 if let Some(page) = bootstrap.pages.last()
                     && page.messages.len() == 2
                     && page.messages[1].status == Some(MessageStatus::Complete)
@@ -2429,13 +2434,13 @@ async fn rpc_surface_over_in_memory_transport() {
                     break (page.id.clone(), page.revision.clone());
                 }
             }
-            jolt_doc::TranscriptWatchFrame::Delta {
+            jolt_session_doc::TranscriptWatchFrame::Delta {
                 page_id,
                 page_revision,
                 frame,
                 ..
             } => {
-                if let jolt_doc::TranscriptFrame::Delta { upsert, .. } = &frame
+                if let jolt_session_doc::TranscriptFrame::Delta { upsert, .. } = &frame
                     && upsert
                         .iter()
                         .any(|change| change.entry.status == Some(MessageStatus::Complete))
@@ -2445,9 +2450,9 @@ async fn rpc_surface_over_in_memory_transport() {
             }
         }
     };
-    let fetched: jolt_doc::TranscriptPage = client
+    let fetched: jolt_session_doc::TranscriptPage = client
         .call_as(
-            jolt_rpc::methods::GET_TRANSCRIPT_PAGE,
+            jolt_api::methods::GET_TRANSCRIPT_PAGE,
             serde_json::json!({"chatId": CHAT, "pageId": page_id}),
         )
         .await
@@ -2461,9 +2466,9 @@ async fn rpc_surface_over_in_memory_transport() {
         other => panic!("unexpected part {other:?}"),
     }
 
-    let search: Vec<jolt_doc::TranscriptSearchResult> = client
+    let search: Vec<jolt_session_doc::TranscriptSearchResult> = client
         .call_as(
-            jolt_rpc::methods::SEARCH_TRANSCRIPT,
+            jolt_api::methods::SEARCH_TRANSCRIPT,
             serde_json::json!({"chatId": CHAT, "query": "via RPC"}),
         )
         .await
@@ -2479,8 +2484,15 @@ async fn rpc_surface_over_in_memory_transport() {
             .await
             .expect("session update before timeout")
             .expect("stream alive");
-        let list: Vec<serde_json::Value> = serde_json::from_value(item).unwrap();
-        if list.first().and_then(|s| s["status"].as_str()) == Some("idle") {
+        let frame: jolt_api::SessionWatchFrame = serde_json::from_value(item).unwrap();
+        let sessions = match frame {
+            jolt_api::SessionWatchFrame::Bootstrap { sessions } => sessions,
+            jolt_api::SessionWatchFrame::Delta { upserts, .. } => upserts,
+        };
+        if sessions
+            .iter()
+            .any(|session| session.status == SessionStatus::Idle)
+        {
             break;
         }
     }
@@ -2845,7 +2857,7 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
             controls: RunControls,
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
-            if request.prompt == "second run" {
+            if request.prompt.ends_with("second run") {
                 // The post-interrupt turn: completes immediately.
                 tokio::spawn(async move {
                     let _ = tx
@@ -3223,7 +3235,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     for (seq, data) in [(0, first), (1, second)] {
         client
             .call(
-                jolt_rpc::methods::UPLOAD_CHUNK,
+                jolt_api::methods::UPLOAD_CHUNK,
                 serde_json::json!({ "uploadId": "e2e-att", "seq": seq, "data": data }),
             )
             .await
@@ -3231,7 +3243,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     }
     let committed = client
         .call(
-            jolt_rpc::methods::UPLOAD_COMMIT,
+            jolt_api::methods::UPLOAD_COMMIT,
             serde_json::json!({ "uploadId": "e2e-att", "fileName": "red.png", "chatId": CHAT }),
         )
         .await
@@ -3297,7 +3309,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     // Read-back over the same RPC surface the transcript uses.
     let chunk = client
         .call(
-            jolt_rpc::methods::READ_ATTACHMENT_CHUNK,
+            jolt_api::methods::READ_ATTACHMENT_CHUNK,
             serde_json::json!({ "path": path, "offset": 0 }),
         )
         .await
@@ -3343,14 +3355,14 @@ async fn real_claude_sees_uploaded_image_inline() {
     let client = jolt_rpc::memory_client(core.rpc_service());
     client
         .call(
-            jolt_rpc::methods::UPLOAD_CHUNK,
+            jolt_api::methods::UPLOAD_CHUNK,
             serde_json::json!({ "uploadId": "real-img", "seq": 0, "data": RED_PNG_B64 }),
         )
         .await
         .expect("UploadChunk");
     let committed = client
         .call(
-            jolt_rpc::methods::UPLOAD_COMMIT,
+            jolt_api::methods::UPLOAD_COMMIT,
             serde_json::json!({ "uploadId": "real-img", "fileName": "swatch.png", "chatId": CHAT }),
         )
         .await
@@ -3368,6 +3380,7 @@ async fn real_claude_sees_uploaded_image_inline() {
     );
     let request = RunRequest {
         prompt,
+        harness: None,
         model: Some("haiku".into()),
         reasoning: None,
         model_options: Default::default(),

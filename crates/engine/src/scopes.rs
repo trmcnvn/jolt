@@ -6,44 +6,15 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension as _;
-use serde::{Deserialize, Serialize};
 
-use jolt_doc::{REGISTRY_DOC_ID, RegistryDoc, SessionDoc};
+pub use jolt_api::{ScopeKind, ScopeStatus};
+use jolt_registry_model::{REGISTRY_DOC_ID, RegistryDoc};
+use jolt_session_doc::SessionDoc;
 
 use crate::{EngineError, new_id};
 
 const SCOPES_DIR: &str = "scopes";
 const LOCAL_SCOPE_ID: &str = "local-scope-id";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ScopeKind {
-    Local,
-    Account,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScopeStatus {
-    pub active: ScopeKind,
-    pub account_available: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_email: Option<String>,
-    pub local_has_data: bool,
-    pub merge_pending: bool,
-}
-
-impl ScopeStatus {
-    pub fn local() -> Self {
-        Self {
-            active: ScopeKind::Local,
-            account_available: false,
-            account_email: None,
-            local_has_data: false,
-            merge_pending: false,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ScopeLayout {
@@ -319,10 +290,12 @@ fn merge_usage(
             "INSERT OR IGNORE INTO usage_events (
                 chat_id, journal_seq, device_id, harness, model, cwd, purpose, recorded_at_ms,
                 input_tokens, output_tokens, cache_read_input_tokens,
-                cache_write_input_tokens, cost_usd, context_tokens, context_window
+                cache_write_input_tokens, cost_usd, cost_provenance,
+                context_tokens, context_window
              ) SELECT chat_id, journal_seq, ?1, harness, model, cwd, purpose, recorded_at_ms,
                 input_tokens, output_tokens, cache_read_input_tokens,
-                cache_write_input_tokens, cost_usd, context_tokens, context_window
+                cache_write_input_tokens, cost_usd, cost_provenance,
+                context_tokens, context_window
              FROM local_usage.usage_events",
             [target_device],
         )
@@ -386,8 +359,8 @@ mod tests {
 
     #[test]
     fn merging_into_existing_account_keeps_documents_and_ledgers() {
-        use jolt_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-        use jolt_sync::DocsStore;
+        use jolt_session_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+        use jolt_store::DocsStore;
 
         use crate::UsageStore;
 

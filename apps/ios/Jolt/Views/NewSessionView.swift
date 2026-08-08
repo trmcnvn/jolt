@@ -1,4 +1,4 @@
-// New session — a composer page rather than a form. Its canvas uses a faded
+// New thread — a composer page rather than a form. Its canvas uses a faded
 // mark, prompt, and glass composer with in-pill picker chips. The space already
 // fixes device + folder; the composer
 // carries the agent/model chip, and sending mints the chat, queues the first
@@ -103,7 +103,7 @@ struct NewSessionView: View {
                 .padding(.bottom, 8)
         }
         .background(Theme.bg.ignoresSafeArea())
-        .navigationTitle("New session")  // feeds the back menu
+        .navigationTitle("New thread")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $showGoalSheet) {
             NewGoalSheet(onCreate: createGoalSession)
@@ -111,11 +111,11 @@ struct NewSessionView: View {
         .toolbar {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
-                    Text("New session")
+                    Text("New thread")
                         .font(Theme.sans(13, weight: .medium))
                         .foregroundStyle(Theme.text)
                     if let space {
-                        Text("\(space.displayName) · \(model.deviceName(space.deviceId))")
+                        Text("\(space.displayName) @ \(model.deviceName(space.deviceId))")
                             .font(Theme.sans(10.5))
                             .foregroundStyle(Theme.textMuted.opacity(0.6))
                             .lineLimit(1)
@@ -127,7 +127,7 @@ struct NewSessionView: View {
             SpaceFilterSheet(
                 selected: selectedSpaceId,
                 includeAll: false,
-                title: "Session space"
+                title: "Thread space"
             ) { selected in
                 if let selected {
                     selectedSpaceId = selected
@@ -444,7 +444,7 @@ struct NewSessionView: View {
             return
         }
         if prompt == "/answer" || prompt == "/bro" {
-            sendError = "Start the session before using this command."
+            sendError = "Start the thread before using this command."
             return
         }
 
@@ -478,7 +478,7 @@ struct NewSessionView: View {
                                                     branch: branch, cwd: cwd),
                       let chat = model.chat(id: chatId),
                       let store = model.sessionStore(for: chat) else {
-                    sendError = "Couldn't create the session."
+                    sendError = "Couldn't create the thread."
                     return
                 }
                 createdChatId = chatId
@@ -548,7 +548,7 @@ struct NewSessionView: View {
                                                 branch: branch, cwd: cwd),
                   let chat = model.chat(id: chatId),
                   let store = model.sessionStore(for: chat) else {
-                sendError = "Couldn't create the goal session."
+                sendError = "Couldn't create the goal thread."
                 return
             }
             store.createGoal(objective: objective, tokenBudget: tokenBudget)
@@ -929,7 +929,7 @@ struct ModelPickerSheet: View {
 
     private func refSubtitle(_ ref: RepoRef, checkout: SessionCheckoutContext) -> String? {
         if ref.worktreePath == checkout.cwd {
-            return checkout.isJujutsu ? "This session's workspace" : "This session's worktree"
+            return checkout.isJujutsu ? "This thread's workspace" : "This thread's worktree"
         }
         if let worktree = ref.worktreePath, worktree != checkout.cwd {
             return checkout.isJujutsu ? "Switches to its workspace" : "Switches to its worktree"
