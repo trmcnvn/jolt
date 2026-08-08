@@ -134,7 +134,7 @@ Linux:
 scripts/package-linux.sh
 ```
 
-Produces `target/package/jolt-<version>-linux-<arch>.tar.gz` with the binary, desktop entry, icon, and per-user installer.
+Produces `target/package/jolt-<version>-linux-<arch>.tar.gz` with separate CLI/engine and desktop binaries, the desktop entry, icons, and per-user installer.
 
 macOS:
 

@@ -1,7 +1,7 @@
 name: release
 
 # Build release artifacts and publish them:
-#   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
+#   - Linux CLI/engine + desktop tarballs (x86_64 + aarch64) via scripts/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
 # then create a GitHub Release AND upload everything to the
 # `jolt-releases` R2 bucket (served at jolt.trmcnvn.dev/releases/* for

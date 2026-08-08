@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Linux packaging: build the release binary and produce
+# Linux packaging: build the release binaries and produce
 #   target/package/jolt-<version>-linux-<arch>.tar.gz
-# containing the binary, the .desktop entry, and the icon, plus an install.sh
+# containing the CLI/engine, desktop app, .desktop entry, icons, and install.sh
 # that drops them into ~/.local (XDG) paths.
 #
 # Usage: scripts/package-linux.sh
@@ -22,18 +22,21 @@ TARBALL="$STAGE.tar.gz"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
-cd "$ROOT"
-if [[ "$PROFILE" == "release" ]]; then
-  cargo build --release -p jolt
-  BIN="$ROOT/target/release/Jolt"
-else
-  cargo build -p jolt
-  BIN="$ROOT/target/debug/Jolt"
-fi
-
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
-install -m 755 "$BIN" "$STAGE/jolt"
+
+cd "$ROOT"
+if [[ "$PROFILE" == "release" ]]; then
+  cargo build --release -p jolt --bin Jolt
+  install -m 755 "$ROOT/target/release/Jolt" "$STAGE/jolt-desktop"
+  cargo build --release -p jolt --no-default-features --features cli --bin jolt-cli
+  install -m 755 "$ROOT/target/release/jolt-cli" "$STAGE/jolt"
+else
+  cargo build -p jolt --bin Jolt
+  install -m 755 "$ROOT/target/debug/Jolt" "$STAGE/jolt-desktop"
+  cargo build -p jolt --no-default-features --features cli --bin jolt-cli
+  install -m 755 "$ROOT/target/debug/jolt-cli" "$STAGE/jolt"
+fi
 install -m 644 "$ROOT/dist/jolt.desktop" "$STAGE/jolt.desktop"
 install -m 644 "$ROOT/dist/jolt-512.png" "$STAGE/jolt-512.png"
 install -m 644 "$ROOT/dist/jolt.png" "$STAGE/jolt.png"
@@ -44,6 +47,7 @@ cat >"$STAGE/install.sh" <<'INSTALL'
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/jolt" "$HOME/.local/bin/jolt"
+install -Dm755 "$HERE/jolt-desktop" "$HOME/.local/bin/jolt-desktop"
 install -Dm644 "$HERE/jolt.desktop" "$HOME/.local/share/applications/jolt.desktop"
 install -Dm644 "$HERE/jolt-512.png" "$HOME/.local/share/icons/hicolor/512x512/apps/jolt.png"
 install -Dm644 "$HERE/jolt.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/jolt.png"

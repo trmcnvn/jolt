@@ -1,12 +1,12 @@
-//! jolt — headed by default; `jolt headless` runs the engine alone. Auth is
-//! decoupled from the daemon: `jolt login` persists the session and exits, so a
-//! service-managed `jolt headless` only ever loads saved credentials.
+// jolt — headed by default; `jolt headless` runs the engine alone. Auth is
+// decoupled from the daemon: `jolt login` persists the session and exits, so a
+// service-managed `jolt headless` only ever loads saved credentials.
 
 mod auth_cli;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
-use jolt_ui::background_service as daemon;
+use jolt_update::background_service as daemon;
 
 #[derive(Parser)]
 #[command(name = "jolt", about = "Multi-device controller for coding agents")]
@@ -193,27 +193,49 @@ fn main() -> anyhow::Result<()> {
             DaemonCommand::Restart => daemon::restart(),
             DaemonCommand::Status => daemon::status(),
         },
-        None => {
-            let edge_token = std::env::var("JOLT_EDGE_TOKEN").ok();
-            // Headed: the UI probes JOLT_IPC_PORT and connects to a running
-            // daemon, or embeds the engine in-process (docs/architecture.md).
-            jolt_ui::run_app(jolt_ui::UiConfig {
-                data_dir: std::env::var_os("JOLT_DATA_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(dirs_data_dir),
-                ipc_port: std::env::var("JOLT_IPC_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(27654),
-                edge_url: edge_url_from_env(),
-                workos_client_id: workos_client_id_from_env(&edge_token),
-                edge_token,
-                org_id: std::env::var("JOLT_ORG_ID").ok(),
-                default_harness: harness_from_env(),
-            });
-            Ok(())
-        }
+        None => run_headed(),
     }
+}
+
+#[cfg(feature = "desktop")]
+fn run_headed() -> anyhow::Result<()> {
+    let edge_token = std::env::var("JOLT_EDGE_TOKEN").ok();
+    // Headed: the UI probes JOLT_IPC_PORT and connects to a running daemon,
+    // or embeds the engine in-process (docs/architecture.md).
+    jolt_ui::run_app(jolt_ui::UiConfig {
+        data_dir: std::env::var_os("JOLT_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(dirs_data_dir),
+        ipc_port: std::env::var("JOLT_IPC_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(27654),
+        edge_url: edge_url_from_env(),
+        workos_client_id: workos_client_id_from_env(&edge_token),
+        edge_token,
+        org_id: std::env::var("JOLT_ORG_ID").ok(),
+        default_harness: harness_from_env(),
+    });
+    Ok(())
+}
+
+#[cfg(not(feature = "desktop"))]
+fn run_headed() -> anyhow::Result<()> {
+    let current = std::env::current_exe()
+        .map_err(|err| anyhow::anyhow!("could not locate the Jolt desktop executable: {err}"))?;
+    let packaged = current.with_file_name("jolt-desktop");
+    let executable = if packaged.is_file() {
+        packaged
+    } else {
+        current.with_file_name("Jolt")
+    };
+    let status = std::process::Command::new(&executable)
+        .status()
+        .map_err(|err| anyhow::anyhow!("could not launch {}: {err}", executable.display()))?;
+    if !status.success() {
+        anyhow::bail!("{} exited with {status}", executable.display());
+    }
+    Ok(())
 }
 
 /// The env-resolved engine configuration shared by `headless`, `login`,

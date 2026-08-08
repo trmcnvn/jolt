@@ -1044,8 +1044,9 @@ pub async fn capture_turn_diff(
 }
 
 /// Capture a turn diff restricted to paths explicitly mutated by that turn.
-/// An empty path list preserves the checkout-wide behavior for callers that
-/// cannot provide reliable mutation paths.
+/// Paths outside the checkout are discarded before invoking the VCS. An empty
+/// path list preserves checkout-wide behavior for callers that cannot provide
+/// reliable mutation paths.
 pub(crate) async fn capture_scoped_turn_diff(
     repos: &Repos,
     root: &Path,
@@ -1057,9 +1058,87 @@ pub(crate) async fn capture_scoped_turn_diff(
             "checkout VCS changed while capturing turn diff".into(),
         ));
     }
+    let scoped_paths;
+    let paths = if paths.is_empty() {
+        paths
+    } else {
+        let checkout = repos.checkout_identity(root).await?;
+        scoped_paths = checkout_scoped_paths(root, &checkout.root, paths);
+        if scoped_paths.is_empty() {
+            return Ok(turn_snapshot(
+                baseline.vcs,
+                Some(baseline.revision.clone()),
+                String::new(),
+                Vec::new(),
+                false,
+            ));
+        }
+        &scoped_paths
+    };
     match baseline.vcs {
         VcsKind::Git => capture_git_turn_diff(repos, root, &baseline.revision, paths).await,
         VcsKind::Jujutsu => capture_jj_turn_diff(repos, root, &baseline.revision, paths).await,
+    }
+}
+
+fn checkout_scoped_paths(cwd: &Path, checkout_root: &Path, paths: &[String]) -> Vec<String> {
+    let Some(cwd) = canonicalize_with_missing_tail(cwd) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    paths
+        .iter()
+        .filter_map(|path| {
+            let path = Path::new(path);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            let path = normalize_absolute_path(&path)?;
+            let path = canonicalize_with_missing_tail(&path)?;
+            (path != checkout_root && path.starts_with(checkout_root))
+                .then(|| path.to_str().map(str::to_owned))?
+        })
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+fn normalize_absolute_path(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(normalized)
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(mut resolved) = std::fs::canonicalize(ancestor) {
+            for component in tail.iter().rev() {
+                resolved.push(component);
+            }
+            return Some(resolved);
+        }
+        tail.push(ancestor.file_name()?.to_os_string());
+        ancestor = ancestor.parent()?;
     }
 }
 
@@ -1652,16 +1731,68 @@ mod turn_diff_tests {
         let baseline = capture_turn_diff_baseline(&repos, &root).await.unwrap();
         std::fs::write(root.join("session.txt"), "session change\n").unwrap();
         std::fs::write(root.join("other.txt"), "concurrent change\n").unwrap();
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, "outside change\n").unwrap();
 
-        let snapshot =
-            capture_scoped_turn_diff(&repos, &root, &baseline, &["session.txt".to_string()])
-                .await
-                .unwrap();
+        let snapshot = capture_scoped_turn_diff(
+            &repos,
+            &root,
+            &baseline,
+            &[
+                "session.txt".to_string(),
+                outside.to_string_lossy().into_owned(),
+            ],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(snapshot.files.len(), 1);
         assert_eq!(snapshot.files[0].path, "session.txt");
         assert!(snapshot.patch.contains("session change"));
         assert!(!snapshot.patch.contains("other.txt"));
+
+        let outside_only = capture_scoped_turn_diff(
+            &repos,
+            &root,
+            &baseline,
+            &[outside.to_string_lossy().into_owned()],
+        )
+        .await
+        .unwrap();
+        assert!(outside_only.files.is_empty());
+        assert!(outside_only.patch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn jujutsu_scoped_turn_diff_ignores_paths_outside_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(temp.path(), "device", temp.path().join("worktrees"));
+        if repos.set_vcs(jolt_proto::VcsKind::Jujutsu).is_err() {
+            return; // jj 0.43+ is optional on test hosts
+        }
+        let repo = repos.create("jj-scoped-turn-diff").await.unwrap();
+        let root = std::path::PathBuf::from(repo.path);
+        std::fs::write(root.join("session.txt"), "before\n").unwrap();
+        let baseline = capture_turn_diff_baseline(&repos, &root).await.unwrap();
+        std::fs::write(root.join("session.txt"), "after\n").unwrap();
+        let outside = temp.path().join("JoltExportOptions.plist");
+        std::fs::write(&outside, "outside\n").unwrap();
+
+        let snapshot = capture_scoped_turn_diff(
+            &repos,
+            &root,
+            &baseline,
+            &[
+                "session.txt".to_string(),
+                outside.to_string_lossy().into_owned(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].path, "session.txt");
     }
 }
 

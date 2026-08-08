@@ -27,6 +27,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::watch;
 
+pub mod background_service;
+
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -227,7 +229,7 @@ fn install_linux_desktop_integration(
     data_home: &Path,
 ) -> anyhow::Result<(PathBuf, bool)> {
     let current = app_root.join("current");
-    let executable = current.join("jolt");
+    let executable = current.join("jolt-desktop");
     if !executable.is_file() {
         bail!("{} is not a managed Jolt executable", executable.display());
     }
@@ -957,7 +959,7 @@ mod tests {
         let app_root = tmp.path().join("app");
         let current = app_root.join("current");
         std::fs::create_dir_all(&current).unwrap();
-        std::fs::write(current.join("jolt"), b"binary").unwrap();
+        std::fs::write(current.join("jolt-desktop"), b"binary").unwrap();
         std::fs::write(
             current.join("jolt.desktop"),
             b"[Desktop Entry]\nExec=jolt\nTryExec=jolt\nIcon=jolt\n",
@@ -972,7 +974,10 @@ mod tests {
         assert!(changed);
         assert_eq!(applications, data_home.join("applications"));
         let desktop = std::fs::read_to_string(applications.join("jolt.desktop")).unwrap();
-        assert!(desktop.contains(&format!("Exec=\"{}\"", current.join("jolt").display())));
+        assert!(desktop.contains(&format!(
+            "Exec=\"{}\"",
+            current.join("jolt-desktop").display()
+        )));
         assert_eq!(
             std::fs::read(data_home.join("icons/hicolor/512x512/apps/jolt.png")).unwrap(),
             b"icon"

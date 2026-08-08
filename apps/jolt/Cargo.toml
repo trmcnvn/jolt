@@ -4,18 +4,28 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+default-run = "Jolt"
 
 [features]
-debug-ui = ["jolt-ui/debug-ui"]
+default = ["desktop"]
+cli = []
+desktop = ["dep:jolt-ui"]
+debug-ui = ["desktop", "jolt-ui/debug-ui"]
 
 [[bin]]
 name = "Jolt"
 path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "jolt-cli"
+path = "src/cli.rs"
+required-features = ["cli"]
 
 [dependencies]
 jolt-engine.workspace = true
 jolt-rpc.workspace = true
-jolt-ui.workspace = true
+jolt-ui = { workspace = true, optional = true }
 jolt-update.workspace = true
 tokio.workspace = true
 clap.workspace = true

@@ -3,8 +3,8 @@
 #
 #   curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh
 #
-# Installs the self-contained native binary (no runtime deps) to
-# ~/.jolt/app, puts `jolt` on PATH, adds a desktop launcher, and — once you've
+# Installs the UI-free CLI/engine and desktop app to ~/.jolt/app, puts `jolt`
+# on PATH, adds a desktop launcher, and — once you've
 # signed in — runs it as a systemd user service that survives reboots.
 # Re-running upgrades in place; ~/.jolt state is preserved.
 #
@@ -77,7 +77,7 @@ install -m 644 "$dest/jolt.png" "$icon_dir_1024/jolt.png"
 # Desktop launchers do not reliably inherit ~/.local/bin in PATH. Point the
 # entry at the managed `current` symlink so upgrades remain atomic.
 desktop_tmp="$applications_dir/.jolt.desktop.$$"
-JOLT_DESKTOP_EXEC="$app_root/current/jolt" awk '
+JOLT_DESKTOP_EXEC="$app_root/current/jolt-desktop" awk '
 function quote_exec(value, out, i, ch) {
   out = "\""
   for (i = 1; i <= length(value); i++) {
