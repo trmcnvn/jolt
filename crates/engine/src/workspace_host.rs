@@ -16,7 +16,7 @@
 //!
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::watch;
 
 use jolt_proto::{
@@ -54,6 +54,10 @@ const RELAY_PROBE_INTERVAL_MS: u64 = 30_000;
 const RELAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Debounce window for local snapshot saves after a change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
+/// Active-list retention: inactive threads move to Closed after three days.
+const AUTO_ARCHIVE_AFTER_MS: i64 = 3 * 24 * 60 * 60 * 1_000;
+/// Minute precision keeps the transition timely without waking for every row.
+const AUTO_ARCHIVE_SWEEP_INTERVAL_MS: u64 = 60_000;
 /// Initial-join retry backoff (base, cap). A first registry-room join that
 /// fails must not strand the device offline until an app restart — retry until
 /// it lands. Jittered so N devices restarting together don't resynchronize
@@ -186,6 +190,14 @@ impl WorkspaceHost {
             // on the Devices page; workspace version — same for every crate).
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
         })?;
+
+        let auto_archived = archive_inactive_chats(&mut doc, &config.device_id, now)?;
+        if !auto_archived.is_empty() {
+            tracing::info!(
+                count = auto_archived.len(),
+                "archived inactive threads on startup"
+            );
+        }
 
         let state = doc.read_all()?;
         let (chats_tx, _) = watch::channel(state.chats);
@@ -988,6 +1000,21 @@ impl WorkspaceHostInner {
         self.changed_tx.send_modify(|v| *v = v.wrapping_add(1));
     }
 
+    fn archive_inactive_chats(&self, now: DateTime<Utc>) {
+        let result = archive_inactive_chats(&mut lock(&self.reg), &self.config.device_id, now);
+        match result {
+            Ok(chat_ids) if !chat_ids.is_empty() => {
+                self.bump_changed();
+                if let Some(room) = lock(&self.room).as_ref() {
+                    room.nudge();
+                }
+                tracing::info!(count = chat_ids.len(), chats = ?chat_ids, "archived inactive threads");
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(error = %err, "inactive thread archive sweep failed"),
+        }
+    }
+
     fn publish(&self) {
         let state = { lock(&self.reg).read_all() };
         match state {
@@ -1277,6 +1304,11 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
         tokio::time::interval(std::time::Duration::from_millis(PRESENCE_INTERVAL_MS));
     presence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     presence.tick().await; // consume the immediate first tick
+    let mut auto_archive = tokio::time::interval(std::time::Duration::from_millis(
+        AUTO_ARCHIVE_SWEEP_INTERVAL_MS,
+    ));
+    auto_archive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    auto_archive.tick().await; // startup already swept before the initial publish
     let mut save_deadline: Option<tokio::time::Instant> = None;
     loop {
         let sleep_until = save_deadline.unwrap_or_else(tokio::time::Instant::now);
@@ -1307,13 +1339,196 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
                 // offline" hints) need a tick to observe that staleness.
                 inner.publish();
             }
+            _ = auto_archive.tick() => {
+                let Some(inner) = weak.upgrade() else { break };
+                inner.archive_inactive_chats(Utc::now());
+            }
         }
     }
 }
 
+fn should_auto_archive_chat(
+    chat: &Chat,
+    archive_changed_at: Option<DateTime<Utc>>,
+    session: Option<&Session>,
+    owner_device_id: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    if chat.archived || chat.device_id != owner_device_id {
+        return false;
+    }
+    if chat
+        .goal
+        .as_ref()
+        .is_some_and(|goal| goal.status == jolt_proto::GoalStatus::Active)
+    {
+        return false;
+    }
+    if matches!(
+        jolt_proto::view::effective_indicator(session, now),
+        jolt_proto::view::Indicator::Working | jolt_proto::view::Indicator::AwaitingInput
+    ) {
+        return false;
+    }
+
+    let activity_at = chat
+        .last_message_at
+        .into_iter()
+        .chain(archive_changed_at)
+        .fold(chat.created_at, std::cmp::max);
+    now.signed_duration_since(activity_at).num_milliseconds() >= AUTO_ARCHIVE_AFTER_MS
+}
+
+fn archive_inactive_chats(
+    doc: &mut RegistryDoc,
+    owner_device_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, jolt_registry_model::RegistryError> {
+    let sessions = doc.read_sessions()?;
+    let sessions_by_chat: std::collections::HashMap<&str, &Session> = sessions
+        .iter()
+        .map(|session| (session.chat_id.as_str(), session))
+        .collect();
+    let chat_ids: Vec<String> = doc
+        .read_chats()?
+        .into_iter()
+        .filter(|chat| {
+            should_auto_archive_chat(
+                chat,
+                doc.chat_archived_changed_at(&chat.id),
+                sessions_by_chat.get(chat.id.as_str()).copied(),
+                owner_device_id,
+                now,
+            )
+        })
+        .map(|chat| chat.id)
+        .collect();
+
+    for chat_id in &chat_ids {
+        doc.set_chat_archived(chat_id, true)?;
+    }
+    Ok(chat_ids)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::linked_worktree_root;
+    use super::{AUTO_ARCHIVE_AFTER_MS, linked_worktree_root, should_auto_archive_chat};
+    use chrono::{DateTime, TimeDelta, Utc};
+    use jolt_proto::{Chat, Goal, GoalStatus, Session, SessionStatus};
+
+    fn chat(now: DateTime<Utc>) -> Chat {
+        Chat {
+            id: "chat-1".into(),
+            device_id: "dev-a".into(),
+            title: None,
+            archived: false,
+            pinned: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: Some(now - TimeDelta::milliseconds(AUTO_ARCHIVE_AFTER_MS)),
+            created_at: now - TimeDelta::days(4),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            harness_conversations: Vec::new(),
+            space_id: Some("space-1".into()),
+            last_seen_at: None,
+            goal: None,
+        }
+    }
+
+    fn session(now: DateTime<Utc>, updated_at: DateTime<Utc>) -> Session {
+        Session {
+            chat_id: "chat-1".into(),
+            device_id: "dev-a".into(),
+            status: SessionStatus::Working,
+            compacting: false,
+            started_at: Some(now - TimeDelta::minutes(1)),
+            updated_at,
+        }
+    }
+
+    fn active_goal(now: DateTime<Utc>) -> Goal {
+        Goal {
+            id: "goal-1".into(),
+            revision: 1,
+            objective: "Ship it".into(),
+            status: GoalStatus::Active,
+            pause_source: None,
+            status_message: None,
+            token_budget: None,
+            tokens_used: 0,
+            elapsed_active_ms: 0,
+            turns: 0,
+            blocker_key: None,
+            blocker_streak: 0,
+            created_at_ms: now.timestamp_millis(),
+            updated_at_ms: now.timestamp_millis(),
+        }
+    }
+
+    #[test]
+    fn inactive_chat_archives_at_three_days() {
+        let now = DateTime::from_timestamp_millis(2_000_000_000_000).unwrap();
+        assert!(should_auto_archive_chat(
+            &chat(now),
+            None,
+            None,
+            "dev-a",
+            now
+        ));
+    }
+
+    #[test]
+    fn recent_reopen_and_live_work_delay_auto_archive() {
+        let now = DateTime::from_timestamp_millis(2_000_000_000_000).unwrap();
+        let candidate = chat(now);
+        assert!(!should_auto_archive_chat(
+            &candidate,
+            Some(now - TimeDelta::days(1)),
+            None,
+            "dev-a",
+            now,
+        ));
+        assert!(!should_auto_archive_chat(
+            &candidate,
+            None,
+            Some(&session(now, now)),
+            "dev-a",
+            now,
+        ));
+        assert!(should_auto_archive_chat(
+            &candidate,
+            None,
+            Some(&session(now, now - TimeDelta::minutes(1))),
+            "dev-a",
+            now,
+        ));
+    }
+
+    #[test]
+    fn auto_archive_only_touches_owned_inactive_non_goal_threads() {
+        let now = DateTime::from_timestamp_millis(2_000_000_000_000).unwrap();
+        let mut candidate = chat(now);
+        candidate.device_id = "dev-b".into();
+        assert!(!should_auto_archive_chat(
+            &candidate, None, None, "dev-a", now
+        ));
+
+        candidate.device_id = "dev-a".into();
+        candidate.goal = Some(active_goal(now));
+        assert!(!should_auto_archive_chat(
+            &candidate, None, None, "dev-a", now
+        ));
+
+        candidate.goal = None;
+        candidate.archived = true;
+        assert!(!should_auto_archive_chat(
+            &candidate, None, None, "dev-a", now
+        ));
+    }
 
     #[test]
     fn linked_worktree_resolves_to_checkout_root() {

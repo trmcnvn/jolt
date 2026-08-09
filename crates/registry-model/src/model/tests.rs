@@ -420,6 +420,36 @@ fn field_mutators_round_trip() {
 }
 
 #[test]
+fn archived_field_clock_exposes_reopen_activity_without_touching_messages() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.apply_state(
+        1,
+        true,
+        0,
+        vec![RegistryRow {
+            kind: KIND_CHATS.into(),
+            id: "chat-1".into(),
+            seq: 1,
+            deleted: false,
+            del_hlc: None,
+            fields: fields([
+                ("id", json!("chat-1")),
+                ("deviceId", json!("dev-a")),
+                ("archived", json!(false)),
+                ("createdAt", json!(1_000)),
+            ]),
+            clocks: BTreeMap::from([("archived".into(), "0000000005000-000000-dev-b".into())]),
+        }],
+    );
+
+    assert_eq!(
+        ws.chat_archived_changed_at("chat-1"),
+        DateTime::from_timestamp_millis(5_000)
+    );
+    assert_eq!(ws.chat("chat-1").unwrap().unwrap().last_message_at, None);
+}
+
+#[test]
 fn harness_conversations_update_independently() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();

@@ -57,6 +57,14 @@ fn dt(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
 }
 
+fn hlc_timestamp(clock: &str) -> Option<DateTime<Utc>> {
+    let (millis, _) = clock.split_once('-')?;
+    millis
+        .parse::<i64>()
+        .ok()
+        .and_then(DateTime::from_timestamp_millis)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawDevice {
@@ -1165,6 +1173,14 @@ impl RegistryDoc {
             .overlay_row(KIND_CHATS, chat_id)
             .and_then(|row| row_to::<RawChat>(&row))
             .map(Chat::from))
+    }
+
+    /// When the archived flag last changed. Reopening an old chat is activity
+    /// for lifecycle purposes even though it must not falsify lastMessageAt.
+    pub fn chat_archived_changed_at(&self, chat_id: &str) -> Option<DateTime<Utc>> {
+        self.overlay_row(KIND_CHATS, chat_id)
+            .and_then(|row| row.clocks.get("archived").cloned())
+            .and_then(|clock| hlc_timestamp(&clock))
     }
 
     pub fn read_chats(&self) -> Result<Vec<Chat>, RegistryError> {
