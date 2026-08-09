@@ -17,13 +17,14 @@ pub use requests::{
     ListHarnessSecrets, ListHarnesses, ListModels, ListRefs, ListThemes, Mutate, OpenTerminal,
     PinDiffDocument, PollAgentLogin, ProbeSync, PutReviewDraft, QueryChats, QueueCommand,
     ReadAttachmentChunk, RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal,
-    ResolveAccountLink, SearchFiles, SearchTranscript, SessionWatchFrame, SetVcsBackend, SignIn,
-    SignOut, StartAgentLogin, StreamRequest, SubscribeTerminal, SwitchRef, SwitchScope,
-    TransportCapabilities, UnaryRequest, UploadBinaryChunk, UploadChunk, UploadCommit,
-    UpsertHarnessSecret, UpsertThemes, UsageBreakdownRequest, VcsSettings, WatchAuthStatus,
-    WatchChatUsage, WatchChats, WatchCheckoutDiff, WatchDevices, WatchHarnessUpdates,
-    WatchQueuedPrompts, WatchScopeStatus, WatchSessions, WatchSpaces, WatchThemes, WatchTranscript,
-    WatchUpdateStatus, WriteTerminal, call, call_binary, subscribe, subscribe_binary,
+    ResolveAccountLink, SearchFiles, SearchTranscript, SessionWatchFrame, SetTerminalCommand,
+    SetVcsBackend, SignIn, SignOut, StartAgentLogin, StreamRequest, SubscribeTerminal, SwitchRef,
+    SwitchScope, TerminalSettings, TransportCapabilities, UnaryRequest, UploadBinaryChunk,
+    UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes, UsageBreakdownRequest,
+    VcsSettings, WatchAuthStatus, WatchChatUsage, WatchChats, WatchCheckoutDiff, WatchDevices,
+    WatchHarnessUpdates, WatchQueuedPrompts, WatchScopeStatus, WatchSessions, WatchSpaces,
+    WatchThemes, WatchTranscript, WatchUpdateStatus, WriteTerminal, call, call_binary, subscribe,
+    subscribe_binary,
 };
 
 pub mod methods {
@@ -117,6 +118,9 @@ pub mod methods {
     /// Per-device active VCS backend and executable availability.
     pub const VCS_SETTINGS: &str = "VcsSettings";
     pub const SET_VCS_BACKEND: &str = "SetVcsBackend";
+    /// Per-device command used when a new terminal opens.
+    pub const TERMINAL_SETTINGS: &str = "TerminalSettings";
+    pub const SET_TERMINAL_COMMAND: &str = "SetTerminalCommand";
     // Terminals (ControlRpc, relay-forwardable; V2 carries binary output).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     /// Binary terminal output stream; control remains JSON RPC.

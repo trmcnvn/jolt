@@ -364,6 +364,31 @@ impl UnaryRequest for SetVcsBackend {
     const METHOD: &'static str = methods::SET_VCS_BACKEND;
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<String>,
+}
+
+impl UnaryRequest for TerminalSettings {
+    type Response = jolt_proto::TerminalSettingsSnapshot;
+    const METHOD: &'static str = methods::TERMINAL_SETTINGS;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTerminalCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<String>,
+}
+
+impl UnaryRequest for SetTerminalCommand {
+    type Response = jolt_proto::TerminalSettingsSnapshot;
+    const METHOD: &'static str = methods::SET_TERMINAL_COMMAND;
+}
+
 /// A mutation against the synchronized workspace document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]

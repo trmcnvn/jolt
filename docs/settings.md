@@ -13,7 +13,7 @@ Open settings from the user menu or with `Cmd+,` on macOS / `Ctrl+,` elsewhere. 
 | **Secrets** | Write-only environment secrets scoped to Claude Code, Codex, and/or Pi | Local engine only |
 | **Devices** | Background availability plus registered-device presence, version, rename/removal, and copyable IDs | Service setting is local; device rows sync |
 | **Version control** | Active Git or Jujutsu command-line backend and executable status | Selected engine device |
-| **Terminal** | Command used when a new terminal tab opens | Local viewport setting |
+| **Terminal** | Command used when a new terminal tab opens | Selected engine device |
 
 The sidebar groups these pages as **Preferences** (Appearance, Notifications, Hotkeys), **Agents** (Accounts, Secrets), and **System** (Devices, Version control, Terminal). Settings opens to Appearance by default.
 
@@ -43,7 +43,7 @@ Jolt prefers Jujutsu 0.43 or newer when available and no backend choice has been
 
 ### Terminal
 
-Leave **Launch command** blank to open the default interactive login shell. A custom command runs through the login shell in the thread directory and applies only to terminals opened after the change.
+Leave **Launch command** blank to open the default interactive login shell. A custom command runs through the login shell in the thread directory and applies only to terminals opened after the change. The command is stored on the selected engine device; use the device switcher to configure each reachable device independently.
 
 ### Appearance
 
@@ -107,7 +107,9 @@ Current-thread context and token usage remains beside the composer’s separate 
 
 ## Persistence
 
-Desktop viewport settings are stored in `{data_dir}/ui-settings.json`. They include pane sizes, sidebar state, the per-scope space filter and last active space, notification mode, keymap, appearance, selected light/dark theme IDs, font families and sizes, and terminal command.
+Desktop viewport settings are stored in `{data_dir}/ui-settings.json`. They include pane sizes, sidebar state, the per-scope space filter and last active space, notification mode, keymap, appearance, selected light/dark theme IDs, and font families and sizes.
+
+The device-specific terminal launch command is stored in `{data_dir}/terminal-settings.json` on each engine device.
 
 Custom themes are stored individually in `{data_dir}/themes/<uuid>.json`. These files are global to the Jolt installation rather than Local/Account data scopes, and remain available after switching scope or signing out. While signed in, Jolt opportunistically reconciles only these files through the account registry; appearance mode, selected light/dark themes, and typography remain device-local. If the same theme was changed incompatibly on two hosts, Jolt retains the registry version and creates a named conflict copy of the local version instead of discarding either palette.
 

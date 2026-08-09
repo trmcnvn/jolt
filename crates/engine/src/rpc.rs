@@ -68,8 +68,8 @@ use jolt_api::{
     ListHarnessSecrets, ListModels, ListRefs, Mutate, OpenTerminal, PinDiffDocument,
     PollAgentLogin, PutReviewDraft, QueryChats, QueueCommand, ReadAttachmentChunk,
     RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal, SearchFiles, SearchTranscript,
-    SessionWatchFrame, SetVcsBackend, StartAgentLogin, SubscribeTerminal, SwitchRef,
-    UploadBinaryChunk, UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes,
+    SessionWatchFrame, SetTerminalCommand, SetVcsBackend, StartAgentLogin, SubscribeTerminal,
+    SwitchRef, UploadBinaryChunk, UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes,
     UsageBreakdownRequest, WatchChatUsage, WatchCheckoutDiff, WatchQueuedPrompts, WatchTranscript,
     WriteTerminal, methods,
 };
@@ -1364,6 +1364,16 @@ impl RpcService for EngineRpc {
                 self.diff_sync.sync_all();
                 RpcReply::value(&snapshot)
             }
+            methods::TERMINAL_SETTINGS => RpcReply::value(&self.terminals.settings()),
+            methods::SET_TERMINAL_COMMAND => {
+                let p: SetTerminalCommand = parse_params(params)?;
+                let snapshot = self
+                    .terminals
+                    .set_launch_command(p.command)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
+
             methods::LIST_REPOS => RpcReply::value(&self.repos.list().await),
             methods::ADD_REPO => {
                 #[derive(Deserialize)]

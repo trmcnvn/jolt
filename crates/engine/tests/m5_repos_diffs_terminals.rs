@@ -755,6 +755,22 @@ async fn terminal_e2e_replay_live_resize_exit() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_settings_migrate_from_viewport_settings() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("ui-settings.json"),
+        serde_json::json!({ "terminalCommand": "exec fish" }).to_string(),
+    )
+    .expect("legacy settings");
+
+    let terminals = Terminals::with_data_dir(tmp.path());
+    assert_eq!(terminals.settings().command, "exec fish");
+    let persisted = std::fs::read_to_string(tmp.path().join("terminal-settings.json"))
+        .expect("migrated terminal settings");
+    assert!(persisted.contains("exec fish"));
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_launch_command_runs_in_the_session_directory() {
@@ -860,6 +876,30 @@ async fn rpc_dispatch_for_m5_methods() {
             .as_array()
             .is_some_and(|rows| !rows.is_empty())
     );
+
+    let terminal_settings = client
+        .call(methods::TERMINAL_SETTINGS, serde_json::Value::Null)
+        .await
+        .expect("TerminalSettings");
+    assert_eq!(terminal_settings["command"], "");
+    let terminal_settings = client
+        .call(
+            methods::SET_TERMINAL_COMMAND,
+            serde_json::json!({ "command": "exec fish" }),
+        )
+        .await
+        .expect("SetTerminalCommand");
+    assert_eq!(terminal_settings["command"], "exec fish");
+    let persisted = std::fs::read_to_string(tmp.path().join("data/terminal-settings.json"))
+        .expect("persisted terminal settings");
+    assert!(persisted.contains("exec fish"));
+    client
+        .call(
+            methods::SET_TERMINAL_COMMAND,
+            serde_json::json!({ "command": "" }),
+        )
+        .await
+        .expect("reset terminal command");
 
     // AddRepo (idempotent re-add of the same path).
     let added = client

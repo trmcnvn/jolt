@@ -468,6 +468,35 @@ async fn terminal_stream_proxies_over_the_relay() {
         "cwd from B's chat row"
     );
 
+    // Terminal defaults are stored and addressed independently on each engine
+    // device rather than inherited from the viewing device.
+    let remote_settings = client
+        .call(
+            methods::SET_TERMINAL_COMMAND,
+            serde_json::json!({
+                "command": "exec fish",
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("set B terminal command");
+    assert_eq!(remote_settings["command"], "exec fish");
+    let local_settings = client
+        .call(methods::TERMINAL_SETTINGS, serde_json::Value::Null)
+        .await
+        .expect("read A terminal command");
+    assert_eq!(local_settings["command"], "");
+    client
+        .call(
+            methods::SET_TERMINAL_COMMAND,
+            serde_json::json!({
+                "command": "",
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("reset B terminal command");
+
     // SubscribeTerminalV2: arbitrary binary output is proxied unchanged.
     let mut stream = client
         .subscribe_binary(

@@ -275,7 +275,6 @@ impl Render for TabGhost {
 pub struct TerminalPanel {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
-    launch_command: String,
     chats: HashMap<String, ChatTabs>,
     /// Shell-driven visibility gate: no RPC happens while closed (lazy).
     open: bool,
@@ -291,12 +290,11 @@ pub struct TerminalPanel {
 impl EventEmitter<TerminalPanelEvent> for TerminalPanel {}
 
 impl TerminalPanel {
-    pub fn new(state: Entity<AppState>, launch_command: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         Self {
             state,
             focus_handle: cx.focus_handle(),
-            launch_command,
             chats: HashMap::new(),
             open: false,
             expanded_view: false,
@@ -311,13 +309,6 @@ impl TerminalPanel {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
-    }
-
-    /// Update the command used by subsequently opened tabs. Existing PTYs keep
-    /// running unchanged.
-    pub fn set_launch_command(&mut self, command: String, cx: &mut Context<Self>) {
-        self.launch_command = command;
-        cx.notify();
     }
 
     /// Shell toggle hook. Opening lazily creates the first tab for the
@@ -429,8 +420,7 @@ impl TerminalPanel {
         entry.active = entry.tabs.len() - 1;
 
         let target = self.chat_target(&chat, cx);
-        let command = self.launch_command.trim().to_string();
-        let run = Self::spawn_session(chat.clone(), key, engine, target, command, cx);
+        let run = Self::spawn_session(chat.clone(), key, engine, target, cx);
         if let Some(tab) = self.tab_mut(&chat, key) {
             tab._run = Some(run);
         }
@@ -443,7 +433,6 @@ impl TerminalPanel {
         key: u64,
         engine: EngineHandle,
         target: Option<String>,
-        command: String,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -462,7 +451,7 @@ impl TerminalPanel {
                     chat_id: chat.clone(),
                     cols,
                     rows,
-                    command: (!command.is_empty()).then_some(command),
+                    command: None,
                     target_device_id: target.clone(),
                 },
             )

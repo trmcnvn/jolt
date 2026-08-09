@@ -196,21 +196,8 @@ impl Shell {
             }
             SettingsSection::Terminal => {
                 if self.terminal_page.is_none() {
-                    let command = self.settings.terminal_command.clone();
-                    let page = cx.new(|cx| TerminalPage::new(command, cx));
-                    self.terminal_settings_sub = Some(cx.subscribe(
-                        &page,
-                        |this: &mut Shell, _, event: &TerminalSettingsEvent, cx| {
-                            let TerminalSettingsEvent::Changed(command) = event;
-                            this.settings.terminal_command = command.clone();
-                            if let Some(panel) = this.terminal.clone() {
-                                panel.update(cx, |panel, cx| {
-                                    panel.set_launch_command(command.clone(), cx);
-                                });
-                            }
-                            this.schedule_save(cx);
-                        },
-                    ));
+                    let state = self.state.clone();
+                    let page = cx.new(|cx| TerminalPage::new(state, cx));
                     self.terminal_page = Some(page);
                 }
                 match &self.terminal_page {

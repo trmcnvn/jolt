@@ -314,6 +314,12 @@ pub struct VcsSettingsSnapshot {
     pub backends: Vec<VcsBackendStatus>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSettingsSnapshot {
+    pub command: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RepoRefKind {
