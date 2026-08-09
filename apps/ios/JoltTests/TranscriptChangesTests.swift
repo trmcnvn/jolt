@@ -11,6 +11,7 @@ final class TranscriptChangesTests: XCTestCase {
             "deviceId":"device-1",
             "cwd":"/tmp/repo",
             "vcs":"git",
+            "attribution":"partial",
             "files":[{
                 "id":"file-1",
                 "path":"Sources/App.swift",
@@ -34,6 +35,7 @@ final class TranscriptChangesTests: XCTestCase {
         let diff = try JSONDecoder().decode(TurnDiffSummary.self, from: data)
 
         XCTAssertEqual(diff.catalogRevision, "catalog-1")
+        XCTAssertEqual(diff.attribution, "partial")
         XCTAssertEqual(diff.files.map(\.path), ["Sources/App.swift"])
         XCTAssertEqual(diff.additions, 8)
         XCTAssertEqual(diff.deletions, 3)

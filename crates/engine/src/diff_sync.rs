@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError, Weak};
 use std::time::Duration;
 
 use memchr::memchr;
@@ -85,6 +85,9 @@ pub struct DiffSnapshot {
     pub head_sha: Option<String>,
     pub patch: String,
     pub files: Vec<DiffFileSummary>,
+    /// Unified patch sections keyed by their verified target path. Consumers
+    /// never infer file ownership from command output ordering.
+    pub file_patches: HashMap<String, String>,
     pub additions: u32,
     pub deletions: u32,
     pub truncated: bool,
@@ -94,10 +97,24 @@ pub struct DiffSnapshot {
 /// Immutable VCS object captured before an assistant turn mutates the checkout.
 /// The object includes pre-existing working-copy changes, so the finalized diff
 /// contains only the net filesystem delta produced during that turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TurnDiffBaseline {
     vcs: VcsKind,
     revision: String,
+    /// Git snapshots live outside the user's object database and disappear
+    /// when the last baseline handle is dropped. JJ owns its snapshots.
+    git_objects: Option<Arc<TemporaryGitObjects>>,
+}
+
+#[cfg(test)]
+impl TurnDiffBaseline {
+    pub(crate) fn for_tracker_test(revision: &str) -> Self {
+        Self {
+            vcs: VcsKind::Git,
+            revision: revision.into(),
+            git_objects: None,
+        }
+    }
 }
 
 struct CheckoutEntry {
@@ -795,15 +812,16 @@ async fn capture_command(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<Capture, EngineError> {
-    capture_command_with_index(repos, cwd, args, max_bytes, None).await
+    capture_command_with_git_env(repos, cwd, args, max_bytes, None, None).await
 }
 
-async fn capture_command_with_index(
+async fn capture_command_with_git_env(
     repos: &Repos,
     cwd: &Path,
     args: &[&str],
     max_bytes: usize,
     git_index: Option<&Path>,
+    git_objects: Option<&TemporaryGitObjects>,
 ) -> Result<Capture, EngineError> {
     let backend = repos.vcs_command()?;
     let mut cmd = tokio::process::Command::new(&backend.executable);
@@ -815,6 +833,10 @@ async fn capture_command_with_index(
     cmd.args(args);
     if let Some(index) = git_index {
         cmd.env("GIT_INDEX_FILE", index);
+    }
+    if let Some(objects) = git_objects {
+        cmd.env("GIT_OBJECT_DIRECTORY", &objects.objects);
+        cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &objects.alternate);
     }
     compose_command_path(&mut cmd, &backend.executable);
     cmd.stdin(std::process::Stdio::null());
@@ -957,6 +979,118 @@ fn quote_patch_path(path: &str) -> String {
     }
 }
 
+fn associate_file_patches(
+    files: &[DiffFileSummary],
+    patch: &str,
+) -> (HashMap<String, String>, bool) {
+    let sections = patch_section_ranges(patch);
+    let mut patches = HashMap::with_capacity(sections.len());
+    let mut every_section_matched = true;
+    for (start, end) in sections {
+        let section = &patch[start..end];
+        let header = section.lines().next().unwrap_or_default();
+        let target = parse_diff_git_target(header);
+        let matched = target
+            .as_deref()
+            .and_then(|target| files.iter().find(|file| file.path == target));
+        if let Some(file) = matched {
+            patches.insert(file.path.clone(), section.to_string());
+        } else {
+            every_section_matched = false;
+        }
+    }
+    let every_file_matched = files
+        .iter()
+        .filter(|file| !file.binary)
+        .all(|file| patches.contains_key(&file.path));
+    (patches, every_section_matched && every_file_matched)
+}
+
+fn parse_diff_git_target(header: &str) -> Option<String> {
+    let rest = header.strip_prefix("diff --git ")?;
+    let (source, rest) = parse_git_path_token(rest)?;
+    let (target, _) = parse_git_path_token(rest.trim_start())?;
+    if source.starts_with("a/") && target.starts_with("b/") {
+        target.strip_prefix("b/").map(str::to_owned)
+    } else {
+        Some(target)
+    }
+}
+
+/// Decode one token from a Git patch header, including Git's octal C quoting
+/// for non-ASCII and control bytes.
+fn parse_git_path_token(input: &str) -> Option<(String, &str)> {
+    if !input.starts_with('"') {
+        let end = input.find(char::is_whitespace).unwrap_or(input.len());
+        return Some((input[..end].to_string(), &input[end..]));
+    }
+
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 1usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let value = String::from_utf8(decoded).ok()?;
+                return Some((value, &input[index + 1..]));
+            }
+            b'\\' => {
+                index += 1;
+                let escaped = *bytes.get(index)?;
+                match escaped {
+                    b'0'..=b'7' => {
+                        let mut value = 0u16;
+                        let mut digits = 0;
+                        while digits < 3
+                            && index < bytes.len()
+                            && matches!(bytes[index], b'0'..=b'7')
+                        {
+                            value = value * 8 + u16::from(bytes[index] - b'0');
+                            index += 1;
+                            digits += 1;
+                        }
+                        decoded.push(value as u8);
+                        continue;
+                    }
+                    b'n' => decoded.push(b'\n'),
+                    b'r' => decoded.push(b'\r'),
+                    b't' => decoded.push(b'\t'),
+                    b'b' => decoded.push(8),
+                    b'f' => decoded.push(12),
+                    b'v' => decoded.push(11),
+                    b'\\' | b'"' => decoded.push(escaped),
+                    _ => decoded.push(escaped),
+                }
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    None
+}
+
+fn patch_section_ranges(patch: &str) -> Vec<(usize, usize)> {
+    let mut starts = Vec::new();
+    if patch.starts_with("diff --git ") {
+        starts.push(0);
+    }
+    starts.extend(
+        patch
+            .match_indices("\ndiff --git ")
+            .map(|(offset, _)| offset + 1),
+    );
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            (
+                *start,
+                starts.get(index + 1).copied().unwrap_or(patch.len()),
+            )
+        })
+        .collect()
+}
+
 /// Synthesize a new-file hunk for an untracked file (git diff never shows them).
 fn untracked_patch(path: &str, content: &str) -> String {
     let mut lines: Vec<&str> = content.split('\n').collect();
@@ -979,14 +1113,75 @@ fn untracked_patch(path: &str, content: &str) -> String {
 struct TemporaryGitIndex(PathBuf);
 
 impl TemporaryGitIndex {
-    fn new() -> Self {
-        Self(std::env::temp_dir().join(format!("jolt-turn-diff-{}.index", uuid::Uuid::new_v4())))
+    fn new(parent: &Path) -> Self {
+        Self(parent.join(format!("{}.index", uuid::Uuid::new_v4())))
     }
 }
 
 impl Drop for TemporaryGitIndex {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TemporaryGitObjects {
+    root: PathBuf,
+    objects: PathBuf,
+    alternate: PathBuf,
+}
+
+impl TemporaryGitObjects {
+    fn new(alternate: PathBuf) -> Result<Self, EngineError> {
+        let temporary_root = std::env::temp_dir();
+        cleanup_stale_turn_diff_temps(&temporary_root);
+        let root = temporary_root.join(format!("jolt-turn-diff-{}", uuid::Uuid::new_v4()));
+        let objects = root.join("objects");
+        std::fs::create_dir_all(&objects)?;
+        Ok(Self {
+            root,
+            objects,
+            alternate,
+        })
+    }
+}
+
+fn cleanup_stale_turn_diff_temps(temporary_root: &Path) {
+    static CLEANUP: Once = Once::new();
+    CLEANUP.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(temporary_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("jolt-turn-diff-")
+            {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+                .is_ok_and(|age| age >= Duration::from_secs(24 * 60 * 60));
+            if !stale {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                // Cleans up stale `.index` files written by older releases.
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    });
+}
+
+impl Drop for TemporaryGitObjects {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -998,10 +1193,37 @@ pub async fn capture_turn_diff_baseline(
     root: &Path,
 ) -> Result<TurnDiffBaseline, EngineError> {
     match repos.vcs_kind() {
-        Some(VcsKind::Git) => Ok(TurnDiffBaseline {
-            vcs: VcsKind::Git,
-            revision: capture_git_worktree_tree(repos, root).await?,
-        }),
+        Some(VcsKind::Git) => {
+            let object_path = capture_command(
+                repos,
+                root,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "objects",
+                ],
+                4096,
+            )
+            .await?;
+            let object_path = PathBuf::from(
+                String::from_utf8_lossy(&object_path.stdout)
+                    .trim()
+                    .to_string(),
+            );
+            if object_path.as_os_str().is_empty() {
+                return Err(EngineError::Other(
+                    "Git object directory is unavailable".into(),
+                ));
+            }
+            let git_objects = Arc::new(TemporaryGitObjects::new(object_path)?);
+            let revision = capture_git_worktree_tree(repos, root, &git_objects).await?;
+            Ok(TurnDiffBaseline {
+                vcs: VcsKind::Git,
+                revision,
+                git_objects: Some(git_objects),
+            })
+        }
         Some(VcsKind::Jujutsu) => {
             let revision = capture_command(
                 repos,
@@ -1028,6 +1250,7 @@ pub async fn capture_turn_diff_baseline(
             Ok(TurnDiffBaseline {
                 vcs: VcsKind::Jujutsu,
                 revision,
+                git_objects: None,
             })
         }
         None => Err(EngineError::Other(
@@ -1078,7 +1301,7 @@ pub(crate) async fn capture_scoped_turn_diff(
         &scoped_paths
     };
     match baseline.vcs {
-        VcsKind::Git => capture_git_turn_diff(repos, root, &baseline.revision, paths).await,
+        VcsKind::Git => capture_git_turn_diff(repos, root, baseline, paths).await,
         VcsKind::Jujutsu => capture_jj_turn_diff(repos, root, &baseline.revision, paths).await,
     }
 }
@@ -1144,12 +1367,39 @@ fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
     }
 }
 
-async fn capture_git_worktree_tree(repos: &Repos, root: &Path) -> Result<String, EngineError> {
-    let index = TemporaryGitIndex::new();
-    capture_command_with_index(repos, root, &["read-tree", "--empty"], 256, Some(&index.0)).await?;
-    capture_command_with_index(repos, root, &["add", "-A", "--", "."], 256, Some(&index.0)).await?;
-    let tree =
-        capture_command_with_index(repos, root, &["write-tree"], 256, Some(&index.0)).await?;
+async fn capture_git_worktree_tree(
+    repos: &Repos,
+    root: &Path,
+    objects: &TemporaryGitObjects,
+) -> Result<String, EngineError> {
+    let index = TemporaryGitIndex::new(&objects.root);
+    capture_command_with_git_env(
+        repos,
+        root,
+        &["read-tree", "--empty"],
+        256,
+        Some(&index.0),
+        Some(objects),
+    )
+    .await?;
+    capture_command_with_git_env(
+        repos,
+        root,
+        &["add", "-A", "--", "."],
+        256,
+        Some(&index.0),
+        Some(objects),
+    )
+    .await?;
+    let tree = capture_command_with_git_env(
+        repos,
+        root,
+        &["write-tree"],
+        256,
+        Some(&index.0),
+        Some(objects),
+    )
+    .await?;
     let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
     if tree.is_empty() {
         return Err(EngineError::Other(
@@ -1167,36 +1417,53 @@ fn scoped_diff_args<'a>(mut args: Vec<&'a str>, paths: &'a [String]) -> Vec<&'a 
 async fn capture_git_turn_diff(
     repos: &Repos,
     root: &Path,
-    baseline: &str,
+    baseline: &TurnDiffBaseline,
     paths: &[String],
 ) -> Result<DiffSnapshot, EngineError> {
-    let target = capture_git_worktree_tree(repos, root).await?;
+    let objects = baseline_git_objects(baseline)?;
+    let target = capture_git_worktree_tree(repos, root, objects).await?;
     let names_args = scoped_diff_args(
         vec![
             "diff",
             "--name-status",
             "-z",
             "--find-renames",
-            baseline,
+            &baseline.revision,
             &target,
             "--",
         ],
         paths,
     );
-    let names = capture_command(repos, root, &names_args, 2 * 1024 * 1024).await?;
+    let names = capture_command_with_git_env(
+        repos,
+        root,
+        &names_args,
+        2 * 1024 * 1024,
+        None,
+        Some(objects),
+    )
+    .await?;
     let nums_args = scoped_diff_args(
         vec![
             "diff",
             "--numstat",
             "-z",
             "--find-renames",
-            baseline,
+            &baseline.revision,
             &target,
             "--",
         ],
         paths,
     );
-    let nums = capture_command(repos, root, &nums_args, 2 * 1024 * 1024).await?;
+    let nums = capture_command_with_git_env(
+        repos,
+        root,
+        &nums_args,
+        2 * 1024 * 1024,
+        None,
+        Some(objects),
+    )
+    .await?;
     let patch_args = scoped_diff_args(
         vec![
             "diff",
@@ -1204,13 +1471,21 @@ async fn capture_git_turn_diff(
             "--no-color",
             "--find-renames",
             "--unified=3",
-            baseline,
+            &baseline.revision,
             &target,
             "--",
         ],
         paths,
     );
-    let captured = capture_command(repos, root, &patch_args, MAX_PATCH_BYTES).await?;
+    let captured = capture_command_with_git_env(
+        repos,
+        root,
+        &patch_args,
+        MAX_PATCH_BYTES,
+        None,
+        Some(objects),
+    )
+    .await?;
     let mut patch = String::from_utf8_lossy(&captured.stdout).to_string();
     let truncated = captured.truncated || names.truncated || nums.truncated;
     if captured.truncated {
@@ -1226,6 +1501,13 @@ async fn capture_git_turn_diff(
         files,
         truncated,
     ))
+}
+
+fn baseline_git_objects(baseline: &TurnDiffBaseline) -> Result<&TemporaryGitObjects, EngineError> {
+    baseline
+        .git_objects
+        .as_deref()
+        .ok_or_else(|| EngineError::Other("Git turn baseline has no temporary object store".into()))
 }
 
 async fn capture_jj_turn_diff(
@@ -1295,7 +1577,7 @@ async fn capture_jj_turn_diff(
         patch.push_str("\n# Jolt diff truncated\n");
     }
     let mut files = parse_jj_files(&listed.stdout);
-    apply_patch_stats_by_order(&mut files, &patch);
+    apply_patch_stats(&mut files, &patch);
     Ok(turn_snapshot(
         VcsKind::Jujutsu,
         Some(target),
@@ -1310,8 +1592,10 @@ fn turn_snapshot(
     revision: Option<String>,
     patch: String,
     files: Vec<DiffFileSummary>,
-    truncated: bool,
+    mut truncated: bool,
 ) -> DiffSnapshot {
+    let (file_patches, associations_complete) = associate_file_patches(&files, &patch);
+    truncated |= !associations_complete && !files.is_empty();
     let additions = files.iter().map(|file| file.additions).sum();
     let deletions = files.iter().map(|file| file.deletions).sum();
     let mut hasher = Sha256::new();
@@ -1330,6 +1614,7 @@ fn turn_snapshot(
         head_sha: revision,
         patch,
         files,
+        file_patches,
         additions,
         deletions,
         truncated,
@@ -1493,6 +1778,8 @@ async fn capture_git_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
 
     let additions: u32 = files.iter().map(|f| f.additions).sum();
     let deletions: u32 = files.iter().map(|f| f.deletions).sum();
+    let (file_patches, associations_complete) = associate_file_patches(&files, &patch);
+    truncated |= !associations_complete && !files.is_empty();
     let files_json = serde_json::to_string(&files)
         .map_err(|e| EngineError::Other(format!("diff files serialize: {e}")))?;
     let mut hasher = Sha256::new();
@@ -1513,6 +1800,7 @@ async fn capture_git_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
         head_sha: (!head.is_empty()).then_some(head),
         patch,
         files,
+        file_patches,
         additions,
         deletions,
         truncated,
@@ -1549,23 +1837,20 @@ fn parse_jj_files(value: &[u8]) -> Vec<DiffFileSummary> {
         .collect()
 }
 
-fn apply_patch_stats_by_order(files: &mut [DiffFileSummary], patch: &str) {
-    let mut index = None;
-    for line in patch.lines() {
-        if line.starts_with("diff --git ") {
-            let next = index.map_or(0, |index: usize| index + 1);
-            index = (next < files.len()).then_some(next);
-            continue;
-        }
-        let Some(file) = index.and_then(|index| files.get_mut(index)) else {
+fn apply_patch_stats(files: &mut [DiffFileSummary], patch: &str) {
+    let (sections, _) = associate_file_patches(files, patch);
+    for file in files {
+        let Some(section) = sections.get(&file.path) else {
             continue;
         };
-        if line.starts_with("Binary files ") || line == "GIT binary patch" {
-            file.binary = true;
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            file.additions = file.additions.saturating_add(1);
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            file.deletions = file.deletions.saturating_add(1);
+        for line in section.lines().skip(1) {
+            if line.starts_with("Binary files ") || line == "GIT binary patch" {
+                file.binary = true;
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                file.additions = file.additions.saturating_add(1);
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                file.deletions = file.deletions.saturating_add(1);
+            }
         }
     }
 }
@@ -1621,16 +1906,18 @@ async fn capture_jj_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, Eng
     let (change_id, commit_id) = identity.trim().split_once('\t').unwrap_or(("@", ""));
     let label = change_id.to_string();
     let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
-    let truncated = tracked.truncated || listed.truncated;
+    let mut truncated = tracked.truncated || listed.truncated;
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
         patch.truncate(boundary);
         patch.push_str("\n# Jolt diff truncated\n");
     }
     let mut files = parse_jj_files(&listed.stdout);
-    apply_patch_stats_by_order(&mut files, &patch);
+    apply_patch_stats(&mut files, &patch);
     let additions = files.iter().map(|file| file.additions).sum();
     let deletions = files.iter().map(|file| file.deletions).sum();
+    let (file_patches, associations_complete) = associate_file_patches(&files, &patch);
+    truncated |= !associations_complete && !files.is_empty();
     let files_json = serde_json::to_string(&files)
         .map_err(|err| EngineError::Other(format!("diff files serialize: {err}")))?;
     let mut hasher = Sha256::new();
@@ -1650,6 +1937,7 @@ async fn capture_jj_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, Eng
         head_sha: (!commit_id.is_empty()).then(|| commit_id.to_string()),
         patch,
         files,
+        file_patches,
         additions,
         deletions,
         truncated,
@@ -1662,7 +1950,11 @@ mod turn_diff_tests {
     use std::collections::HashSet;
     use std::process::Command;
 
-    use super::{capture_scoped_turn_diff, capture_turn_diff, capture_turn_diff_baseline};
+    use super::{
+        associate_file_patches, capture_scoped_turn_diff, capture_turn_diff,
+        capture_turn_diff_baseline,
+    };
+    use jolt_proto::DiffFileSummary;
     use jolt_vcs::Repos;
 
     fn git(root: &std::path::Path, args: &[&str]) -> String {
@@ -1678,6 +1970,64 @@ mod turn_diff_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn patch_sections_are_associated_by_verified_path_not_position() {
+        let files = vec![
+            DiffFileSummary {
+                path: "new name.rs".into(),
+                old_path: Some("old name.rs".into()),
+                status: "renamed".into(),
+                additions: 1,
+                deletions: 1,
+                binary: false,
+            },
+            DiffFileSummary {
+                path: "plain.rs".into(),
+                old_path: None,
+                status: "modified".into(),
+                additions: 1,
+                deletions: 1,
+                binary: false,
+            },
+        ];
+        // Deliberately reverse metadata order relative to patch order.
+        let patch = concat!(
+            "diff --git a/plain.rs b/plain.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            "diff --git \"a/old name.rs\" \"b/new name.rs\"\n@@ -1 +1 @@\n-c\n+d\n",
+        );
+        let (sections, complete) = associate_file_patches(&files, patch);
+        assert!(complete);
+        assert!(sections["plain.rs"].contains("-a"));
+        assert!(sections["new name.rs"].contains("-c"));
+
+        let unicode = vec![DiffFileSummary {
+            path: "café.rs".into(),
+            old_path: None,
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            binary: false,
+        }];
+        let quoted =
+            "diff --git \"a/caf\\303\\251.rs\" \"b/caf\\303\\251.rs\"\n@@ -1 +1 @@\n-a\n+b\n";
+        let (sections, complete) = associate_file_patches(&unicode, quoted);
+        assert!(complete);
+        assert!(sections.contains_key("café.rs"));
+
+        let no_prefix = vec![DiffFileSummary {
+            path: "b/nested.rs".into(),
+            old_path: None,
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            binary: false,
+        }];
+        let patch = "diff --git b/nested.rs b/nested.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let (sections, complete) = associate_file_patches(&no_prefix, patch);
+        assert!(complete);
+        assert!(sections.contains_key("b/nested.rs"));
     }
 
     #[tokio::test]
@@ -1698,10 +2048,23 @@ mod turn_diff_tests {
         std::fs::write(root.join("staged.txt"), "staged before\n").unwrap();
         git(&root, &["add", "staged.txt"]);
         let status_before = git(&root, &["status", "--porcelain"]);
+        let object_count_before = git(&root, &["count-objects", "-v"]);
+        let loose_before = object_count_before
+            .lines()
+            .find_map(|line| line.strip_prefix("count: "))
+            .unwrap();
 
         let repos =
             Repos::with_worktrees_root(temp.path(), "device", temp.path().join("worktrees"));
         let baseline = capture_turn_diff_baseline(&repos, &root).await.unwrap();
+        let temporary_objects = baseline.git_objects.as_ref().unwrap().root.clone();
+        assert!(temporary_objects.exists());
+        let object_count_after_baseline = git(&root, &["count-objects", "-v"]);
+        let loose_after_baseline = object_count_after_baseline
+            .lines()
+            .find_map(|line| line.strip_prefix("count: "))
+            .unwrap();
+        assert_eq!(loose_after_baseline, loose_before);
         assert_eq!(git(&root, &["status", "--porcelain"]), status_before);
 
         std::fs::write(root.join("tracked.txt"), "dirty after\n").unwrap();
@@ -1716,6 +2079,14 @@ mod turn_diff_tests {
         assert_eq!(paths, HashSet::from(["tracked.txt", "new.txt"]));
         assert!(!snapshot.patch.contains("untouched-before.txt"));
         assert!(!snapshot.patch.contains("staged.txt"));
+        let object_count_after = git(&root, &["count-objects", "-v"]);
+        let loose_after = object_count_after
+            .lines()
+            .find_map(|line| line.strip_prefix("count: "))
+            .unwrap();
+        assert_eq!(loose_after, loose_before);
+        drop(baseline);
+        assert!(!temporary_objects.exists());
     }
 
     #[tokio::test]

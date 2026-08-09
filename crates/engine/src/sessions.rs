@@ -163,13 +163,67 @@ struct RunHandle {
     pending_inputs: PendingInputs,
     compaction_follow_up: Arc<CompactionFollowUp>,
     pending_external_turns: Arc<AtomicUsize>,
-    turn_diff_baselines: Arc<Mutex<VecDeque<Option<crate::TurnDiffBaseline>>>>,
+    turn_diff_tracker: Arc<Mutex<TurnDiffTracker>>,
     /// True only while the persistent process is parked with no internal
     /// continuation already queued.
     idle: Arc<AtomicBool>,
     /// Maintenance retirement is clean at an idle boundary: unlike interrupt,
     /// it does not abort a transcript entry or pause an active goal.
     retire: CancellationToken,
+}
+
+/// Owns baseline transitions for one persistent harness run. Keeping queue
+/// mechanics behind named boundary operations prevents dispatch, steering and
+/// shutdown paths from independently manipulating positional state.
+#[derive(Default)]
+struct TurnDiffTracker {
+    active: Option<crate::TurnDiffBaseline>,
+    queued: VecDeque<Option<crate::TurnDiffBaseline>>,
+}
+
+impl TurnDiffTracker {
+    fn new(initial: Option<crate::TurnDiffBaseline>) -> Self {
+        Self {
+            active: initial,
+            queued: VecDeque::new(),
+        }
+    }
+
+    fn queue(&mut self, baseline: Option<crate::TurnDiffBaseline>) {
+        self.queued.push_back(baseline);
+    }
+
+    fn rollback_last_queue(&mut self) {
+        self.queued.pop_back();
+    }
+
+    fn active(&self) -> Option<crate::TurnDiffBaseline> {
+        self.active.clone()
+    }
+
+    fn activate_queued_if_needed(&mut self) {
+        if self.active.is_none() {
+            self.active = self.queued.pop_front().flatten();
+        }
+    }
+
+    /// A Steered event is the authoritative boundary. The queued snapshot was
+    /// taken before the old segment settled, so discard it in favor of the
+    /// boundary snapshot.
+    fn observe_boundary(&mut self, baseline: Option<crate::TurnDiffBaseline>) {
+        self.queued.pop_front();
+        self.active = baseline;
+    }
+
+    fn advance_after_done(&mut self) {
+        self.active = self.queued.pop_front().flatten();
+    }
+
+    fn install_if_missing(&mut self, baseline: Option<crate::TurnDiffBaseline>) {
+        if self.active.is_none() {
+            self.active = baseline;
+        }
+    }
 }
 
 struct Inner {
@@ -279,6 +333,14 @@ impl SessionsEngine {
         store
             .page(chat_id, assistant_message_id, catalog_revision, page_id)
             .await
+    }
+
+    /// Delete locally retained patch bodies after their owning chat is deleted.
+    pub async fn remove_turn_diffs(&self, chat_id: &str) -> Result<(), EngineError> {
+        let Some(store) = self.inner.turn_diffs.get() else {
+            return Ok(());
+        };
+        store.remove_chat(chat_id).await
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually

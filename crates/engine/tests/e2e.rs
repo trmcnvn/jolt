@@ -1341,6 +1341,7 @@ async fn completed_turn_persists_an_authoritative_filesystem_diff() {
         .unwrap();
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].path, "changed.txt");
+    assert_eq!(diff.attribution, jolt_proto::TurnDiffAttribution::Exact);
     let page = core
         .sessions
         .turn_diff_page(

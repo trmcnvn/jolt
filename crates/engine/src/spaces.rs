@@ -28,6 +28,7 @@ use tokio::sync::{mpsc, watch};
 
 use jolt_proto::Space;
 
+use crate::TurnDiffStore;
 use crate::workspace_host::WorkspaceHost;
 use jolt_vcs::Repos;
 
@@ -47,6 +48,7 @@ struct SpacesSyncInner {
     repos: Repos,
     workspace: WorkspaceHost,
     device_id: String,
+    turn_diffs: TurnDiffStore,
     entries: Mutex<HashMap<String, Arc<SpaceEntry>>>,
 }
 
@@ -62,12 +64,18 @@ pub struct SpacesSync {
 impl SpacesSync {
     /// Build and start the sync loop: follows the workspace spaces watch and
     /// runs the repair tick. Requires a tokio runtime.
-    pub fn start(repos: Repos, workspace: WorkspaceHost, device_id: &str) -> Self {
+    pub fn start(
+        repos: Repos,
+        workspace: WorkspaceHost,
+        device_id: &str,
+        turn_diffs: TurnDiffStore,
+    ) -> Self {
         let sync = Self {
             inner: Arc::new(SpacesSyncInner {
                 repos,
                 workspace: workspace.clone(),
                 device_id: device_id.to_string(),
+                turn_diffs,
                 entries: Mutex::new(HashMap::new()),
             }),
         };
@@ -233,6 +241,14 @@ fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
         tracing::info!(chat = %chat.id, space = %space_id, "deleting orphaned chat (space gone)");
         if let Err(err) = inner.workspace.delete_chat(&chat.id) {
             tracing::warn!(chat = %chat.id, error = %err, "spaces: orphan delete failed");
+        } else {
+            let store = inner.turn_diffs.clone();
+            let chat_id = chat.id.clone();
+            tokio::spawn(async move {
+                if let Err(err) = store.remove_chat(&chat_id).await {
+                    tracing::warn!(chat = %chat_id, error = %err, "spaces: turn diff cleanup failed");
+                }
+            });
         }
     }
 }

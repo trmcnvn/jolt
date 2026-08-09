@@ -1041,6 +1041,7 @@ mod tests {
             device_id: "dev-a".into(),
             cwd: "/repo".into(),
             vcs: jolt_proto::VcsKind::Git,
+            attribution: jolt_proto::TurnDiffAttribution::Exact,
             files: vec![],
             pages: vec![],
             additions: 2,

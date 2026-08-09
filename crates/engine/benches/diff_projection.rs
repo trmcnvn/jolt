@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,18 @@ fn fixture() -> DiffSnapshot {
         });
         index += 1;
     }
+    let file_patches = files
+        .iter()
+        .map(|file| {
+            let marker = format!("diff --git a/{0} b/{0}", file.path);
+            let start = patch.find(&marker).unwrap();
+            let end = patch[start + marker.len()..]
+                .find("\ndiff --git ")
+                .map(|offset| start + marker.len() + offset + 1)
+                .unwrap_or(patch.len());
+            (file.path.clone(), patch[start..end].to_string())
+        })
+        .collect::<HashMap<_, _>>();
     DiffSnapshot {
         vcs: VcsKind::Git,
         label: None,
@@ -36,6 +49,7 @@ fn fixture() -> DiffSnapshot {
         head_sha: Some("head".into()),
         patch,
         files,
+        file_patches,
         additions: 0,
         deletions: 0,
         truncated: false,

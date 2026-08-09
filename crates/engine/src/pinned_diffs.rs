@@ -1,6 +1,6 @@
 //! Durable leases for immutable working-copy diff revisions under review.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use jolt_proto::{CheckoutDiffManifest, CheckoutDiffPage};
@@ -45,12 +45,12 @@ impl PinnedDiffStore {
             }
             let bytes = serde_json::to_vec(page)
                 .map_err(|error| EngineError::Other(format!("pinned diff page encode: {error}")))?;
-            atomic_write(&path, &bytes).await?;
+            crate::atomic_file::write_immutable(&path, &bytes).await?;
         }
         let manifest = serde_json::to_vec(&projection.manifest)
             .map_err(|error| EngineError::Other(format!("pinned diff manifest encode: {error}")))?;
-        atomic_write(&entry.join("manifest.json"), &manifest).await?;
-        atomic_write(&leases.join(lease_name(review_id)), b"").await
+        crate::atomic_file::write_immutable(&entry.join("manifest.json"), &manifest).await?;
+        crate::atomic_file::write_immutable(&leases.join(lease_name(review_id)), b"").await
     }
 
     pub(crate) async fn release(&self, revision: &str, review_id: &str) -> Result<(), EngineError> {
@@ -113,20 +113,6 @@ impl PinnedDiffStore {
     }
 }
 
-async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| EngineError::Other("pinned diff path has no parent".into()))?;
-    tokio::fs::create_dir_all(parent).await?;
-    let temporary = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    tokio::fs::write(&temporary, bytes).await?;
-    if let Err(error) = tokio::fs::rename(&temporary, path).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error.into());
-    }
-    Ok(())
-}
-
 fn lease_name(review_id: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(review_id.as_bytes());
@@ -139,6 +125,8 @@ fn is_digest(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use chrono::Utc;
     use jolt_proto::{DiffFileSummary, VcsKind};
 
@@ -168,6 +156,7 @@ mod tests {
                     deletions: 1,
                     binary: false,
                 }],
+                file_patches: HashMap::from([("a.rs".into(), patch.into())]),
                 additions: 1,
                 deletions: 1,
                 truncated: false,

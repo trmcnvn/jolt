@@ -28,14 +28,13 @@ impl DiffProjection {
         snapshot: &DiffSnapshot,
         updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        let sections = patch_sections(&snapshot.patch);
         let mut descriptors = Vec::with_capacity(snapshot.files.len());
         let mut page_descriptors = Vec::new();
         let mut pages = HashMap::new();
 
-        for (index, summary) in snapshot.files.iter().enumerate() {
+        for summary in &snapshot.files {
             let file_id = digest_hex(&[checkout_id.as_bytes(), &[0], summary.path.as_bytes()]);
-            let section = sections.get(index).copied();
+            let section = snapshot.file_patches.get(&summary.path);
             let mut completeness = if summary.binary {
                 DiffCompleteness::Binary
             } else if section.is_none() {
@@ -47,14 +46,13 @@ impl DiffProjection {
             let mut row_count = 0usize;
             let mut estimated_bytes = 0usize;
             if !summary.binary
-                && let Some(section) = section
+                && let Some(raw) = section
             {
-                let raw = &snapshot.patch[section.0..section.1];
                 let projected = project_file(raw);
                 if projected.oversized {
                     completeness = DiffCompleteness::OversizedLine;
                 }
-                if snapshot.truncated && index + 1 == sections.len() {
+                if snapshot.truncated && snapshot.patch.ends_with(raw) {
                     completeness = DiffCompleteness::SnapshotTruncated;
                 }
                 for page in projected.pages {
@@ -182,6 +180,7 @@ fn digest_hex(parts: &[&[u8]]) -> String {
 /// scanning measured 67 µs versus 497 µs for the scalar reference; complete
 /// catalog construction measured 12.9 ms. The section parser remains
 /// line-oriented and is covered against the scalar reference in tests.
+#[cfg(test)]
 fn patch_sections(patch: &str) -> Vec<(usize, usize)> {
     let bytes = patch.as_bytes();
     let needle = b"diff --git ";
@@ -529,23 +528,31 @@ mod tests {
     }
 
     fn snapshot(patch: &str, paths: &[&str], truncated: bool) -> DiffSnapshot {
+        let files: Vec<_> = paths
+            .iter()
+            .map(|path| DiffFileSummary {
+                path: (*path).into(),
+                old_path: None,
+                status: "modified".into(),
+                additions: 1,
+                deletions: 1,
+                binary: false,
+            })
+            .collect();
+        let sections = patch_sections(patch);
+        let file_patches = files
+            .iter()
+            .zip(sections)
+            .map(|(file, (start, end))| (file.path.clone(), patch[start..end].to_string()))
+            .collect();
         DiffSnapshot {
             vcs: jolt_proto::VcsKind::Git,
             label: None,
             branch: "main".into(),
             head_sha: Some("head".into()),
             patch: patch.into(),
-            files: paths
-                .iter()
-                .map(|path| DiffFileSummary {
-                    path: (*path).into(),
-                    old_path: None,
-                    status: "modified".into(),
-                    additions: 1,
-                    deletions: 1,
-                    binary: false,
-                })
-                .collect(),
+            files,
+            file_patches,
             additions: paths.len() as u32,
             deletions: paths.len() as u32,
             truncated,
