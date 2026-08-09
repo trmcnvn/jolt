@@ -8,3 +8,8 @@ node_modules
 .wrangler
 build/
 edge/dist/
+**/.zig-cache/
+**/zig-out/
+/jolt.db
+/jolt.db-shm
+/jolt.db-wal
