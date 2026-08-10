@@ -682,6 +682,7 @@ impl AppState {
             let transcript = &self.transcript;
             echoes.retain(|echo| !transcript.iter().any(|entry| entry.id == echo.id));
         }
+        self.ack_pending_send_from_transcript();
         Ok(())
     }
 
@@ -700,11 +701,19 @@ impl AppState {
             self.transcript_loading_pages.remove(&page_id);
             return;
         };
+        let target_device_id = self
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| {
+                (self.local_device_id.as_deref() != Some(chat.device_id.as_str()))
+                    .then(|| chat.device_id.clone())
+            });
         cx.spawn(async move |this, cx| {
             let request = GetTranscriptPage {
                 chat_id: chat_id.clone(),
                 page_id: page_id.clone(),
-                target_device_id: None,
+                target_device_id,
             };
             let mut result = call_api(handle.client(), &request).await;
             for delay in [250u64, 1_000] {
@@ -1067,13 +1076,20 @@ impl AppState {
         ];
         // Re-subscribe selected-chat projections after reconnect.
         if let Some(chat_id) = self.selected_chat.clone() {
-            let target_device_id = self
-                .chats
-                .iter()
-                .find(|chat| chat.id == chat_id)
-                .map(|chat| chat.device_id.clone());
-            self.transcript_task =
-                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            let target_device_id =
+                self.chats
+                    .iter()
+                    .find(|chat| chat.id == chat_id)
+                    .and_then(|chat| {
+                        (self.local_device_id.as_deref() != Some(chat.device_id.as_str()))
+                            .then(|| chat.device_id.clone())
+                    });
+            self.transcript_task = Some(spawn_transcript_watch(
+                cx,
+                handle.clone(),
+                chat_id.clone(),
+                target_device_id.clone(),
+            ));
             self.queue_task = Some(spawn_queue_watch(cx, handle.clone(), chat_id.clone()));
             self.usage_task = Some(spawn_usage_watch(cx, handle, chat_id, target_device_id));
         }
@@ -1154,13 +1170,20 @@ impl AppState {
             self.mark_chat_seen(id, cx);
         }
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            let target_device_id = self
-                .chats
-                .iter()
-                .find(|chat| chat.id == chat_id)
-                .map(|chat| chat.device_id.clone());
-            self.transcript_task =
-                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            let target_device_id =
+                self.chats
+                    .iter()
+                    .find(|chat| chat.id == chat_id)
+                    .and_then(|chat| {
+                        (self.local_device_id.as_deref() != Some(chat.device_id.as_str()))
+                            .then(|| chat.device_id.clone())
+                    });
+            self.transcript_task = Some(spawn_transcript_watch(
+                cx,
+                handle.clone(),
+                chat_id.clone(),
+                target_device_id.clone(),
+            ));
             self.queue_task = Some(spawn_queue_watch(cx, handle.clone(), chat_id.clone()));
             self.usage_task = Some(spawn_usage_watch(cx, handle, chat_id, target_device_id));
         }
@@ -1763,6 +1786,7 @@ fn spawn_transcript_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     chat_id: String,
+    target_device_id: Option<String>,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
         // Outer loop: a delta desync (missed frame) resubscribes immediately
@@ -1777,6 +1801,7 @@ fn spawn_transcript_watch(
         'resubscribe: loop {
             let request = WatchTranscript {
                 chat_id: chat_id.clone(),
+                target_device_id: target_device_id.clone(),
             };
             let mut rx = match subscribe_api(handle.client(), &request).await {
                 Ok(rx) => rx,

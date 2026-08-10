@@ -88,6 +88,13 @@ impl Shell {
             cx.notify();
             return;
         };
+        let target_device_id = {
+            let state = self.state.read(cx);
+            state.selected_chat_row().and_then(|chat| {
+                (state.local_device_id.as_deref() != Some(chat.device_id.as_str()))
+                    .then(|| chat.device_id.clone())
+            })
+        };
 
         // Keep useful rows mounted while the replacement request runs. This
         // avoids flashing back to the empty "Searching…" state on every edit.
@@ -103,7 +110,7 @@ impl Shell {
                 &SearchTranscript {
                     chat_id: request_chat,
                     query: request_query,
-                    target_device_id: None,
+                    target_device_id,
                 },
             )
             .await;

@@ -2352,6 +2352,8 @@ mod tests {
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(forwardable(methods::QUEUE_COMMAND));
+        assert!(forwardable(methods::WATCH_TRANSCRIPT_V2));
+        assert!(is_stream_method(methods::WATCH_TRANSCRIPT_V2));
         assert!(forwardable(methods::LIST_COMMANDS));
         assert!(forwardable(methods::SEARCH_TRANSCRIPT));
         assert!(forwardable(methods::CREATE_RECOVERY_FORK));

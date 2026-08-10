@@ -945,6 +945,8 @@ impl StreamRequest for WatchQueuedPrompts {
 #[serde(rename_all = "camelCase")]
 pub struct WatchTranscript {
     pub chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<String>,
 }
 
 impl StreamRequest for WatchTranscript {
@@ -1196,6 +1198,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             serde_json::json!({ "harness": "pi" })
+        );
+    }
+
+    #[test]
+    fn transcript_watches_carry_the_target_host() {
+        assert_eq!(
+            serde_json::to_value(WatchTranscript {
+                chat_id: "chat-1".into(),
+                target_device_id: Some("device-1".into()),
+            })
+            .unwrap(),
+            serde_json::json!({ "chatId": "chat-1", "targetDeviceId": "device-1" })
         );
     }
 
