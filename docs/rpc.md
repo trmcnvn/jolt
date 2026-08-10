@@ -139,7 +139,8 @@ These methods are local IPC only. `ScopeStatus` withholds its initial frame unti
 | --- | --- | --- |
 | `ListRepos`, `AddRepo`, `CloneRepo`, `CreateRepo` | unary | yes |
 | `ListBranches`, `ListRefs`, `SwitchRef` | unary | yes |
-| `GetCheckoutReview` | unary | yes |
+| `GetCheckoutReview`, `GetCheckoutVcsStatus` | unary | yes |
+| `RunVcsAction` | stream | yes |
 | `ListFolders`, `SearchFiles` | unary | yes |
 | `CreateWorktree`, `DeleteWorktree` | unary | yes |
 | `VcsSettings`, `SetVcsBackend` | unary | yes |
@@ -152,6 +153,8 @@ These methods are local IPC only. `ScopeStatus` withholds its initial frame unti
 `WatchCheckoutDiffV2` is checkout-specific by `chatId`. It opens with an atomic compact manifest; later frames replace only that manifest. Expanded file bodies load as immutable, SHA-256-addressed raw-patch pages through `GetCheckoutDiffPage`. Sequence or catalog mismatch causes a fresh bootstrap. `GetTurnDiffPage` loads an immutable, hash-verified page captured for one assistant transcript entry, addressed by chat, assistant message, catalog revision, and page ID. Turn manifests may carry `attribution: "partial"` when opaque tools could have made additional unreported changes; omission means exact attribution for backwards compatibility. `PinDiffDocument` durably retains a working-copy revision while a review draft references it; release removes that lease. Review-draft RPCs persist typed, pending annotations only in the directly connected device's SQLite store and reject relay access.
 
 `GetCheckoutReview` resolves a chat checkout on its host and returns the open provider-neutral code review when a supported forge adapter can authenticate. The initial GitHub adapter uses that device's authenticated `gh` CLI. Unsupported forges, unavailable provider tooling, missing authentication, and no matching review all return no review.
+
+`GetCheckoutVcsStatus` resolves a chat to its host-owned canonical checkout and returns one compact Git-or-Jujutsu working-copy/publication snapshot. `RunVcsAction` serializes Commit/Push mutations per checkout and streams phase and terminal result events. Commit file selections are verified against the exact diff catalog the user reviewed. Git pushes the current branch without force; JJ commits selected files into `@-`, leaves the remainder in `@`, and publishes only a Jolt-owned `jolt/*` bookmark at `@-`. These actions require a live host connection and are never queued for later execution.
 
 File search roots are resolved from synced chat/space rows and verified against the owning repository checkout before walking. Results contain paths only, never file contents.
 

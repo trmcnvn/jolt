@@ -355,6 +355,28 @@ impl SessionsEngine {
         let _ = self.inner.titles.set(titles);
     }
 
+    /// Generate a commit message with the chat's configured harness and economy model.
+    pub async fn generate_commit_message(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+        paths: &[String],
+        patch: &str,
+    ) -> Result<String, EngineError> {
+        let host =
+            self.inner.doc_host.get().ok_or_else(|| {
+                EngineError::Other("doc host not wired into sessions engine".into())
+            })?;
+        let titles = self
+            .inner
+            .titles
+            .get()
+            .ok_or_else(|| EngineError::Other("commit-message generator unavailable".into()))?;
+        titles
+            .generate_commit_message(chat_id, host.harness_for(chat_id), cwd, paths, patch)
+            .await
+    }
+
     /// Regenerate an existing chat title from its first user prompt using the
     /// host device's configured harness and economy model.
     pub async fn regenerate_title(&self, chat_id: &str) -> Result<(), EngineError> {

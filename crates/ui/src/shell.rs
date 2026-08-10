@@ -42,6 +42,7 @@ use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::harnesses::HarnessesPage;
 use crate::settings::hotkeys::{HotkeysEvent, HotkeysPage};
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::secrets::SecretsPage;
@@ -73,9 +74,11 @@ mod spaces;
 mod transcript_search;
 mod updates;
 mod usage;
+mod vcs_actions;
 
 use spaces::{AddSpaceFlow, ArchivedChatRow, RenameSpaceDialog, SessionSearchFlow, SpacesMenu};
 use transcript_search::TranscriptSearchFlow;
+use vcs_actions::{PendingVcsAction, VcsCommitDialog};
 
 actions!(
     shell,
@@ -307,6 +310,7 @@ fn session_shortcut_hint(keymap: &KeymapConfig, position: usize, visible: bool) 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Devices,
+    Harnesses,
     Agents,
     Secrets,
     VersionControl,
@@ -328,7 +332,11 @@ impl SettingsSection {
         ),
         (
             "Agents",
-            &[SettingsSection::Agents, SettingsSection::Secrets],
+            &[
+                SettingsSection::Harnesses,
+                SettingsSection::Agents,
+                SettingsSection::Secrets,
+            ],
         ),
         (
             "System",
@@ -344,6 +352,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
+            SettingsSection::Harnesses => "Harnesses",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Secrets => "Secrets",
             SettingsSection::VersionControl => "Version control",
@@ -866,6 +875,14 @@ pub struct Shell {
     changes: Option<Entity<Changes>>,
     changes_expanded: bool,
     changes_sub: Option<Subscription>,
+    /// Selected checkout's compact Commit/Push state and UI lifecycle.
+    vcs_status_chat: Option<String>,
+    vcs_status: Loadable<jolt_proto::CheckoutVcsStatus>,
+    vcs_status_task: Option<Task<()>>,
+    vcs_menu_open: bool,
+    vcs_commit_dialog: Option<VcsCommitDialog>,
+    vcs_default_confirm: Option<PendingVcsAction>,
+    vcs_action_task: Option<Task<()>>,
     #[cfg(any(debug_assertions, feature = "debug-ui"))]
     performance_hud: Option<Entity<PerformanceHud>>,
     /// Chat outlet vs secondary app pages.
@@ -873,6 +890,7 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
+    harnesses_page: Option<Entity<HarnessesPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
     hotkeys_page: Option<Entity<HotkeysPage>>,
@@ -1009,6 +1027,7 @@ pub struct Shell {
     _ticker: Task<()>,
     /// Refreshes Claude and ChatGPT/Codex rate-limit windows in the background.
     _account_usage_task: Task<()>,
+    _vcs_status_poll_task: Task<()>,
     _state_observation: Subscription,
     _new_chat_space_picker_observation: Subscription,
     _composer_events: Subscription,
@@ -1102,6 +1121,22 @@ impl Shell {
                 }
             }
         });
+        let vcs_status_poll_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                let alive = this.update(cx, |shell: &mut Shell, cx| {
+                    if shell.vcs_status_task.is_none()
+                        && shell.vcs_action_task.is_none()
+                        && shell.state.read(cx).selected_chat.is_some()
+                    {
+                        shell.refresh_vcs_status(cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
         let account_usage_task = cx.spawn(async move |this, cx| {
             loop {
                 let Ok(engine) = this.update(cx, |shell: &mut Shell, cx| {
@@ -1147,6 +1182,7 @@ impl Shell {
                 Route::Settings(SettingsSection::Appearance)
             }
             Some("settings/devices") => Route::Settings(SettingsSection::Devices),
+            Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/secrets") => Route::Settings(SettingsSection::Secrets),
             Some("settings/vcs") => Route::Settings(SettingsSection::VersionControl),
@@ -1192,11 +1228,19 @@ impl Shell {
             changes: None,
             changes_expanded: false,
             changes_sub: None,
+            vcs_status_chat: None,
+            vcs_status: Loadable::Idle,
+            vcs_status_task: None,
+            vcs_menu_open: false,
+            vcs_commit_dialog: None,
+            vcs_default_confirm: None,
+            vcs_action_task: None,
             #[cfg(any(debug_assertions, feature = "debug-ui"))]
             performance_hud,
             route,
             nav,
             devices_page: None,
+            harnesses_page: None,
             appearance_page: None,
             notifications_page: None,
             hotkeys_page: None,
@@ -1272,6 +1316,7 @@ impl Shell {
             focus_sub: None,
             _ticker: ticker,
             _account_usage_task: account_usage_task,
+            _vcs_status_poll_task: vcs_status_poll_task,
             _state_observation: observation,
             _new_chat_space_picker_observation: new_chat_space_picker_observation,
             _composer_events: composer_events,
@@ -1328,6 +1373,13 @@ impl Shell {
         self.changes = None;
         self.changes_expanded = false;
         self.changes_sub = None;
+        self.vcs_status_chat = None;
+        self.vcs_status = Loadable::Idle;
+        self.vcs_status_task = None;
+        self.vcs_menu_open = false;
+        self.vcs_commit_dialog = None;
+        self.vcs_default_confirm = None;
+        self.vcs_action_task = None;
         self.devices_page = None;
         self.add_space = None;
         self.session_search = None;
@@ -1813,6 +1865,7 @@ impl Shell {
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::DEVICE_DESKTOP,
+            SettingsSection::Harnesses => icons::APPS,
             SettingsSection::Agents => icons::USER,
             SettingsSection::Secrets => icons::KEY,
             SettingsSection::VersionControl => icons::GIT_BRANCH,
@@ -1823,8 +1876,8 @@ impl Shell {
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
-        // the sidebar's right edge (user-reported). Device identity lives on
-        // the Accounts page now — the one surface where the device matters.
+        // the sidebar's right edge (user-reported). Device-targeted pages put
+        // identity in their shared page-header switcher.
         div()
             .w(px(self.settings.sidebar_width))
             .h_full()
@@ -3032,6 +3085,7 @@ impl Shell {
         if let Some(overlay) = self.render_breakdown_dialog(viewport, cx) {
             overlays.push(overlay);
         }
+        overlays.extend(self.render_vcs_action_overlays(viewport, window, cx));
 
         if self
             .state
@@ -3815,6 +3869,18 @@ impl Render for Shell {
                     cx.stop_propagation();
                     return;
                 }
+                if event.keystroke.key == "escape"
+                    && (this.vcs_menu_open
+                        || this.vcs_commit_dialog.is_some()
+                        || this.vcs_default_confirm.is_some())
+                {
+                    this.vcs_menu_open = false;
+                    this.vcs_commit_dialog = None;
+                    this.vcs_default_confirm = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 let shell_overlay_open = this.user_menu_open
                     || this.chat_menu.is_some()
                     || this.rename_dialog.is_some()
@@ -3824,6 +3890,9 @@ impl Render for Shell {
                     || this.spaces_menu.is_some()
                     || this.rename_space_dialog.is_some()
                     || this.delete_space_confirm.is_some()
+                    || this.vcs_menu_open
+                    || this.vcs_commit_dialog.is_some()
+                    || this.vcs_default_confirm.is_some()
                     || this.add_space.is_some()
                     || this.session_search.is_some()
                     || this.transcript_search.is_some();

@@ -85,6 +85,8 @@ pub(super) fn forwardable(method: &str) -> bool {
             | methods::LIST_BRANCHES
             | methods::LIST_REFS
             | methods::GET_CHECKOUT_REVIEW
+            | methods::GET_CHECKOUT_VCS_STATUS
+            | methods::RUN_VCS_ACTION
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
             | methods::SEARCH_FILES
@@ -136,6 +138,7 @@ pub(super) fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_HARNESS_UPDATES
             | methods::WATCH_CHAT_USAGE
             | methods::WATCH_CHECKOUT_DIFF_V2
+            | methods::RUN_VCS_ACTION
             | methods::UPDATE_STATUS
     )
 }

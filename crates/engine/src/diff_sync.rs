@@ -29,7 +29,8 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use jolt_proto::{
-    Chat, CheckoutDiffBootstrap, CheckoutDiffPage, CheckoutDiffWatchFrame, DiffFileSummary, VcsKind,
+    Chat, CheckoutDiffBootstrap, CheckoutDiffPage, CheckoutDiffWatchFrame, DiffFileSummary,
+    VcsCommitSelection, VcsKind,
 };
 
 use crate::EngineError;
@@ -220,6 +221,107 @@ impl CheckoutDiffSync {
         lock(&entry.projection)
             .as_ref()
             .map(|projection| projection.manifest.clone())
+    }
+
+    /// Force one authoritative checkout capture and return its compact manifest.
+    pub async fn refresh_manifest(
+        &self,
+        chat_id: &str,
+    ) -> Result<jolt_proto::CheckoutDiffManifest, EngineError> {
+        let entry = self.ensure_entry_for_chat(chat_id).await?;
+        let _sync = entry.sync_lock.lock().await;
+        sync_entry_locked(&self.inner, &entry).await?;
+        lock(&entry.projection)
+            .as_ref()
+            .map(|projection| projection.manifest.clone())
+            .ok_or_else(|| EngineError::Other("diff projection unavailable".into()))
+    }
+
+    /// Resolve a file-id selection against an exact diff revision and collect
+    /// the bounded patch used for commit-message generation.
+    pub async fn commit_context(
+        &self,
+        chat_id: &str,
+        expected_revision: &str,
+        selection: &VcsCommitSelection,
+    ) -> Result<
+        (
+            jolt_proto::CheckoutDiffManifest,
+            Option<Vec<String>>,
+            String,
+        ),
+        EngineError,
+    > {
+        let manifest = self.refresh_manifest(chat_id).await?;
+        if manifest.catalog_revision != expected_revision {
+            return Err(EngineError::Other(
+                "Working-copy changes changed; review the refreshed file list before committing"
+                    .into(),
+            ));
+        }
+        if manifest.files.is_empty() {
+            return Err(EngineError::Other("Working copy is clean".into()));
+        }
+        let selected = match selection {
+            VcsCommitSelection::All => manifest.files.iter().collect::<Vec<_>>(),
+            VcsCommitSelection::Files { file_ids } => {
+                if file_ids.is_empty() {
+                    return Err(EngineError::Other(
+                        "Select at least one file to commit".into(),
+                    ));
+                }
+                let selected = file_ids
+                    .iter()
+                    .map(|id| {
+                        manifest
+                            .files
+                            .iter()
+                            .find(|file| &file.id == id)
+                            .ok_or_else(|| {
+                                EngineError::Other(format!(
+                                    "Selected file {id} is no longer changed"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let unique = selected
+                    .iter()
+                    .map(|file| file.id.as_str())
+                    .collect::<HashSet<_>>();
+                if unique.len() != file_ids.len() {
+                    return Err(EngineError::Other(
+                        "Commit selection contains duplicate files".into(),
+                    ));
+                }
+                selected
+            }
+        };
+        let entry = self
+            .entry_for_chat(chat_id)
+            .ok_or_else(|| EngineError::Other(format!("chat {chat_id} has no local checkout")))?;
+        let projection = lock(&entry.projection)
+            .clone()
+            .ok_or_else(|| EngineError::Other("diff projection unavailable".into()))?;
+        let mut patch = String::new();
+        let mut paths = Vec::new();
+        for file in &selected {
+            if let Some(old_path) = &file.old_path {
+                paths.push(old_path.clone());
+            }
+            paths.push(file.path.clone());
+            for page_id in &file.page_ids {
+                if let Some(page) = projection.page(page_id) {
+                    if !patch.is_empty() && !patch.ends_with('\n') {
+                        patch.push('\n');
+                    }
+                    patch.push_str(&page.patch);
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let paths = matches!(selection, VcsCommitSelection::Files { .. }).then_some(paths);
+        Ok((manifest, paths, patch))
     }
 
     pub fn diff_page(

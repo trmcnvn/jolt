@@ -130,6 +130,20 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Strin
     }
 }
 
+/// Parse a response id tolerantly. Requests use integers, but JSON-RPC peers
+/// sometimes echo them as numeric strings or integral floats.
+fn response_id(id: &Value) -> Option<i64> {
+    if let Some(id) = id.as_i64() {
+        return Some(id);
+    }
+    if let Some(id) = id.as_str() {
+        return id.parse().ok();
+    }
+    id.as_f64()
+        .filter(|id| id.is_finite() && id.fract() == 0.0)
+        .map(|id| id as i64)
+}
+
 /// Parse stdout lines: responses resolve the pending map, everything else is
 /// forwarded in order. Non-JSON noise is skipped; on EOF all pending requests
 /// fail (their senders drop) and one final [`Incoming::Eof`] is delivered.
@@ -151,7 +165,9 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
         match (method, id) {
             // Response: resolve the awaiting request.
             (None, Some(id)) => {
-                let Some(id) = id.as_i64() else { continue };
+                let Some(id) = response_id(id) else {
+                    continue;
+                };
                 let Some(sender) = pending.lock().expect("pending lock").remove(&id) else {
                     continue;
                 };
@@ -192,4 +208,18 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
     // EOF/read error: fail every awaiting request, then signal the loop.
     pending.lock().expect("pending lock").clear();
     let _ = tx.send(Incoming::Eof).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_ids_accept_equivalent_json_number_shapes() {
+        assert_eq!(response_id(&Value::from(5)), Some(5));
+        assert_eq!(response_id(&Value::from("5")), Some(5));
+        assert_eq!(response_id(&serde_json::json!(5.0)), Some(5));
+        assert_eq!(response_id(&serde_json::json!(5.5)), None);
+        assert_eq!(response_id(&Value::from("not-an-id")), None);
+    }
 }

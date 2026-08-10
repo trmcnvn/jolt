@@ -9,13 +9,11 @@ use gpui::{
 };
 use std::time::Duration;
 
-use jolt_api::{Mutate, call as call_api};
-use jolt_proto::{HarnessId, HarnessUpdateState};
-
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
 use crate::state::{AppState, RemoteJoltUpdateAction};
 use crate::theme::Theme;
+use jolt_api::{Mutate, call as call_api};
 
 /// A device that pinged within this window shows a presence dot (engines
 /// heartbeat every 15s; 70s tolerates a couple of missed beats).
@@ -357,22 +355,13 @@ impl Render for DevicesPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
-        let (
-            devices,
-            local_id,
-            remote_updates,
-            remote_update_actions,
-            local_harness_updates,
-            remote_harness_updates,
-        ) = {
+        let (devices, local_id, remote_updates, remote_update_actions) = {
             let state = self.state.read(cx);
             (
                 state.devices.clone(),
                 state.local_device_id.clone(),
                 state.remote_updates.clone(),
                 state.remote_update_actions.clone(),
-                state.harness_updates.clone(),
-                state.remote_harness_updates.clone(),
             )
         };
         let copied = self.copied.clone();
@@ -426,15 +415,6 @@ impl Render for DevicesPage {
                 let remote_update = remote_updates.get(&device.id).cloned();
                 let remote_update_action = remote_update_actions.get(&device.id).cloned();
                 let update_state = self.state.clone();
-                let harness_target_device_id = (!is_local).then(|| device.id.clone());
-                let harness_updates = if is_local {
-                    local_harness_updates.clone()
-                } else {
-                    remote_harness_updates
-                        .get(&device.id)
-                        .cloned()
-                        .unwrap_or_default()
-                };
                 let platform_icon = match device.platform.as_str() {
                     "macos" | "darwin" => crate::icons::DEVICE_LAPTOP,
                     "web" => crate::icons::WORLD,
@@ -650,117 +630,6 @@ impl Render for DevicesPage {
                         (None, None)
                     };
 
-                let harness_banners: Vec<AnyElement> = harness_updates
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(harness_ix, status)| {
-                        let pending = self.state.read(cx).harness_update_pending(
-                            harness_target_device_id.as_deref(),
-                            status.harness,
-                        );
-                        let request_failed = self.state.read(cx).harness_update_failed(
-                            harness_target_device_id.as_deref(),
-                            status.harness,
-                        );
-                        let name = harness_name(status.harness);
-                        let current = status.current_version.as_deref().unwrap_or("installed");
-                        let latest = status.latest_version.as_deref().unwrap_or("latest");
-                        let failure_detail =
-                            format!("Update {name} directly on this device to continue.");
-                        let (message, detail, action_label, failed) = if request_failed {
-                            (
-                                format!("{name} update failed"),
-                                Some(failure_detail.clone()),
-                                None,
-                                true,
-                            )
-                        } else if pending {
-                            (
-                                format!("Starting {name} update…"),
-                                Some("The update request is being sent to this device.".into()),
-                                None,
-                                false,
-                            )
-                        } else {
-                            match status.state {
-                                HarnessUpdateState::UpdateAvailable => (
-                                    format!("{name} is out of date. {current} → {latest}"),
-                                    (!online).then(|| "Device is offline".into()),
-                                    (status.can_apply && online).then_some("Update"),
-                                    false,
-                                ),
-                                HarnessUpdateState::Manual => (
-                                    format!("{name} is out of date. {current} → {latest}"),
-                                    status.detail.clone().or_else(|| {
-                                        Some("This installation must be updated manually.".into())
-                                    }),
-                                    None,
-                                    false,
-                                ),
-                                HarnessUpdateState::WaitingForIdle => (
-                                    format!("Waiting to update {name}…"),
-                                    status.detail.clone(),
-                                    None,
-                                    false,
-                                ),
-                                HarnessUpdateState::Updating => (
-                                    format!("Updating {name}…"),
-                                    status.detail.clone(),
-                                    None,
-                                    false,
-                                ),
-                                HarnessUpdateState::Failed if status.latest_version.is_some() => (
-                                    format!("{name} update failed"),
-                                    Some(failure_detail),
-                                    None,
-                                    true,
-                                ),
-                                _ => return None,
-                            }
-                        };
-                        let action = action_label.map(|label| {
-                            let state = self.state.clone();
-                            let target_device_id = harness_target_device_id.clone();
-                            let harness = status.harness;
-                            widgets::ghost_action(&theme)
-                                .id(format!("device-{ix}-harness-{harness_ix}-update"))
-                                .text_color(if failed {
-                                    theme.danger
-                                } else {
-                                    theme.warning_muted
-                                })
-                                .hover(move |style| {
-                                    style
-                                        .bg(if failed {
-                                            theme.danger.opacity(0.08)
-                                        } else {
-                                            theme.warning.opacity(0.08)
-                                        })
-                                        .text_color(if failed {
-                                            theme.danger
-                                        } else {
-                                            theme.warning_muted
-                                        })
-                                })
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    state.update(cx, |state, cx| {
-                                        state.begin_harness_update(
-                                            harness,
-                                            target_device_id.clone(),
-                                            cx,
-                                        );
-                                    });
-                                }))
-                                .child(SharedString::from(label))
-                                .into_any_element()
-                        });
-                        Some(
-                            harness_update_banner(&theme, message, detail, action, failed)
-                                .into_any_element(),
-                        )
-                    })
-                    .collect();
-
                 widgets::card_row(&theme, ix == 0)
                     .child(tile)
                     .child(
@@ -779,8 +648,7 @@ impl Render for DevicesPage {
                                         .text_color(theme.text_muted)
                                         .child(detail),
                                 )
-                            })
-                            .children(harness_banners),
+                            }),
                     )
                     .when(is_local, |el| {
                         el.child(widgets::badge(&theme, "This device"))
@@ -882,55 +750,6 @@ impl Render for DevicesPage {
             .when_some(rename_dialog, |element, dialog| element.child(dialog))
             .when_some(delete_dialog, |element, dialog| element.child(dialog))
     }
-}
-
-fn harness_name(harness: HarnessId) -> &'static str {
-    match harness {
-        HarnessId::ClaudeCode => "Claude Code",
-        HarnessId::Codex => "Codex",
-        HarnessId::Pi => "Pi",
-        HarnessId::Mock => "Mock",
-    }
-}
-
-fn harness_update_banner(
-    theme: &Theme,
-    message: String,
-    detail: Option<String>,
-    action: Option<AnyElement>,
-    failed: bool,
-) -> gpui::Div {
-    let accent = if failed { theme.danger } else { theme.warning };
-    div()
-        .mt(px(8.0))
-        .w_full()
-        .flex()
-        .items_center()
-        .gap(px(10.0))
-        .px(px(12.0))
-        .py(px(9.0))
-        .rounded(px(9.0))
-        .border_1()
-        .border_color(accent.opacity(0.18))
-        .bg(accent.opacity(0.055))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_size(px(11.5))
-                .text_color(theme.text)
-                .child(message)
-                .when_some(detail, |el, detail| {
-                    el.child(
-                        div()
-                            .mt(px(2.0))
-                            .text_size(px(10.5))
-                            .text_color(theme.text_muted)
-                            .child(detail),
-                    )
-                }),
-        )
-        .when_some(action, |el, action| el.child(action))
 }
 
 #[cfg(test)]

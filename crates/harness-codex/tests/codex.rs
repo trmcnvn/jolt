@@ -365,6 +365,35 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
 }
 
 #[tokio::test]
+async fn steering_keeps_draining_notifications_until_the_response() {
+    let (controls, steer, _token) = controls("Yes");
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: None,
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness(), request("scenario:steer-flood"), controls).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Steered { .. }))
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "steered".into(),
+    }));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn rejected_steer_falls_back_to_a_follow_up_turn() {
     let (controls, steer, _token) = controls("Yes");
     steer

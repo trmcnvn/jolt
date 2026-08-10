@@ -12,15 +12,15 @@ pub use requests::{
     CancelAgentLogin, CancelQueuedPrompt, ChatPage, ChatSection, ChatWatchFrame,
     CheckHarnessUpdates, CloseTerminal, CompleteAgentLogin, CreateWorktree, DeleteHarnessSecret,
     DeleteReviewDraft, DeleteTheme, EnsurePersonalOrg, ExtractQuestions, ForgetAgentAccount,
-    GetCheckoutDiffPage, GetCheckoutReview, GetLocalDevice, GetReviewDraft, GetTranscriptPage,
-    GetTransportCapabilities, GetTurnDiffPage, ListAgentAccounts, ListCommands, ListFolders,
-    ListHarnessSecrets, ListHarnesses, ListModels, ListRefs, ListThemes, Mutate, OpenTerminal,
-    PinDiffDocument, PollAgentLogin, ProbeSync, PutReviewDraft, QueryChats, QueueCommand,
-    ReadAttachmentChunk, RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal,
-    ResolveAccountLink, SearchFiles, SearchTranscript, SessionWatchFrame, SetTerminalCommand,
-    SetVcsBackend, SignIn, SignOut, StartAgentLogin, StopEngine, StreamRequest, SubscribeTerminal,
-    SwitchRef, SwitchScope, TerminalSettings, TransportCapabilities, UnaryRequest,
-    UploadBinaryChunk, UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes,
+    GetCheckoutDiffPage, GetCheckoutReview, GetCheckoutVcsStatus, GetLocalDevice, GetReviewDraft,
+    GetTranscriptPage, GetTransportCapabilities, GetTurnDiffPage, ListAgentAccounts, ListCommands,
+    ListFolders, ListHarnessSecrets, ListHarnesses, ListModels, ListRefs, ListThemes, Mutate,
+    OpenTerminal, PinDiffDocument, PollAgentLogin, ProbeSync, PutReviewDraft, QueryChats,
+    QueueCommand, ReadAttachmentChunk, RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal,
+    ResolveAccountLink, RunVcsAction, SearchFiles, SearchTranscript, SessionWatchFrame,
+    SetTerminalCommand, SetVcsBackend, SignIn, SignOut, StartAgentLogin, StopEngine, StreamRequest,
+    SubscribeTerminal, SwitchRef, SwitchScope, TerminalSettings, TransportCapabilities,
+    UnaryRequest, UploadBinaryChunk, UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes,
     UsageBreakdownRequest, VcsSettings, WatchAuthStatus, WatchChatUsage, WatchChats,
     WatchCheckoutDiff, WatchDevices, WatchHarnessUpdates, WatchQueuedPrompts, WatchScopeStatus,
     WatchSessions, WatchSpaces, WatchThemes, WatchTranscript, WatchUpdateStatus, WriteTerminal,
@@ -111,6 +111,10 @@ pub mod methods {
     pub const LIST_REFS: &str = "ListRefs";
     /// Open provider-neutral PR/MR associated with a chat's concrete checkout.
     pub const GET_CHECKOUT_REVIEW: &str = "GetCheckoutReview";
+    /// Current working-copy and publication status for a chat's concrete checkout.
+    pub const GET_CHECKOUT_VCS_STATUS: &str = "GetCheckoutVcsStatus";
+    /// Host-owned Commit/Push action progress stream for a concrete checkout.
+    pub const RUN_VCS_ACTION: &str = "RunVcsAction";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.

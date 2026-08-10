@@ -84,7 +84,8 @@ impl Shell {
                 .appearance_page
                 .as_ref()
                 .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_modal(cx))),
-            SettingsSection::VersionControl
+            SettingsSection::Harnesses
+            | SettingsSection::VersionControl
             | SettingsSection::Terminal
             | SettingsSection::Notifications
             | SettingsSection::Hotkeys => false,
@@ -160,6 +161,16 @@ impl Shell {
                         Some(cx.new(|cx| DevicesPage::new(state, background_service, cx)));
                 }
                 match &self.devices_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Harnesses => {
+                if self.harnesses_page.is_none() {
+                    let state = self.state.clone();
+                    self.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state, cx)));
+                }
+                match &self.harnesses_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }

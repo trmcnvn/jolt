@@ -140,6 +140,9 @@ impl Shell {
                     cx.listener(|this, _, _, cx| this.open_new_session(cx)),
                 ))
             })
+            .when(git && selected.is_some(), |el| {
+                el.child(self.render_vcs_actions_control(cx))
+            })
             .child(header_icon_button(
                 "toggle-terminal",
                 icons::TERMINAL_2,

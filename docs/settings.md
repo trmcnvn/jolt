@@ -9,13 +9,14 @@ Open settings from the user menu or with `Cmd+,` on macOS / `Ctrl+,` elsewhere. 
 | **Appearance** | System/light/dark mode, paired themes, custom colors, and typography | Local viewport setting; custom theme files are installation-level |
 | **Notifications** | In-app toasts versus operating-system notifications | Local viewport setting |
 | **Hotkeys** | Rebindable app commands with conflict detection and reset controls | Local viewport setting |
+| **Harnesses** | Installed Claude Code, Codex, and Pi versions, release checks, and user-approved updates | Selected engine device |
 | **Accounts** | Claude Code and Codex login slots, activation, removal, and provider quota meters | Selected engine device |
 | **Secrets** | Write-only environment secrets scoped to Claude Code, Codex, and/or Pi | Local engine only |
 | **Devices** | Background availability plus registered-device presence, version, rename/removal, and copyable IDs | Service setting is local; device rows sync |
 | **Version control** | Active Git or Jujutsu command-line backend and executable status | Selected engine device |
 | **Terminal** | Command used when a new terminal tab opens | Selected engine device |
 
-The sidebar groups these pages as **Preferences** (Appearance, Notifications, Hotkeys), **Agents** (Accounts, Secrets), and **System** (Devices, Version control, Terminal). Settings opens to Appearance by default.
+The sidebar groups these pages as **Preferences** (Appearance, Notifications, Hotkeys), **Agents** (Harnesses, Accounts, Secrets), and **System** (Devices, Version control, Terminal). Settings opens to Appearance by default.
 
 Removing a device tombstones its spaces and threads. Synced R2 backups and attachments are purged asynchronously; folders and other local files on that machine are unaffected. If Jolt later starts there again, it registers as an empty device.
 
@@ -25,7 +26,9 @@ Enable **Keep this device available** to install and start Jolt's per-user backg
 
 Reachable remote engine devices report their Jolt release status on this page. Managed installations with an available release show an explicit **Update** action; offline devices disable it, and unmanaged installations show **Manual update**. The row tracks waiting, restart, verification, and failure states. Background checks never install a release automatically.
 
-Installed harness versions are also checked per device. Outdated Claude Code, Codex, or Pi installations appear as attached banners on that device row with current and latest versions, inline progress or manual-update guidance, and an **Update** action when Jolt can safely manage the installation. Harness availability does not generate notifications.
+### Harnesses
+
+Installed Claude Code, Codex, and Pi versions are checked per device. Use the device switcher to review a reachable engine, manually refresh its release status, and apply available updates. The page shows current and latest versions, inline progress or manual-update guidance, and an **Update** action when Jolt can safely manage the installation. Harness availability does not generate notifications.
 
 ### Accounts
 
@@ -59,7 +62,7 @@ Font pickers enumerate installed fonts. The composer family applies only to the 
 
 ### Notifications
 
-Jolt defaults to in-app toasts. Enabling **System notifications** sends Claude/Codex quota warnings, Jolt update notices, and app-wide errors through the OS instead. Harness updates remain inline on the Devices page.
+Jolt defaults to in-app toasts. Enabling **System notifications** sends Claude/Codex quota warnings, Jolt update notices, and app-wide errors through the OS instead. Harness updates remain inline on the Harnesses page.
 
 ## Default hotkeys
 

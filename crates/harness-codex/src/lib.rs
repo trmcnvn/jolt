@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
@@ -336,6 +337,12 @@ struct Session {
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: jolt_harness::StderrTail,
+}
+
+struct SteeringCall {
+    text: String,
+    expected_turn: String,
+    response: BoxFuture<'static, Result<Value, HarnessError>>,
 }
 
 /// Turn-routing state: the `turn/start` response and turn lifecycle
@@ -746,6 +753,12 @@ async fn run_session(session: Session) {
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
     let mut queued_steers: VecDeque<String> = VecDeque::new();
+    // Keep the request in the main select instead of awaiting it inside the
+    // mailbox arm. The RPC reader shares a bounded notification channel; if
+    // that fills before the response arrives, an inline await deadlocks both
+    // sides. While a call is pending, followers remain in the bounded
+    // steering mailbox, preserving order and backpressure.
+    let mut steering_call: Option<SteeringCall> = None;
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -756,6 +769,67 @@ async fn run_session(session: Session) {
 
     'main: loop {
         tokio::select! {
+            biased;
+
+            response = async {
+                steering_call
+                    .as_mut()
+                    .expect("guarded by steering_call.is_some()")
+                    .response
+                    .as_mut()
+                    .await
+            }, if steering_call.is_some() => {
+                let SteeringCall {
+                    text,
+                    expected_turn,
+                    ..
+                } = steering_call
+                    .take()
+                    .expect("guarded by steering_call.is_some()");
+                if !interrupted {
+                    match response {
+                        Ok(_) => {
+                            let (prev, next) = rotate(&mut assistant_message_id);
+                            if !send(
+                                &event_tx,
+                                AgentEvent::Steered {
+                                    assistant_message_id: Some(prev),
+                                    next_assistant_message_id: Some(next),
+                                },
+                            )
+                            .await
+                            {
+                                break 'main;
+                            }
+                        }
+                        // A failed `turn/steer` most commonly means the active
+                        // turn ended while the request was in flight.
+                        Err(error) => {
+                            tracing::debug!(
+                                target: "jolt_harness::codex",
+                                "turn/steer rejected (queued as next turn): {error}"
+                            );
+                            if router.active.as_deref() == Some(expected_turn.as_str())
+                                && !router.is_completed(&expected_turn)
+                            {
+                                queued_steers.push_back(text);
+                            } else if !steer_as_new_turn(
+                                &client,
+                                turn_params(&text),
+                                &mut router,
+                                &event_tx,
+                                &mut assistant_message_id,
+                                &mut done_current,
+                            )
+                            .await
+                            {
+                                break 'main;
+                            }
+                        }
+                    }
+                }
+            },
+
             inc = incoming.recv() => match inc {
                 Some(Incoming::Notification { method, params }) => match method.as_str() {
                     "turn/started" => router.note_started(turn_id(&params)),
@@ -878,7 +952,7 @@ async fn run_session(session: Session) {
                             {
                                 break 'main;
                             }
-                        } else if !steering_open {
+                        } else if !steering_open && steering_call.is_none() {
                             break 'main;
                         }
                     }
@@ -964,58 +1038,24 @@ async fn run_session(session: Session) {
                 Some(Incoming::Eof) | None => break 'main,
             },
 
-            steer = steering.recv(), if steering_open && !interrupted => match steer {
+            steer = steering.recv(), if steering_open && !interrupted && steering_call.is_none() => match steer {
                 Some(msg) => {
                     let text = msg.prompt;
                     if let Some(expected) = router.active.clone() {
-                        let steer_params = json!({
+                        let params = json!({
                             "threadId": thread_id,
                             "expectedTurnId": expected,
                             "input": codex_input(&text, &skills),
                         });
-                        match client.request("turn/steer", steer_params).await {
-                            Ok(_) => {
-                                let (prev, next) = rotate(&mut assistant_message_id);
-                                if !send(
-                                    &event_tx,
-                                    AgentEvent::Steered {
-                                        assistant_message_id: Some(prev),
-                                        next_assistant_message_id: Some(next),
-                                    },
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
-                            }
-                            // A failed `turn/steer` does NOT mean the text is
-                            // bad: most commonly the active turn finished
-                            // between the UI send and this request. Queue it
-                            // for redelivery as the next `turn/start` when the
-                            // expected turn's end arrives.
-                            Err(e) => {
-                                tracing::debug!(
-                                    target: "jolt_harness::codex",
-                                    "turn/steer rejected (queued as next turn): {e}"
-                                );
-                                if router.active.as_deref() == Some(expected.as_str())
-                                    && !router.is_completed(&expected)
-                                {
-                                    queued_steers.push_back(text);
-                                } else if !steer_as_new_turn(
-                                    &client,
-                                    turn_params(&text),
-                                    &mut router,
-                                    &event_tx,
-                                    &mut assistant_message_id,
-                                    &mut done_current,
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
-                            }
-                        }
+                        let request_client = client.clone();
+                        let future = Box::pin(async move {
+                            request_client.request("turn/steer", params).await
+                        });
+                        steering_call = Some(SteeringCall {
+                            text,
+                            expected_turn: expected,
+                            response: future,
+                        });
                     } else if !steer_as_new_turn(
                         &client,
                         turn_params(&text),
@@ -1033,7 +1073,10 @@ async fn run_session(session: Session) {
                     // Mailbox closed during graceful idle reap: finish once
                     // nothing is in flight.
                     steering_open = false;
-                    if router.active.is_none() && queued_steers.is_empty() {
+                    if router.active.is_none()
+                        && queued_steers.is_empty()
+                        && steering_call.is_none()
+                    {
                         break 'main;
                     }
                 }

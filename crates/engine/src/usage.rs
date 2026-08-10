@@ -27,6 +27,7 @@ pub(crate) struct UsageContext {
 pub(crate) enum UsagePurpose {
     Chat,
     TitleGeneration,
+    CommitMessageGeneration,
     QuestionExtraction,
 }
 
@@ -35,6 +36,7 @@ impl UsagePurpose {
         match self {
             Self::Chat => "chat",
             Self::TitleGeneration => "title-generation",
+            Self::CommitMessageGeneration => "commit-message-generation",
             Self::QuestionExtraction => "question-extraction",
         }
     }

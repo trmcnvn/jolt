@@ -3517,3 +3517,142 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
         "text deltas unaffected"
     );
 }
+
+#[tokio::test]
+async fn parked_session_ignores_trailing_frames_and_stays_idle() {
+    let mut script = mock_script();
+    script.push(AgentEvent::ToolCall {
+        id: "tool-1".into(),
+        call: ToolCall::Exec {
+            command: "echo late-echo".into(),
+        },
+    });
+    script.push(AgentEvent::TextDelta {
+        text: "trailing flush".into(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-parked",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-parked".into(),
+        },
+    );
+
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session to complete",
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            core.sessions.session_status(CHAT).map(|s| s.status),
+            Some(SessionStatus::Idle),
+            "trailing frames must not re-arm Working"
+        );
+        assert!(
+            entries_now(&core).len() <= 2,
+            "trailing frames must not open a phantom entry"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let all = entries(&core);
+    assert_eq!(all.len(), 2, "user + one assistant entry");
+    assert_eq!(all[1].status, Some(MessageStatus::Complete));
+}
+
+#[tokio::test]
+async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
+    let script = vec![
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: "/tmp".into(),
+            session_id: "hs-steer".into(),
+            assistant_message_id: "a-1".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "part one".into(),
+        },
+        AgentEvent::ToolCall {
+            id: "tool-long".into(),
+            call: ToolCall::Exec {
+                command: "sleep 60".into(),
+            },
+        },
+        AgentEvent::Steered {
+            assistant_message_id: Some("a-1".into()),
+            next_assistant_message_id: Some("a-2".into()),
+        },
+        AgentEvent::TextDelta {
+            text: "part ".into(),
+        },
+        AgentEvent::ToolCall {
+            id: "tool-long".into(),
+            call: ToolCall::Exec {
+                command: "sleep 60".into(),
+            },
+        },
+        AgentEvent::ToolResult {
+            id: "tool-long".into(),
+            is_error: false,
+        },
+        AgentEvent::TextDelta { text: "two".into() },
+        done(DoneStatus::Completed),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-echo",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-echo".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).len() == 3
+                && core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle)
+        },
+        "both segments to land",
+    )
+    .await;
+    let all = entries(&core);
+    assert!(
+        all[1]
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::Tool { id, .. } if id == "tool-long")),
+        "first segment keeps its tool: {:#?}",
+        all[1].parts
+    );
+    let text_parts: Vec<_> = all[2]
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text_parts,
+        vec!["part two"],
+        "stale echo must not split the streaming text"
+    );
+    assert!(
+        !all[2]
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::Tool { .. })),
+        "stale echo must not create a tool part: {:#?}",
+        all[2].parts
+    );
+}

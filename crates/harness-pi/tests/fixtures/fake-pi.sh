@@ -12,6 +12,7 @@ model="beta"
 session="pi-session-1"
 wedge=0
 steer_race=0
+steer_flood=0
 extension=""
 all_args="$*"
 while [ "$#" -gt 0 ]; do
@@ -104,6 +105,12 @@ while IFS= read -r line; do
           emit '{"type":"agent_start"}'
           emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"first"}}'
           ;;
+        *scenario:steer-flood*)
+          steer_flood=1
+          respond "$line" prompt '{}'
+          emit '{"type":"agent_start"}'
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"first"}}'
+          ;;
         *scenario:steer*)
           respond "$line" prompt '{}'
           emit '{"type":"agent_start"}'
@@ -178,6 +185,13 @@ while IFS= read -r line; do
       if [ "$steer_race" -eq 1 ]; then
         fail "$line" steer 'agent already settled'
       elif has "$line" 'redirect please'; then
+        if [ "$steer_flood" -eq 1 ]; then
+          i=0
+          while [ "$i" -lt 300 ]; do
+            emit "{\"type\":\"future_event\",\"index\":$i}"
+            i=$((i + 1))
+          done
+        fi
         respond "$line" steer '{}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"steered"}}'
         emit '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":1,"output":2},"stopReason":"stop"}}'

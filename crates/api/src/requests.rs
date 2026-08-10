@@ -3,10 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use jolt_proto::{
     AgentAccountsSnapshot, AgentCommand, AgentLoginPoll, AgentLoginStart, Chat, ChatConfig,
-    CheckoutDiffPage, CheckoutDiffWatchFrame, CheckoutReview, Device, ExtractQuestionsResult,
-    FileSearchMatch, FolderListing, HarnessId, HarnessSecretsSnapshot, HarnessUpdateStatus, Model,
-    RepoRef, ReviewDraft, Session, Space, TerminalSession, ThemeFileRecord, UsageBreakdown,
-    UsageSummary, VcsKind, VcsSettingsSnapshot, Worktree,
+    CheckoutDiffPage, CheckoutDiffWatchFrame, CheckoutReview, CheckoutVcsStatus, Device,
+    ExtractQuestionsResult, FileSearchMatch, FolderListing, HarnessId, HarnessSecretsSnapshot,
+    HarnessUpdateStatus, Model, RepoRef, ReviewDraft, Session, Space, TerminalSession,
+    ThemeFileRecord, UsageBreakdown, UsageSummary, VcsAction, VcsActionEvent, VcsKind,
+    VcsSettingsSnapshot, Worktree,
 };
 use jolt_session_doc::{
     QueuedPrompt, SessionCommandPayload, TranscriptPage, TranscriptSearchResult,
@@ -275,6 +276,34 @@ pub struct GetCheckoutReview {
 impl UnaryRequest for GetCheckoutReview {
     type Response = Option<CheckoutReview>;
     const METHOD: &'static str = methods::GET_CHECKOUT_REVIEW;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetCheckoutVcsStatus {
+    pub chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<String>,
+}
+
+impl UnaryRequest for GetCheckoutVcsStatus {
+    type Response = CheckoutVcsStatus;
+    const METHOD: &'static str = methods::GET_CHECKOUT_VCS_STATUS;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunVcsAction {
+    pub action_id: String,
+    pub chat_id: String,
+    pub action: VcsAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<String>,
+}
+
+impl StreamRequest for RunVcsAction {
+    type Item = VcsActionEvent;
+    const METHOD: &'static str = methods::RUN_VCS_ACTION;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

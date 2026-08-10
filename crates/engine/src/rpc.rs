@@ -23,7 +23,8 @@
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffV2` → checkout manifest stream;
-//!   `GetCheckoutDiffPage` → immutable patch page
+//!   `GetCheckoutDiffPage` → immutable patch page; `GetCheckoutVcsStatus` →
+//!   checkout-scoped Git/JJ status; `RunVcsAction` → streamed Commit/Push progress
 //! - Terminals: `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
@@ -63,21 +64,22 @@ use jolt_api::{
     ActivateAgentAccount, ApplyHarnessUpdate, CancelAgentLogin, CancelQueuedPrompt, ChatPage,
     ChatSection, ChatWatchFrame, CloseTerminal, CompleteAgentLogin, CreateWorktree,
     DeleteHarnessSecret, DeleteReviewDraft, DeleteTheme, ExtractQuestions, ForgetAgentAccount,
-    GetCheckoutDiffPage, GetCheckoutReview, GetReviewDraft, GetTranscriptPage,
-    GetTransportCapabilities, GetTurnDiffPage, ListAgentAccounts, ListCommands, ListFolders,
-    ListHarnessSecrets, ListModels, ListRefs, Mutate, OpenTerminal, PinDiffDocument,
+    GetCheckoutDiffPage, GetCheckoutReview, GetCheckoutVcsStatus, GetReviewDraft,
+    GetTranscriptPage, GetTransportCapabilities, GetTurnDiffPage, ListAgentAccounts, ListCommands,
+    ListFolders, ListHarnessSecrets, ListModels, ListRefs, Mutate, OpenTerminal, PinDiffDocument,
     PollAgentLogin, PutReviewDraft, QueryChats, QueueCommand, ReadAttachmentChunk,
-    RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal, SearchFiles, SearchTranscript,
-    SessionWatchFrame, SetTerminalCommand, SetVcsBackend, StartAgentLogin, SubscribeTerminal,
-    SwitchRef, UploadBinaryChunk, UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes,
-    UsageBreakdownRequest, WatchChatUsage, WatchCheckoutDiff, WatchQueuedPrompts, WatchTranscript,
-    WriteTerminal, methods,
+    RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal, RunVcsAction, SearchFiles,
+    SearchTranscript, SessionWatchFrame, SetTerminalCommand, SetVcsBackend, StartAgentLogin,
+    SubscribeTerminal, SwitchRef, UploadBinaryChunk, UploadChunk, UploadCommit,
+    UpsertHarnessSecret, UpsertThemes, UsageBreakdownRequest, WatchChatUsage, WatchCheckoutDiff,
+    WatchQueuedPrompts, WatchTranscript, WriteTerminal, methods,
 };
 #[cfg(test)]
 use jolt_proto::HarnessId;
 use jolt_proto::{
-    AgentCommand, AgentCommandSource, Chat, ExtractQuestionsResult, Session, SessionStatus,
-    ToolCall,
+    AgentCommand, AgentCommandSource, Chat, CheckoutVcsStatus, ExtractQuestionsResult, Session,
+    SessionStatus, ToolCall, VcsAction, VcsActionEvent, VcsActionPhase, VcsActionResult,
+    VcsCommitMessage, VcsCommitResult, VcsPublicationState,
 };
 use jolt_relay::LinkCache;
 use jolt_rpc::{RpcError, RpcReply, RpcService, parse_params};
@@ -171,6 +173,293 @@ fn tool_file_path(call: &ToolCall) -> Option<&str> {
     }
 }
 
+struct VcsActionTaskContext {
+    sessions: SessionsEngine,
+    workspace: WorkspaceHost,
+    repos: Repos,
+    diff_sync: CheckoutDiffSync,
+    device_id: String,
+}
+
+fn publication_revision(state: &VcsPublicationState) -> Option<&str> {
+    match state {
+        VcsPublicationState::Ready { target, .. }
+        | VcsPublicationState::Behind { target, .. }
+        | VcsPublicationState::Diverged { target, .. }
+        | VcsPublicationState::NoCompletedChanges { target, .. } => Some(&target.revision),
+        VcsPublicationState::Ambiguous { candidates } => {
+            candidates.first().map(|target| target.revision.as_str())
+        }
+        VcsPublicationState::NoRemote | VcsPublicationState::Unavailable { .. } => None,
+    }
+}
+
+async fn validate_publication_revision(
+    repos: &Repos,
+    path: &std::path::Path,
+    title: &str,
+    publish_ref: Option<&str>,
+    expected: &str,
+) -> Result<(), String> {
+    let (_, publication) = repos
+        .publication_status_for_ref(path, title, publish_ref)
+        .await
+        .map_err(|error| error.to_string())?;
+    if publication_revision(&publication) != Some(expected) {
+        return Err("Publication state changed; refresh before pushing".into());
+    }
+    Ok(())
+}
+
+async fn run_vcs_action_task(
+    context: VcsActionTaskContext,
+    request: RunVcsAction,
+    events: tokio::sync::mpsc::Sender<VcsActionEvent>,
+) {
+    let action_id = request.action_id.clone();
+    let mut phases = Vec::new();
+    if request.action.includes_commit() {
+        let generates = matches!(
+            &request.action,
+            VcsAction::Commit {
+                message: VcsCommitMessage::Generate,
+                ..
+            } | VcsAction::CommitAndPush {
+                message: VcsCommitMessage::Generate,
+                ..
+            }
+        );
+        if generates {
+            phases.push(VcsActionPhase::GeneratingMessage);
+        }
+        phases.push(VcsActionPhase::Committing);
+    }
+    if request.action.includes_push() {
+        phases.push(VcsActionPhase::Pushing);
+    }
+    let _ = events
+        .send(VcsActionEvent::Started {
+            action_id: action_id.clone(),
+            phases,
+        })
+        .await;
+
+    let mut phase = None;
+    let mut completed_commit: Option<VcsCommitResult> = None;
+    let result: Result<VcsActionResult, String> = async {
+        let chat = context
+            .workspace
+            .chat(&request.chat_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "chat not found".to_string())?;
+        if chat.device_id != context.device_id {
+            return Err("chat belongs to another device".into());
+        }
+        let cwd = chat
+            .cwd
+            .clone()
+            .ok_or_else(|| "chat has no workspace folder".to_string())?;
+        let path = std::path::Path::new(&cwd);
+        let identity = context
+            .repos
+            .checkout_identity(path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let action_lock = context.repos.action_lock(&identity.id);
+        let _guard = action_lock.lock().await;
+
+        let chats = context.workspace.watch_chats().borrow().clone();
+        let active_shared_run = chats.iter().any(|candidate| {
+            let same_checkout = candidate.checkout_id.as_deref() == Some(identity.id.as_str())
+                || candidate.cwd.as_deref() == Some(cwd.as_str());
+            same_checkout
+                && context.sessions.session_status(&candidate.id).is_some_and(|session| {
+                    matches!(session.status, SessionStatus::Working | SessionStatus::AwaitingInput)
+                })
+        });
+        if active_shared_run {
+            return Err("Wait for active agent work in this checkout to finish before committing or pushing".into());
+        }
+
+        let title = chat.title.as_deref().unwrap_or("update");
+        let publication_expectation = match &request.action {
+            VcsAction::Push {
+                expected_publication,
+                publish_ref,
+                ..
+            }
+            | VcsAction::CommitAndPush {
+                expected_publication,
+                publish_ref,
+                ..
+            } => Some((expected_publication.as_str(), publish_ref.as_deref())),
+            VcsAction::Commit { .. } => None,
+        };
+        if let Some((expected, publish_ref)) = publication_expectation {
+            validate_publication_revision(
+                &context.repos,
+                path,
+                title,
+                publish_ref,
+                expected,
+            )
+            .await?;
+        }
+
+        let commit_spec = match &request.action {
+            VcsAction::Commit {
+                expected_working_copy,
+                selection,
+                message,
+            }
+            | VcsAction::CommitAndPush {
+                expected_working_copy,
+                selection,
+                message,
+                ..
+            } => Some((expected_working_copy, selection, message)),
+            VcsAction::Push { .. } => None,
+        };
+        if let Some((expected, selection, requested_message)) = commit_spec {
+            let (manifest, paths, patch) = context
+                .diff_sync
+                .commit_context(&request.chat_id, expected, selection)
+                .await
+                .map_err(|error| error.to_string())?;
+            let generator_paths = paths.clone().unwrap_or_else(|| {
+                manifest
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect()
+            });
+            let message = match requested_message {
+                VcsCommitMessage::Generate => {
+                    phase = Some(VcsActionPhase::GeneratingMessage);
+                    let _ = events
+                        .send(VcsActionEvent::PhaseStarted {
+                            action_id: action_id.clone(),
+                            phase: VcsActionPhase::GeneratingMessage,
+                            label: "Generating commit message…".into(),
+                        })
+                        .await;
+                    context
+                        .sessions
+                        .generate_commit_message(
+                            &request.chat_id,
+                            &cwd,
+                            &generator_paths,
+                            &patch,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?
+                }
+                VcsCommitMessage::Provided { value } => {
+                    let message = value.trim();
+                    if message.is_empty() {
+                        return Err("Commit message cannot be empty".into());
+                    }
+                    if message.chars().count() > 10_000 {
+                        return Err("Commit message cannot exceed 10,000 characters".into());
+                    }
+                    message.to_string()
+                }
+            };
+            // Model generation can take long enough for an editor to change the
+            // checkout. Revalidate the exact diff immediately before mutation.
+            context
+                .diff_sync
+                .commit_context(&request.chat_id, expected, selection)
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some((expected, publish_ref)) = publication_expectation {
+                validate_publication_revision(
+                    &context.repos,
+                    path,
+                    title,
+                    publish_ref,
+                    expected,
+                )
+                .await?;
+            }
+            phase = Some(VcsActionPhase::Committing);
+            let _ = events
+                .send(VcsActionEvent::PhaseStarted {
+                    action_id: action_id.clone(),
+                    phase: VcsActionPhase::Committing,
+                    label: "Committing…".into(),
+                })
+                .await;
+            let commit = context
+                .repos
+                .commit_changes(path, paths.as_deref(), &message)
+                .await
+                .map_err(|error| error.to_string())?;
+            completed_commit = Some(commit);
+        }
+
+        let push = if request.action.includes_push() {
+            let (publish_ref, allow_default_ref) = match &request.action {
+                VcsAction::Push {
+                    publish_ref,
+                    allow_default_ref,
+                    ..
+                }
+                | VcsAction::CommitAndPush {
+                    publish_ref,
+                    allow_default_ref,
+                    ..
+                } => (publish_ref.as_deref(), *allow_default_ref),
+                VcsAction::Commit { .. } => (None, false),
+            };
+            phase = Some(VcsActionPhase::Pushing);
+            let _ = events
+                .send(VcsActionEvent::PhaseStarted {
+                    action_id: action_id.clone(),
+                    phase: VcsActionPhase::Pushing,
+                    label: "Pushing…".into(),
+                })
+                .await;
+            Some(
+                context
+                    .repos
+                    .push_completed(path, title, publish_ref, allow_default_ref)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+
+        let _ = context.diff_sync.refresh_manifest(&request.chat_id).await;
+        match (completed_commit.clone(), push) {
+            (Some(commit), Some(push)) => Ok(VcsActionResult::CommitAndPush { commit, push }),
+            (Some(commit), None) => Ok(VcsActionResult::Commit { commit }),
+            (None, Some(push)) => Ok(VcsActionResult::Push { push }),
+            (None, None) => Err("VCS action contained no operation".into()),
+        }
+    }
+    .await;
+
+    match result {
+        Ok(result) => {
+            let _ = events
+                .send(VcsActionEvent::Finished { action_id, result })
+                .await;
+        }
+        Err(message) => {
+            let _ = events
+                .send(VcsActionEvent::Failed {
+                    action_id,
+                    phase,
+                    completed_commit,
+                    message,
+                })
+                .await;
+        }
+    }
+}
+
 pub struct EngineRpc {
     sessions: SessionsEngine,
     doc_host: DocHost,
@@ -253,6 +542,45 @@ impl EngineRpc {
         self.auth
             .as_ref()
             .ok_or_else(|| RpcError::Failed("auth unavailable".into()))
+    }
+
+    async fn checkout_vcs_status(&self, chat_id: &str) -> Result<CheckoutVcsStatus, RpcError> {
+        let chat = self
+            .workspace
+            .chat(chat_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+            .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+        if chat.device_id != self.doc_host.device_id() {
+            return Err(RpcError::Failed("chat belongs to another device".into()));
+        }
+        let cwd = chat
+            .cwd
+            .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
+        let identity = self
+            .repos
+            .checkout_identity(std::path::Path::new(&cwd))
+            .await
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        let action_lock = self.repos.action_lock(&identity.id);
+        let _guard = action_lock.lock().await;
+        let manifest = self
+            .diff_sync
+            .refresh_manifest(chat_id)
+            .await
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        let title = chat.title.as_deref().unwrap_or("update");
+        let (reference, publication) = self
+            .repos
+            .publication_status(std::path::Path::new(&cwd), title)
+            .await
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        Ok(CheckoutVcsStatus {
+            checkout_id: identity.id,
+            backend: manifest.vcs,
+            reference,
+            working_copy: manifest,
+            publication,
+        })
     }
 
     fn updater(&self) -> Result<&jolt_update::Updater, RpcError> {
@@ -1447,6 +1775,27 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&refs)
+            }
+            methods::GET_CHECKOUT_VCS_STATUS => {
+                let p: GetCheckoutVcsStatus = parse_params(params)?;
+                RpcReply::value(&self.checkout_vcs_status(&p.chat_id).await?)
+            }
+            methods::RUN_VCS_ACTION => {
+                let p: RunVcsAction = parse_params(params)?;
+                let (tx, rx) = tokio::sync::mpsc::channel(32);
+                let context = VcsActionTaskContext {
+                    sessions: self.sessions.clone(),
+                    workspace: self.workspace.clone(),
+                    repos: self.repos.clone(),
+                    diff_sync: self.diff_sync.clone(),
+                    device_id: self.doc_host.device_id().to_string(),
+                };
+                tokio::spawn(run_vcs_action_task(context, p, tx));
+                let stream = futures::stream::unfold(rx, |mut receiver| async move {
+                    let event = receiver.recv().await?;
+                    Some((serde_json::to_value(event).ok()?, receiver))
+                });
+                Ok(RpcReply::Stream(Box::pin(stream)))
             }
             methods::GET_CHECKOUT_REVIEW => {
                 let p: GetCheckoutReview = parse_params(params)?;

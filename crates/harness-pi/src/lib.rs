@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
@@ -503,6 +504,41 @@ fn tool_access_option() -> ModelOption {
     }
 }
 
+fn steering_call_future(
+    client: RpcClient,
+    text: String,
+    was_active: bool,
+    is_extension_command: bool,
+) -> BoxFuture<'static, Result<bool, HarnessError>> {
+    Box::pin(async move {
+        let command = if was_active && !is_extension_command {
+            json!({"type": "steer", "message": text})
+        } else {
+            json!({"type": "prompt", "message": text})
+        };
+        let mut response = client.request(command).await;
+        if let Err(error) = &response
+            && was_active
+            && !is_extension_command
+        {
+            tracing::debug!(target: "jolt_harness::pi", "steer raced with settlement; queuing prompt: {error}");
+            response = client
+                .request(json!({"type": "prompt", "message": text}))
+                .await;
+        }
+        response?;
+        if !is_extension_command {
+            return Ok(false);
+        }
+        Ok(client
+            .request(json!({"type": "get_state"}))
+            .await
+            .ok()
+            .and_then(|state| state.get("isStreaming").and_then(Value::as_bool))
+            == Some(false))
+    })
+}
+
 struct Session {
     executable: PathBuf,
     environment: Vec<(String, String)>,
@@ -804,6 +840,9 @@ async fn run_session(session: Session) {
     let mut bash_open = true;
 
     let mut active = true;
+    // Poll steering requests from the main select so the bounded incoming
+    // event channel keeps draining while Pi prepares the response.
+    let mut steering_call: Option<BoxFuture<'static, Result<bool, HarnessError>>> = None;
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -813,6 +852,58 @@ async fn run_session(session: Session) {
 
     'main: loop {
         tokio::select! {
+            biased;
+
+            response = async {
+                steering_call
+                    .as_mut()
+                    .expect("guarded by steering_call.is_some()")
+                    .as_mut()
+                    .await
+            }, if steering_call.is_some() => {
+                steering_call = None;
+                let command_only_done = match response {
+                    Ok(command_only_done) => command_only_done,
+                    Err(error) => {
+                        let _ = send(&event_tx, AgentEvent::Error {
+                            message: format!("Steering Pi failed: {error}"),
+                        }).await;
+                        break 'main;
+                    }
+                };
+                if !interrupted {
+                    active = !command_only_done;
+                    done_current = false;
+                    let previous = std::mem::replace(&mut assistant_message_id, new_id());
+                    if !send(&event_tx, AgentEvent::Steered {
+                        assistant_message_id: Some(previous),
+                        next_assistant_message_id: Some(assistant_message_id.clone()),
+                    }).await {
+                        break 'main;
+                    }
+                    if command_only_done {
+                        while let Ok(Incoming::Event(event)) = incoming.try_recv() {
+                            if let Some(custom) = normalize::custom_message(&event)
+                                && !send(&event_tx, custom).await
+                            {
+                                break 'main;
+                            }
+                        }
+                        done_current = true;
+                        if !send(&event_tx, AgentEvent::Done {
+                            status: DoneStatus::Completed,
+                            result: None,
+                            error: None,
+                            session_id: Some(session_id.clone()),
+                        }).await {
+                            break 'main;
+                        }
+                    }
+                    if !steering_open && !active {
+                        break 'main;
+                    }
+                }
+            },
             incoming_event = incoming.recv() => match incoming_event {
                 Some(Incoming::Event(event)) => match event.get("type").and_then(Value::as_str) {
                     Some("agent_start") => {
@@ -903,7 +994,7 @@ async fn run_session(session: Session) {
                         }).await {
                             break 'main;
                         }
-                        if interrupted || !steering_open {
+                        if interrupted || (!steering_open && steering_call.is_none()) {
                             break 'main;
                         }
                     }
@@ -930,78 +1021,23 @@ async fn run_session(session: Session) {
                     let _ = response.send(result);
                 }
             },
-            steer = steering.recv(), if steering_open && !interrupted => match steer {
+            steer = steering.recv(), if steering_open && !interrupted && steering_call.is_none() => match steer {
                 Some(message) => {
-                    let was_active = active;
                     let text = message.prompt;
-                    let slash_name = text
+                    let is_extension_command = text
                         .strip_prefix('/')
-                        .and_then(|command| command.split_whitespace().next());
-                    let is_extension_command = slash_name
+                        .and_then(|command| command.split_whitespace().next())
                         .is_some_and(|name| extension_commands.contains(name));
-                    let command = if was_active && !is_extension_command {
-                        json!({"type": "steer", "message": text})
-                    } else {
-                        json!({"type": "prompt", "message": text})
-                    };
-                    let mut response = client.request(command).await;
-                    if let Err(error) = &response
-                        && was_active
-                        && !is_extension_command
-                    {
-                        tracing::debug!(target: "jolt_harness::pi", "steer raced with settlement; queuing prompt: {error}");
-                        response = client.request(json!({"type": "prompt", "message": text})).await;
-                    }
-                    match response {
-                        Ok(_) => {
-                            let command_only_done = is_extension_command
-                                && client
-                                    .request(json!({"type": "get_state"}))
-                                    .await
-                                    .ok()
-                                    .and_then(|state| {
-                                        state.get("isStreaming").and_then(Value::as_bool)
-                                    })
-                                    == Some(false);
-                            active = !command_only_done;
-                            done_current = false;
-                            let previous = std::mem::replace(&mut assistant_message_id, new_id());
-                            if !send(&event_tx, AgentEvent::Steered {
-                                assistant_message_id: Some(previous),
-                                next_assistant_message_id: Some(assistant_message_id.clone()),
-                            }).await {
-                                break 'main;
-                            }
-                            if command_only_done {
-                                while let Ok(Incoming::Event(event)) = incoming.try_recv() {
-                                    if let Some(custom) = normalize::custom_message(&event)
-                                        && !send(&event_tx, custom).await
-                                    {
-                                        break 'main;
-                                    }
-                                }
-                                done_current = true;
-                                if !send(&event_tx, AgentEvent::Done {
-                                    status: DoneStatus::Completed,
-                                    result: None,
-                                    error: None,
-                                    session_id: Some(session_id.clone()),
-                                }).await {
-                                    break 'main;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let _ = send(&event_tx, AgentEvent::Error {
-                                message: format!("Steering Pi failed: {error}"),
-                            }).await;
-                            break 'main;
-                        }
-                    }
+                    steering_call = Some(steering_call_future(
+                        client.clone(),
+                        text,
+                        active,
+                        is_extension_command,
+                    ));
                 }
                 None => {
                     steering_open = false;
-                    if !active {
+                    if !active && steering_call.is_none() {
                         break 'main;
                     }
                 }

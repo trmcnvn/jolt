@@ -110,7 +110,23 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 
-# NOTE: steer-race before steer — `case` takes the first matching glob.
+# NOTE: specific steer scenarios before steer — `case` takes the first match.
+*scenario:steer-flood*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"first"}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  i=0
+  while [ "$i" -lt 300 ]; do
+    emit "{\"method\":\"test/noise\",\"params\":{\"index\":$i}}"
+    i=$((i + 1))
+  done
+  emit "{\"id\":$sid,\"result\":{}}"
+  emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"steered"}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
 *scenario:steer-race*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
   emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'

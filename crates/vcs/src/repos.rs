@@ -13,14 +13,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 use jolt_proto::{
-    FileSearchMatch, FolderEntry, FolderListing, Repo, RepoRef, RepoRefKind, VcsKind,
-    VcsSettingsSnapshot, Worktree,
+    FileSearchMatch, FolderEntry, FolderListing, Repo, RepoRef, RepoRefKind, VcsCommitResult,
+    VcsKind, VcsPublicationState, VcsPublishTarget, VcsPushResult, VcsSettingsSnapshot, Worktree,
 };
 
 use crate::VcsError;
@@ -38,6 +38,51 @@ const FOLDER_LIST_MAX_ENTRIES: usize = 500;
 const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
+static TEMP_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn parse_two_counts(value: &str) -> Result<(u32, u32), VcsError> {
+    let mut fields = value.split_whitespace();
+    let left = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| VcsError::new("VCS divergence output is malformed"))?;
+    let right = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| VcsError::new("VCS divergence output is malformed"))?;
+    Ok((left, right))
+}
+
+fn publication_from_divergence(
+    target: VcsPublishTarget,
+    ahead: u32,
+    behind: u32,
+    is_default_ref: bool,
+) -> VcsPublicationState {
+    match (ahead, behind) {
+        (0, 0) => VcsPublicationState::NoCompletedChanges {
+            target,
+            is_default_ref,
+        },
+        (0, behind) => VcsPublicationState::Behind {
+            target,
+            behind,
+            is_default_ref,
+        },
+        (ahead, 0) => VcsPublicationState::Ready {
+            target,
+            ahead,
+            behind: 0,
+            is_default_ref,
+        },
+        (ahead, behind) => VcsPublicationState::Diverged {
+            target,
+            ahead,
+            behind,
+            is_default_ref,
+        },
+    }
+}
 
 const ADJECTIVES: &[&str] = &[
     "swift", "calm", "bright", "bold", "keen", "brave", "clever", "lucky", "quiet", "warm", "cool",
@@ -97,6 +142,7 @@ struct ReposInner {
     workspaces_root: PathBuf,
     vcs: Vcs,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    action_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Clone)]
@@ -147,6 +193,7 @@ impl Repos {
                 workspaces_root,
                 vcs,
                 file_searches: std::sync::Mutex::new(HashMap::new()),
+                action_locks: std::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -169,6 +216,685 @@ impl Repos {
             .vcs
             .active_command()
             .ok_or_else(|| VcsError::new("No supported VCS executable found"))
+    }
+
+    /// One mutation lane per canonical checkout. Commit and push are checkout
+    /// operations even when several chats happen to point at that checkout.
+    pub fn action_lock(&self, checkout_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .inner
+            .action_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(lock) = locks.get(checkout_id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(checkout_id.to_string(), std::sync::Arc::downgrade(&lock));
+        lock
+    }
+
+    /// Publication state for the active backend. JJ deliberately publishes the
+    /// completed change at `@-`; mutable edits in `@` are never included by Push.
+    pub async fn publication_status(
+        &self,
+        path: &Path,
+        title: &str,
+    ) -> Result<(String, VcsPublicationState), VcsError> {
+        self.publication_status_for_ref(path, title, None).await
+    }
+
+    pub async fn publication_status_for_ref(
+        &self,
+        path: &Path,
+        title: &str,
+        publish_ref: Option<&str>,
+    ) -> Result<(String, VcsPublicationState), VcsError> {
+        match self.vcs_kind() {
+            Some(VcsKind::Git) => self.git_publication_status(path).await,
+            Some(VcsKind::Jujutsu) => self.jj_publication_status(path, title, publish_ref).await,
+            None => Err(VcsError::new("No supported VCS executable found")),
+        }
+    }
+
+    async fn git_publication_status(
+        &self,
+        path: &Path,
+    ) -> Result<(String, VcsPublicationState), VcsError> {
+        let branch = self.current_branch(path).await?;
+        if branch == "HEAD" {
+            return Ok((
+                branch,
+                VcsPublicationState::Unavailable {
+                    reason: "Checkout is detached; switch to a branch before pushing".into(),
+                },
+            ));
+        }
+        let revision = self
+            .git(&["rev-parse", "HEAD"], Some(path))
+            .await
+            .unwrap_or_default();
+        let remotes = self
+            .git(&["remote"], Some(path))
+            .await?
+            .lines()
+            .map(str::trim)
+            .filter(|remote| !remote.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if remotes.is_empty() {
+            return Ok((branch, VcsPublicationState::NoRemote));
+        }
+        let configured_remote = self
+            .git(
+                &["config", "--get", &format!("branch.{branch}.remote")],
+                Some(path),
+            )
+            .await
+            .ok()
+            .filter(|remote| remotes.contains(remote));
+        let remote = configured_remote
+            .or_else(|| {
+                remotes
+                    .contains(&"origin".to_string())
+                    .then(|| "origin".to_string())
+            })
+            .or_else(|| (remotes.len() == 1).then(|| remotes[0].clone()))
+            .ok_or_else(|| {
+                VcsError::new("Several Git remotes are available; configure a push remote")
+            })?;
+        let upstream = self
+            .git(
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+                Some(path),
+            )
+            .await
+            .ok();
+        let remote_branch = upstream
+            .as_deref()
+            .and_then(|value| value.strip_prefix(&format!("{remote}/")))
+            .unwrap_or(&branch)
+            .to_string();
+        let default_ref = self
+            .git(
+                &[
+                    "symbolic-ref",
+                    "--short",
+                    &format!("refs/remotes/{remote}/HEAD"),
+                ],
+                Some(path),
+            )
+            .await
+            .ok()
+            .and_then(|value| {
+                value
+                    .strip_prefix(&format!("{remote}/"))
+                    .map(str::to_string)
+            });
+        let remote_branch_exists = self
+            .git(
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/remotes/{remote}/{remote_branch}"),
+                ],
+                Some(path),
+            )
+            .await
+            .is_ok();
+        let compare_ref = if let Some(upstream) = upstream.as_deref() {
+            Some(upstream.to_string())
+        } else if remote_branch_exists {
+            Some(format!("{remote}/{remote_branch}"))
+        } else {
+            default_ref.as_ref().map(|name| format!("{remote}/{name}"))
+        };
+        let (ahead, behind) = match compare_ref {
+            Some(compare_ref) => self
+                .git_divergence(path, &compare_ref)
+                .await
+                .unwrap_or((0, 0)),
+            None => (1, 0),
+        };
+        let target = VcsPublishTarget {
+            ref_name: remote_branch.clone(),
+            remote: remote.clone(),
+            remote_ref: format!("{remote}/{remote_branch}"),
+            revision,
+            creates_ref: upstream.is_none() && !remote_branch_exists,
+            sets_upstream: upstream.is_none(),
+        };
+        let is_default_ref = default_ref.as_deref() == Some(remote_branch.as_str());
+        Ok((
+            branch,
+            publication_from_divergence(target, ahead, behind, is_default_ref),
+        ))
+    }
+
+    async fn git_divergence(&self, path: &Path, compare_ref: &str) -> Result<(u32, u32), VcsError> {
+        let output = self
+            .git(
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("HEAD...{compare_ref}"),
+                ],
+                Some(path),
+            )
+            .await?;
+        parse_two_counts(&output)
+    }
+
+    async fn jj_publication_status(
+        &self,
+        path: &Path,
+        title: &str,
+        publish_ref: Option<&str>,
+    ) -> Result<(String, VcsPublicationState), VcsError> {
+        let reference = self.working_copy_label(path).await?;
+        let parent = self
+            .jj(
+                &[
+                    "log",
+                    "-r",
+                    "@-",
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+                Some(path),
+                true,
+            )
+            .await?;
+        let parents = parent
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        if parents.len() != 1 {
+            return Ok((
+                reference,
+                VcsPublicationState::Unavailable {
+                    reason: "Commit the current JJ change before pushing this merge".into(),
+                },
+            ));
+        }
+        let revision = parents[0].trim().to_string();
+        let remotes = self
+            .jj(&["git", "remote", "list"], Some(path), true)
+            .await?
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|name| *name != "git")
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if remotes.is_empty() {
+            return Ok((reference, VcsPublicationState::NoRemote));
+        }
+        let nearest_tracked_remotes = self.nearest_tracked_remotes(path, &remotes).await?;
+        if nearest_tracked_remotes.len() > 1 {
+            return Ok((
+                reference,
+                VcsPublicationState::Unavailable {
+                    reason: "Nearest tracked JJ bookmarks use several remotes".into(),
+                },
+            ));
+        }
+        let remote = if let Some(remote) = nearest_tracked_remotes.first() {
+            remote.clone()
+        } else if remotes.contains(&"origin".to_string()) {
+            "origin".to_string()
+        } else if remotes.len() == 1 {
+            remotes[0].clone()
+        } else {
+            return Ok((
+                reference,
+                VcsPublicationState::Unavailable {
+                    reason: "Several JJ Git remotes are available; configure git.push".into(),
+                },
+            ));
+        };
+        let nearest = self.nearest_jolt_bookmarks(path).await?;
+        let desired = worktree_branch_from_title(title);
+        let ref_name = if let Some(requested) = publish_ref {
+            if !nearest.iter().any(|name| name == requested) {
+                return Err(VcsError::new(
+                    "Selected Jolt bookmark is no longer a publish candidate",
+                ));
+            }
+            requested.to_string()
+        } else if nearest.iter().any(|name| name == &desired) {
+            desired
+        } else if nearest.len() == 1 {
+            nearest[0].clone()
+        } else if nearest.len() > 1 {
+            let candidates = nearest
+                .iter()
+                .map(|name| VcsPublishTarget {
+                    ref_name: name.clone(),
+                    remote: remote.clone(),
+                    remote_ref: format!("{remote}/{name}"),
+                    revision: revision.clone(),
+                    creates_ref: false,
+                    // Recomputed after the user selects this candidate.
+                    sets_upstream: true,
+                })
+                .collect();
+            return Ok((reference, VcsPublicationState::Ambiguous { candidates }));
+        } else {
+            self.available_jolt_bookmark(path, &desired).await?
+        };
+        let remote_ref = format!("{ref_name}@{remote}");
+        let remote_exists = self
+            .jj(
+                &[
+                    "log",
+                    "-r",
+                    &remote_ref,
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+                Some(path),
+                true,
+            )
+            .await
+            .is_ok();
+        let (ahead, behind) = if remote_exists {
+            let ahead = self
+                .jj_revset_count(path, &format!("{remote_ref}..@-"))
+                .await?;
+            let behind = self
+                .jj_revset_count(path, &format!("@-..{remote_ref}"))
+                .await?;
+            (ahead, behind)
+        } else {
+            (
+                self.jj_revset_count(path, &format!("@- ~ ::remote_bookmarks(remote={remote})"))
+                    .await?,
+                0,
+            )
+        };
+        let target = VcsPublishTarget {
+            ref_name: ref_name.clone(),
+            remote: remote.clone(),
+            remote_ref: format!("{remote}/{ref_name}"),
+            revision,
+            creates_ref: nearest.is_empty(),
+            sets_upstream: !remote_exists,
+        };
+        Ok((
+            reference,
+            publication_from_divergence(target, ahead, behind, false),
+        ))
+    }
+
+    async fn nearest_tracked_remotes(
+        &self,
+        path: &Path,
+        configured_remotes: &[String],
+    ) -> Result<Vec<String>, VcsError> {
+        let nearest = self
+            .jj(
+                &[
+                    "log",
+                    "-r",
+                    "latest(::@- & bookmarks())",
+                    "--no-graph",
+                    "-T",
+                    "bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
+                ],
+                Some(path),
+                true,
+            )
+            .await?
+            .lines()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        if nearest.is_empty() {
+            return Ok(Vec::new());
+        }
+        let listing = self
+            .jj(
+                &[
+                    "bookmark",
+                    "list",
+                    "--all-remotes",
+                    "-T",
+                    "name ++ \"\\t\" ++ remote ++ \"\\n\"",
+                ],
+                Some(path),
+                true,
+            )
+            .await?;
+        let mut candidates = listing
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(name, remote)| {
+                nearest.contains(*name)
+                    && !remote.is_empty()
+                    && *remote != "git"
+                    && configured_remotes
+                        .iter()
+                        .any(|candidate| candidate == remote)
+            })
+            .map(|(_, remote)| remote.to_string())
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        Ok(candidates)
+    }
+
+    async fn nearest_jolt_bookmarks(&self, path: &Path) -> Result<Vec<String>, VcsError> {
+        let output = self
+            .jj(
+                &[
+                    "log",
+                    "-r",
+                    "latest(::@- & bookmarks(glob:\"jolt/*\"))",
+                    "--no-graph",
+                    "-T",
+                    "bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
+                ],
+                Some(path),
+                true,
+            )
+            .await?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    async fn available_jolt_bookmark(
+        &self,
+        path: &Path,
+        desired: &str,
+    ) -> Result<String, VcsError> {
+        let output = self
+            .jj(
+                &["bookmark", "list", "-T", "name ++ \"\\n\""],
+                Some(path),
+                true,
+            )
+            .await?;
+        let existing = output.lines().collect::<HashSet<_>>();
+        if !existing.contains(desired) {
+            return Ok(desired.to_string());
+        }
+        for suffix in 2..1000 {
+            let candidate = format!("{desired}-{suffix}");
+            if !existing.contains(candidate.as_str()) {
+                return Ok(candidate);
+            }
+        }
+        Err(VcsError::new("Could not allocate a Jolt bookmark"))
+    }
+
+    async fn jj_revset_count(&self, path: &Path, revset: &str) -> Result<u32, VcsError> {
+        let output = self
+            .jj(
+                &["log", "-r", revset, "--no-graph", "-T", "\"x\\n\""],
+                Some(path),
+                true,
+            )
+            .await?;
+        Ok(output.lines().count().try_into().unwrap_or(u32::MAX))
+    }
+
+    /// Commit complete selected files and leave every other working-copy change
+    /// untouched. The caller validates paths against one diff catalog first.
+    pub async fn commit_changes(
+        &self,
+        path: &Path,
+        paths: Option<&[String]>,
+        message: &str,
+    ) -> Result<VcsCommitResult, VcsError> {
+        let subject = message.lines().next().unwrap_or_default().trim();
+        if subject.is_empty() {
+            return Err(VcsError::new("Commit message cannot be empty"));
+        }
+        match self.vcs_kind() {
+            Some(VcsKind::Git) => {
+                let body = message
+                    .lines()
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
+                if let Some(paths) = paths {
+                    self.git_commit_selected(path, paths, subject, &body)
+                        .await?;
+                } else {
+                    self.git(&["add", "-A"], Some(path)).await?;
+                    let mut args = vec!["commit", "-m", subject];
+                    if !body.is_empty() {
+                        args.extend(["-m", body.as_str()]);
+                    }
+                    self.git(&args, Some(path)).await?;
+                }
+                let revision = self.git(&["rev-parse", "HEAD"], Some(path)).await?;
+                let remaining_changes = !self
+                    .git(&["status", "--porcelain"], Some(path))
+                    .await?
+                    .is_empty();
+                Ok(VcsCommitResult {
+                    revision,
+                    subject: subject.to_string(),
+                    remaining_changes,
+                    advanced_ref: None,
+                })
+            }
+            Some(VcsKind::Jujutsu) => {
+                let bookmarks = self.nearest_jolt_bookmarks(path).await?;
+                let mut args = vec!["commit", "-m", message, "--"];
+                if let Some(paths) = paths {
+                    args.extend(paths.iter().map(String::as_str));
+                } else {
+                    args.pop();
+                }
+                self.jj(&args, Some(path), false).await?;
+                let revision = self
+                    .jj(
+                        &[
+                            "log",
+                            "-r",
+                            "@-",
+                            "--no-graph",
+                            "-T",
+                            "commit_id ++ \"\\n\"",
+                        ],
+                        Some(path),
+                        true,
+                    )
+                    .await?;
+                let advanced_ref = if bookmarks.len() == 1 {
+                    self.jj(
+                        &["bookmark", "set", &bookmarks[0], "-r", "@-"],
+                        Some(path),
+                        false,
+                    )
+                    .await?;
+                    Some(bookmarks[0].clone())
+                } else {
+                    None
+                };
+                let remaining_changes = !self
+                    .jj(&["diff", "--summary"], Some(path), true)
+                    .await?
+                    .is_empty();
+                Ok(VcsCommitResult {
+                    revision: revision.trim().to_string(),
+                    subject: subject.to_string(),
+                    remaining_changes,
+                    advanced_ref,
+                })
+            }
+            None => Err(VcsError::new("No supported VCS executable found")),
+        }
+    }
+
+    async fn git_commit_selected(
+        &self,
+        path: &Path,
+        paths: &[String],
+        subject: &str,
+        body: &str,
+    ) -> Result<(), VcsError> {
+        let index = self
+            .git(
+                &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+                Some(path),
+            )
+            .await?;
+        let parent = Path::new(&index)
+            .parent()
+            .ok_or_else(|| VcsError::new("Git index path has no parent"))?;
+        let sequence = TEMP_INDEX_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary_index = parent.join(format!("jolt-index-{}-{sequence}", std::process::id()));
+        let result = async {
+            if self
+                .git(&["rev-parse", "--verify", "HEAD"], Some(path))
+                .await
+                .is_ok()
+            {
+                self.git_with_index(&temporary_index, &["read-tree", "HEAD"], path)
+                    .await?;
+            } else {
+                self.git_with_index(&temporary_index, &["read-tree", "--empty"], path)
+                    .await?;
+            }
+            let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
+            add.extend(paths.iter().map(String::as_str));
+            self.git_with_index(&temporary_index, &add, path).await?;
+
+            let mut commit = vec!["commit", "-m", subject];
+            if !body.is_empty() {
+                commit.extend(["-m", body]);
+            }
+            self.git_with_index(&temporary_index, &commit, path).await?;
+            Ok::<(), VcsError>(())
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&temporary_index).await;
+        let _ = tokio::fs::remove_file(temporary_index.with_extension("lock")).await;
+        result?;
+
+        // HEAD now contains the selected files. Align just those entries in the
+        // user's real index with HEAD; every unrelated staged entry is retained.
+        let mut reset = vec!["--literal-pathspecs", "reset", "HEAD", "--"];
+        reset.extend(paths.iter().map(String::as_str));
+        self.git(&reset, Some(path)).await?;
+        Ok(())
+    }
+
+    pub async fn push_completed(
+        &self,
+        path: &Path,
+        title: &str,
+        publish_ref: Option<&str>,
+        allow_default_ref: bool,
+    ) -> Result<VcsPushResult, VcsError> {
+        let (_, status) = self
+            .publication_status_for_ref(path, title, publish_ref)
+            .await?;
+        let (target, is_default_ref) = match status {
+            VcsPublicationState::Ready {
+                target,
+                is_default_ref,
+                ..
+            } => (target, is_default_ref),
+            VcsPublicationState::NoCompletedChanges { .. } => {
+                return Err(VcsError::new("No completed changes to push"));
+            }
+            VcsPublicationState::NoRemote => {
+                return Err(VcsError::new("No remote is configured"));
+            }
+            VcsPublicationState::Behind { .. } => {
+                return Err(VcsError::new(
+                    "Remote ref is ahead; update the checkout first",
+                ));
+            }
+            VcsPublicationState::Diverged { .. } => {
+                return Err(VcsError::new("Local and remote refs have diverged"));
+            }
+            VcsPublicationState::Ambiguous { .. } => {
+                return Err(VcsError::new("Choose a Jolt bookmark to push"));
+            }
+            VcsPublicationState::Unavailable { reason } => return Err(VcsError::new(reason)),
+        };
+        if is_default_ref && !allow_default_ref {
+            return Err(VcsError::new(format!(
+                "Pushing the default ref {} requires confirmation",
+                target.ref_name
+            )));
+        }
+        match self.vcs_kind() {
+            Some(VcsKind::Git) => {
+                if target.sets_upstream {
+                    self.git(
+                        &[
+                            "push",
+                            "-u",
+                            &target.remote,
+                            &format!("HEAD:refs/heads/{}", target.ref_name),
+                        ],
+                        Some(path),
+                    )
+                    .await?;
+                } else {
+                    self.git(
+                        &[
+                            "push",
+                            &target.remote,
+                            &format!("HEAD:refs/heads/{}", target.ref_name),
+                        ],
+                        Some(path),
+                    )
+                    .await?;
+                }
+            }
+            Some(VcsKind::Jujutsu) => {
+                self.jj(
+                    &["bookmark", "set", &target.ref_name, "-r", "@-"],
+                    Some(path),
+                    false,
+                )
+                .await?;
+                self.jj(
+                    &[
+                        "git",
+                        "push",
+                        "--remote",
+                        &target.remote,
+                        "--bookmark",
+                        &target.ref_name,
+                    ],
+                    Some(path),
+                    false,
+                )
+                .await?;
+            }
+            None => return Err(VcsError::new("No supported VCS executable found")),
+        }
+        Ok(VcsPushResult {
+            revision: target.revision,
+            ref_name: target.ref_name,
+            remote: target.remote,
+            remote_ref: target.remote_ref,
+            created_ref: target.creates_ref,
+            set_upstream: target.sets_upstream,
+            up_to_date: false,
+        })
     }
 
     // ── registry (repos.json) ───────────────────────────────────────────────
@@ -249,6 +975,47 @@ impl Repos {
 
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, VcsError> {
         self.command(VcsKind::Git, args, cwd).await
+    }
+
+    async fn git_with_index(
+        &self,
+        index: &Path,
+        args: &[&str],
+        cwd: &Path,
+    ) -> Result<String, VcsError> {
+        let backend = self
+            .inner
+            .vcs
+            .active_command()
+            .ok_or_else(|| VcsError::new("No supported VCS executable found"))?;
+        if backend.kind != VcsKind::Git {
+            return Err(VcsError::new("Git is not the active VCS backend"));
+        }
+        let mut command = tokio::process::Command::new(&backend.executable);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_INDEX_FILE", index)
+            .stdin(std::process::Stdio::null());
+        compose_command_path(&mut command, &backend.executable);
+        let output = command
+            .output()
+            .await
+            .map_err(|error| VcsError::new(format!("Git spawn failed: {error}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let message = stderr.trim();
+            return Err(VcsError::new(if message.is_empty() {
+                format!(
+                    "Git {} failed ({})",
+                    args.first().unwrap_or(&"?"),
+                    output.status
+                )
+            } else {
+                format!("Git: {message}")
+            }));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     async fn jj(
@@ -1613,5 +2380,257 @@ mod tests {
 
         assert_eq!(alpha.unwrap()[0].path, "alpha.rs");
         assert_eq!(beta.unwrap()[0].path, "beta.rs");
+    }
+
+    #[tokio::test]
+    async fn git_commit_selection_leaves_other_files_uncommitted() {
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let repo = repos.create("git-actions").await.unwrap();
+        let root = PathBuf::from(repo.path);
+        repos
+            .git(&["config", "user.email", "test@example.com"], Some(&root))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "user.name", "Test User"], Some(&root))
+            .await
+            .unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        std::fs::write(root.join("b.txt"), "one\n").unwrap();
+        repos
+            .commit_changes(&root, None, "Initial files")
+            .await
+            .unwrap();
+
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        std::fs::write(root.join("b.txt"), "two\n").unwrap();
+        std::fs::write(root.join("c.txt"), "new\n").unwrap();
+        repos.git(&["add", "b.txt"], Some(&root)).await.unwrap();
+        let result = repos
+            .commit_changes(&root, Some(&["a.txt".into(), "c.txt".into()]), "Update a")
+            .await
+            .unwrap();
+
+        assert!(result.remaining_changes);
+        assert_eq!(
+            repos
+                .git(&["show", "HEAD:a.txt"], Some(&root))
+                .await
+                .unwrap(),
+            "two"
+        );
+        assert_eq!(
+            repos
+                .git(&["show", "HEAD:c.txt"], Some(&root))
+                .await
+                .unwrap(),
+            "new"
+        );
+        assert_eq!(
+            repos
+                .git(&["diff", "--cached", "--name-only"], Some(&root))
+                .await
+                .unwrap(),
+            "b.txt",
+            "Partial commit must preserve unrelated staged changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_first_push_sets_upstream_without_committing_dirty_files() {
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let repo = repos.create("git-push").await.unwrap();
+        let root = PathBuf::from(repo.path);
+        repos
+            .git(&["config", "user.email", "test@example.com"], Some(&root))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "user.name", "Test User"], Some(&root))
+            .await
+            .unwrap();
+        std::fs::write(root.join("published.txt"), "published\n").unwrap();
+        let committed = repos
+            .commit_changes(&root, None, "Publish this")
+            .await
+            .unwrap();
+        std::fs::write(root.join("dirty.txt"), "not published\n").unwrap();
+        let remote = data.path().join("git-push-remote.git");
+        repos
+            .git(&["init", "--bare", remote.to_string_lossy().as_ref()], None)
+            .await
+            .unwrap();
+        repos
+            .git(
+                &["remote", "add", "origin", remote.to_string_lossy().as_ref()],
+                Some(&root),
+            )
+            .await
+            .unwrap();
+
+        let (_, publication) = repos.publication_status(&root, "ignored").await.unwrap();
+        assert!(matches!(
+            publication,
+            VcsPublicationState::Ready {
+                target: VcsPublishTarget {
+                    creates_ref: true,
+                    sets_upstream: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        let pushed = repos
+            .push_completed(&root, "ignored", None, true)
+            .await
+            .unwrap();
+        assert!(pushed.created_ref);
+        assert!(pushed.set_upstream);
+        assert_eq!(pushed.revision, committed.revision);
+        assert!(
+            repos
+                .git(&["status", "--porcelain"], Some(&root))
+                .await
+                .unwrap()
+                .contains("dirty.txt")
+        );
+        assert_eq!(
+            repos
+                .git(&["rev-parse", "--abbrev-ref", "@{upstream}"], Some(&root))
+                .await
+                .unwrap(),
+            "origin/main"
+        );
+    }
+
+    #[tokio::test]
+    async fn jj_partial_commit_and_push_publish_parent_with_jolt_bookmark() {
+        let data = tempfile::tempdir().unwrap();
+        let repos = Repos::with_roots(
+            data.path(),
+            "device",
+            data.path().join("git-worktrees"),
+            data.path().join("jj-workspaces"),
+            false,
+        );
+        if repos.set_vcs(VcsKind::Jujutsu).is_err() {
+            return;
+        }
+        let repo = repos.create("jj-actions").await.unwrap();
+        let root = PathBuf::from(repo.path);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        std::fs::write(root.join("b.txt"), "one\n").unwrap();
+        let initial = repos
+            .commit_changes(&root, None, "Initial files")
+            .await
+            .unwrap();
+        repos
+            .jj(
+                &["bookmark", "set", "feature", "-r", "@-"],
+                Some(&root),
+                false,
+            )
+            .await
+            .unwrap();
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        std::fs::write(root.join("b.txt"), "two\n").unwrap();
+        let committed = repos
+            .commit_changes(&root, Some(&["a.txt".into()]), "Update a")
+            .await
+            .unwrap();
+        assert!(committed.remaining_changes);
+        assert_eq!(
+            repos
+                .jj(
+                    &[
+                        "log",
+                        "-r",
+                        "feature",
+                        "--no-graph",
+                        "-T",
+                        "commit_id ++ \"\\n\"",
+                    ],
+                    Some(&root),
+                    true,
+                )
+                .await
+                .unwrap(),
+            initial.revision,
+            "Commit must not advance a user-owned bookmark"
+        );
+
+        let remote = data.path().join("remote.git");
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--bare", remote.to_string_lossy().as_ref()])
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        repos
+            .jj(
+                &[
+                    "git",
+                    "remote",
+                    "add",
+                    "origin",
+                    remote.to_string_lossy().as_ref(),
+                ],
+                Some(&root),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let (_, publication) = repos
+            .publication_status(&root, "Update a safely")
+            .await
+            .unwrap();
+        assert!(matches!(
+            publication,
+            VcsPublicationState::Ready {
+                target: VcsPublishTarget {
+                    ref ref_name,
+                    creates_ref: true,
+                    ..
+                },
+                ..
+            } if ref_name == "jolt/update-a-safely"
+        ));
+        let pushed = repos
+            .push_completed(&root, "Update a safely", None, false)
+            .await
+            .unwrap();
+        assert_eq!(pushed.ref_name, "jolt/update-a-safely");
+        assert!(pushed.created_ref);
+        assert_eq!(pushed.revision, committed.revision);
+        assert!(
+            repos
+                .jj(&["diff", "--summary"], Some(&root), true)
+                .await
+                .unwrap()
+                .contains("b.txt"),
+            "Push must leave edits in @ untouched"
+        );
+        assert_eq!(
+            repos
+                .jj(
+                    &[
+                        "log",
+                        "-r",
+                        "jolt/update-a-safely@origin",
+                        "--no-graph",
+                        "-T",
+                        "commit_id ++ \"\\n\"",
+                    ],
+                    Some(&root),
+                    true,
+                )
+                .await
+                .unwrap(),
+            committed.revision
+        );
     }
 }

@@ -10,6 +10,7 @@ pub mod motion;
 pub mod review;
 pub mod secrets;
 pub mod usage;
+pub mod vcs_action;
 pub mod view;
 
 pub use agent::*;
@@ -18,3 +19,4 @@ pub use entities::*;
 pub use review::*;
 pub use secrets::*;
 pub use usage::*;
+pub use vcs_action::*;

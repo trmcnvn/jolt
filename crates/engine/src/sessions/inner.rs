@@ -728,6 +728,10 @@ pub(super) async fn drive_run(
 
     let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
+    // Adapters can re-emit a completed tool call with refreshed metadata. Keep
+    // ids across segment resets so an echo from an earlier segment cannot
+    // create a phantom tool part in the next segment.
+    let mut seen_tools = std::collections::HashSet::<String>::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
@@ -817,6 +821,12 @@ pub(super) async fn drive_run(
             Some(event) = engine_rx.recv() => event,
             next = stream.next() => match next {
                 Some(Ok(event)) => event,
+                // The completed turn was already finalized before a parked
+                // harness stream failed, so its child death is a clean end.
+                Some(Err(err)) if idle_since.is_some() => {
+                    tracing::warn!(chat = %chat_id, error = %err, "parked harness stream failed; ending clean");
+                    break SessionStatus::Idle;
+                }
                 Some(Err(err)) => AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
@@ -856,23 +866,37 @@ pub(super) async fn drive_run(
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled).
         inner.touch_session(&chat_id);
-        // First event after parking idle = the next turn beginning (a routed
-        // dispatch steered in): the session is Working again.
-        if idle_since.take().is_some() {
-            idle.store(false, Ordering::Release);
-            goal_turn_started = tokio::time::Instant::now();
-            goal_turn_id = inner
-                .workspace()
-                .and_then(|workspace| workspace.chat_goal(&chat_id))
-                .filter(|goal| goal.status == jolt_proto::GoalStatus::Active)
-                .map(|goal| goal.id);
-            pending_external_turns
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                    pending.checked_sub(1)
-                })
-                .ok();
-            lock(&turn_diff_tracker).activate_queued_if_needed();
-            inner.set_status(&chat_id, SessionStatus::Working, true);
+        // A parked harness may emit late updates after its terminal Done.
+        // Only an explicit turn boundary or input/terminal lifecycle can make
+        // the stream active again; all other trailing frames are inert.
+        if idle_since.is_some() {
+            match &event {
+                AgentEvent::Steered { .. } => {
+                    idle_since = None;
+                    idle.store(false, Ordering::Release);
+                    goal_turn_started = tokio::time::Instant::now();
+                    goal_turn_id = inner
+                        .workspace()
+                        .and_then(|workspace| workspace.chat_goal(&chat_id))
+                        .filter(|goal| goal.status == jolt_proto::GoalStatus::Active)
+                        .map(|goal| goal.id);
+                    pending_external_turns
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                            pending.checked_sub(1)
+                        })
+                        .ok();
+                    lock(&turn_diff_tracker).activate_queued_if_needed();
+                    inner.set_status(&chat_id, SessionStatus::Working, true);
+                }
+                AgentEvent::InputRequested { .. } | AgentEvent::InputResolved { .. } => {
+                    idle_since = None;
+                    idle.store(false, Ordering::Release);
+                }
+                AgentEvent::Done { .. } => {
+                    idle_since = None;
+                }
+                _ => continue,
+            }
         }
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
         // tool-input-generation windows stream them with no text. They fold
@@ -882,6 +906,27 @@ pub(super) async fn drive_run(
             continue;
         }
         compaction_follow_up.observe_agent_event(&event);
+
+        // A tool refresh from an earlier segment belongs to the tool part that
+        // was already finalized there. Same-segment refreshes still update the
+        // existing part in place.
+        let in_segment = |id: &str| {
+            folded
+                .iter()
+                .any(|part| matches!(part, MessagePart::Tool { id: part_id, .. } if part_id == id))
+        };
+        match &event {
+            AgentEvent::ToolCall { id, .. } => {
+                if !in_segment(id) && seen_tools.contains(id) {
+                    continue;
+                }
+                seen_tools.insert(id.clone());
+            }
+            AgentEvent::ToolResult { id, .. } if !in_segment(id) && seen_tools.contains(id) => {
+                continue;
+            }
+            _ => {}
+        }
 
         // Failed-resume fallback: an engine-injected `--resume` naming a session
         // the harness no longer knows dies before ever starting (claude exits
@@ -932,6 +977,9 @@ pub(super) async fn drive_run(
                     .await
                 {
                     tracing::error!(chat = %chat, error = %err, "fresh-session retry dispatch failed");
+                    engine
+                        .inner
+                        .set_status(&chat, SessionStatus::Errored, false);
                 }
             });
             return;

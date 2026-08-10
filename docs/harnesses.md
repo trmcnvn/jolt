@@ -34,9 +34,9 @@ Version-control executable overrides are documented in [Environment variables](e
 
 ## Harness updates
 
-Each device checks its installed Claude Code, Codex, and Pi versions in the background and publishes device-local update status over RPC. A signed-in desktop also watches the other engine-host devices in its account, including headless machines. Offline device watches retry when the device becomes reachable. Available harness updates appear as attached banners on the corresponding rows under **Settings → Devices**; they do not generate app or system notifications. An **Update** action is offered only when Jolt can prove a supported install path; executable overrides and other unmanaged installs receive manual instructions instead.
+Each device checks its installed Claude Code, Codex, and Pi versions in the background and publishes device-local update status over RPC. A signed-in desktop also watches the other engine-host devices in its account, including headless machines. Offline device watches retry when the device becomes reachable. **Settings → Harnesses** provides a device selector, manual refresh, installed/latest versions, and inline update state; harness updates do not generate app or system notifications. An **Update** action is offered only when Jolt can prove a supported install path; executable overrides and other unmanaged installs receive manual instructions instead.
 
-Jolt never applies a harness update from a background check. Installation starts only when the user chooses **Update** on that device's banner; for a remote device the action sends a typed request to that device's engine.
+Jolt never applies a harness update from a background check. Installation starts only when the user chooses **Update** on that harness row; for a remote device the action sends a typed request to that device's engine.
 
 An accepted update fences new durable commands for only that harness. Persistent processes already parked between turns retire immediately and keep their native resume metadata. Active turns and input requests are never interrupted: the updater waits for them to reach a clean idle boundary, retires the old process, runs the provider-owned updater, verifies `--version`, then releases pending commands against the new executable. Other harnesses and open terminals remain available.
 

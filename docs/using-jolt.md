@@ -36,7 +36,7 @@ The desktop shows pinned threads first, then the remaining threads by recency. P
 ## The desktop shell
 
 - **Left sidebar:** searchable space filter (`Mod+Shift+K`), filtered active and closed threads, title search (`Mod+Shift+F`), add-space action, and user menu.
-- **Thread header:** identifies the selected thread and its `space @ device` provenance while keeping New Thread, terminal, and Changes controls available.
+- **Thread header:** identifies the selected thread and its `space @ device` provenance while keeping Commit/Push, New Thread, terminal, and Changes controls available.
 - **Conversation:** virtualized transcript with Markdown, code highlighting, grouped tools, input requests, errors, attachments, and a message rail on wide layouts. `Mod+Shift+Up/Down` moves between user prompts, including unloaded history.
 - **Composer:** prompt input, separate model and traits controls, checkout controls, attachments, context usage, and send/steer/stop state.
 - **Terminal panel:** thread-scoped PTY tabs hosted on the thread's device.
@@ -133,6 +133,8 @@ Live status is freshness-gated so a crashed engine cannot leave a permanent Work
 Terminal tabs are PTYs on the host device. Detaching or hiding the panel does not close the shell. Output has a bounded replay window so a viewport can reconnect and continue from a sequence number. Drag to select cells, double-click words, or triple-click lines; copy with `Cmd+C` on macOS or `Ctrl+Shift+C` elsewhere.
 
 The Changes pane shows the latest bounded working-copy diff for the checkout. It supports per-file folding, additions/deletions, syntax highlighting, binary markers, and a partial-snapshot notice when the patch reaches its size cap. Click a textual diff line to add pending review feedback; Shift-click another line in the same file to extend the range. Comments auto-save only on this device. Once annotation begins, the reviewed revision remains fixed and a newer working copy is reported without moving existing anchors. **Send feedback** groups every pending comment into one ordinary user message while preserving text and attachments already staged in the composer.
+
+The thread header’s version-control split control derives its primary action from the same concrete checkout: **Commit**, **Commit & push**, or **Push**. Commit opens a whole-file selector and accepts an optional message; leaving it blank generates one with the thread harness’s economy model. Actions run on the checkout host, are disabled while an agent is active in the same checkout, reject stale reviewed revisions, and never force-push. Git pushes the current branch and establishes its upstream on first publication. Jujutsu commits selected files while leaving the remainder in the new `@`; Push leaves `@` untouched and publishes the completed `@-` through a Jolt-owned `jolt/*` bookmark rather than moving a user bookmark.
 
 Completed assistant turns that changed files also show a collapsed `N changed files +A −D` card in the transcript. Expanding it lists files; on desktop, selecting a file or **Open diff** opens that immutable turn delta in the Changes pane. iOS shows the summary and file list without diff opening. Successful edit/write chips are replaced by the card, while failed mutation chips remain visible.
 

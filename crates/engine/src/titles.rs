@@ -204,6 +204,77 @@ impl TitleGenerator {
         Ok(())
     }
 
+    /// Generate a commit message from one immutable selected diff. This uses the
+    /// same economy-model, read-only, non-persistent path as chat titles.
+    pub(crate) async fn generate_commit_message(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        cwd: &str,
+        paths: &[String],
+        patch: &str,
+    ) -> Result<String, EngineError> {
+        let harness = self.inner.registry.resolve(harness_id)?;
+        let cheap = cheap_model_id(&harness.models().await.unwrap_or_default(), None);
+        let bounded_patch = patch.chars().take(50_000).collect::<String>();
+        let path_list = paths
+            .iter()
+            .take(200)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "Write a concise commit message for the selected changes below. Follow the repository's existing commit-message style. Reply with ONLY the commit message: a short imperative subject on the first line and an optional explanatory body after one blank line. Do not use Markdown fences.\n\nFiles:\n{path_list}\n\nDiff:\n{bounded_patch}"
+        );
+        let mut model_options = serde_json::Map::new();
+        if harness_id == HarnessId::Pi {
+            model_options.insert("projectTrust".into(), serde_json::json!("ignore"));
+            model_options.insert("toolAccess".into(), serde_json::json!("readOnly"));
+        }
+        let request = RunRequest {
+            prompt,
+            harness: Some(harness_id),
+            model: cheap.clone(),
+            reasoning: Some(ReasoningLevel::Minimal),
+            model_options,
+            cwd: cwd.to_string(),
+            sandbox: SandboxLevel::ReadOnly,
+            auto_approve: true,
+            attachments: Vec::new(),
+            resume: None,
+        };
+        let mut usage = UsageCapture::new(
+            self.inner.usage.clone(),
+            chat_id,
+            UsagePurpose::CommitMessageGeneration,
+            harness_id,
+            cheap.as_deref(),
+            cwd,
+        );
+        let raw = collect_text(harness.as_ref(), request, |event| {
+            if let Err(error) = usage.observe(event) {
+                tracing::error!(chat = %chat_id, %error, "commit-message usage ledger write failed");
+            }
+        })
+        .await?;
+        let message = raw
+            .trim()
+            .trim_start_matches("```text")
+            .trim_start_matches("```gitcommit")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .chars()
+            .take(10_000)
+            .collect::<String>();
+        if message.lines().next().unwrap_or_default().trim().is_empty() {
+            return Err(EngineError::Other(
+                "Commit-message generation returned no message".into(),
+            ));
+        }
+        Ok(message)
+    }
+
     /// One-shot titling run: collect TextDeltas until Done; retries on failure.
     async fn run_title_model(
         &self,

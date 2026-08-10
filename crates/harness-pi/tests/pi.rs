@@ -364,6 +364,40 @@ async fn steering_uses_native_rpc_command() {
 }
 
 #[tokio::test]
+async fn steering_keeps_draining_events_until_the_response() {
+    let (controls, steer, _interrupt) = controls("Yes");
+    let mut stream = harness()
+        .run(request("scenario:steer-flood"), controls)
+        .await
+        .unwrap();
+    while let Some(event) = stream.next().await {
+        if event.unwrap()
+            == (AgentEvent::TextDelta {
+                text: "first".into(),
+            })
+        {
+            break;
+        }
+    }
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: None,
+        })
+        .await
+        .unwrap();
+    let events = until_done(&mut stream).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Steered { .. }))
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "steered".into(),
+    }));
+}
+
+#[tokio::test]
 async fn extension_command_steers_use_prompt_and_complete_without_agent_settled() {
     let (controls, steer, _interrupt) = controls("Yes");
     let mut stream = harness()

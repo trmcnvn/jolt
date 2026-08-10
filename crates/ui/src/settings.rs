@@ -15,6 +15,7 @@ pub mod appearance;
 pub mod composer;
 mod device_switcher;
 pub mod devices;
+pub mod harnesses;
 pub mod hotkeys;
 pub mod notifications;
 pub mod secrets;

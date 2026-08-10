@@ -139,7 +139,13 @@ impl SessionsEngine {
                 pending_external_turns.fetch_add(1, Ordering::AcqRel);
                 lock(&turn_diff_tracker).queue(turn_diff_baseline);
             }
-            if steerable && same_harness && steer_tx.try_send(message).is_ok() {
+            // The run can unregister after we clone its mailbox. Recheck it
+            // after delivery before exposing a user entry or Working status.
+            if steerable
+                && same_harness
+                && steer_tx.try_send(message).is_ok()
+                && self.is_live(chat_id, &run_id)
+            {
                 if write_user_entry {
                     handle.write_user_message(&user_id, &turn_prompt, now_ms())?;
                 }
@@ -436,14 +442,20 @@ impl SessionsEngine {
             })
             .map(|h| {
                 (
+                    h.run_id.clone(),
                     h.steer_tx.clone(),
                     h.compaction_follow_up.clone(),
                     h.pending_external_turns.clone(),
                     h.turn_diff_tracker.clone(),
                 )
             });
-        let Some((steer_tx, compaction_follow_up, pending_external_turns, turn_diff_tracker)) =
-            target
+        let Some((
+            run_id,
+            steer_tx,
+            compaction_follow_up,
+            pending_external_turns,
+            turn_diff_tracker,
+        )) = target
         else {
             return Ok(SteerOutcome::NotSteerable);
         };
@@ -474,7 +486,8 @@ impl SessionsEngine {
         };
         pending_external_turns.fetch_add(1, Ordering::AcqRel);
         lock(&turn_diff_tracker).queue(turn_diff_baseline);
-        if steer_tx.try_send(message).is_err() {
+        // A successful channel send can still race the run's removal.
+        if steer_tx.try_send(message).is_err() || !self.is_live(chat_id, &run_id) {
             pending_external_turns.fetch_sub(1, Ordering::AcqRel);
             lock(&turn_diff_tracker).rollback_last_queue();
             return Ok(SteerOutcome::NotSteerable);
