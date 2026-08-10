@@ -190,8 +190,7 @@ impl Shell {
         if let Some(terminal) = &self.terminal {
             return terminal.clone();
         }
-        let command = self.settings.terminal_command.clone();
-        let terminal = cx.new(|cx| TerminalPanel::new(self.state.clone(), command, cx));
+        let terminal = cx.new(|cx| TerminalPanel::new(self.state.clone(), cx));
         terminal.update(cx, |terminal, cx| {
             terminal.set_expanded_view(self.terminal_expanded, cx)
         });

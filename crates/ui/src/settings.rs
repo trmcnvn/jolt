@@ -85,9 +85,6 @@ pub struct UiSettings {
     pub code_font: String,
     /// Font family used by terminal grids.
     pub terminal_font: String,
-    /// Shell command run when a new terminal opens. Empty uses the default
-    /// interactive login shell.
-    pub terminal_command: String,
 }
 
 impl Default for UiSettings {
@@ -109,7 +106,6 @@ impl Default for UiSettings {
             prompt_font: crate::theme::DEFAULT_UI_FONT.into(),
             code_font: crate::theme::DEFAULT_CODE_FONT.into(),
             terminal_font: crate::theme::DEFAULT_CODE_FONT.into(),
-            terminal_command: String::new(),
         }
     }
 }
@@ -614,7 +610,6 @@ mod tests {
             prompt_font: "Iosevka".into(),
             code_font: "Menlo".into(),
             terminal_font: "Berkeley Mono".into(),
-            terminal_command: "exec fish".into(),
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -718,7 +713,6 @@ mod tests {
         assert_eq!(d.prompt_font, crate::theme::DEFAULT_UI_FONT);
         assert_eq!(d.code_font, crate::theme::DEFAULT_CODE_FONT);
         assert_eq!(d.terminal_font, crate::theme::DEFAULT_CODE_FONT);
-        assert!(d.terminal_command.is_empty());
         assert!(!d.system_notifications_enabled);
     }
 

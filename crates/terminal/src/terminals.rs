@@ -11,18 +11,21 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 
-use jolt_proto::TerminalSession;
+use jolt_proto::{TerminalSession, TerminalSettingsSnapshot};
 use jolt_session_doc::TERMINAL_OUTPUT_BATCH_MS;
+use serde::{Deserialize, Serialize};
 
 use crate::TerminalError;
 
 const MAX_TERMINALS: usize = 32;
+const SETTINGS_FILE: &str = "terminal-settings.json";
 const MAX_INPUT_BYTES: usize = 64 * 1024;
 const MAX_LAUNCH_COMMAND_BYTES: usize = 8 * 1024;
 const MAX_REPLAY_BYTES: usize = 1024 * 1024;
@@ -109,7 +112,15 @@ impl LiveTerminal {
     }
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StoredSettings {
+    command: String,
+}
+
 struct TerminalsInner {
+    settings_path: Option<PathBuf>,
+    launch_command: Mutex<String>,
     sessions: Mutex<HashMap<String, Arc<Mutex<LiveTerminal>>>>,
 }
 
@@ -154,16 +165,110 @@ fn selected_shell() -> String {
         })
 }
 
+fn load_launch_command(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<StoredSettings>(&raw).ok())
+        .map(|settings| settings.command)
+}
+
+fn load_legacy_launch_command(path: &Path) -> Option<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    value
+        .get("terminalCommand")
+        .and_then(serde_json::Value::as_str)
+        .filter(|command| !command.is_empty())
+        .map(str::to_string)
+}
+
+fn save_launch_command(path: &Path, command: &str) -> Result<(), TerminalError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| TerminalError::new("Terminal settings path has no parent"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| TerminalError::new(format!("Terminal settings directory: {error}")))?;
+    let json = serde_json::to_string_pretty(&StoredSettings {
+        command: command.to_string(),
+    })
+    .map_err(|error| TerminalError::new(format!("Terminal settings serialize: {error}")))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)
+        .map_err(|error| TerminalError::new(format!("Terminal settings write: {error}")))?;
+    std::fs::rename(tmp, path)
+        .map_err(|error| TerminalError::new(format!("Terminal settings persist: {error}")))
+}
+
 impl Terminals {
     /// Requires a tokio runtime (spawns the exited-session reaper).
     pub fn new() -> Self {
         let terminals = Self {
             inner: Arc::new(TerminalsInner {
+                settings_path: None,
+                launch_command: Mutex::new(String::new()),
                 sessions: Mutex::new(HashMap::new()),
             }),
         };
         tokio::spawn(reaper_task(Arc::downgrade(&terminals.inner)));
         terminals
+    }
+    /// Open a device-persistent terminal manager. The launch command is shared
+    /// by Local and Account runtimes on this installation.
+    pub fn with_data_dir(data_dir: &Path) -> Self {
+        let settings_path = data_dir.join(SETTINGS_FILE);
+        let launch_command = match load_launch_command(&settings_path) {
+            Some(command) => command,
+            None => {
+                let command = load_legacy_launch_command(&data_dir.join("ui-settings.json"))
+                    .unwrap_or_default();
+                if !command.is_empty()
+                    && let Err(error) = save_launch_command(&settings_path, &command)
+                {
+                    tracing::warn!(%error, "failed to migrate terminal launch command");
+                }
+                command
+            }
+        };
+        let terminals = Self {
+            inner: Arc::new(TerminalsInner {
+                settings_path: Some(settings_path),
+                launch_command: Mutex::new(launch_command),
+                sessions: Mutex::new(HashMap::new()),
+            }),
+        };
+        tokio::spawn(reaper_task(Arc::downgrade(&terminals.inner)));
+        terminals
+    }
+
+    pub fn settings(&self) -> TerminalSettingsSnapshot {
+        TerminalSettingsSnapshot {
+            command: self.launch_command(),
+        }
+    }
+
+    pub fn set_launch_command(
+        &self,
+        command: String,
+    ) -> Result<TerminalSettingsSnapshot, TerminalError> {
+        if command.len() > MAX_LAUNCH_COMMAND_BYTES {
+            return Err(TerminalError::new(format!(
+                "Launch command must not exceed {MAX_LAUNCH_COMMAND_BYTES} bytes"
+            )));
+        }
+        if let Some(path) = &self.inner.settings_path {
+            save_launch_command(path, &command)?;
+        }
+        *lock(&self.inner.launch_command) = command.clone();
+        Ok(TerminalSettingsSnapshot { command })
+    }
+
+    fn launch_command(&self) -> String {
+        if let Some(path) = &self.inner.settings_path
+            && let Some(command) = load_launch_command(path)
+        {
+            *lock(&self.inner.launch_command) = command;
+        }
+        lock(&self.inner.launch_command).clone()
     }
 
     /// Open a login shell in `cwd`. The PTY outlives every subscriber; it dies on
@@ -181,6 +286,14 @@ impl Terminals {
         rows: u16,
         command: Option<&str>,
     ) -> Result<TerminalSession, TerminalError> {
+        let configured;
+        let command = match command {
+            Some(command) => Some(command),
+            None => {
+                configured = self.launch_command();
+                Some(configured.as_str())
+            }
+        };
         self.open_configured(cwd, cols, rows, None, command)
     }
 

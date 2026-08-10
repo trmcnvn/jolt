@@ -92,6 +92,8 @@ pub(super) fn forwardable(method: &str) -> bool {
             | methods::DELETE_WORKTREE
             | methods::VCS_SETTINGS
             | methods::SET_VCS_BACKEND
+            | methods::TERMINAL_SETTINGS
+            | methods::SET_TERMINAL_COMMAND
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFF_V2
             | methods::GET_CHECKOUT_DIFF_PAGE

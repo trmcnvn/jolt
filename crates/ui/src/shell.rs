@@ -48,7 +48,7 @@ use crate::settings::devices::DevicesPage;
 use crate::settings::hotkeys::{HotkeysEvent, HotkeysPage};
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::secrets::SecretsPage;
-use crate::settings::terminal::{TerminalPage, TerminalSettingsEvent};
+use crate::settings::terminal::TerminalPage;
 use crate::settings::vcs::VcsPage;
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
@@ -887,7 +887,6 @@ pub struct Shell {
     terminal_page: Option<Entity<TerminalPage>>,
     notifications_sub: Option<Subscription>,
     hotkeys_sub: Option<Subscription>,
-    terminal_settings_sub: Option<Subscription>,
     terminal_panel_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: Option<(String, Point<Pixels>)>,
@@ -1217,7 +1216,6 @@ impl Shell {
             terminal_page: None,
             notifications_sub: None,
             hotkeys_sub: None,
-            terminal_settings_sub: None,
             terminal_panel_sub: None,
             chat_menu: None,
             rename_dialog: None,

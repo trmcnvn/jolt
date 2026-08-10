@@ -315,7 +315,7 @@ impl EngineCore {
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
         }
-        let terminals = Terminals::new();
+        let terminals = Terminals::with_data_dir(data_dir);
         let uploads = Uploads::new(identity_dir, edge.clone());
         let agent_accounts = services.agent_accounts;
         sessions.set_titles(TitleGenerator::new(

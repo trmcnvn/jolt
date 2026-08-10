@@ -159,10 +159,13 @@ File search roots are resolved from synced chat/space rows and verified against 
 | Method | Reply | Remote target |
 | --- | --- | --- |
 | `OpenTerminal` | unary | yes |
+| `TerminalSettings`, `SetTerminalCommand` | unary | yes |
 | `SubscribeTerminalV2` | binary stream | yes |
 | `WriteTerminal`, `ResizeTerminal`, `CloseTerminal` | unary | yes |
 
 `SubscribeTerminalV2` carries versioned binary items with a compact event header, monotonically increasing sequence, and raw PTY bytes without base64. `afterSeq` resumes from the bounded 1 MiB raw-byte replay window.
+
+The launch command is persisted on each engine device. `OpenTerminal` uses that device’s command when the request does not supply an explicit override.
 
 ### Agent accounts
 
