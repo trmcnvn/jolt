@@ -3,6 +3,7 @@
 //! Local data lives in `scopes/local/current`. Account data lives in
 //! `scopes/accounts/<org>/<user>`.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension as _;
@@ -45,13 +46,7 @@ impl ScopeLayout {
     pub fn ensure_local(&self) -> Result<PathBuf, EngineError> {
         let dir = self.local_dir();
         std::fs::create_dir_all(&dir)?;
-        let id_path = dir.join(LOCAL_SCOPE_ID);
-        if std::fs::read_to_string(&id_path)
-            .ok()
-            .is_none_or(|id| id.trim().is_empty())
-        {
-            std::fs::write(id_path, new_id())?;
-        }
+        load_or_create_id(&dir.join(LOCAL_SCOPE_ID))?;
         Ok(dir)
     }
 
@@ -85,7 +80,14 @@ impl ScopeLayout {
         }
         let source_device = read_id(&local.join("device-id"))?;
         let target_device = read_id(&target.join("device-id"))?;
-        merge_docs(&local, &target, &source_device, &target_device)?;
+        merge_docs(
+            &local,
+            &target,
+            &source_device,
+            &target_device,
+            &local.join("uploads").to_string_lossy(),
+            &target.join("uploads").to_string_lossy(),
+        )?;
         merge_usage(&local, &target, &target_device)?;
         copy_tree_missing(&local.join("journals"), &target.join("journals"))?;
         copy_tree_missing(&local.join("uploads"), &target.join("uploads"))?;
@@ -108,14 +110,28 @@ impl ScopeLayout {
                 "this account already has local data; keep Local separate for now".into(),
             ));
         }
-        std::fs::create_dir_all(
-            target
-                .parent()
-                .ok_or_else(|| EngineError::Other("account scope has no parent".into()))?,
-        )?;
-        std::fs::rename(&local, &target)?;
-        // Local-only identity is not meaningful once the scope is account-bound.
-        let _ = std::fs::remove_file(target.join(LOCAL_SCOPE_ID));
+        let parent = target
+            .parent()
+            .ok_or_else(|| EngineError::Other("account scope has no parent".into()))?;
+        std::fs::create_dir_all(parent)?;
+        let staging = parent.join(format!(".account-migration-{}", new_id()));
+        let prepared = (|| -> Result<(), EngineError> {
+            copy_tree_missing(&local, &staging)?;
+            rewrite_stored_documents(
+                &staging,
+                &local.join("uploads").to_string_lossy(),
+                &target.join("uploads").to_string_lossy(),
+            )?;
+            // Local-only identity is not meaningful once the scope is account-bound.
+            let _ = std::fs::remove_file(staging.join(LOCAL_SCOPE_ID));
+            std::fs::rename(&staging, &target)?;
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        std::fs::remove_dir_all(&local)?;
         self.ensure_local()?;
         Ok(AccountScope {
             dir: target,
@@ -129,6 +145,58 @@ pub struct AccountScope {
     pub dir: PathBuf,
     /// The account already had device-local data before this startup.
     pub existed: bool,
+}
+
+pub(crate) fn load_or_create_id(path: &Path) -> Result<String, EngineError> {
+    match std::fs::read_to_string(path) {
+        Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_string()),
+        Ok(_) => {
+            // Empty identity files are a recoverable legacy/crash artifact. Remove
+            // the invalid value before the create-once publication below.
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| EngineError::Other("identity path has no parent".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let id = new_id();
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("identity"),
+        std::process::id(),
+        new_id()
+    ));
+    let result = (|| -> Result<(), EngineError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(id.as_bytes())?;
+        file.sync_all()?;
+        match std::fs::hard_link(&temporary, path) {
+            Ok(()) => {
+                if let Ok(directory) = std::fs::File::open(parent) {
+                    let _ = directory.sync_all();
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result?;
+    read_id(path)
 }
 
 fn read_id(path: &Path) -> Result<String, EngineError> {
@@ -148,6 +216,8 @@ fn merge_docs(
     target_dir: &Path,
     source_device: &str,
     target_device: &str,
+    upload_from: &str,
+    upload_to: &str,
 ) -> Result<(), EngineError> {
     let source_path = source_dir.join("docs.sqlite3");
     let target_path = target_dir.join("docs.sqlite3");
@@ -208,8 +278,14 @@ fn merge_docs(
             raw.import(&bytes)
                 .map_err(|error| EngineError::Other(format!("import Account document: {error}")))?;
         }
-        raw.import(source_bytes)
+        let source = loro::LoroDoc::new();
+        source
+            .import(source_bytes)
             .map_err(|error| EngineError::Other(format!("import Local document: {error}")))?;
+        let source = SessionDoc::from_doc(source);
+        rewrite_document_prefix(&source, upload_from, upload_to)?;
+        raw.import(&source.export_snapshot()?)
+            .map_err(|error| EngineError::Other(format!("merge Local document: {error}")))?;
         let document = SessionDoc::from_doc(raw);
         save_snapshot(&target, chat_id, &document.export_snapshot()?)?;
     }
@@ -233,6 +309,48 @@ fn merge_docs(
             .map_err(|error| EngineError::Other(format!("merge command ledger: {error}")))?;
     }
     Ok(())
+}
+
+fn rewrite_stored_documents(scope_dir: &Path, from: &str, to: &str) -> Result<(), EngineError> {
+    let path = scope_dir.join("docs.sqlite3");
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = rusqlite::Connection::open(path)
+        .map_err(|error| EngineError::Other(format!("open promoted documents: {error}")))?;
+    for (chat_id, bytes) in read_snapshots(&connection)?
+        .into_iter()
+        .filter(|(id, _)| id != REGISTRY_DOC_ID)
+    {
+        let raw = loro::LoroDoc::new();
+        raw.import(&bytes)
+            .map_err(|error| EngineError::Other(format!("import promoted document: {error}")))?;
+        let document = SessionDoc::from_doc(raw);
+        if rewrite_document_prefix(&document, from, to)? {
+            save_snapshot(&connection, &chat_id, &document.export_snapshot()?)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_document_prefix(
+    document: &SessionDoc,
+    from: &str,
+    to: &str,
+) -> Result<bool, EngineError> {
+    let mut changed = false;
+    for entry in document.read_entries()? {
+        let message_id = entry.id;
+        for part in entry.parts {
+            let jolt_session_doc::MessagePart::Text { id, text } = part else {
+                continue;
+            };
+            if text.contains(from) {
+                changed |= document.replace_text_part(&message_id, &id, &text.replace(from, to))?;
+            }
+        }
+    }
+    Ok(changed)
 }
 
 fn read_snapshots(
@@ -380,7 +498,10 @@ mod tests {
                 role: MessageRole::User,
                 parts: vec![MessagePart::Text {
                     id: "text-local".into(),
-                    text: "hello".into(),
+                    text: local
+                        .join("uploads/image.png")
+                        .to_string_lossy()
+                        .into_owned(),
                 }],
                 created_at: 1,
                 device_id: "local-device".into(),
@@ -413,11 +534,108 @@ mod tests {
         layout.merge_local_into_account("org", "user").unwrap();
 
         let account_store = DocsStore::open(&account).unwrap();
-        assert!(account_store.load_snapshot("chat-local").unwrap().is_some());
+        let merged = account_store
+            .load_snapshot("chat-local")
+            .unwrap()
+            .expect("merged Local snapshot");
+        let raw = loro::LoroDoc::new();
+        raw.import(&merged).unwrap();
+        let merged = SessionDoc::from_doc(raw);
+        let entries = merged.read_entries().unwrap();
+        let text = match &entries[0].parts[0] {
+            MessagePart::Text { text, .. } => text,
+            _ => panic!("expected text attachment reference"),
+        };
+        assert!(text.starts_with(&account.join("uploads").to_string_lossy().into_owned()));
         assert!(account_store.is_processed("command-local").unwrap());
         assert!(account.join("uploads/image.png").exists());
         assert!(layout.local_dir().join(LOCAL_SCOPE_ID).exists());
         assert!(!layout.local_dir().join("uploads/image.png").exists());
+    }
+
+    #[test]
+    fn failed_merge_leaves_local_attachment_references_unchanged() {
+        use jolt_session_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+        use jolt_store::DocsStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let layout = ScopeLayout::new(root.path());
+        let local = layout.ensure_local().unwrap();
+        std::fs::write(local.join("device-id"), "local-device").unwrap();
+        let account = layout.ensure_account("org", "user").unwrap().dir;
+        std::fs::write(account.join("device-id"), "account-device").unwrap();
+        let local_path = local
+            .join("uploads/image.png")
+            .to_string_lossy()
+            .into_owned();
+        let store = DocsStore::open(&local).unwrap();
+        let document = SessionDoc::init("chat-local").unwrap();
+        document
+            .push_message(&SessionMessageEntry {
+                id: "message-local".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "text-local".into(),
+                    text: local_path.clone(),
+                }],
+                created_at: 1,
+                device_id: "local-device".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })
+            .unwrap();
+        store
+            .save_snapshot("chat-local", &document.export_snapshot().unwrap())
+            .unwrap();
+        drop(store);
+        std::fs::create_dir_all(local.join("uploads")).unwrap();
+        std::fs::create_dir_all(account.join("uploads")).unwrap();
+        std::fs::write(local.join("uploads/image.png"), b"local").unwrap();
+        std::fs::write(account.join("uploads/image.png"), b"account").unwrap();
+
+        layout
+            .merge_local_into_account("org", "user")
+            .expect_err("different upload contents must stop the merge");
+
+        let store = DocsStore::open(&local).unwrap();
+        let bytes = store
+            .load_snapshot("chat-local")
+            .unwrap()
+            .expect("Local source remains");
+        let raw = loro::LoroDoc::new();
+        raw.import(&bytes).unwrap();
+        let document = SessionDoc::from_doc(raw);
+        let entries = document.read_entries().unwrap();
+        let text = match &entries[0].parts[0] {
+            MessagePart::Text { text, .. } => text,
+            _ => panic!("expected text attachment reference"),
+        };
+        assert_eq!(text, &local_path);
+    }
+
+    #[test]
+    fn concurrent_identity_creation_publishes_one_complete_value() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("device-id");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create_id(&path).unwrap()
+                })
+            })
+            .collect();
+        let ids: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert!(!ids[0].is_empty());
+        assert!(ids.iter().all(|id| id == &ids[0]));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), ids[0]);
     }
 
     #[test]

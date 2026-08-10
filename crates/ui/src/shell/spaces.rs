@@ -68,6 +68,7 @@ pub(super) struct ArchivedChatRow {
     pub(super) id: String,
     pub(super) title: SharedString,
     pub(super) time_ago: SharedString,
+    pub(super) selected: bool,
 }
 
 #[derive(Clone)]
@@ -678,6 +679,7 @@ impl Shell {
         let now = Utc::now();
         let filter = self.settings.space_filter.as_deref();
         let state = self.state.read(cx);
+        let selected = state.selected_chat.as_deref();
         state
             .chats
             .iter()
@@ -701,6 +703,7 @@ impl Shell {
                 .into(),
                 time_ago: format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
                     .into(),
+                selected: selected == Some(chat.id.as_str()),
             })
             .collect()
     }

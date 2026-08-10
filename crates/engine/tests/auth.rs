@@ -10,7 +10,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use jolt_api::methods;
-use jolt_engine::{Auth, AuthConfig, AuthState, EngineConfig, EngineSupervisor, HarnessId};
+use jolt_engine::{
+    Auth, AuthConfig, AuthState, Engine, EngineConfig, EngineSupervisor, HarnessId, InstanceLock,
+};
 use jolt_rpc::connect_ws;
 
 // ---------------------------------------------------------------------------
@@ -383,6 +385,134 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
 }
 
 #[tokio::test]
+async fn sign_out_fences_an_in_flight_code_exchange() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept exchange");
+        let _ = read_request(&mut stream).await.expect("read exchange");
+        reached_tx.send(()).ok();
+        release_rx.await.ok();
+        let body = serde_json::json!({
+            "user": { "id": "user_1", "email": "w@example.com" },
+            "accessToken": fake_jwt(3600, Some("org_1")),
+            "refreshToken": "late-refresh",
+        });
+        respond(&mut stream, "200 OK", &body.to_string()).await;
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Auth::new(workos_config(
+        &format!("http://127.0.0.1:{port}"),
+        dir.path(),
+    ));
+    let url = auth.start_headless_sign_in();
+    let state = query_param(&url, "state").expect("state");
+    let completing = {
+        let auth = auth.clone();
+        tokio::spawn(async move { auth.complete_sign_in(&format!("{state}.code")).await })
+    };
+
+    reached_rx.await.expect("exchange reached edge");
+    auth.sign_out();
+    release_tx.send(()).ok();
+
+    let error = completing
+        .await
+        .expect("completion task")
+        .expect_err("canceled exchange must not publish credentials");
+    assert!(error.to_string().contains("canceled"));
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert!(!dir.path().join("session.json").exists());
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn sign_out_fences_an_in_flight_refresh() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept refresh");
+        let _ = read_request(&mut stream).await.expect("read refresh");
+        reached_tx.send(()).ok();
+        release_rx.await.ok();
+        let body = serde_json::json!({
+            "accessToken": fake_jwt(3600, Some("org_1")),
+            "refreshToken": "late-rotation",
+        });
+        respond(&mut stream, "200 OK", &body.to_string()).await;
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("session.json"),
+        r#"{"refreshToken":"refresh-1","user":{"id":"user_1","email":"w@example.com"},"orgId":"org_1"}"#,
+    )
+    .expect("seed session");
+    let auth = Auth::new(workos_config(
+        &format!("http://127.0.0.1:{port}"),
+        dir.path(),
+    ));
+    let refreshing = {
+        let auth = auth.clone();
+        tokio::spawn(async move { auth.access_token().await })
+    };
+
+    reached_rx.await.expect("refresh reached edge");
+    auth.sign_out();
+    release_tx.send(()).ok();
+
+    assert_eq!(refreshing.await.expect("refresh task"), None);
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert_eq!(auth.access_token().await, None);
+    assert!(!dir.path().join("session.json").exists());
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn transient_refresh_failure_enters_cooldown() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("session.json"),
+        r#"{"refreshToken":"refresh-1","user":{"id":"user_1","email":"w@example.com"},"orgId":"org_1"}"#,
+    )
+    .expect("seed session");
+    let auth = Auth::new(workos_config(
+        &format!("http://127.0.0.1:{port}"),
+        dir.path(),
+    ));
+    let first = {
+        let auth = auth.clone();
+        tokio::spawn(async move { auth.access_token().await })
+    };
+    let (mut stream, _) = listener.accept().await.expect("first refresh");
+    let _ = read_request(&mut stream).await.expect("read refresh");
+    respond(
+        &mut stream,
+        "503 Service Unavailable",
+        r#"{"error":"offline"}"#,
+    )
+    .await;
+    assert_eq!(first.await.expect("refresh task"), None);
+
+    assert_eq!(auth.access_token().await, None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), listener.accept())
+            .await
+            .is_err(),
+        "cooldown must suppress immediate retry"
+    );
+    assert!(
+        auth.state().is_signed_in(),
+        "transient failures keep the session"
+    );
+}
+
+#[tokio::test]
 async fn first_sign_in_creates_a_personal_org_automatically() {
     let edge = StubEdge::start().await;
     edge.state.orgs.lock().expect("lock").clear();
@@ -565,27 +695,75 @@ async fn loopback_callback_completes_headed_sign_in() {
 }
 
 #[tokio::test]
-async fn detect_probes_edge_dev_mode() {
-    // A stub that reports auth:"dev" forces dev mode even with a client id configured.
+async fn construction_does_not_probe_edge_auth_mode() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
-    let task = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            if read_request(&mut stream).await.is_some() {
-                respond(&mut stream, "200 OK", r#"{"ok":true,"auth":"dev"}"#).await;
-            }
-        }
-    });
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut config = workos_config(&format!("http://127.0.0.1:{port}"), dir.path());
-    config.dev_user_id = "dev-w".into();
-    let auth = Auth::detect(config).await;
-    assert!(!auth.workos_enabled(), "edge dev mode wins");
-    assert_eq!(auth.access_token().await.as_deref(), Some("dev-w"));
-    task.abort();
+    let config = workos_config(&format!("http://127.0.0.1:{port}"), dir.path());
+
+    let auth = Auth::new(config);
+
+    assert!(auth.workos_enabled());
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "auth construction must not contact Edge"
+    );
+}
+
+#[tokio::test]
+async fn signed_out_headless_stops_gracefully_over_ipc() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve port");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = EngineConfig {
+        data_dir: dir.path().to_path_buf(),
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        ipc_port: port,
+        default_harness: HarnessId::Mock,
+        org_id: None,
+        workos_client_id: Some("client_test".into()),
+    };
+    let engine = tokio::spawn(Engine::new(config).run());
+    let client = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(client) = connect_ws(&format!("ws://127.0.0.1:{port}")).await {
+                break client;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("headless Local IPC starts");
+
+    let response = client
+        .call(methods::STOP_ENGINE, serde_json::json!({}))
+        .await
+        .expect("stop acknowledgement");
+    assert_eq!(response, serde_json::json!({ "ok": true }));
+    tokio::time::timeout(Duration::from_secs(5), engine)
+        .await
+        .expect("engine stops")
+        .expect("engine task")
+        .expect("clean shutdown");
+
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "IPC listener released"
+    );
+    assert_eq!(
+        InstanceLock::holder(dir.path()),
+        None,
+        "engine lock released"
+    );
 }
 
 #[tokio::test]

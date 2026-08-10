@@ -5,6 +5,7 @@
 //! See docs/architecture.md for process and data ownership.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use async_trait::async_trait;
@@ -541,6 +542,8 @@ pub struct EngineSupervisor {
     harness_updater: harness_updates::HarnessUpdater,
     state_tx: tokio::sync::watch::Sender<SupervisedEngineState>,
     scope_tx: tokio::sync::watch::Sender<ScopeStatus>,
+    scope_generation: AtomicU64,
+    stop_tx: tokio::sync::watch::Sender<bool>,
     local: std::sync::Mutex<Option<EngineRuntime>>,
     account: std::sync::Mutex<Option<EngineRuntime>>,
     device_services: std::sync::Mutex<Option<DeviceServices>>,
@@ -571,6 +574,7 @@ impl EngineSupervisor {
     pub fn new(config: EngineConfig, auth: Auth) -> Arc<Self> {
         let (state_tx, _) = tokio::sync::watch::channel(SupervisedEngineState::Waiting);
         let (scope_tx, _) = tokio::sync::watch::channel(ScopeStatus::local());
+        let (stop_tx, _) = tokio::sync::watch::channel(false);
         Arc::new_cyclic(|weak: &Weak<Self>| {
             let quiescent_supervisor = weak.clone();
             let quiescent: jolt_update::QuiescentCheck = Arc::new(move || {
@@ -637,6 +641,8 @@ impl EngineSupervisor {
                 harness_updater,
                 state_tx,
                 scope_tx,
+                scope_generation: AtomicU64::new(0),
+                stop_tx,
                 local: std::sync::Mutex::new(None),
                 account: std::sync::Mutex::new(None),
                 device_services: std::sync::Mutex::new(None),
@@ -673,24 +679,24 @@ impl EngineSupervisor {
     async fn start(&self) -> anyhow::Result<()> {
         self.ensure_local_runtime()?;
         if !self.auth.workos_enabled() && self.config.edge_token.is_none() {
-            self.activate(ScopeKind::Local)?;
+            self.activate(ScopeKind::Local).await?;
             return Ok(());
         }
         match self.auth.state() {
             AuthState::SignedIn { .. } => {
                 if let Err(error) = self.prepare_signed_in(true).await {
                     tracing::warn!(error = %error, "account unavailable at startup; using Local");
-                    self.activate(ScopeKind::Local)?;
+                    self.activate(ScopeKind::Local).await?;
                 }
             }
             AuthState::NeedsOrganization { .. } => {
                 if self.auth.ensure_personal_org().await.is_ok() {
                     self.prepare_signed_in(true).await?;
                 } else {
-                    self.activate(ScopeKind::Local)?;
+                    self.activate(ScopeKind::Local).await?;
                 }
             }
-            AuthState::SignedOut => self.activate(ScopeKind::Local)?,
+            AuthState::SignedOut => self.activate(ScopeKind::Local).await?,
         }
         Ok(())
     }
@@ -703,7 +709,7 @@ impl EngineSupervisor {
                 Ok(())
             }
             AuthState::SignedOut => {
-                self.activate(ScopeKind::Local)?;
+                self.activate(ScopeKind::Local).await?;
                 let runtime = { lock(&self.account).take() };
                 if let Some(runtime) = runtime {
                     runtime.shutdown().await;
@@ -724,14 +730,14 @@ impl EngineSupervisor {
             };
             self.publish_scope(active, false);
             if startup {
-                self.activate(ScopeKind::Account)?;
+                self.activate(ScopeKind::Account).await?;
             }
             return Ok(());
         }
         let (org_id, user_id) = self.account_identity()?;
         if ScopeLayout::new(&self.config.data_dir).has_account_data(&org_id, &user_id) {
             self.ensure_account_runtime()?;
-            self.activate(ScopeKind::Account)?;
+            self.activate(ScopeKind::Account).await?;
             self.publish_scope(ScopeKind::Account, false);
             return Ok(());
         }
@@ -743,11 +749,11 @@ impl EngineSupervisor {
                 status.local_has_data = true;
                 status.merge_pending = true;
             });
-            self.activate(ScopeKind::Local)?;
+            self.activate(ScopeKind::Local).await?;
             return Ok(());
         }
         self.ensure_account_runtime()?;
-        self.activate(ScopeKind::Account)?;
+        self.activate(ScopeKind::Account).await?;
         self.publish_scope(ScopeKind::Account, false);
         Ok(())
     }
@@ -871,7 +877,7 @@ impl EngineSupervisor {
         })
     }
 
-    fn activate(&self, scope: ScopeKind) -> anyhow::Result<()> {
+    async fn activate(&self, scope: ScopeKind) -> anyhow::Result<()> {
         let service = match scope {
             ScopeKind::Local => lock(&self.local)
                 .as_ref()
@@ -881,22 +887,59 @@ impl EngineSupervisor {
                 .map(|runtime| runtime.core().rpc_service()),
         }
         .ok_or_else(|| anyhow::anyhow!("{scope:?} runtime unavailable"))?;
+        let previous = self.scope_tx.borrow().active;
+        let merge_pending = self.scope_tx.borrow().merge_pending;
+        let generation = self.scope_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if previous != scope && matches!(&*self.state_tx.borrow(), SupervisedEngineState::Ready(_))
+        {
+            self.publish_scope_transition(previous, scope, merge_pending, generation);
+            // Let attached viewports hide and cancel the old scope before the
+            // supervisor routes any subsequent RPC into the target runtime.
+            tokio::task::yield_now().await;
+        }
         self.state_tx
             .send_replace(SupervisedEngineState::Ready(service));
-        let merge_pending = self.scope_tx.borrow().merge_pending;
-        self.publish_scope(scope, merge_pending);
+        self.publish_scope_with_generation(scope, merge_pending, generation);
         Ok(())
     }
 
     fn publish_scope(&self, active: ScopeKind, merge_pending: bool) {
-        let account_available = lock(&self.account).is_some();
-        self.scope_tx.send_replace(ScopeStatus {
+        let generation = self.scope_generation.load(Ordering::SeqCst);
+        self.publish_scope_with_generation(active, merge_pending, generation);
+    }
+
+    fn publish_scope_transition(
+        &self,
+        active: ScopeKind,
+        target: ScopeKind,
+        merge_pending: bool,
+        generation: u64,
+    ) {
+        let mut status = self.scope_status(active, merge_pending, generation);
+        status.transitioning_to = Some(target);
+        self.scope_tx.send_replace(status);
+    }
+
+    fn publish_scope_with_generation(
+        &self,
+        active: ScopeKind,
+        merge_pending: bool,
+        generation: u64,
+    ) {
+        self.scope_tx
+            .send_replace(self.scope_status(active, merge_pending, generation));
+    }
+
+    fn scope_status(&self, active: ScopeKind, merge_pending: bool, generation: u64) -> ScopeStatus {
+        ScopeStatus {
             active,
-            account_available,
+            account_available: lock(&self.account).is_some(),
             account_email: self.auth.state().user().map(|user| user.email.clone()),
             local_has_data: self.local_has_data(),
             merge_pending,
-        });
+            generation,
+            transitioning_to: None,
+        }
     }
 
     async fn resolve_account_link(&self, merge: bool) -> anyhow::Result<()> {
@@ -918,22 +961,14 @@ impl EngineSupervisor {
                         "finish or stop active Local runs and terminals before syncing Local"
                     );
                 }
-                let chat_ids: Vec<String> = runtime
-                    .core()
-                    .workspace
-                    .read_chats()?
-                    .into_iter()
-                    .map(|chat| chat.id)
-                    .collect();
-                runtime.core().doc_host.rewrite_text_prefix(
-                    &chat_ids,
-                    &layout.local_dir().join("uploads").to_string_lossy(),
-                    &layout
-                        .account_dir(&org_id, &user_id)
-                        .join("uploads")
-                        .to_string_lossy(),
-                )?;
             }
+            // Gate every attached viewport before stopping either store. The
+            // merge can copy large journals/uploads, so waiting until the final
+            // Account frame would leave stale Local content interactive.
+            let current = self.scope_tx.borrow().active;
+            let generation = self.scope_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            self.publish_scope_transition(current, ScopeKind::Account, true, generation);
+            tokio::task::yield_now().await;
             // Stop routing new work into either store before merging files.
             self.state_tx.send_replace(SupervisedEngineState::Waiting);
             let local = { lock(&self.local).take() };
@@ -953,13 +988,13 @@ impl EngineSupervisor {
             if let Err(error) = result {
                 self.ensure_local_runtime()?;
                 let _ = self.ensure_account_runtime();
-                self.activate(ScopeKind::Local)?;
+                self.activate(ScopeKind::Local).await?;
                 return Err(error.into());
             }
             self.ensure_local_runtime()?;
         }
         if let Err(error) = self.ensure_account_runtime() {
-            self.activate(ScopeKind::Local)?;
+            self.activate(ScopeKind::Local).await?;
             return Err(error);
         }
         if merge && let Some(account) = lock(&self.account).as_ref() {
@@ -967,7 +1002,7 @@ impl EngineSupervisor {
                 account.core().doc_host.open(&chat.id)?;
             }
         }
-        self.activate(ScopeKind::Account)?;
+        self.activate(ScopeKind::Account).await?;
         self.publish_scope(ScopeKind::Account, false);
         Ok(())
     }
@@ -991,6 +1026,10 @@ impl EngineSupervisor {
         }
     }
 
+    pub fn watch_stop(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stop_tx.subscribe()
+    }
+
     pub async fn shutdown(&self) {
         self.state_tx.send_replace(SupervisedEngineState::Waiting);
         let account = { lock(&self.account).take() };
@@ -1011,9 +1050,23 @@ impl RpcService for EngineSupervisor {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
             jolt_api::methods::SCOPE_STATUS => {
+                // Never expose the constructor's placeholder Local status. The
+                // initial frame must describe the startup-selected routed scope.
+                self.wait_ready()
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 return Ok(RpcReply::Stream(rpc::watch_stream(
                     self.scope_tx.subscribe(),
                 )));
+            }
+            jolt_api::methods::STOP_ENGINE => {
+                if self.stop_tx.receiver_count() == 0 {
+                    return Err(RpcError::Failed(
+                        "this engine is owned by the desktop process".into(),
+                    ));
+                }
+                self.stop_tx.send_replace(true);
+                return RpcReply::value(&jolt_api::Acknowledged { ok: true });
             }
             jolt_api::methods::SWITCH_SCOPE => {
                 #[derive(serde::Deserialize)]
@@ -1022,6 +1075,7 @@ impl RpcService for EngineSupervisor {
                 }
                 let params: Params = jolt_rpc::parse_params(params)?;
                 self.activate(params.scope)
+                    .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 return RpcReply::value(&self.scope_tx.borrow().clone());
             }
@@ -1038,6 +1092,7 @@ impl RpcService for EngineSupervisor {
             }
             jolt_api::methods::SIGN_OUT => {
                 self.activate(ScopeKind::Local)
+                    .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 self.auth.sign_out();
                 return RpcReply::value(&serde_json::json!({ "ok": true }));
@@ -1141,7 +1196,10 @@ impl Engine {
     /// bearers still opt into the local dev identity.
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
-        auth_config.workos_client_id = config.workos_client_id.clone();
+        auth_config.workos_client_id = config
+            .edge_token
+            .as_ref()
+            .map_or_else(|| config.workos_client_id.clone(), |_| None);
         if let Ok(base) = std::env::var("JOLT_WORKOS_API_BASE")
             && !base.trim().is_empty()
         {
@@ -1156,7 +1214,7 @@ impl Engine {
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
         }
-        Auth::detect(auth_config).await
+        Auth::new(auth_config)
     }
 
     /// Run until ctrl-c: auth (dev or WorkOS), sessions engine + doc host + command
@@ -1170,12 +1228,9 @@ impl Engine {
         let auth = Self::build_auth(&config).await;
         let refresh_loop = auth.spawn_refresh_loop();
 
-        // WorkOS mode: gate edge features on a signed-in, org-scoped session. A TTY
-        // gets the interactive paste-code flow; a service manager (systemd/launchd)
-        // fails fast with a "run `jolt login`" error instead of hanging on a prompt.
-        if auth.workos_enabled() {
-            terminal_sign_in(&auth).await?;
-        }
+        // Scope selection is entirely local: a saved account opens its cached
+        // Account runtime, while a signed-out installation serves Local. Network
+        // availability affects synchronization only, never daemon startup.
 
         // Headless and headed ownership expose the same Local/Account service.
         // Otherwise a desktop attached to the background daemon loses scope
@@ -1188,6 +1243,8 @@ impl Engine {
             return Err(error);
         }
 
+        // Register the owner-side stop receiver before exposing StopEngine on IPC.
+        let mut stop = supervisor.watch_stop();
         // A daemon exists to serve this port, so a bind failure is fatal here —
         // unlike the headed app, which can still work over its in-process
         // transport (see `serve_ipc`).
@@ -1201,7 +1258,17 @@ impl Engine {
             }
         };
 
-        let signal = shutdown_signal().await;
+        let signal = tokio::select! {
+            signal = shutdown_signal() => signal,
+            changed = stop.changed() => {
+                changed.map_err(std::io::Error::other)?;
+                // Give the RPC writer a scheduling turn to flush StopEngine's ack
+                // before closing the listener and its active connections.
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                tracing::info!("headless shutdown requested over IPC");
+                Ok(())
+            }
+        };
         tracing::info!("shutting down");
         server.abort();
         boot_task.abort();
@@ -1359,20 +1426,41 @@ fn sanitize_path_id(id: &str) -> String {
 
 /// Stable per-scope device ID, persisted at `{scope_dir}/device-id`.
 fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
-    let path = data_dir.join("device-id");
-    match std::fs::read_to_string(&path) {
-        Ok(id) if !id.trim().is_empty() => Ok(id.trim().to_string()),
-        Ok(_) | Err(_) => {
-            let id = new_id();
-            std::fs::write(&path, &id)?;
-            Ok(id)
-        }
-    }
+    scopes::load_or_create_id(&data_dir.join("device-id"))
 }
 
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_engine_rpc_notifies_the_local_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::new(AuthConfig::new("http://127.0.0.1:1", dir.path()));
+        let supervisor = EngineSupervisor::new(
+            EngineConfig {
+                data_dir: dir.path().to_path_buf(),
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                ipc_port: 0,
+                default_harness: HarnessId::Mock,
+                org_id: None,
+                workos_client_id: None,
+            },
+            auth,
+        );
+        let mut stop = supervisor.watch_stop();
+        let client = jolt_rpc::memory_client(supervisor);
+
+        let response = client
+            .call(jolt_api::methods::STOP_ENGINE, serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(response, serde_json::json!({ "ok": true }));
+        stop.changed().await.unwrap();
+        assert!(*stop.borrow());
+    }
 
     #[tokio::test]
     async fn existing_account_with_local_data_opens_without_merge_prompt() {
@@ -1439,6 +1527,19 @@ mod supervisor_tests {
         );
         let task = supervisor.spawn_when_ready();
         let client = jolt_rpc::memory_client(supervisor.clone());
+        let mut scope_frames = client
+            .subscribe(jolt_api::methods::SCOPE_STATUS, serde_json::json!({}))
+            .await
+            .expect("subscribe while supervisor is booting");
+        let first_scope: ScopeStatus =
+            serde_json::from_value(scope_frames.recv().await.expect("initial scope frame"))
+                .expect("parse scope status");
+        assert_eq!(
+            first_scope.active,
+            ScopeKind::Account,
+            "the placeholder Local status must never escape before Account boot"
+        );
+        assert!(first_scope.transitioning_to.is_none());
         let account_local_device = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.call(jolt_api::methods::LOCAL_DEVICE, serde_json::json!({})),

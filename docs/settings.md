@@ -25,6 +25,8 @@ Enable **Keep this device available** to install and start Jolt's per-user backg
 
 Reachable remote engine devices report their Jolt release status on this page. Managed installations with an available release show an explicit **Update** action; offline devices disable it, and unmanaged installations show **Manual update**. The row tracks waiting, restart, verification, and failure states. Background checks never install a release automatically.
 
+Installed harness versions are also checked per device. Outdated Claude Code, Codex, or Pi installations appear as attached banners on that device row with current and latest versions, inline progress or manual-update guidance, and an **Update** action when Jolt can safely manage the installation. Harness availability does not generate notifications.
+
 ### Accounts
 
 Account switching changes credentials on the selected device, not across the fleet. Jolt supports account-slot management for Claude Code and Codex. Pi provider authentication stays in Pi and is configured with Pi's `/login`.
@@ -57,7 +59,7 @@ Font pickers enumerate installed fonts. The composer family applies only to the 
 
 ### Notifications
 
-Jolt defaults to in-app toasts. Enabling **System notifications** sends app-wide harness updates, Claude/Codex quota warnings, Jolt update notices, and app-wide errors through the OS instead.
+Jolt defaults to in-app toasts. Enabling **System notifications** sends Claude/Codex quota warnings, Jolt update notices, and app-wide errors through the OS instead. Harness updates remain inline on the Devices page.
 
 ## Default hotkeys
 

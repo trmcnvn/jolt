@@ -52,9 +52,9 @@ The gpui desktop app is a viewport over the RPC service. On startup it probes th
 - a responding engine becomes a remote local backend over WebSocket;
 - otherwise the app creates an `EngineSupervisor`, uses the same JSON envelopes over an in-memory channel, and best-effort serves that engine on the localhost port.
 
-The supervisor resolves the preferred scope behind the splash. It always owns a fully offline Local runtime and, while authenticated, a separate Account runtime. Switching the viewport to Local leaves Account runs, synchronization, and relay hosting alive in the background. Only Account is exposed through the device relay.
+The supervisor resolves the preferred scope from local configuration and the saved session behind the splash; authentication construction never probes Edge. It always owns a fully offline Local runtime and, while authenticated, a separate Account runtime. The scope stream withholds its initial frame until that route is ready, and runtime changes carry a generation plus a transition gate so Local content cannot paint briefly before Account. Switching the viewport to Local leaves Account runs, synchronization, and relay hosting alive in the background. Only Account is exposed through the device relay.
 
-On macOS and Linux, the Devices setting can install the same headless engine as a per-user launchd/systemd service. Changing that setting gracefully shuts down the current engine, applies the service configuration, and relaunches the viewport so one process always owns the data directory.
+On macOS and Linux, the Devices setting can install the same headless engine as a per-user launchd/systemd service. A signed-out service starts Local without a network dependency. Changing the setting gracefully shuts down the current engine, waits for IPC and data-directory ownership to release, applies the service configuration, and relaunches the viewport so one process always owns the data directory.
 
 ### iOS viewport
 
@@ -189,7 +189,7 @@ Default root: `~/.jolt`.
 
 Git worktrees default to `~/.jolt/worktrees`; Jujutsu workspaces default to `~/.jolt/workspaces`.
 
-Scope-isolated stores prevent Local data from entering edge synchronization and prevent a later WorkOS identity from reusing another account's cached documents. Existing `orgs/<org>/<user>` stores are moved into this layout on first startup; the existing account device identity is preserved and a fresh Local scope is created.
+Scope-isolated stores prevent Local data from entering edge synchronization and prevent a later WorkOS identity from reusing another account's cached documents. Scope and device identities use create-once atomic publication. Moving Local into Account prepares and rewrites a staged target while leaving the source immutable, then publishes the target and creates a fresh Local scope; a failed merge therefore keeps Local attachment references valid. Existing `orgs/<org>/<user>` stores are moved into this layout on first startup; the existing account device identity is preserved and a fresh Local scope is created.
 
 ## Rust workspace
 

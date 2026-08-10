@@ -11,8 +11,12 @@ use jolt_proto::HarnessId;
 #[test]
 #[ignore]
 fn capture_composer_control_rows() {
-    use gpui::{AppContext as _, HeadlessAppContext, size};
+    use gpui::{
+        AppContext as _, HeadlessAppContext, InputEvent as _, Modifiers, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, point, size,
+    };
     use std::sync::Arc;
+    use std::time::Duration;
 
     for compact in [false, true] {
         let platform = gpui_platform::current_platform(false);
@@ -58,6 +62,55 @@ fn capture_composer_control_rows() {
         let mode = if compact { "compact" } else { "expanded" };
         let path = format!("/tmp/jolt-composer-{mode}.png");
         screenshot.save(&path).expect("save composer screenshot");
+        eprintln!("saved {path}");
+
+        let hover_y = if compact { 24.0 } else { 97.0 };
+        cx.update_window(window, |_, window, cx| {
+            let position = point(px(540.0), px(hover_y));
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position,
+                    modifiers: Modifiers::default(),
+                    pressed_button: None,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseDownEvent {
+                    position,
+                    modifiers: Modifiers::default(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    position,
+                    modifiers: Modifiers::default(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .expect("hover model action");
+        cx.advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .expect("refresh hovered composer window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window)
+            .expect("capture hovered composer framebuffer");
+        let path = format!("/tmp/jolt-composer-{mode}-model-open.png");
+        screenshot
+            .save(&path)
+            .expect("save hovered composer screenshot");
         eprintln!("saved {path}");
     }
 }
@@ -112,6 +165,9 @@ fn assert_composer_controls_are_sequential(cx: &mut TestAppContext, compact: boo
     let model_label = cx
         .debug_bounds("picker-model-label-bounds")
         .expect("model label rendered");
+    let model_icon = cx
+        .debug_bounds("picker-model-icon-bounds")
+        .expect("model icon rendered");
     let traits = cx
         .debug_bounds("picker-traits-bounds")
         .expect("traits control rendered");
@@ -142,6 +198,16 @@ fn assert_composer_controls_are_sequential(cx: &mut TestAppContext, compact: boo
         model_label.size.width > px(0.0),
         "model label collapsed to zero width: {model_label:?}"
     );
+    assert_eq!(
+        model_icon.left() - model.left(),
+        px(Theme::SPACE_SM),
+        "model action left padding must match its right padding"
+    );
+    assert_eq!(
+        model.right() - model_label.right(),
+        px(Theme::SPACE_SM),
+        "model action right padding must match its left padding"
+    );
     assert!(
         traits.size.width > px(0.0),
         "traits control collapsed to zero width: {traits:?}"
@@ -149,6 +215,20 @@ fn assert_composer_controls_are_sequential(cx: &mut TestAppContext, compact: boo
     assert!(
         traits_label.size.width > px(0.0),
         "traits label collapsed to zero width: {traits_label:?}"
+    );
+    assert_eq!(
+        traits_label.left() - traits.left(),
+        px(Theme::SPACE_SM),
+        "traits action left padding must match its right padding"
+    );
+    assert_eq!(
+        traits.right() - traits_label.right(),
+        px(Theme::SPACE_SM),
+        "traits action right padding must match its left padding"
+    );
+    assert_eq!(
+        usage.size, attach.size,
+        "context and attachment actions must use the same button footprint"
     );
     let gaps = [
         ("model→traits", traits.left() - model.right()),
@@ -165,8 +245,8 @@ fn assert_composer_controls_are_sequential(cx: &mut TestAppContext, compact: boo
     }
     assert_eq!(
         traits_label.left() - model_label.right(),
-        px(Theme::SPACE_MD),
-        "visible model→traits spacing should be two inner 4px insets plus the shared 4px gap"
+        px(Theme::SPACE_SM * 2.0 + Theme::SPACE_XS),
+        "visible model→traits spacing should be two inner 8px insets plus the shared 4px gap"
     );
     assert!(
         send.right() <= pill.right(),

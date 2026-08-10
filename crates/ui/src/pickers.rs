@@ -361,7 +361,9 @@ fn usage_progress_ring(
         move |bounds, _, window, _| {
             let center_x = bounds.origin.x + bounds.size.width / 2.0;
             let center_y = bounds.origin.y + bounds.size.height / 2.0;
-            let radius = px(6.0);
+            // 7px path radius + 1px half-stroke = a 16px visual diameter,
+            // matching Attach's 16px paperclip inside the shared 28px button.
+            let radius = px(7.0);
             let stroke = px(2.0);
 
             let mut track = PathBuilder::stroke(stroke);
@@ -1470,12 +1472,11 @@ impl Pickers {
             PickerKind::Usage => "composer-usage",
         };
         let open = self.open == Some(kind);
-        // The adjacent model/traits pair uses a 4px inner edge inset so the
-        // visible content gap matches the rest of the 4px action rhythm. The
-        // model keeps its 10px leading inset around the brand mark.
+        // The adjacent model/traits pair uses symmetric 8px inner insets so
+        // hover/open surfaces balance around their content while the visible
+        // content spacing stays comfortably between the earlier extremes.
         let (pad_left, pad_right) = match kind {
-            PickerKind::HarnessModel => (10.0, Theme::SPACE_XS),
-            PickerKind::Traits => (Theme::SPACE_XS, Theme::SPACE_XS),
+            PickerKind::HarnessModel | PickerKind::Traits => (Theme::SPACE_SM, Theme::SPACE_SM),
             _ => (10.0, 10.0),
         };
         // Ghost pill: 32px high with 12px medium muted text, 16px icons, and
@@ -1515,9 +1516,15 @@ impl Pickers {
             .on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)))
             .when_some(chip_icon, |el, (path, tint)| {
                 el.child(
-                    crate::icons::icon(path)
+                    div()
+                        .debug_selector(move || format!("{id}-icon-bounds"))
                         .size(px(16.0))
-                        .text_color(tint.unwrap_or(theme.text_muted)),
+                        .flex_none()
+                        .child(
+                            crate::icons::icon(path)
+                                .size(px(16.0))
+                                .text_color(tint.unwrap_or(theme.text_muted)),
+                        ),
                 )
             })
             .child(
@@ -1683,7 +1690,9 @@ impl Pickers {
             .id("composer-usage")
             .debug_selector(|| "composer-usage-bounds".into())
             .relative()
-            .size(px(20.0))
+            // Match Attach's footprint; the ring remains visually centered
+            // inside the same 28px action button.
+            .size(px(28.0))
             .flex_none()
             .flex()
             .items_center()

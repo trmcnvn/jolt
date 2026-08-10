@@ -97,7 +97,7 @@ impl Render for NotificationsPage {
                                                     .text_size(px(11.5))
                                                     .text_color(theme.text_muted.opacity(0.7))
                                                     .child(SharedString::from(
-                                                        "Deliver harness updates, Claude and Codex usage warnings, Jolt updates, and app-wide errors through your operating system instead of inside Jolt.",
+                                                        "Deliver Claude and Codex usage warnings, Jolt updates, and app-wide errors through your operating system instead of inside Jolt.",
                                                     )),
                                             ),
                                     )

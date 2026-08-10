@@ -126,11 +126,12 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 
 | Method | Reply | Purpose |
 | --- | --- | --- |
-| `ScopeStatus` | stream | Active scope, account availability, and pending Local merge state |
-| `SwitchScope` | unary | Route the local viewport to Local or Account without stopping either runtime |
+| `ScopeStatus` | stream | Active scope, transition target/generation, account availability, and pending Local merge state |
+| `SwitchScope` | unary | Gate the viewport, then route it to Local or Account without stopping either runtime |
 | `ResolveAccountLink` | unary | Keep non-empty Local data separate or move it into the signed-in account |
+| `StopEngine` | unary | Gracefully stop a separately owned localhost engine |
 
-These methods are local IPC only. DeviceRoom relay traffic is permanently routed to Account.
+These methods are local IPC only. `ScopeStatus` withholds its initial frame until the startup-selected route is ready. DeviceRoom relay traffic is permanently routed to Account, and `StopEngine` is never relay-forwardable.
 
 ### Repositories and files
 

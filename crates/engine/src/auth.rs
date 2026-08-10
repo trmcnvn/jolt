@@ -5,8 +5,8 @@
 //! (`/auth/exchange`, `/auth/refresh` — the WorkOS API key lives only there).
 //!
 //! Two modes:
-//! - **Dev** (no WorkOS client id configured, or the edge reports `auth: "dev"`): always
-//!   signed in; the bearer IS the configured user id (current M2/M3 behavior).
+//! - **Dev** (no WorkOS client id configured): always signed in; the bearer IS the
+//!   explicitly configured user id.
 //! - **WorkOS**: authorization-code flow. Headed devices use a loopback callback server
 //!   on an ephemeral port; headless devices use the paste-code flow (the redirect is the
 //!   edge's hosted `/auth/cli/callback` page, which shows `state.code` to paste back via
@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,8 @@ const PERSONAL_ORG_NAME: &str = "Personal";
 /// Refresh when the cached token has less than this much life left.
 const TOKEN_SLACK: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+const REFRESH_RETRY_MIN: Duration = Duration::from_secs(5);
+const REFRESH_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -205,6 +208,43 @@ impl AccessEntry {
     }
 }
 
+struct RefreshRetry {
+    failures: u32,
+    not_before: Option<Instant>,
+}
+
+impl RefreshRetry {
+    fn clear(&mut self) {
+        self.failures = 0;
+        self.not_before = None;
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        self.not_before
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    fn fail(&mut self, retry_after: Option<Duration>) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let exponent = self.failures.saturating_sub(1).min(6);
+        let exponential = REFRESH_RETRY_MIN
+            .saturating_mul(1_u32 << exponent)
+            .min(REFRESH_RETRY_MAX);
+        let jitter_ms = u64::from_le_bytes(
+            *uuid::Uuid::new_v4()
+                .as_bytes()
+                .first_chunk::<8>()
+                .expect("UUID has eight leading bytes"),
+        ) % 1_000;
+        let delay = retry_after
+            .unwrap_or(exponential.saturating_add(Duration::from_millis(jitter_ms)))
+            .min(REFRESH_RETRY_MAX);
+        self.not_before = Some(Instant::now() + delay);
+        delay
+    }
+}
+
 struct AuthInner {
     config: AuthConfig,
     /// `Some(client_id)` = WorkOS mode; `None` = dev mode.
@@ -213,8 +253,13 @@ struct AuthInner {
     state_tx: watch::Sender<AuthState>,
     stored: Mutex<Option<StoredSession>>,
     access: Mutex<Option<AccessEntry>>,
-    /// Pending sign-in `state` values (CSRF), stamped so abandoned attempts expire.
-    pending: Mutex<HashMap<String, Instant>>,
+    /// Serializes credential publication with sign-out without crossing awaits.
+    mutation_gate: Mutex<()>,
+    /// Invalidates OAuth and refresh responses issued before an auth transition.
+    generation: AtomicU64,
+    /// Pending sign-in `state` values (CSRF), stamped with time and generation.
+    pending: Mutex<HashMap<String, (Instant, u64)>>,
+    refresh_retry: Mutex<RefreshRetry>,
     /// Single-flight refresh: WorkOS refresh tokens are single-use (rotated per
     /// exchange); two concurrent refreshes would race and could revoke the session.
     refresh_gate: tokio::sync::Mutex<()>,
@@ -271,43 +316,18 @@ impl Auth {
                 state_tx,
                 stored: Mutex::new(stored),
                 access: Mutex::new(None),
+                mutation_gate: Mutex::new(()),
+                generation: AtomicU64::new(0),
                 pending: Mutex::new(HashMap::new()),
+                refresh_retry: Mutex::new(RefreshRetry {
+                    failures: 0,
+                    not_before: None,
+                }),
                 refresh_gate: tokio::sync::Mutex::new(()),
                 onboarding_gate: tokio::sync::Mutex::new(()),
                 loopback: tokio::sync::Mutex::new(None),
             }),
         }
-    }
-
-    /// Like [`Auth::new`], but additionally probes `{edge}/health`: an edge running in
-    /// dev auth mode forces dev mode even when a client id is configured (matching the
-    /// edge's "bearer = user id" verification).
-    pub async fn detect(mut config: AuthConfig) -> Self {
-        if config.workos_client_id.is_some() {
-            #[derive(Deserialize)]
-            struct Health {
-                auth: Option<String>,
-            }
-            let url = format!("{}/health", config.edge_url.trim_end_matches('/'));
-            let probe = async {
-                reqwest::Client::new()
-                    .get(&url)
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                    .ok()?
-                    .json::<Health>()
-                    .await
-                    .ok()
-            };
-            if let Some(health) = probe.await
-                && health.auth.as_deref() == Some("dev")
-            {
-                tracing::info!("auth: edge is in dev mode — using dev bearer");
-                config.workos_client_id = None;
-            }
-        }
-        Self::new(config)
     }
 
     pub fn workos_enabled(&self) -> bool {
@@ -398,9 +418,17 @@ impl Auth {
                         _ = wake.recv() => {}
                     }
                 }
-                if let Err(err) = auth.refresh(None).await {
-                    tracing::warn!(error = %err, "auth: background refresh failed");
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                match auth.refresh(None).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        if let Some(delay) = auth.refresh_retry_delay() {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "auth: background refresh failed");
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
                 }
             }
         })
@@ -436,18 +464,30 @@ impl Auth {
         }
         let trimmed = pasted.trim();
         let (state, code) = trimmed.split_once('.').unwrap_or(("", ""));
-        if state.is_empty() || code.is_empty() || !self.take_pending(state) {
+        let Some(generation) = self.take_pending(state) else {
+            return Err(EngineError::Other(
+                "invalid or expired sign-in code — start sign-in again and paste the full code"
+                    .into(),
+            ));
+        };
+        if code.is_empty() {
             return Err(EngineError::Other(
                 "invalid or expired sign-in code — start sign-in again and paste the full code"
                     .into(),
             ));
         }
         let result = self.exchange_code(code).await?;
-        self.finish_sign_in(result);
+        if !self.finish_sign_in(generation, result) {
+            return Err(EngineError::Other("sign-in was canceled".into()));
+        }
         Ok(())
     }
 
     pub fn sign_out(&self) {
+        let _mutation = lock(&self.inner.mutation_gate);
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+        lock(&self.inner.pending).clear();
+        lock(&self.inner.refresh_retry).clear();
         *lock(&self.inner.stored) = None;
         *lock(&self.inner.access) = None;
         self.persist::<&StoredSession>(None);
@@ -541,12 +581,16 @@ impl Auth {
 
     fn begin_sign_in(&self, redirect_uri: &str) -> String {
         let state = uuid::Uuid::new_v4().to_string();
-        {
+        let generation = {
+            let _mutation = lock(&self.inner.mutation_gate);
+            let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            lock(&self.inner.refresh_retry).clear();
             let mut pending = lock(&self.inner.pending);
-            let cutoff = Instant::now();
-            pending.retain(|_, at| cutoff.duration_since(*at) < SIGN_IN_TTL);
-            pending.insert(state.clone(), cutoff);
-        }
+            pending.clear();
+            pending.insert(state.clone(), (Instant::now(), generation));
+            generation
+        };
+        tracing::debug!(generation, "auth: sign-in attempt started");
         let client_id = self.inner.workos.clone().unwrap_or_default();
         format!(
             "{}/user_management/authorize?response_type=code&client_id={}&redirect_uri={}&provider=authkit&state={}",
@@ -557,12 +601,12 @@ impl Auth {
         )
     }
 
-    /// Consume a pending sign-in state; false when unknown/expired (CSRF check).
-    fn take_pending(&self, state: &str) -> bool {
+    /// Consume a pending sign-in state and return its auth generation.
+    fn take_pending(&self, state: &str) -> Option<u64> {
         let mut pending = lock(&self.inner.pending);
         let now = Instant::now();
-        pending.retain(|_, at| now.duration_since(*at) < SIGN_IN_TTL);
-        pending.remove(state).is_some()
+        pending.retain(|_, (at, _)| now.duration_since(*at) < SIGN_IN_TTL);
+        pending.remove(state).map(|(_, generation)| generation)
     }
 
     async fn exchange_code(&self, code: &str) -> Result<SignInResult, EngineError> {
@@ -622,7 +666,12 @@ impl Auth {
         })
     }
 
-    fn finish_sign_in(&self, result: SignInResult) {
+    fn finish_sign_in(&self, generation: u64, result: SignInResult) -> bool {
+        let _mutation = lock(&self.inner.mutation_gate);
+        if self.inner.generation.load(Ordering::SeqCst) != generation {
+            tracing::info!(generation, "auth: discarded canceled sign-in exchange");
+            return false;
+        }
         let org_id = jwt_claims(&result.access_token).and_then(|c| c.org_id);
         *lock(&self.inner.access) = Some(AccessEntry::fresh(result.access_token));
         let session = StoredSession {
@@ -632,16 +681,18 @@ impl Auth {
         };
         self.persist(Some(&session));
         *lock(&self.inner.stored) = Some(session);
+        lock(&self.inner.refresh_retry).clear();
         tracing::info!(email = %result.user.email, org = org_id.as_deref().unwrap_or("<none>"),
             "auth: signed in");
         self.inner
             .state_tx
             .send_replace(state_for(result.user, org_id));
+        true
     }
 
     /// Refresh the session (single-flight). `organization_id` migrates the WorkOS
     /// session to that org; routine refreshes keep the current scope. Returns the new
-    /// access token, `None` when signed out / the refresh could not run.
+    /// access token, `None` when signed out or during transient backoff.
     async fn refresh(&self, organization_id: Option<&str>) -> Result<Option<String>, EngineError> {
         let _gate = self.inner.refresh_gate.lock().await;
         // Re-check under the gate: the refresh we queued behind may have done the work.
@@ -651,12 +702,16 @@ impl Auth {
         {
             return Ok(Some(entry.token.clone()));
         }
+        if organization_id.is_none() && self.refresh_retry_delay().is_some() {
+            return Ok(None);
+        }
         let Some((refresh_token, current_org_id)) = lock(&self.inner.stored)
             .as_ref()
-            .map(|s| (s.refresh_token.clone(), s.org_id.clone()))
+            .map(|session| (session.refresh_token.clone(), session.org_id.clone()))
         else {
             return Ok(None);
         };
+        let generation = self.inner.generation.load(Ordering::SeqCst);
         // WorkOS does not guarantee that an unscoped refresh preserves the
         // session's current organization. Pin routine refreshes explicitly so
         // every fresh bearer still authorizes the already-open workspace.
@@ -672,7 +727,7 @@ impl Auth {
             "{}/auth/refresh",
             self.inner.config.edge_url.trim_end_matches('/')
         );
-        let res = self
+        let response = self
             .inner
             .http
             .post(&url)
@@ -682,28 +737,39 @@ impl Auth {
             })
             .send()
             .await;
-        let res = match res {
-            Ok(res) => res,
+        let response = match response {
+            Ok(response) => response,
             Err(err) => {
-                // Network failure is transient: keep the session, caller retries later.
-                tracing::warn!(error = %err, "auth: refresh could not reach the edge");
+                let delay = self.note_refresh_failure(None);
+                tracing::warn!(error = %err, ?delay, "auth: refresh could not reach the edge");
                 return Ok(None);
             }
         };
-        let status = res.status().as_u16();
-        if (400..500).contains(&status) && organization_id.is_none() {
-            // A definitive 4xx means the refresh token itself is dead (revoked session,
-            // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
-            // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
-            // there means "not a member", not a dead session.)
-            tracing::warn!(
-                status,
-                "auth: refresh rejected — session revoked; signing out"
-            );
-            self.sign_out();
+        let status = response.status().as_u16();
+        let transient = status == 408 || status == 429 || (500..600).contains(&status);
+        if transient {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let delay = self.note_refresh_failure(retry_after);
+            tracing::warn!(status, ?delay, "auth: transient refresh failure");
             return Ok(None);
         }
-        if !res.status().is_success() {
+        if (400..500).contains(&status) && organization_id.is_none() {
+            let _mutation = lock(&self.inner.mutation_gate);
+            if self.refresh_is_current(generation, &refresh_token) {
+                tracing::warn!(
+                    status,
+                    "auth: refresh rejected — session revoked; signing out"
+                );
+                self.clear_session_locked();
+            }
+            return Ok(None);
+        }
+        if !response.status().is_success() {
             return Err(EngineError::Other(format!("refresh failed ({status})")));
         }
         #[derive(Deserialize)]
@@ -712,11 +778,20 @@ impl Auth {
             access_token: String,
             refresh_token: String,
         }
-        let tokens: Tokens = res
-            .json()
-            .await
-            .map_err(|e| EngineError::Other(format!("malformed refresh response: {e}")))?;
-        let org_id = jwt_claims(&tokens.access_token).and_then(|c| c.org_id);
+        let tokens: Tokens = match response.json().await {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                let delay = self.note_refresh_failure(None);
+                tracing::warn!(%error, ?delay, "auth: malformed refresh response");
+                return Ok(None);
+            }
+        };
+        let org_id = jwt_claims(&tokens.access_token).and_then(|claims| claims.org_id);
+        let _mutation = lock(&self.inner.mutation_gate);
+        if !self.refresh_is_current(generation, &refresh_token) {
+            tracing::info!(generation, "auth: discarded stale refresh response");
+            return Ok(None);
+        }
         if let Some(expected_org) = requested_org_id.as_deref()
             && org_id.as_deref() != Some(expected_org)
         {
@@ -725,21 +800,18 @@ impl Auth {
                 actual_org = org_id.as_deref().unwrap_or("<none>"),
                 "auth: refreshed token changed workspace scope"
             );
-            // Refresh tokens rotate. Preserve the returned credential, but
-            // clear the invalid scope and access token so reconnecting rooms
-            // cannot present a bearer for the wrong workspace. The auth gate
-            // asks the user to select a workspace again.
             let user = {
                 let mut stored = lock(&self.inner.stored);
-                let Some(session) = stored.as_mut() else {
-                    return Ok(None);
-                };
+                let session = stored
+                    .as_mut()
+                    .expect("refresh current check requires a stored session");
                 session.refresh_token = tokens.refresh_token;
                 session.org_id = None;
                 session.user.clone()
             };
             *lock(&self.inner.access) = None;
             self.persist(lock(&self.inner.stored).as_ref());
+            lock(&self.inner.refresh_retry).clear();
             self.inner
                 .state_tx
                 .send_replace(AuthState::NeedsOrganization { user });
@@ -752,21 +824,45 @@ impl Auth {
         *lock(&self.inner.access) = Some(entry);
         let (user, org_changed) = {
             let mut stored = lock(&self.inner.stored);
-            match stored.as_mut() {
-                Some(session) => {
-                    let changed = session.org_id != org_id;
-                    session.refresh_token = tokens.refresh_token;
-                    session.org_id = org_id.clone();
-                    (session.user.clone(), changed)
-                }
-                None => return Ok(None), // signed out mid-refresh
-            }
+            let session = stored
+                .as_mut()
+                .expect("refresh current check requires a stored session");
+            let changed = session.org_id != org_id;
+            session.refresh_token = tokens.refresh_token;
+            session.org_id = org_id.clone();
+            (session.user.clone(), changed)
         };
         self.persist(lock(&self.inner.stored).as_ref());
+        lock(&self.inner.refresh_retry).clear();
         if org_changed {
             self.inner.state_tx.send_replace(state_for(user, org_id));
         }
         Ok(Some(tokens.access_token))
+    }
+
+    fn refresh_is_current(&self, generation: u64, refresh_token: &str) -> bool {
+        self.inner.generation.load(Ordering::SeqCst) == generation
+            && lock(&self.inner.stored)
+                .as_ref()
+                .is_some_and(|session| session.refresh_token == refresh_token)
+    }
+
+    fn clear_session_locked(&self) {
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+        lock(&self.inner.pending).clear();
+        lock(&self.inner.refresh_retry).clear();
+        *lock(&self.inner.stored) = None;
+        *lock(&self.inner.access) = None;
+        self.persist::<&StoredSession>(None);
+        self.inner.state_tx.send_replace(AuthState::SignedOut);
+    }
+
+    fn note_refresh_failure(&self, retry_after: Option<Duration>) -> Duration {
+        lock(&self.inner.refresh_retry).fail(retry_after)
+    }
+
+    fn refresh_retry_delay(&self) -> Option<Duration> {
+        lock(&self.inner.refresh_retry).remaining()
     }
 
     fn session_file(&self) -> PathBuf {
@@ -932,14 +1028,20 @@ async fn handle_loopback_conn(
         let code = params.get("code");
         let state = params.get("state");
         match (code, state) {
-            (Some(code), Some(state)) if auth.take_pending(state) => {
-                match auth.exchange_code(code).await {
+            (Some(code), Some(state)) => match auth.take_pending(state) {
+                Some(generation) => match auth.exchange_code(code).await {
                     Ok(result) => {
-                        auth.finish_sign_in(result);
-                        (
-                            "200 OK",
-                            page("Signed in. You can close this tab and return to Jolt."),
-                        )
+                        if auth.finish_sign_in(generation, result) {
+                            (
+                                "200 OK",
+                                page("Signed in. You can close this tab and return to Jolt."),
+                            )
+                        } else {
+                            (
+                                "409 Conflict",
+                                page("Sign-in was canceled. Start again from Jolt."),
+                            )
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "auth: loopback code exchange failed");
@@ -948,8 +1050,12 @@ async fn handle_loopback_conn(
                             page("Sign-in failed during token exchange — check the Jolt logs."),
                         )
                     }
-                }
-            }
+                },
+                None => (
+                    "400 Bad Request",
+                    page("Invalid or expired sign-in link. Start again from Jolt."),
+                ),
+            },
             _ => (
                 "400 Bad Request",
                 page("Invalid or expired sign-in link. Start again from Jolt."),
@@ -1041,26 +1147,44 @@ fn url_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Write a file readable only by the owner (0600). On non-unix targets a plain write.
+/// Atomically write a file readable only by the owner (0600 on Unix).
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        // An existing file keeps its old mode through OpenOptions — enforce 0600 anyway.
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("session path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".session.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
         file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        file.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+        #[cfg(not(unix))]
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        std::fs::rename(&temporary, path)?;
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
 }
 
 #[cfg(test)]

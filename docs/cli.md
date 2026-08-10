@@ -14,7 +14,7 @@ jolt [COMMAND]
 | `jolt headless` | Run the engine and localhost RPC server without a window. |
 | `jolt login` | Complete paste-code sign-in, provision the hidden Personal organization, save the session, and exit. |
 | `jolt logout` | Remove the saved Jolt session. Refuses while an engine owns the data directory. |
-| `jolt status` | Show data directory, edge, auth state, engine PID, and IPC reachability. Exits nonzero when sign-in is required. |
+| `jolt status` | Show data directory, edge, Local/Account auth state, engine PID, and IPC reachability. Signed-out Local mode is healthy. |
 | `jolt sync` | Query the running engine for workspace/chat sync state and liveness counters. |
 | `jolt update` | Check, download, verify, apply, and restart a managed install. |
 | `jolt update --check` | Report whether an update exists. Exits `1` when one is available. |
@@ -29,16 +29,16 @@ The headed app probes `ws://127.0.0.1:27654` by default:
 3. The embedded engine also binds the localhost port when possible, allowing another viewport to attach.
 4. If the port is occupied by a non-Jolt process, the app still embeds an engine; only external viewports lose access.
 
-`jolt headless` always owns the engine and treats an IPC bind failure as fatal.
+`jolt headless` always owns the engine and treats an IPC bind failure as fatal. It serves Local immediately when signed out; a saved account also enables the Account runtime and relay.
 
 One data directory can have only one engine. The process holds `{data_dir}/engine.lock` for its lifetime to prevent concurrent SQLite and journal writers.
 
 ## Authentication
 
-A background service cannot wait on an OAuth prompt. Sign in before starting it:
+A background service starts Local without authentication. To enable Account sync from the CLI, stop it before changing the saved session:
 
 ```bash
-jolt daemon stop     # if already running
+jolt daemon stop
 jolt login
 jolt daemon start
 ```

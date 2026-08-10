@@ -18,13 +18,13 @@ pub use requests::{
     PinDiffDocument, PollAgentLogin, ProbeSync, PutReviewDraft, QueryChats, QueueCommand,
     ReadAttachmentChunk, RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal,
     ResolveAccountLink, SearchFiles, SearchTranscript, SessionWatchFrame, SetTerminalCommand,
-    SetVcsBackend, SignIn, SignOut, StartAgentLogin, StreamRequest, SubscribeTerminal, SwitchRef,
-    SwitchScope, TerminalSettings, TransportCapabilities, UnaryRequest, UploadBinaryChunk,
-    UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes, UsageBreakdownRequest,
-    VcsSettings, WatchAuthStatus, WatchChatUsage, WatchChats, WatchCheckoutDiff, WatchDevices,
-    WatchHarnessUpdates, WatchQueuedPrompts, WatchScopeStatus, WatchSessions, WatchSpaces,
-    WatchThemes, WatchTranscript, WatchUpdateStatus, WriteTerminal, call, call_binary, subscribe,
-    subscribe_binary,
+    SetVcsBackend, SignIn, SignOut, StartAgentLogin, StopEngine, StreamRequest, SubscribeTerminal,
+    SwitchRef, SwitchScope, TerminalSettings, TransportCapabilities, UnaryRequest,
+    UploadBinaryChunk, UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes,
+    UsageBreakdownRequest, VcsSettings, WatchAuthStatus, WatchChatUsage, WatchChats,
+    WatchCheckoutDiff, WatchDevices, WatchHarnessUpdates, WatchQueuedPrompts, WatchScopeStatus,
+    WatchSessions, WatchSpaces, WatchThemes, WatchTranscript, WatchUpdateStatus, WriteTerminal,
+    call, call_binary, subscribe, subscribe_binary,
 };
 
 pub mod methods {
@@ -100,6 +100,8 @@ pub mod methods {
     pub const SCOPE_STATUS: &str = "ScopeStatus";
     pub const SWITCH_SCOPE: &str = "SwitchScope";
     pub const RESOLVE_ACCOUNT_LINK: &str = "ResolveAccountLink";
+    /// Gracefully stop a separately owned local engine (IPC-only).
+    pub const STOP_ENGINE: &str = "StopEngine";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";

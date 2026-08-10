@@ -704,6 +704,14 @@ impl UnaryRequest for SignOut {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StopEngine {}
+
+impl UnaryRequest for StopEngine {
+    type Response = Acknowledged;
+    const METHOD: &'static str = methods::STOP_ENGINE;
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnsurePersonalOrg {}
 
 impl UnaryRequest for EnsurePersonalOrg {

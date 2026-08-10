@@ -10,7 +10,6 @@ The installer places a managed binary under `~/.jolt/app`, adds a desktop launch
 
 ```bash
 curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh
-jolt login
 systemctl --user start jolt
 ```
 
@@ -58,13 +57,7 @@ See [Agent harnesses](harnesses.md) for details.
 
 The desktop opens without an account in a Local scope stored only on that device. Sign in from the user menu to add synchronized spaces, remote device control, and iOS access. If Local already contains threads, Jolt asks before moving them into the account and explains which data remains device-local.
 
-For a headless device, an account is required:
-
-```bash
-jolt login
-```
-
-Open the printed URL, then paste the browser code into the terminal. The session is saved under Jolt's data directory and reused by the daemon.
+A headless engine also starts in Local without an account or network connection. To make its spaces remotely available, stop the daemon, run `jolt login`, open the printed URL and paste the browser code, then restart the daemon. The session is saved under Jolt's data directory and reused by the daemon. A headed viewport can instead sign in without stopping its embedded engine.
 
 Organization setup is automatic: Jolt adopts the sole existing membership or creates a private organization named `Personal`. **Switch to Local** keeps the account runtime running in the background; **Sign out** disconnects it and returns to Local.
 

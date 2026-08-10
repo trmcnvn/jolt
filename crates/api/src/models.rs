@@ -18,6 +18,12 @@ pub struct ScopeStatus {
     pub account_email: Option<String>,
     pub local_has_data: bool,
     pub merge_pending: bool,
+    /// Changes whenever the supervisor installs a new routed runtime.
+    #[serde(default)]
+    pub generation: u64,
+    /// Present while clients must hide and discard the previous scope's state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transitioning_to: Option<ScopeKind>,
 }
 
 impl ScopeStatus {
@@ -28,6 +34,8 @@ impl ScopeStatus {
             account_email: None,
             local_has_data: false,
             merge_pending: false,
+            generation: 0,
+            transitioning_to: None,
         }
     }
 }

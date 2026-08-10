@@ -71,31 +71,23 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `jolt status`: report auth + engine liveness. Exits nonzero when a sign-in
-/// is needed, so scripts (and service health checks) can gate on it.
+/// `jolt status`: report auth + engine liveness. Signed-out Local mode is a
+/// healthy configuration; authentication is required only for Account sync.
 pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
     let auth = Engine::build_auth(&config).await;
     println!("Data dir: {}", config.data_dir.display());
     println!("Edge:     {}", config.edge_url);
-    let signed_in = match (auth.workos_enabled(), auth.state()) {
-        (false, _) => {
-            println!("Auth:     dev mode (bearer = user id)");
-            true
-        }
+    match (auth.workos_enabled(), auth.state()) {
+        (false, _) => println!("Auth:     development bearer configured"),
         (true, AuthState::SignedIn { user, .. }) => {
-            println!("Auth:     signed in as {}", user.email);
-            true
+            println!("Auth:     signed in as {} (Account available)", user.email);
         }
-        (true, AuthState::NeedsOrganization { user }) => {
-            println!(
-                "Auth:     signed in as {} but setup is incomplete — run `jolt login`",
-                user.email
-            );
-            false
-        }
+        (true, AuthState::NeedsOrganization { user }) => println!(
+            "Auth:     signed in as {} but Account setup is incomplete — Local available",
+            user.email
+        ),
         (true, AuthState::SignedOut) => {
-            println!("Auth:     signed out — run `jolt login`");
-            false
+            println!("Auth:     signed out (Local available; run `jolt login` to sync)");
         }
     };
     match InstanceLock::holder(&config.data_dir) {
@@ -113,9 +105,6 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
         },
         config.ipc_port
     );
-    if !signed_in {
-        std::process::exit(1);
-    }
     Ok(())
 }
 

@@ -34,13 +34,13 @@ Version-control executable overrides are documented in [Environment variables](e
 
 ## Harness updates
 
-Each device checks its installed Claude Code, Codex, and Pi versions in the background and publishes device-local update status over RPC. A signed-in desktop also watches the other engine-host devices in its account, including headless machines, and labels their notices with the device name. Offline device watches retry when the device becomes reachable. Jolt notifies once per device and harness release through the configured in-app or system-notification destination. An **Update** action is offered only when Jolt can prove a supported install path; executable overrides and other unmanaged installs receive manual instructions instead.
+Each device checks its installed Claude Code, Codex, and Pi versions in the background and publishes device-local update status over RPC. A signed-in desktop also watches the other engine-host devices in its account, including headless machines. Offline device watches retry when the device becomes reachable. Available harness updates appear as attached banners on the corresponding rows under **Settings → Devices**; they do not generate app or system notifications. An **Update** action is offered only when Jolt can prove a supported install path; executable overrides and other unmanaged installs receive manual instructions instead.
 
-Jolt never applies a harness update from a background check. Installation starts only when the user chooses **Update** in that device's notification; for a remote device the action sends a typed request to that device's engine.
+Jolt never applies a harness update from a background check. Installation starts only when the user chooses **Update** on that device's banner; for a remote device the action sends a typed request to that device's engine.
 
 An accepted update fences new durable commands for only that harness. Persistent processes already parked between turns retire immediately and keep their native resume metadata. Active turns and input requests are never interrupted: the updater waits for them to reach a clean idle boundary, retires the old process, runs the provider-owned updater, verifies `--version`, then releases pending commands against the new executable. Other harnesses and open terminals remain available.
 
-Jolt invokes `claude update` for managed native/npm installs, `codex update`, and `pi update --self`; detected Homebrew installs use `brew upgrade --cask` with a forced cask-API metadata refresh. Update commands are selected by the host engine from the resolved executable; clients never submit arbitrary shell commands. Bounded updater stdout/stderr is recorded in `{data_dir}/logs/jolt-headed.log` or `jolt-headless.log`; failures also include a concise output tail in the notification.
+Jolt invokes `claude update` for managed native/npm installs, `codex update`, and `pi update --self`; detected Homebrew installs use `brew upgrade --cask` with a forced cask-API metadata refresh. Update commands are selected by the host engine from the resolved executable; clients never submit arbitrary shell commands. Bounded updater stdout/stderr is recorded in `{data_dir}/logs/jolt-headed.log` or `jolt-headless.log`; failures also include a concise output tail on the device banner.
 
 ## Claude Code
 

@@ -37,7 +37,7 @@ JOLT_WORKOS_CLIENT_ID= \
 cargo run -p jolt --bin Jolt
 ```
 
-With WorkOS disabled and no edge token, the engine operates as an offline development identity.
+With WorkOS disabled and no edge token, the engine opens the offline Local scope. Development edge mode is explicit: setting `JOLT_EDGE_TOKEN` selects the Account runtime for that bearer without probing `/health`.
 
 ## Executables and working-copy roots
 

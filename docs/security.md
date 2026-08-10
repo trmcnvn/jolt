@@ -4,7 +4,7 @@ Jolt coordinates powerful local coding agents. Its security boundary is the sign
 
 ## Authentication and tenancy
 
-Desktop Jolt runs locally without an account. Production Account scopes use WorkOS AuthKit: the engine is a public client that builds the authorize URL, while the edge Worker holds the WorkOS API key and performs code exchange and refresh. Local scopes never receive an edge token or join registry, session, or device rooms; the public release endpoint remains available for update checks.
+Desktop and headless Jolt run locally without an account. Production Account scopes use WorkOS AuthKit: the engine is a public client that builds the authorize URL, while the edge Worker holds the WorkOS API key and performs code exchange and refresh. Startup chooses Local or a cached Account solely from local configuration and the saved session; it never probes Edge to infer authentication mode. Local scopes never receive an edge token or join registry, session, or device rooms; the public release endpoint remains available for update checks.
 
 Each signed-in user has one hidden Jolt organization:
 
@@ -37,7 +37,7 @@ Use operating-system isolation, containers, or a dedicated user account when a r
 
 ## Jolt login sessions
 
-The saved Jolt refresh session lives at `{data_dir}/session.json` with owner-only permissions. Refresh tokens rotate, so the engine owns session refresh while running. Standalone `login` and `logout` refuse to mutate the same data directory concurrently.
+The saved Jolt refresh session lives at `{data_dir}/session.json` with owner-only permissions. Refresh tokens rotate, so the engine owns session refresh while running. OAuth exchanges and refresh responses are generation-fenced so a response completing after sign-out cannot restore credentials. Transient refresh failures preserve the session and enter bounded exponential backoff. Standalone `login` and `logout` refuse to mutate the same data directory concurrently.
 
 Local and Account stores live under separate `scopes/` directories. Switching to Local does not sign out, but the relay remains hardwired to Account and cannot route into Local. Signing out returns the viewport to Local and preserves the account cache for the same identity's next sign-in.
 

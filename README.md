@@ -11,14 +11,14 @@ working after you close your laptop.
 
 ```bash
 curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh
-jolt login                          # sign in (paste a code, done)
-systemctl --user start jolt
+# Optional before starting: jolt login
+systemctl --user start jolt         # Local works without an account
 ```
 
 No configuration needed. Day-to-day:
 
 ```bash
-jolt status      # signed in? engine running?
+jolt status      # Local/Account auth and engine status
 jolt update      # update to the latest release
 jolt daemon start|stop|restart|status
 ```

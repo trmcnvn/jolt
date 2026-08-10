@@ -23,19 +23,17 @@ use chrono::{DateTime, Utc};
 use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use jolt_api::{
-    ApplyUpdate, ChatWatchFrame, DeleteTheme, GetLocalDevice, GetTranscriptPage, ListThemes,
-    Mutate, ProbeSync, ScopeKind, ScopeStatus, SessionWatchFrame, StreamRequest, UpsertThemes,
-    WatchAuthStatus, WatchChatUsage, WatchChats, WatchDevices, WatchHarnessUpdates,
-    WatchQueuedPrompts, WatchScopeStatus, WatchSessions, WatchSpaces, WatchTranscript,
-    WatchUpdateStatus, call as call_api, subscribe as subscribe_api,
+    ApplyHarnessUpdate, ApplyUpdate, ChatWatchFrame, DeleteTheme, GetLocalDevice,
+    GetTranscriptPage, ListThemes, Mutate, ProbeSync, ScopeKind, ScopeStatus, SessionWatchFrame,
+    StreamRequest, UpsertThemes, WatchAuthStatus, WatchChatUsage, WatchChats, WatchDevices,
+    WatchHarnessUpdates, WatchQueuedPrompts, WatchScopeStatus, WatchSessions, WatchSpaces,
+    WatchTranscript, WatchUpdateStatus, call as call_api, subscribe as subscribe_api,
 };
 #[cfg(test)]
 use jolt_api::{ListHarnesses, SwitchScope};
-#[cfg(test)]
-use jolt_proto::HarnessId;
 use jolt_proto::{
-    AuthState, Chat, ChatIndicator, Device, HarnessUpdateStatus, Session, Space, ThemeFileRecord,
-    UsageSummary,
+    AuthState, Chat, ChatIndicator, Device, HarnessId, HarnessUpdateState, HarnessUpdateStatus,
+    Session, Space, ThemeFileRecord, UsageSummary,
 };
 use jolt_session_doc::{
     QueuedPrompt, SessionMessageEntry, TranscriptDesync, TranscriptManifest, TranscriptPage,
@@ -67,6 +65,8 @@ pub use jolt_proto::view::{
 /// How long a queued send may override the synced session status. An offline
 /// host must not leave the chat looking permanently active.
 pub const PENDING_SEND_TTL_MS: i64 = 30_000;
+
+type HarnessUpdateTarget = (Option<String>, HarnessId);
 
 #[derive(Debug, Clone)]
 struct PendingSend {
@@ -107,6 +107,8 @@ pub struct AppState {
     pub auth: Option<AuthState>,
     /// Active Local/Account data scope.
     pub scope: Option<ScopeStatus>,
+    /// Keeps workspace content gated until the new scope's first spaces frame.
+    scope_loading: bool,
     pub devices: Vec<Device>,
     /// Sorted (see [`sort_spaces`]).
     pub spaces: Vec<Space>,
@@ -152,7 +154,6 @@ pub struct AppState {
     pub harness_updates: Vec<HarnessUpdateStatus>,
     /// Coding-harness states streamed from reachable engine-host devices.
     pub remote_harness_updates: HashMap<String, Vec<HarnessUpdateStatus>>,
-    pub remote_harness_update_device_names: HashMap<String, String>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -165,6 +166,9 @@ pub struct AppState {
     remote_harness_update_tasks: HashMap<String, Task<()>>,
     remote_update_tasks: HashMap<String, Task<()>>,
     remote_update_action_tasks: HashMap<String, Task<()>>,
+    harness_update_pending: HashSet<HarnessUpdateTarget>,
+    harness_update_failures: HashSet<HarnessUpdateTarget>,
+    harness_update_action_tasks: HashMap<HarnessUpdateTarget, Task<()>>,
     transcript_task: Option<Task<()>>,
     queue_task: Option<Task<()>>,
     usage_task: Option<Task<()>>,
@@ -183,6 +187,7 @@ impl AppState {
             connection: ConnectionStatus::Connecting,
             auth: None,
             scope: None,
+            scope_loading: false,
             devices: Vec::new(),
             spaces: Vec::new(),
             chats: Vec::new(),
@@ -205,7 +210,6 @@ impl AppState {
             remote_update_actions: HashMap::new(),
             harness_updates: Vec::new(),
             remote_harness_updates: HashMap::new(),
-            remote_harness_update_device_names: HashMap::new(),
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -213,6 +217,9 @@ impl AppState {
             remote_harness_update_tasks: HashMap::new(),
             remote_update_tasks: HashMap::new(),
             remote_update_action_tasks: HashMap::new(),
+            harness_update_pending: HashSet::new(),
+            harness_update_failures: HashSet::new(),
+            harness_update_action_tasks: HashMap::new(),
             transcript_task: None,
             queue_task: None,
             usage_task: None,
@@ -315,6 +322,10 @@ impl AppState {
         sort_spaces(&mut spaces);
         self.spaces = spaces;
         self.spaces_synced = true;
+        if self.scope_loading {
+            self.scope_loading = false;
+            self.connection = ConnectionStatus::Ready;
+        }
         // Heal a vanished selection (space deleted elsewhere): fall back to the
         // first space; its chats died with it, so a matching chat selection is
         // healed by the accompanying chats frame (`apply_chats`).
@@ -352,26 +363,25 @@ impl AppState {
         else {
             return;
         };
-        let desired: HashMap<String, String> = self
+        let desired: HashSet<String> = self
             .devices
             .iter()
             .filter(|device| device.is_engine_host() && device.id != local_device_id)
-            .map(|device| (device.id.clone(), device.name.clone()))
+            .map(|device| device.id.clone())
             .collect();
         self.remote_harness_update_tasks
-            .retain(|device_id, _| desired.contains_key(device_id));
+            .retain(|device_id, _| desired.contains(device_id));
         self.remote_update_tasks
-            .retain(|device_id, _| desired.contains_key(device_id));
+            .retain(|device_id, _| desired.contains(device_id));
         self.remote_update_action_tasks
-            .retain(|device_id, _| desired.contains_key(device_id));
+            .retain(|device_id, _| desired.contains(device_id));
         self.remote_harness_updates
-            .retain(|device_id, _| desired.contains_key(device_id));
+            .retain(|device_id, _| desired.contains(device_id));
         self.remote_updates
-            .retain(|device_id, _| desired.contains_key(device_id));
+            .retain(|device_id, _| desired.contains(device_id));
         self.remote_update_actions
-            .retain(|device_id, _| desired.contains_key(device_id));
-        self.remote_harness_update_device_names = desired.clone();
-        for device_id in desired.into_keys() {
+            .retain(|device_id, _| desired.contains(device_id));
+        for device_id in desired {
             self.remote_harness_update_tasks
                 .entry(device_id.clone())
                 .or_insert_with(|| {
@@ -455,18 +465,99 @@ impl AppState {
     }
 
     pub fn apply_harness_updates(&mut self, statuses: Vec<HarnessUpdateStatus>) {
+        self.reconcile_harness_update_requests(None, &statuses);
         self.harness_updates = statuses;
+    }
+
+    fn reconcile_harness_update_requests(
+        &mut self,
+        target_device_id: Option<&str>,
+        statuses: &[HarnessUpdateStatus],
+    ) {
+        for status in statuses {
+            let key = (target_device_id.map(str::to_owned), status.harness);
+            if status.state != HarnessUpdateState::UpdateAvailable {
+                self.harness_update_pending.remove(&key);
+            }
+            if matches!(
+                status.state,
+                HarnessUpdateState::Updated | HarnessUpdateState::UpToDate
+            ) {
+                self.harness_update_failures.remove(&key);
+            }
+        }
+    }
+
+    pub fn harness_update_pending(
+        &self,
+        target_device_id: Option<&str>,
+        harness: HarnessId,
+    ) -> bool {
+        self.harness_update_pending
+            .contains(&(target_device_id.map(str::to_owned), harness))
+    }
+
+    pub fn harness_update_failed(
+        &self,
+        target_device_id: Option<&str>,
+        harness: HarnessId,
+    ) -> bool {
+        self.harness_update_failures
+            .contains(&(target_device_id.map(str::to_owned), harness))
+    }
+
+    pub fn begin_harness_update(
+        &mut self,
+        harness: HarnessId,
+        target_device_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (target_device_id.clone(), harness);
+        if !self.harness_update_pending.insert(key.clone()) {
+            return;
+        }
+        self.harness_update_failures.remove(&key);
+        let Some(handle) = self.engine.clone() else {
+            self.harness_update_pending.remove(&key);
+            return;
+        };
+        let request = ApplyHarnessUpdate {
+            harness,
+            target_device_id,
+        };
+        let task_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = call_api(handle.client(), &request).await;
+            this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    tracing::warn!(
+                        ?harness,
+                        target_device_id = ?request.target_device_id,
+                        %error,
+                        "harness update request failed"
+                    );
+                    state.harness_update_pending.remove(&key);
+                    state.harness_update_failures.insert(key);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.harness_update_action_tasks.insert(task_key, task);
+        cx.notify();
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
         if !matches!(&auth, AuthState::SignedIn { .. }) {
             self.remote_harness_updates.clear();
-            self.remote_harness_update_device_names.clear();
             self.remote_harness_update_tasks.clear();
             self.remote_updates.clear();
             self.remote_update_actions.clear();
             self.remote_update_tasks.clear();
             self.remote_update_action_tasks.clear();
+            self.harness_update_pending.clear();
+            self.harness_update_failures.clear();
+            self.harness_update_action_tasks.clear();
         }
         self.auth = Some(auth);
     }
@@ -996,7 +1087,8 @@ impl AppState {
         self.theme_sync_task = Some(spawn_theme_file_sync(cx, handle, data_dir));
     }
 
-    fn restart_scope_watches(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+    fn clear_scope_state(&mut self) {
+        self.watch_tasks.clear();
         self.devices.clear();
         self.spaces.clear();
         self.chats.clear();
@@ -1011,6 +1103,10 @@ impl AppState {
         self.usage_task = None;
         self.local_device_id = None;
         self.spaces_synced = false;
+    }
+
+    fn restart_scope_watches(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        self.clear_scope_state();
         self.watch_tasks = vec![
             spawn_sessions_watch(cx, handle.clone()),
             spawn_chats_watch(cx, handle.clone()),
@@ -1343,11 +1439,24 @@ fn spawn_scope_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
             received_status = true;
             if this
                 .update(cx, |state, cx| {
-                    let changed = state.scope.as_ref().map(|old| old.active) != Some(status.active);
+                    let had_scope = state.scope.is_some();
+                    let changed = state.scope.as_ref().is_none_or(|old| {
+                        old.active != status.active || old.generation != status.generation
+                    });
+                    let transitioning = status.transitioning_to.is_some();
                     state.scope = Some(status);
-                    state.connection = ConnectionStatus::Ready;
-                    if changed {
+                    if transitioning {
+                        state.scope_loading = true;
+                        state.connection = ConnectionStatus::Connecting;
+                        state.clear_scope_state();
+                    } else if changed {
                         state.restart_scope_watches(handle.clone(), cx);
+                        if had_scope {
+                            state.scope_loading = true;
+                            state.connection = ConnectionStatus::Connecting;
+                        } else {
+                            state.connection = ConnectionStatus::Ready;
+                        }
                     }
                     cx.notify();
                 })
@@ -1518,6 +1627,7 @@ fn spawn_remote_harness_update_watch(
                 };
                 if this
                     .update(cx, |state, cx| {
+                        state.reconcile_harness_update_requests(Some(&device_id), &statuses);
                         state
                             .remote_harness_updates
                             .insert(device_id.clone(), statuses);
@@ -2228,6 +2338,22 @@ mod tests {
         state.selected_chat = Some("b".into());
         state.apply_chats(vec![chat("b", 1, None), chat("c", 2, None)]);
         assert_eq!(state.selected_chat.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn harness_update_ui_state_is_scoped_by_device_and_harness() {
+        let mut state = AppState::new();
+        state
+            .harness_update_pending
+            .insert((Some("device-2".into()), HarnessId::Codex));
+        state
+            .harness_update_failures
+            .insert((Some("device-2".into()), HarnessId::Pi));
+
+        assert!(state.harness_update_pending(Some("device-2"), HarnessId::Codex));
+        assert!(!state.harness_update_pending(None, HarnessId::Codex));
+        assert!(state.harness_update_failed(Some("device-2"), HarnessId::Pi));
+        assert!(!state.harness_update_failed(None, HarnessId::Pi));
     }
 
     #[test]

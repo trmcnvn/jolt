@@ -24,13 +24,10 @@ use gpui::{
 
 use gpui_tokio::Tokio;
 use jolt_api::{
-    ApplyHarnessUpdate, ChatSection, EnsurePersonalOrg, ListAgentAccounts, Mutate, QueryChats,
-    RegenerateChatTitle, ScopeKind, SignIn, SignOut, UsageBreakdownRequest, call as call_api,
+    ChatSection, EnsurePersonalOrg, ListAgentAccounts, Mutate, QueryChats, RegenerateChatTitle,
+    ScopeKind, SignIn, SignOut, UsageBreakdownRequest, call as call_api,
 };
-use jolt_proto::{
-    CostProvenance, HarnessId, HarnessUpdateState, HarnessUpdateStatus, UsageBreakdown,
-    UsageBreakdownRow, UsageDay,
-};
+use jolt_proto::{CostProvenance, HarnessId, UsageBreakdown, UsageBreakdownRow, UsageDay};
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
@@ -849,8 +846,6 @@ struct JumpToBottom {
     transcript: Entity<Transcript>,
 }
 
-type HarnessUpdateKey = (Option<String>, HarnessId);
-
 pub struct Shell {
     state: Entity<AppState>,
     background_service: crate::background_service::BackgroundServiceController,
@@ -941,11 +936,6 @@ pub struct Shell {
     update_check_task: Option<Task<()>>,
     /// Latest release already announced during this process.
     notified_update_version: Option<String>,
-    /// Harness/version notices already delivered during this process.
-    notified_harness_updates: std::collections::HashSet<String>,
-    /// Updates explicitly accepted by the user and awaiting a terminal state.
-    requested_harness_updates: std::collections::HashSet<HarnessUpdateKey>,
-    harness_update_tasks: std::collections::HashMap<HarnessUpdateKey, Task<()>>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: jolt_update::InstallKind,
@@ -1246,9 +1236,6 @@ impl Shell {
             update_checking: false,
             update_check_task: None,
             notified_update_version: None,
-            notified_harness_updates: std::collections::HashSet::new(),
-            requested_harness_updates: std::collections::HashSet::new(),
-            harness_update_tasks: std::collections::HashMap::new(),
             install: jolt_update::detect_install(),
             org: None,
             mutate_task: None,
@@ -1376,7 +1363,6 @@ impl Shell {
             }
         }
         self.notify_jolt_update(state, cx);
-        self.notify_harness_updates(state, cx);
         // Boot: restore the last selected space once the first spaces frame
         // lands (a still-existing row wins over the auto-selected first one;
         // the boot-auto-selected chat's own space wins over both — selecting a
@@ -2289,6 +2275,24 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let selected = row.selected;
+        let selected_wash = crate::theme::glass_selected_bg();
+        let rest_bg = if selected {
+            selected_wash
+        } else {
+            crate::theme::wash(0.0)
+        };
+        let hover_bg = if selected {
+            selected_wash
+        } else {
+            crate::theme::wash(0.11)
+        };
+        let text = theme.text;
+        let rest_text = if selected {
+            text
+        } else {
+            theme.text_muted.opacity(0.7)
+        };
         let open_id = row.id.clone();
         let restore_id = row.id;
         let group: SharedString = format!("archived-chat-group-{restore_id}").into();
@@ -2304,8 +2308,12 @@ impl Shell {
             .gap(px(Theme::SPACE_SM))
             .rounded(px(8.0))
             .cursor_pointer()
-            .text_color(theme.text_muted.opacity(0.7))
-            .hover(|style| style.bg(crate::theme::wash(0.11)).text_color(theme.text))
+            .text_color(rest_text)
+            .bg(rest_bg)
+            .when(selected, |element| {
+                element.shadow(crate::theme::glass_selected_shadows())
+            })
+            .hover(move |style| style.bg(hover_bg).text_color(text))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_chat(open_id.clone(), cx);
             }))
