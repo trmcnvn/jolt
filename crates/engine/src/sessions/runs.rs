@@ -103,7 +103,7 @@ impl SessionsEngine {
                 h.steer_tx.clone(),
                 h.compaction_follow_up.clone(),
                 h.pending_external_turns.clone(),
-                h.turn_diff_baselines.clone(),
+                h.turn_diff_tracker.clone(),
             )
         });
         if let Some((
@@ -113,7 +113,7 @@ impl SessionsEngine {
             steer_tx,
             compaction_follow_up,
             pending_external_turns,
-            turn_diff_baselines,
+            turn_diff_tracker,
         )) = routed
         {
             if write_user_entry {
@@ -137,7 +137,7 @@ impl SessionsEngine {
             };
             if steerable && same_harness {
                 pending_external_turns.fetch_add(1, Ordering::AcqRel);
-                lock(&turn_diff_baselines).push_back(turn_diff_baseline);
+                lock(&turn_diff_tracker).queue(turn_diff_baseline);
             }
             if steerable && same_harness && steer_tx.try_send(message).is_ok() {
                 if write_user_entry {
@@ -156,7 +156,7 @@ impl SessionsEngine {
             }
             if steerable && same_harness {
                 pending_external_turns.fetch_sub(1, Ordering::AcqRel);
-                lock(&turn_diff_baselines).pop_back();
+                lock(&turn_diff_tracker).rollback_last_queue();
             }
             // A harness switch is a settled-boundary operation. Interrupt and
             // wait for the current segment/diff to finalize before summarizing.
@@ -268,11 +268,12 @@ impl SessionsEngine {
         };
         let compaction_follow_up = Arc::new(CompactionFollowUp::default());
         let pending_external_turns = Arc::new(AtomicUsize::new(0));
-        let turn_diff_baselines = Arc::new(Mutex::new(VecDeque::new()));
         let idle = Arc::new(AtomicBool::new(false));
         let retire = CancellationToken::new();
         let initial_turn_diff_baseline =
             self.capture_turn_diff_baseline(chat_id, &request.cwd).await;
+        let turn_diff_tracker =
+            Arc::new(Mutex::new(TurnDiffTracker::new(initial_turn_diff_baseline)));
 
         // Native harness questions and Jolt's MCP answer tool share one pending-input
         // registry, event stream, durable response command, and composer UI.
@@ -307,7 +308,7 @@ impl SessionsEngine {
                 pending_inputs,
                 compaction_follow_up: compaction_follow_up.clone(),
                 pending_external_turns: pending_external_turns.clone(),
-                turn_diff_baselines: turn_diff_baselines.clone(),
+                turn_diff_tracker: turn_diff_tracker.clone(),
                 idle: idle.clone(),
                 retire: retire.clone(),
             },
@@ -341,10 +342,9 @@ impl SessionsEngine {
             cancel_rx,
             compaction_follow_up,
             pending_external_turns,
-            turn_diff_baselines,
+            turn_diff_tracker,
             idle,
             retire,
-            initial_turn_diff_baseline,
             RunResumeState {
                 user_message_id: user_id,
                 resume_injected,
@@ -439,10 +439,10 @@ impl SessionsEngine {
                     h.steer_tx.clone(),
                     h.compaction_follow_up.clone(),
                     h.pending_external_turns.clone(),
-                    h.turn_diff_baselines.clone(),
+                    h.turn_diff_tracker.clone(),
                 )
             });
-        let Some((steer_tx, compaction_follow_up, pending_external_turns, turn_diff_baselines)) =
+        let Some((steer_tx, compaction_follow_up, pending_external_turns, turn_diff_tracker)) =
             target
         else {
             return Ok(SteerOutcome::NotSteerable);
@@ -473,10 +473,10 @@ impl SessionsEngine {
             None => None,
         };
         pending_external_turns.fetch_add(1, Ordering::AcqRel);
-        lock(&turn_diff_baselines).push_back(turn_diff_baseline);
+        lock(&turn_diff_tracker).queue(turn_diff_baseline);
         if steer_tx.try_send(message).is_err() {
             pending_external_turns.fetch_sub(1, Ordering::AcqRel);
-            lock(&turn_diff_baselines).pop_back();
+            lock(&turn_diff_tracker).rollback_last_queue();
             return Ok(SteerOutcome::NotSteerable);
         }
         // Accepted: the steer prompt becomes a user entry immediately (client-minted id).

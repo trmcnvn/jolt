@@ -1776,7 +1776,13 @@ impl Transcript {
             .and_then(|fold| fold.open)
             .unwrap_or(false);
         let count = diff.files.len();
-        let title = format!("{count} changed file{}", if count == 1 { "" } else { "s" });
+        let partial = (diff.attribution == jolt_proto::TurnDiffAttribution::Partial)
+            .then_some(" · partial")
+            .unwrap_or_default();
+        let title = format!(
+            "{count} changed file{}{partial}",
+            if count == 1 { "" } else { "s" }
+        );
         let toggle_id = row_id.clone();
         let open_diff = diff.clone();
 

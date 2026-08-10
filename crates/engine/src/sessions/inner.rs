@@ -542,12 +542,15 @@ pub(super) async fn capture_turn_diff_baseline(
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum TurnMutationScope {
     None,
-    Paths(Vec<String>),
+    ExactPaths(Vec<String>),
+    PartialPaths(Vec<String>),
+    Unknown,
 }
 
 pub(super) fn successful_file_mutations(parts: &[MessagePart]) -> TurnMutationScope {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
+    let mut may_have_unreported_mutations = false;
     for part in parts {
         let MessagePart::Tool {
             call,
@@ -566,18 +569,29 @@ pub(super) fn successful_file_mutations(parts: &[MessagePart]) -> TurnMutationSc
                 path: Some(path), ..
             } => std::slice::from_ref(path),
             ToolCall::ApplyPatch { path: None, paths } => paths,
+            ToolCall::Exec { .. }
+            | ToolCall::Mcp { .. }
+            | ToolCall::Unknown { .. }
+            | ToolCall::SpawnAgent { .. } => {
+                may_have_unreported_mutations = true;
+                continue;
+            }
             _ => continue,
         };
+        if mutation_paths.is_empty() {
+            may_have_unreported_mutations = true;
+        }
         for path in mutation_paths {
             if !path.trim().is_empty() && seen.insert(path.as_str()) {
                 paths.push(path.clone());
             }
         }
     }
-    if paths.is_empty() {
-        TurnMutationScope::None
-    } else {
-        TurnMutationScope::Paths(paths)
+    match (paths.is_empty(), may_have_unreported_mutations) {
+        (true, false) => TurnMutationScope::None,
+        (true, true) => TurnMutationScope::Unknown,
+        (false, false) => TurnMutationScope::ExactPaths(paths),
+        (false, true) => TurnMutationScope::PartialPaths(paths),
     }
 }
 
@@ -596,8 +610,10 @@ pub(super) async fn append_turn_diff(
     // delta to paths this turn explicitly mutated so edits from other sessions
     // are not attributed here. A pathless mutation report cannot safely claim
     // any checkout-wide change and therefore produces no diff card by itself.
-    let TurnMutationScope::Paths(paths) = successful_file_mutations(folded) else {
-        return;
+    let (paths, attribution) = match successful_file_mutations(folded) {
+        TurnMutationScope::ExactPaths(paths) => (paths, jolt_proto::TurnDiffAttribution::Exact),
+        TurnMutationScope::PartialPaths(paths) => (paths, jolt_proto::TurnDiffAttribution::Partial),
+        TurnMutationScope::None | TurnMutationScope::Unknown => return,
     };
     match store
         .finalize(
@@ -606,6 +622,7 @@ pub(super) async fn append_turn_diff(
             Path::new(cwd),
             baseline,
             &paths,
+            attribution,
         )
         .await
     {
@@ -645,10 +662,9 @@ pub(super) async fn drive_run(
     mut cancel_rx: watch::Receiver<bool>,
     compaction_follow_up: Arc<CompactionFollowUp>,
     pending_external_turns: Arc<AtomicUsize>,
-    turn_diff_baselines: Arc<Mutex<VecDeque<Option<crate::TurnDiffBaseline>>>>,
+    turn_diff_tracker: Arc<Mutex<TurnDiffTracker>>,
     idle: Arc<AtomicBool>,
     retire: CancellationToken,
-    initial_turn_diff_baseline: Option<crate::TurnDiffBaseline>,
     resume_state: RunResumeState,
 ) {
     let device_id = inner.device_id.clone();
@@ -713,7 +729,6 @@ pub(super) async fn drive_run(
     let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
     let mut entry_id = new_id();
-    let mut active_turn_diff_baseline = initial_turn_diff_baseline;
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
     let mut dirty = false;
@@ -856,9 +871,7 @@ pub(super) async fn drive_run(
                     pending.checked_sub(1)
                 })
                 .ok();
-            if active_turn_diff_baseline.is_none() {
-                active_turn_diff_baseline = lock(&turn_diff_baselines).pop_front().flatten();
-            }
+            lock(&turn_diff_tracker).activate_queued_if_needed();
             inner.set_status(&chat_id, SessionStatus::Working, true);
         }
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
@@ -931,12 +944,13 @@ pub(super) async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
+            let turn_diff_baseline = lock(&turn_diff_tracker).active();
             append_turn_diff(
                 &inner,
                 &chat_id,
                 &entry_id,
                 &run_cwd,
-                active_turn_diff_baseline.as_ref(),
+                turn_diff_baseline.as_ref(),
                 &mut folded,
             )
             .await;
@@ -960,9 +974,8 @@ pub(super) async fn drive_run(
             // A queued baseline was captured before the steer entered the
             // harness. Recapture at the observed boundary so late work from
             // the previous segment cannot leak into this one.
-            lock(&turn_diff_baselines).pop_front();
-            active_turn_diff_baseline =
-                capture_turn_diff_baseline(&inner, &chat_id, &run_cwd).await;
+            let boundary_baseline = capture_turn_diff_baseline(&inner, &chat_id, &run_cwd).await;
+            lock(&turn_diff_tracker).observe_boundary(boundary_baseline);
             continue;
         }
 
@@ -1064,12 +1077,13 @@ pub(super) async fn drive_run(
                 DoneStatus::Interrupted => MessageStatus::Aborted,
                 DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
             };
+            let turn_diff_baseline = lock(&turn_diff_tracker).active();
             append_turn_diff(
                 &inner,
                 &chat_id,
                 &entry_id,
                 &run_cwd,
-                active_turn_diff_baseline.as_ref(),
+                turn_diff_baseline.as_ref(),
                 &mut folded,
             )
             .await;
@@ -1181,10 +1195,10 @@ pub(super) async fn drive_run(
                 dirty = false;
                 entry_id = new_id();
                 segment_started = now_ms();
-                active_turn_diff_baseline = lock(&turn_diff_baselines).pop_front().flatten();
-                if internal_follow_up_queued && active_turn_diff_baseline.is_none() {
-                    active_turn_diff_baseline =
-                        capture_turn_diff_baseline(&inner, &chat_id, &run_cwd).await;
+                lock(&turn_diff_tracker).advance_after_done();
+                if internal_follow_up_queued && lock(&turn_diff_tracker).active().is_none() {
+                    let baseline = capture_turn_diff_baseline(&inner, &chat_id, &run_cwd).await;
+                    lock(&turn_diff_tracker).install_if_missing(baseline);
                 }
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;

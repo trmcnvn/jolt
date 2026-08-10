@@ -60,7 +60,7 @@ fn insert_test_run(sessions: &SessionsEngine, chat_id: &str, idle: bool) -> Canc
             pending_inputs: Arc::new(Mutex::new(HashMap::new())),
             compaction_follow_up: Arc::new(CompactionFollowUp::default()),
             pending_external_turns: Arc::new(AtomicUsize::new(0)),
-            turn_diff_baselines: Arc::new(Mutex::new(VecDeque::new())),
+            turn_diff_tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
             idle: Arc::new(AtomicBool::new(idle)),
             retire: retire.clone(),
         },
@@ -124,7 +124,7 @@ fn turn_mutation_scope_contains_only_successful_explicit_paths() {
 
     assert_eq!(
         successful_file_mutations(&parts),
-        TurnMutationScope::Paths(vec!["src/session.rs".into()])
+        TurnMutationScope::ExactPaths(vec!["src/session.rs".into()])
     );
 }
 
@@ -138,7 +138,7 @@ fn multi_file_patch_preserves_every_reported_path() {
             },
             false,
         )]),
-        TurnMutationScope::Paths(vec!["src/one.rs".into(), "src/two.rs".into()])
+        TurnMutationScope::ExactPaths(vec!["src/one.rs".into(), "src/two.rs".into()])
     );
 }
 
@@ -152,8 +152,51 @@ fn pathless_patch_does_not_claim_checkout_changes() {
             },
             false,
         )]),
-        TurnMutationScope::None
+        TurnMutationScope::Unknown
     );
+}
+
+#[test]
+fn path_reporting_and_opaque_tools_produce_a_partial_scope() {
+    assert_eq!(
+        successful_file_mutations(&[
+            tool_part(
+                ToolCall::WriteFile {
+                    path: "src/known.rs".into(),
+                    content: None,
+                },
+                false,
+            ),
+            tool_part(
+                ToolCall::Exec {
+                    command: "generator".into(),
+                },
+                false,
+            ),
+        ]),
+        TurnMutationScope::PartialPaths(vec!["src/known.rs".into()])
+    );
+}
+
+#[test]
+fn turn_diff_tracker_names_boundary_and_rollback_transitions() {
+    let baseline = |name| Some(crate::TurnDiffBaseline::for_tracker_test(name));
+    let mut tracker = TurnDiffTracker::new(baseline("initial"));
+    assert!(tracker.active().is_some());
+
+    tracker.queue(baseline("rejected"));
+    tracker.rollback_last_queue();
+    tracker.advance_after_done();
+    assert!(tracker.active().is_none());
+
+    tracker.queue(baseline("queued-too-early"));
+    tracker.observe_boundary(baseline("observed-boundary"));
+    assert!(tracker.active().is_some());
+    tracker.advance_after_done();
+    assert!(tracker.active().is_none());
+
+    tracker.install_if_missing(baseline("internal-follow-up"));
+    assert!(tracker.active().is_some());
 }
 
 fn active_goal(workspace: &crate::workspace_host::WorkspaceHost) -> jolt_proto::Goal {

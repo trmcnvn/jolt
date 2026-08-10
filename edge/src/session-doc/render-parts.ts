@@ -53,6 +53,8 @@ export interface TurnDiffFileSummary {
  * Patch pages remain on the host and are intentionally absent here. */
 export interface TurnDiffSummary {
   readonly catalogRevision: string;
+  /** Omitted means exact for manifests written before attribution metadata. */
+  readonly attribution?: "exact" | "partial";
   readonly files: ReadonlyArray<TurnDiffFileSummary>;
   readonly additions: number;
   readonly deletions: number;

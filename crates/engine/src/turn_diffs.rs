@@ -7,13 +7,29 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use jolt_proto::{CheckoutDiffPage, TurnDiffManifest};
+use jolt_proto::{CheckoutDiffPage, TurnDiffAttribution, TurnDiffManifest};
 use sha2::{Digest, Sha256};
 
 use crate::EngineError;
 use crate::diff_projection::DiffProjection;
 use crate::diff_sync::{TurnDiffBaseline, capture_scoped_turn_diff, capture_turn_diff_baseline};
 use jolt_vcs::Repos;
+
+const TURN_DIFF_STORE_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredManifest {
+    version: u32,
+    manifest: TurnDiffManifest,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum StoredOrLegacyManifest {
+    Stored(StoredManifest),
+    Legacy(TurnDiffManifest),
+}
 
 #[derive(Clone)]
 pub struct TurnDiffStore {
@@ -44,6 +60,7 @@ impl TurnDiffStore {
         cwd: &Path,
         baseline: &TurnDiffBaseline,
         paths: &[String],
+        attribution: TurnDiffAttribution,
     ) -> Result<Option<TurnDiffManifest>, EngineError> {
         let snapshot = capture_scoped_turn_diff(&self.repos, cwd, baseline, paths).await?;
         if snapshot.files.is_empty() {
@@ -65,6 +82,7 @@ impl TurnDiffStore {
             device_id: self.device_id.clone(),
             cwd: cwd.to_string_lossy().into_owned(),
             vcs: checkout.vcs,
+            attribution,
             files: checkout.files.clone(),
             pages: checkout.pages.clone(),
             additions: checkout.additions,
@@ -90,9 +108,20 @@ impl TurnDiffStore {
             .entry_dir(chat_id, assistant_message_id)
             .join("manifest.json");
         let manifest: TurnDiffManifest = match tokio::fs::read(&manifest_path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            Ok(bytes) => match serde_json::from_slice(&bytes).map_err(|error| {
                 EngineError::Other(format!("turn diff manifest decode: {error}"))
-            })?,
+            })? {
+                StoredOrLegacyManifest::Stored(stored) => {
+                    if stored.version != TURN_DIFF_STORE_VERSION {
+                        return Err(EngineError::Other(format!(
+                            "unsupported turn diff store version {}",
+                            stored.version
+                        )));
+                    }
+                    stored.manifest
+                }
+                StoredOrLegacyManifest::Legacy(manifest) => manifest,
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
@@ -112,7 +141,10 @@ impl TurnDiffStore {
                 let page: CheckoutDiffPage = serde_json::from_slice(&bytes).map_err(|error| {
                     EngineError::Other(format!("turn diff page decode: {error}"))
                 })?;
-                if page.id != page_id || page.catalog_revision != catalog_revision {
+                if page.id != page_id
+                    || page.catalog_revision != catalog_revision
+                    || content_digest(page.patch.as_bytes()) != page_id
+                {
                     return Err(EngineError::Other(
                         "stored turn diff page does not match its manifest".into(),
                     ));
@@ -135,13 +167,30 @@ impl TurnDiffStore {
         for page in pages {
             let bytes = serde_json::to_vec(page)
                 .map_err(|error| EngineError::Other(format!("turn diff page encode: {error}")))?;
-            atomic_write(&pages_dir.join(format!("{}.json", page.id)), &bytes).await?;
+            crate::atomic_file::write_immutable(
+                &pages_dir.join(format!("{}.json", page.id)),
+                &bytes,
+            )
+            .await?;
         }
-        let bytes = serde_json::to_vec(manifest)
-            .map_err(|error| EngineError::Other(format!("turn diff manifest encode: {error}")))?;
+        let bytes = serde_json::to_vec(&StoredManifest {
+            version: TURN_DIFF_STORE_VERSION,
+            manifest: manifest.clone(),
+        })
+        .map_err(|error| EngineError::Other(format!("turn diff manifest encode: {error}")))?;
         // The manifest is the commit marker: readers cannot observe it until
         // every referenced immutable page has landed.
-        atomic_write(&entry.join("manifest.json"), &bytes).await
+        crate::atomic_file::write_immutable(&entry.join("manifest.json"), &bytes).await
+    }
+
+    /// Remove every locally retained turn diff for a deleted chat.
+    pub async fn remove_chat(&self, chat_id: &str) -> Result<(), EngineError> {
+        let path = self.root.join(digest(&[chat_id.as_bytes()]));
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn entry_dir(&self, chat_id: &str, assistant_message_id: &str) -> PathBuf {
@@ -151,20 +200,6 @@ impl TurnDiffStore {
     }
 }
 
-async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| EngineError::Other("turn diff path has no parent".into()))?;
-    tokio::fs::create_dir_all(parent).await?;
-    let temporary = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    tokio::fs::write(&temporary, bytes).await?;
-    if let Err(error) = tokio::fs::rename(&temporary, path).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error.into());
-    }
-    Ok(())
-}
-
 fn digest(parts: &[&[u8]]) -> String {
     let mut hash = Sha256::new();
     for part in parts {
@@ -172,6 +207,10 @@ fn digest(parts: &[&[u8]]) -> String {
         hash.update([0]);
     }
     jolt_vcs::hex(&hash.finalize())
+}
+
+fn content_digest(bytes: &[u8]) -> String {
+    jolt_vcs::hex(&Sha256::digest(bytes))
 }
 
 fn is_digest(value: &str) -> bool {
@@ -217,7 +256,14 @@ mod tests {
         let baseline = store.capture_baseline(&repo).await.unwrap();
         std::fs::write(repo.join("file.txt"), "after\n").unwrap();
         let manifest = store
-            .finalize("chat", "assistant", &repo, &baseline, &[])
+            .finalize(
+                "chat",
+                "assistant",
+                &repo,
+                &baseline,
+                &[],
+                TurnDiffAttribution::Exact,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -231,5 +277,76 @@ mod tests {
             .unwrap();
         assert!(page.patch.contains("-before"));
         assert!(page.patch.contains("+after"));
+
+        // Manifests written before the versioned storage envelope remain
+        // readable after an upgrade.
+        let legacy_path = reopened
+            .entry_dir("chat", "assistant")
+            .join("manifest.json");
+        std::fs::write(&legacy_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(
+            reopened
+                .page("chat", "assistant", &manifest.catalog_revision, &page_id,)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        reopened.remove_chat("chat").await.unwrap();
+        assert!(
+            reopened
+                .page("chat", "assistant", &manifest.catalog_revision, &page_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupted_content_addressed_page_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "jolt@example.invalid"]);
+        git(&repo, &["config", "user.name", "Jolt Test"]);
+        std::fs::write(repo.join("file.txt"), "before\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "initial"]);
+
+        let repos =
+            Repos::with_worktrees_root(temp.path(), "device", temp.path().join("worktrees"));
+        let root = temp.path().join("turn-diffs");
+        let store = TurnDiffStore::new(root, repos, "device".into());
+        let baseline = store.capture_baseline(&repo).await.unwrap();
+        std::fs::write(repo.join("file.txt"), "after\n").unwrap();
+        let manifest = store
+            .finalize(
+                "chat",
+                "assistant",
+                &repo,
+                &baseline,
+                &[],
+                TurnDiffAttribution::Exact,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let page_id = manifest.pages[0].id.clone();
+        let page_path = store
+            .entry_dir("chat", "assistant")
+            .join("pages")
+            .join(format!("{page_id}.json"));
+        let mut page: CheckoutDiffPage =
+            serde_json::from_slice(&std::fs::read(&page_path).unwrap()).unwrap();
+        page.patch.push_str("tampered");
+        std::fs::write(page_path, serde_json::to_vec(&page).unwrap()).unwrap();
+
+        assert!(
+            store
+                .page("chat", "assistant", &manifest.catalog_revision, &page_id,)
+                .await
+                .is_err()
+        );
     }
 }

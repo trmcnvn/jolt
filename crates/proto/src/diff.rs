@@ -79,6 +79,24 @@ pub struct CheckoutDiffPage {
     pub patch: String,
 }
 
+/// How completely the host could attribute filesystem mutations to this turn.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnDiffAttribution {
+    /// Every included path came from a successful path-reporting file tool.
+    #[default]
+    Exact,
+    /// The turn also ran tools that may mutate files without reporting paths;
+    /// the manifest contains the safely attributable subset.
+    Partial,
+}
+
+impl TurnDiffAttribution {
+    pub fn is_exact(value: &Self) -> bool {
+        *value == Self::Exact
+    }
+}
+
 /// Immutable filesystem changes attributed to one assistant transcript entry.
 ///
 /// The manifest is small enough to travel with transcript metadata. Patch
@@ -94,6 +112,8 @@ pub struct TurnDiffManifest {
     pub cwd: String,
     #[serde(default)]
     pub vcs: VcsKind,
+    #[serde(default, skip_serializing_if = "TurnDiffAttribution::is_exact")]
+    pub attribution: TurnDiffAttribution,
     pub files: Vec<DiffFileDescriptor>,
     pub pages: Vec<DiffPageDescriptor>,
     pub additions: u32,

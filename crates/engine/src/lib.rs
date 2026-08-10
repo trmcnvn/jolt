@@ -15,6 +15,7 @@ pub use jolt_proto::HarnessId;
 use jolt_store::DocsStore;
 
 pub mod agent_accounts;
+mod atomic_file;
 pub mod auth;
 pub mod diff_projection;
 pub mod diff_sync;
@@ -278,11 +279,12 @@ impl EngineCore {
         let repos = Repos::new(data_dir, &device_id);
         let sessions =
             SessionsEngine::new(device_id.clone(), journal, registry.clone(), usage.clone());
-        sessions.set_turn_diffs(TurnDiffStore::new(
+        let turn_diffs = TurnDiffStore::new(
             identity_dir.join("turn-diffs"),
             repos.clone(),
             device_id.clone(),
-        ));
+        );
+        sessions.set_turn_diffs(turn_diffs.clone());
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -333,7 +335,8 @@ impl EngineCore {
         );
         let review_store = ReviewStore::open(&identity_dir.join("review-drafts.sqlite"))
             .map_err(|error| EngineError::Other(format!("review store: {error}")))?;
-        let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        let spaces_sync =
+            SpacesSync::start(repos.clone(), workspace.clone(), &device_id, turn_diffs);
         Ok(Self {
             sessions,
             doc_host,

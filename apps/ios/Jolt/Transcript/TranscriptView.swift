@@ -578,7 +578,8 @@ struct TurnChangesView: View {
 
     private var title: String {
         let count = diff.files.count
-        return "\(count) changed file\(count == 1 ? "" : "s")"
+        let partial = diff.attribution == "partial" ? " · partial" : ""
+        return "\(count) changed file\(count == 1 ? "" : "s")\(partial)"
     }
 
     var body: some View {

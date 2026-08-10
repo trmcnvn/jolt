@@ -211,6 +211,8 @@ struct TurnDiffFileSummary: Codable, Hashable, Identifiable {
 
 struct TurnDiffSummary: Codable, Hashable {
     var catalogRevision: String
+    /// Nil is the backwards-compatible exact value.
+    var attribution: String?
     var files: [TurnDiffFileSummary]
     var additions: Int
     var deletions: Int

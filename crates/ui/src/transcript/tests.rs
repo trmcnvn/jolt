@@ -235,6 +235,7 @@ fn turn_diff() -> TurnDiffManifest {
         device_id: "dev".into(),
         cwd: "/repo".into(),
         vcs: jolt_proto::VcsKind::Git,
+        attribution: jolt_proto::TurnDiffAttribution::Exact,
         files: vec![jolt_proto::DiffFileDescriptor {
             id: "file".into(),
             path: "src/lib.rs".into(),
