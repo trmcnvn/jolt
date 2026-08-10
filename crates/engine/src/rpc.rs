@@ -62,15 +62,15 @@ use tokio::sync::watch;
 
 use jolt_api::{
     ActivateAgentAccount, ApplyHarnessUpdate, CancelAgentLogin, CancelQueuedPrompt, ChatPage,
-    ChatSection, ChatWatchFrame, CloseTerminal, CompleteAgentLogin, CreateWorktree,
-    DeleteHarnessSecret, DeleteReviewDraft, DeleteTheme, ExtractQuestions, ForgetAgentAccount,
-    GetCheckoutDiffPage, GetCheckoutReview, GetCheckoutVcsStatus, GetReviewDraft,
-    GetTranscriptPage, GetTransportCapabilities, GetTurnDiffPage, ListAgentAccounts, ListCommands,
-    ListFolders, ListHarnessSecrets, ListModels, ListRefs, Mutate, OpenTerminal, PinDiffDocument,
-    PollAgentLogin, PutReviewDraft, QueryChats, QueueCommand, ReadAttachmentChunk,
-    RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal, RunVcsAction, SearchFiles,
-    SearchTranscript, SessionWatchFrame, SetTerminalCommand, SetVcsBackend, StartAgentLogin,
-    SubscribeTerminal, SwitchRef, UploadBinaryChunk, UploadChunk, UploadCommit,
+    ChatSection, ChatWatchFrame, CloseTerminal, CompleteAgentLogin, CreateRecoveryFork,
+    CreateWorktree, DeleteHarnessSecret, DeleteReviewDraft, DeleteTheme, ExtractQuestions,
+    ForgetAgentAccount, GetCheckoutDiffPage, GetCheckoutReview, GetCheckoutVcsStatus,
+    GetReviewDraft, GetTranscriptPage, GetTransportCapabilities, GetTurnDiffPage,
+    ListAgentAccounts, ListCommands, ListFolders, ListHarnessSecrets, ListModels, ListRefs, Mutate,
+    OpenTerminal, PinDiffDocument, PollAgentLogin, PutReviewDraft, QueryChats, QueueCommand,
+    ReadAttachmentChunk, RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal, RunVcsAction,
+    SearchFiles, SearchTranscript, SessionWatchFrame, SetTerminalCommand, SetVcsBackend,
+    StartAgentLogin, SubscribeTerminal, SwitchRef, UploadBinaryChunk, UploadChunk, UploadCommit,
     UpsertHarnessSecret, UpsertThemes, UsageBreakdownRequest, WatchChatUsage, WatchCheckoutDiff,
     WatchQueuedPrompts, WatchTranscript, WriteTerminal, methods,
 };
@@ -1422,6 +1422,60 @@ impl RpcService for EngineRpc {
                     .map_err(|error| RpcError::Failed(format!("usage store: {error}")))?;
                 RpcReply::value(&breakdown)
             }
+            methods::CREATE_RECOVERY_FORK => {
+                let p: CreateRecoveryFork = parse_params(params)?;
+                let source = self
+                    .workspace
+                    .chat(&p.source_chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .ok_or_else(|| RpcError::BadParams("source chat does not exist".into()))?;
+                if self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .is_some()
+                {
+                    return Err(RpcError::BadParams(
+                        "recovery fork requires a fresh chat id".into(),
+                    ));
+                }
+                let space = self
+                    .workspace
+                    .space(&p.space_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .ok_or_else(|| RpcError::BadParams("target space does not exist".into()))?;
+                if space.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::BadParams(
+                        "target space is not owned by this recovery host".into(),
+                    ));
+                }
+                self.doc_host
+                    .import_recovery_fork(&p.source_chat_id, &p.chat_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if let Err(error) =
+                    self.workspace
+                        .create_chat(&p.chat_id, &p.space_id, source.config, None)
+                {
+                    self.doc_host.purge_chat(&p.chat_id);
+                    return Err(RpcError::Failed(error.to_string()));
+                }
+                let title = source
+                    .title
+                    .as_deref()
+                    .filter(|title| !title.trim().is_empty())
+                    .map_or_else(
+                        || "Recovered chat".to_string(),
+                        |title| format!("{title} (Recovery fork)"),
+                    );
+                if let Err(error) = self.workspace.rename_chat(&p.chat_id, &title) {
+                    tracing::warn!(chat = %p.chat_id, %error, "recovery fork title write failed");
+                }
+                if let Err(error) = self.doc_host.open(&p.chat_id) {
+                    tracing::warn!(chat = %p.chat_id, %error, "recovery fork SessionHub seed open failed");
+                }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::EXTRACT_QUESTIONS => {
                 let p: ExtractQuestions = parse_params(params)?;
                 let status = self.sessions.session_status(&p.chat_id);
@@ -1526,7 +1580,21 @@ impl RpcService for EngineRpc {
                         "rejected": s.rejected,
                     })
                 }
+                fn hub_json(s: &jolt_sync::SessionHubStats) -> serde_json::Value {
+                    serde_json::json!({
+                        "protocol": "sessionHub",
+                        "connected": s.connected,
+                        "lease": s.lease,
+                        "projectionSequence": s.projection_sequence,
+                        "commandRevision": s.command_revision,
+                        "reconnects": s.reconnects,
+                    })
+                }
                 let workspace = self.workspace.sync_status();
+                let hosted = self
+                    .doc_host
+                    .hosted_hub_publication_status()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let chats: Vec<serde_json::Value> = self
                     .doc_host
                     .sync_statuses()
@@ -1534,7 +1602,7 @@ impl RpcService for EngineRpc {
                     .map(|(chat_id, room)| {
                         serde_json::json!({
                             "chatId": chat_id,
-                            "room": room.as_ref().map(room_json),
+                            "room": room.as_ref().map(hub_json),
                         })
                     })
                     .collect();
@@ -1542,6 +1610,12 @@ impl RpcService for EngineRpc {
                     "deviceId": self.doc_host.device_id(),
                     "nowMs": crate::now_ms(),
                     "workspace": workspace.as_ref().map(room_json),
+                    "hostedSessions": hosted.map(|hosted| serde_json::json!({
+                        "total": hosted.total,
+                        "normalized": hosted.normalized,
+                        "unseeded": hosted.unseeded,
+                        "unpublished": hosted.unpublished,
+                    })),
                     "chats": chats,
                 }))
             }
@@ -2280,8 +2354,12 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::LIST_COMMANDS));
         assert!(forwardable(methods::SEARCH_TRANSCRIPT));
+        assert!(forwardable(methods::CREATE_RECOVERY_FORK));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::GET_CHECKOUT_REVIEW));
+        assert!(forwardable(methods::GET_CHECKOUT_VCS_STATUS));
+        assert!(forwardable(methods::RUN_VCS_ACTION));
+        assert!(is_stream_method(methods::RUN_VCS_ACTION));
         assert!(forwardable(methods::REGENERATE_CHAT_TITLE));
         assert!(forwardable(methods::GET_TURN_DIFF_PAGE));
         assert!(forwardable(methods::PIN_DIFF_DOCUMENT));

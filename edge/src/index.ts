@@ -11,14 +11,19 @@
  *   GET  /auth/orgs                   — caller's active org memberships
  *   POST /auth/orgs                   — create org + admin membership
  *   GET  /auth/cli/callback           — headless sign-in paste-code page
- *   GET  /session/:chatId/ws          — loro-protocol room (wss upgrade)
- *   GET  /tail/:chatId                — L2 instant-open tail JSON (§5)
+ *   GET  /hub/:chatId/ws              — fenced host/viewer SessionHub socket
+ *   POST /hub/:chatId/command         — typed idempotent command
+ *   GET  /hub/:chatId/commands        — revision-paged command reconciliation
+ *   GET  /hub/:chatId/bootstrap       — bounded transcript projection
+ *   PUT  /hub/:chatId/pages/:sha256   — immutable transcript page
+ *   GET  /session/:chatId/ws          — legacy rollback room during cutover
+ *   GET  /tail/:chatId                — legacy rollback tail during cutover
  *   GET  /diff/:chatId                — latest paged working-tree manifest
  *   GET  /diff/:chatId/page?id=       — one immutable patch page
  *   GET  /diff/:chatId/ws             — manifest update stream
  *   POST /diff/:chatId                — host publishes manifest + missing pages
- *   GET  /snapshot/:chatId            — repair: read current doc snapshot
- *   POST /append/:chatId              — repair: merge-import a Loro update
+ *   GET  /snapshot/:chatId            — legacy repair snapshot during cutover
+ *   POST /append/:chatId              — legacy repair import during cutover
  *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
  *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
  *   GET  /registry/:orgId/rows        — registry full-table repair read
@@ -35,16 +40,18 @@ import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
 import { AUTH_USER_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
+import { SessionHub } from "./session-hub";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
 import { parseDiffSidecar, type CheckoutDiffPage, type StoredDiffSidecar } from "./session-doc";
 import installSh from "./install.sh";
 
-export { SessionRoom, DeviceRoom, RegistryRoom };
+export { SessionRoom, SessionHub, DeviceRoom, RegistryRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024; // mirrors today's upload cap
+const MAX_TRANSCRIPT_PAGE_BYTES = 4 * 1024 * 1024;
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
@@ -156,7 +163,112 @@ export default {
     const auth = await authenticate(env, request);
     if (!auth) return json({ error: "unauthenticated" }, 401);
 
-    // ── session rooms ───────────────────────────────────────────────────────
+    // ── SessionHub: typed commands + host-published transcript projection ──
+    if (parts[0] === "hub" && parts[1] && ID_RE.test(parts[1])) {
+      const chatId = parts[1];
+      const room = `hub1/${chatId}`;
+      if (parts[2] === "ws") {
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
+        }
+        const role = url.searchParams.get("role") === "host" ? "host" : "viewer";
+        const device = url.searchParams.get("device") ?? "";
+        const search = `?chatId=${encodeURIComponent(chatId)}&role=${role}${
+          ID_RE.test(device) ? `&device=${encodeURIComponent(device)}` : ""
+        }`;
+        return forward(env.SESSION_HUBS, room, request, auth.userId, "/ws", search);
+      }
+      if (parts[2] === "bootstrap" && request.method === "GET") {
+        return forward(
+          env.SESSION_HUBS,
+          room,
+          request,
+          auth.userId,
+          "/bootstrap",
+          `?chatId=${encodeURIComponent(chatId)}`
+        );
+      }
+      if (parts[2] === "commands" && parts[3] === undefined && request.method === "GET") {
+        const after = url.searchParams.get("after") ?? "0";
+        if (!/^\d+$/.test(after)) return json({ error: "invalid_command_cursor" }, 400);
+        return forward(
+          env.SESSION_HUBS,
+          room,
+          request,
+          auth.userId,
+          "/commands",
+          `?chatId=${encodeURIComponent(chatId)}&after=${encodeURIComponent(after)}`
+        );
+      }
+      if (parts[2] === "command" && parts[3] === undefined && request.method === "POST") {
+        return forward(
+          env.SESSION_HUBS,
+          room,
+          request,
+          auth.userId,
+          "/command",
+          `?chatId=${encodeURIComponent(chatId)}`
+        );
+      }
+      if (parts[2] === "command" && parts[3] === "cancel" && request.method === "POST") {
+        return forward(
+          env.SESSION_HUBS,
+          room,
+          request,
+          auth.userId,
+          "/command/cancel",
+          `?chatId=${encodeURIComponent(chatId)}`
+        );
+      }
+      if (parts[2] === "stats" && request.method === "GET") {
+        return forward(env.SESSION_HUBS, room, request, auth.userId, "/stats", "");
+      }
+      if (parts[2] === "retire" && request.method === "POST") {
+        return forward(env.SESSION_HUBS, room, request, auth.userId, "/retire", "");
+      }
+      if (
+        parts[2] === "pages" &&
+        parts[3] &&
+        SHA256_RE.test(parts[3]) &&
+        parts.length === 4
+      ) {
+        const hash = parts[3];
+        const key = `transcript/${auth.userId}/${chatId}/${hash}`;
+        if (request.method === "PUT") {
+          const bytes = await request.arrayBuffer();
+          if (bytes.byteLength > MAX_TRANSCRIPT_PAGE_BYTES) {
+            return json({ error: "too_large" }, 413);
+          }
+          const digest = await crypto.subtle.digest("SHA-256", bytes);
+          const actual = [...new Uint8Array(digest)]
+            .map((byte) => byte.toString(16).padStart(2, "0"))
+            .join("");
+          if (actual !== hash) return json({ error: "hash_mismatch" }, 400);
+          if (await env.BLOBS.head(key) === null) {
+            await env.BLOBS.put(key, bytes, {
+              httpMetadata: {
+                contentType: request.headers.get("content-type") ?? "application/json"
+              }
+            });
+          }
+          return json({ ok: true, hash, bytes: bytes.byteLength });
+        }
+        if (request.method === "GET" || request.method === "HEAD") {
+          const object = await env.BLOBS.get(key);
+          if (!object) return json({ error: "not_found" }, 404);
+          return new Response(request.method === "HEAD" ? null : object.body, {
+            headers: {
+              "content-type": object.httpMetadata?.contentType ?? "application/json",
+              "content-length": String(object.size),
+              "cache-control": "private, max-age=31536000, immutable",
+              etag: object.httpEtag
+            }
+          });
+        }
+      }
+    }
+
+    // ── legacy Loro session rooms ───────────────────────────────────────────
     if (parts[0] === "session" && parts[1] && ID_RE.test(parts[1]) && parts[2] === "ws") {
       if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
         return json({ error: "expected websocket" }, 426);
@@ -179,21 +291,67 @@ export default {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/tail", "");
     }
     if (parts[0] === "transcript" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      const path = parts[2] === "page"
-        ? "/transcript/page"
-        : parts[2] === "ws"
-          ? "/transcript/ws"
-          : "/transcript";
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, path);
+      const chatId = parts[1];
+      const room = `hub1/${chatId}`;
+      if (parts[2] === "ws") {
+        return forward(
+          env.SESSION_HUBS,
+          room,
+          request,
+          auth.userId,
+          "/ws",
+          `?chatId=${encodeURIComponent(chatId)}&role=viewer`
+        );
+      }
+      if (parts[2] === "page") {
+        const pageId = url.searchParams.get("id");
+        if (!pageId || !ID_RE.test(pageId)) return json({ error: "invalid_page_id" }, 400);
+        const bootstrapResponse = await forward(
+          env.SESSION_HUBS,
+          room,
+          request,
+          auth.userId,
+          "/bootstrap",
+          `?chatId=${encodeURIComponent(chatId)}`
+        );
+        if (!bootstrapResponse.ok) return bootstrapResponse;
+        const bootstrap = await bootstrapResponse.json<{
+          manifest?: { pages?: Array<{ id?: unknown; contentHash?: unknown }> };
+        }>();
+        const descriptor = bootstrap.manifest?.pages?.find((page) => page.id === pageId);
+        if (!descriptor || typeof descriptor.contentHash !== "string" || !SHA256_RE.test(descriptor.contentHash)) {
+          return json({ error: "page_not_found" }, 404);
+        }
+        const object = await env.BLOBS.get(
+          `transcript/${auth.userId}/${chatId}/${descriptor.contentHash}`
+        );
+        return object
+          ? new Response(object.body, {
+              headers: {
+                "content-type": object.httpMetadata?.contentType ?? "application/json",
+                "cache-control": "private, max-age=31536000, immutable",
+                etag: object.httpEtag
+              }
+            })
+          : json({ error: "page_not_found" }, 404);
+      }
+      return forward(
+        env.SESSION_HUBS,
+        room,
+        request,
+        auth.userId,
+        "/bootstrap",
+        `?chatId=${encodeURIComponent(chatId)}`
+      );
     }
     if (parts[0] === "command" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
       return forward(
-        env.SESSION_ROOMS,
-        `s2/${parts[1]}`,
+        env.SESSION_HUBS,
+        `hub1/${parts[1]}`,
         request,
         auth.userId,
         "/command",
-        `?chatId=${parts[1]}`
+        `?chatId=${encodeURIComponent(parts[1])}`
       );
     }
     if (parts[0] === "stats" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
@@ -205,12 +363,12 @@ export default {
         const pageId = url.searchParams.get("id") ?? "";
         if (!SHA256_RE.test(pageId)) return json({ error: "invalid_page_id" }, 400);
         const manifestResponse = await forward(
-          env.SESSION_ROOMS,
-          `s2/${chatId}`,
+          env.SESSION_HUBS,
+          `hub1/${chatId}`,
           request,
           auth.userId,
           "/diff",
-          ""
+          `?chatId=${encodeURIComponent(chatId)}`
         );
         if (!manifestResponse.ok) return manifestResponse;
         const stored = await manifestResponse.json<StoredDiffSidecar>();
@@ -224,7 +382,11 @@ export default {
       }
       if (request.method === "POST" && parts[2] === undefined) {
         const sidecar = parseDiffSidecar(await request.clone().json());
-        if (!sidecar || sidecar.chatId !== chatId || !ID_RE.test(sidecar.manifest.checkoutId)) {
+        if (!sidecar
+          || sidecar.chatId !== chatId
+          || !ID_RE.test(sidecar.deviceId)
+          || sidecar.deviceId !== sidecar.manifest.deviceId
+          || !ID_RE.test(sidecar.manifest.checkoutId)) {
           return json({ error: "invalid_diff_sidecar" }, 400);
         }
         const prefix = `diff-pages/${auth.userId}/${sidecar.manifest.checkoutId}`;
@@ -257,10 +419,24 @@ export default {
           headers: request.headers,
           body: JSON.stringify(stored)
         });
-        return forward(env.SESSION_ROOMS, `s2/${chatId}`, forwarded, auth.userId, "/diff", "");
+        return forward(
+          env.SESSION_HUBS,
+          `hub1/${chatId}`,
+          forwarded,
+          auth.userId,
+          "/diff",
+          `?chatId=${encodeURIComponent(chatId)}`
+        );
       }
       const path = parts[2] === "ws" ? "/diff/ws" : "/diff";
-      return forward(env.SESSION_ROOMS, `s2/${chatId}`, request, auth.userId, path);
+      return forward(
+        env.SESSION_HUBS,
+        `hub1/${chatId}`,
+        request,
+        auth.userId,
+        path,
+        `?chatId=${encodeURIComponent(chatId)}`
+      );
     }
     if (parts[0] === "snapshot" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/snapshot", "");

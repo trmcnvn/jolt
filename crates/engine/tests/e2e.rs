@@ -881,7 +881,7 @@ fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
 
 /// Queue a command into the chat doc the way a REMOTE viewer device would: an immutable
 /// pending entry appended under the viewer's device id (ledger rule 1).
-fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
+fn queue_as_viewer(doc: &jolt_store::StoredSession, id: &str, payload: SessionCommandPayload) {
     let now = chrono::Utc::now().timestamp_millis();
     let based_on = doc.read_entries().expect("read entries").last().map(|m| {
         jolt_session_doc::CommandBasedOn {
@@ -2199,7 +2199,8 @@ async fn processed_commands_are_skipped_on_redelivery() {
         },
     );
 
-    // Give the drain a moment: the command must be SKIPPED — no user entry, no run.
+    // Give the drain a moment: the command must not execute and its stranded
+    // mailbox row must become terminal with an explicit unknown outcome.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         entries(&core).is_empty(),
@@ -2207,8 +2208,11 @@ async fn processed_commands_are_skipped_on_redelivery() {
     );
     assert_eq!(
         command_status(&core, "cmd-crashed"),
-        Some((SessionCommandStatus::Pending, None)),
-        "skip leaves the entry pending without an outcome"
+        Some((
+            SessionCommandStatus::Rejected,
+            Some("execution was claimed before host restart; outcome is unknown".into())
+        )),
+        "crash reconciliation must not leave the command pending"
     );
     assert!(core.sessions.session_status(CHAT).is_none());
 

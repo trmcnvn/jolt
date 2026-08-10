@@ -67,7 +67,7 @@ The phone uses three paths:
 2. **Transcript projection:** an edge WebSocket opens with a compact whole-session manifest and trailing pages; older byte-bounded pages load over authenticated HTTP as scrolling reaches them.
 3. **Device relay:** binary device-room frames carrying RPC when folder browsing, file-mention search, model/ref discovery, worktree creation, or host file upload requires a live engine.
 
-Run, steer, interrupt, and input-answer operations are written to a device-local durable outbox, submitted idempotently to the edge, and appended there to the canonical Loro command ledger. The phone then posts a device nudge so a cold host opens the document. If either network or host is offline, the command remains queued.
+Run, steer, interrupt, and input-answer operations are written to a device-local durable outbox and submitted idempotently to SessionHub's typed command mailbox. The phone then posts a device nudge so a cold host opens canonical SQLite state. If either network or host is offline, the command remains queued.
 
 Workspace registry, transcript manifests/pages, and pending commands are cached on disk for instant reopen and offline history. Transcript page files use a byte-budgeted LRU. Signing out clears identity-scoped caches. WorkOS tokens remain in Keychain.
 

@@ -73,6 +73,7 @@ pub(super) fn forwardable(method: &str) -> bool {
             | methods::WATCH_TRANSCRIPT_V2
             | methods::GET_TRANSCRIPT_PAGE
             | methods::SEARCH_TRANSCRIPT
+            | methods::CREATE_RECOVERY_FORK
             | methods::EXTRACT_QUESTIONS
             | methods::WATCH_CHAT_USAGE
             | methods::USAGE_BREAKDOWN

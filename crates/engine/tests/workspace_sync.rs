@@ -643,3 +643,290 @@ async fn two_engines_converge_through_a_real_registry_room() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a live edge: set JOLT_EDGE_WS (e.g. ws://127.0.0.1:27640)"]
+async fn remote_command_executes_and_publishes_through_session_hub() {
+    use jolt_engine::doc_host::EdgeConfig;
+
+    let ws_base = std::env::var("JOLT_EDGE_WS").expect("set JOLT_EDGE_WS");
+    let http_base = ws_base
+        .replacen("ws://", "http://", 1)
+        .replacen("wss://", "https://", 1);
+    let org = format!("org-{}", uuid::Uuid::new_v4().simple());
+    let user = "alice";
+    let token = format!("{user}@{org}");
+    let chat = format!("hub-{}", uuid::Uuid::new_v4().simple());
+    let dir = tempfile::tempdir().unwrap();
+    let scope = dir.path().join("scopes/accounts").join(&org).join(user);
+    std::fs::create_dir_all(&scope).unwrap();
+    std::fs::write(scope.join("device-id"), "hub-host").unwrap();
+    let imported_command_id = format!("imported-{}", uuid::Uuid::new_v4().simple());
+    let imported_at = chrono::Utc::now().timestamp_millis();
+    let store = Arc::new(jolt_store::DocsStore::open(&scope).unwrap());
+    store
+        .import_session_state(
+            &chat,
+            &[],
+            &[SessionCommandEntry {
+                id: imported_command_id.clone(),
+                payload: SessionCommandPayload::Interrupt {},
+                issued_by: "viewer-device".into(),
+                issued_at: imported_at,
+                based_on: None,
+                expires_at: Some(imported_at + 60_000),
+                status: SessionCommandStatus::Pending,
+                resolution: None,
+            }],
+        )
+        .unwrap();
+    drop(store);
+    let core = EngineCore::assemble_with_identity(
+        dir.path(),
+        registry(),
+        HarnessId::Mock,
+        Some(EdgeConfig::with_static_token(
+            http_base.clone(),
+            token.clone(),
+        )),
+        &org,
+        user,
+    )
+    .unwrap();
+    core.workspace
+        .create_space("hub-space", "hub-host", "/tmp", None, false)
+        .unwrap();
+    core.workspace
+        .create_chat(&chat, "hub-space", None, None)
+        .unwrap();
+    let handle = core.doc_host.open(&chat).unwrap();
+    handle
+        .write_user_message(
+            "initial-race-message",
+            "written while SessionHub connects",
+            imported_at,
+        )
+        .unwrap();
+    wait_for(|| handle.connected(), "SessionHub host connection").await;
+    wait_for(
+        || {
+            handle
+                .doc()
+                .read_command(&imported_command_id)
+                .unwrap_or_default()
+                .is_some_and(|command| command.status != SessionCommandStatus::Pending)
+        },
+        "imported remote command reconciliation",
+    )
+    .await;
+
+    let message_id = format!("message-{}", uuid::Uuid::new_v4().simple());
+    let command_id = format!("command-{}", uuid::Uuid::new_v4().simple());
+    let now = chrono::Utc::now().timestamp_millis();
+    let command = serde_json::json!({
+        "id": command_id,
+        "kind": "run",
+        "payload": {
+            "kind": "run",
+            "request": run_request("from remote"),
+            "messageId": message_id
+        },
+        "issuedBy": "viewer-device",
+        "issuedAt": now,
+        "expiresAt": now + 60_000
+    });
+    reqwest::Client::new()
+        .post(format!("{http_base}/hub/{chat}/command"))
+        .bearer_auth(&token)
+        .json(&command)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    wait_for(
+        || {
+            let entries = handle.doc().read_entries().unwrap_or_default();
+            entries.iter().any(|entry| entry.id == message_id)
+                && entries
+                    .iter()
+                    .any(|entry| entry.role == jolt_session_doc::MessageRole::Assistant)
+        },
+        "remote command transcript",
+    )
+    .await;
+    wait_for(
+        || {
+            handle
+                .doc()
+                .read_commands()
+                .unwrap_or_default()
+                .iter()
+                .any(|command| {
+                    command.id == command_id && command.status == SessionCommandStatus::Applied
+                })
+        },
+        "terminal remote command",
+    )
+    .await;
+
+    let local_command_id = core
+        .doc_host
+        .queue_command(&chat, SessionCommandPayload::Interrupt {})
+        .unwrap();
+    wait_for(
+        || {
+            handle
+                .doc()
+                .read_command(&local_command_id)
+                .unwrap_or_default()
+                .is_some_and(|command| command.status != SessionCommandStatus::Pending)
+        },
+        "terminal local command",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let page: serde_json::Value = reqwest::Client::new()
+                .get(format!("{http_base}/hub/{chat}/commands?after=0"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if page["commands"].as_array().is_some_and(|commands| {
+                commands.iter().any(|command| {
+                    command["id"] == local_command_id && command["deliveryState"] == "terminal"
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("local command SessionHub reconciliation");
+
+    let bootstrap: serde_json::Value = reqwest::Client::new()
+        .get(format!("{http_base}/hub/{chat}/bootstrap"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(bootstrap["manifest"]["totalMessages"].as_u64().unwrap_or(0) >= 2);
+
+    for index in 0..=jolt_session_doc::TRANSCRIPT_PAGE_MESSAGE_COUNT {
+        handle
+            .write_user_message(
+                &format!("sealed-{index}"),
+                "page body",
+                now + index as i64 + 1,
+            )
+            .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let (page_id, content_hash) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bootstrap: serde_json::Value = client
+                .get(format!("{http_base}/hub/{chat}/bootstrap"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if let Some(page) = bootstrap["manifest"]["pages"]
+                .as_array()
+                .and_then(|pages| pages.iter().find(|page| page["live"] == false))
+                && let (Some(id), Some(hash)) = (page["id"].as_str(), page["contentHash"].as_str())
+            {
+                break (id.to_string(), hash.to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("sealed page publication");
+    let page_response = client
+        .get(format!("{http_base}/transcript/{chat}/page?id={page_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(page_response.status().is_success());
+    assert!(
+        handle
+            .doc()
+            .page_is_published(&page_id, &content_hash)
+            .unwrap()
+    );
+    wait_for(
+        || !handle.doc().hub_projection_dirty().unwrap_or(true),
+        "SessionHub projection acknowledgement",
+    )
+    .await;
+
+    let recovery_chat = format!("recovery-{}", uuid::Uuid::new_v4().simple());
+    let recovered = core
+        .doc_host
+        .import_recovery_fork(&chat, &recovery_chat)
+        .await
+        .expect("materialize recovery fork");
+    let recovery_handle = core.doc_host.open(&recovery_chat).unwrap();
+    let recovery_entries = recovery_handle.doc().read_entries().unwrap();
+    assert_eq!(recovery_entries.len(), recovered);
+    assert!(matches!(
+        recovery_entries.last(),
+        Some(entry) if entry.role == jolt_session_doc::MessageRole::System
+    ));
+    drop(recovery_handle);
+    core.doc_host.purge_chat(&recovery_chat);
+
+    core.shutdown().await;
+    drop(handle);
+    drop(core);
+
+    let store = Arc::new(jolt_store::DocsStore::open(&scope).unwrap());
+    store
+        .open_session(&chat)
+        .unwrap()
+        .set_command_status(&command_id, SessionCommandStatus::Pending, None)
+        .unwrap();
+    drop(store);
+    let restarted = EngineCore::assemble_with_identity(
+        dir.path(),
+        registry(),
+        HarnessId::Mock,
+        Some(EdgeConfig::with_static_token(http_base, token)),
+        &org,
+        user,
+    )
+    .unwrap();
+    let restarted_handle = restarted.doc_host.open(&chat).unwrap();
+    wait_for(
+        || {
+            restarted_handle
+                .doc()
+                .read_commands()
+                .unwrap_or_default()
+                .iter()
+                .any(|command| {
+                    command.id == command_id && command.status == SessionCommandStatus::Applied
+                })
+        },
+        "terminal command reconciliation after restart",
+    )
+    .await;
+    restarted.shutdown().await;
+}

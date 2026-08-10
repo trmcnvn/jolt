@@ -6,10 +6,7 @@
 use std::collections::BTreeSet;
 
 use jolt_proto::{Goal, HarnessId, ToolCall};
-use jolt_session_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionDoc, SessionMessageEntry,
-    join_continuation_entries,
-};
+use jolt_session_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 
 use crate::EngineError;
 
@@ -24,13 +21,12 @@ pub(crate) struct HandoffContext {
 }
 
 pub(crate) fn build(
-    doc: &SessionDoc,
+    entries: Vec<SessionMessageEntry>,
     goal: Option<&Goal>,
     source_harness: Option<HarnessId>,
     target_harness: HarnessId,
     covered_through_message_id: Option<&str>,
 ) -> Result<Option<HandoffContext>, EngineError> {
-    let entries = join_continuation_entries(doc.read_entries()?);
     let Some(through_index) = entries.iter().rposition(is_settled_assistant) else {
         return Ok(None);
     };
@@ -209,7 +205,7 @@ fn collect_tool_paths(call: &ToolCall, paths: &mut BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jolt_session_doc::SessionMessageEntry;
+    use jolt_session_doc::{SessionDoc, SessionMessageEntry};
 
     fn entry(id: &str, role: MessageRole, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -242,7 +238,7 @@ mod tests {
         doc.push_message(&assistant).unwrap();
 
         let handoff = build(
-            &doc,
+            doc.read_entries().unwrap(),
             None,
             Some(HarnessId::ClaudeCode),
             HarnessId::Codex,
@@ -267,7 +263,7 @@ mod tests {
             .unwrap();
 
         let full = build(
-            &doc,
+            doc.read_entries().unwrap(),
             None,
             Some(HarnessId::ClaudeCode),
             HarnessId::Codex,
@@ -280,7 +276,7 @@ mod tests {
         assert_eq!(full.through_message_id, "a2");
 
         let delta = build(
-            &doc,
+            doc.read_entries().unwrap(),
             None,
             Some(HarnessId::ClaudeCode),
             HarnessId::Codex,
@@ -295,7 +291,7 @@ mod tests {
 
         assert!(
             build(
-                &doc,
+                doc.read_entries().unwrap(),
                 None,
                 Some(HarnessId::ClaudeCode),
                 HarnessId::Codex,

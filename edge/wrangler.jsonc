@@ -41,6 +41,10 @@
         "class_name": "SessionRoom"
       },
       {
+        "name": "SESSION_HUBS",
+        "class_name": "SessionHub"
+      },
+      {
         "name": "DEVICE_ROOMS",
         "class_name": "DeviceRoom"
       },
@@ -64,6 +68,14 @@
       "tag": "v2",
       "new_sqlite_classes": [
         "RegistryRoom"
+      ]
+    },
+    {
+      // Typed commands plus host-published transcript projections. SessionHub
+      // never imports Loro or any other CRDT runtime.
+      "tag": "v3",
+      "new_sqlite_classes": [
+        "SessionHub"
       ]
     }
   ],

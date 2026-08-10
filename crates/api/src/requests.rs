@@ -237,6 +237,23 @@ impl UnaryRequest for SearchTranscript {
     const METHOD: &'static str = methods::SEARCH_TRANSCRIPT;
 }
 
+/// Explicit permanent-host-loss recovery. The caller supplies a fresh chat id
+/// and targets the engine that owns `space_id`; the source chat remains intact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRecoveryFork {
+    pub source_chat_id: String,
+    pub chat_id: String,
+    pub space_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<String>,
+}
+
+impl UnaryRequest for CreateRecoveryFork {
+    type Response = Acknowledged;
+    const METHOD: &'static str = methods::CREATE_RECOVERY_FORK;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtractQuestions {
@@ -1179,6 +1196,25 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             serde_json::json!({ "harness": "pi" })
+        );
+    }
+
+    #[test]
+    fn recovery_fork_carries_fresh_identity_and_target_host() {
+        let request = CreateRecoveryFork {
+            source_chat_id: "source-chat".into(),
+            chat_id: "recovered-chat".into(),
+            space_id: "target-space".into(),
+            target_device_id: Some("device-1".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "sourceChatId": "source-chat",
+                "chatId": "recovered-chat",
+                "spaceId": "target-space",
+                "targetDeviceId": "device-1",
+            })
         );
     }
 

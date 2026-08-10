@@ -1,9 +1,8 @@
 //! Byte-bounded transcript projection for tail-first viewports.
 //!
-//! The Loro document remains authoritative. This module builds a compact
-//! catalog and materializes individual pages without retaining a second full
-//! transcript vector. Page ids are anchored to stable message ids; list
-//! ordinals are descriptive only and may change after a CRDT merge.
+//! Page IDs are anchored to stable message IDs. The legacy [`TranscriptCatalog`]
+//! still reads an imported snapshot during cutover; canonical runtime projection
+//! is generated directly from normalized SQLite rows in `jolt-store`.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +22,9 @@ pub const TRANSCRIPT_BOOTSTRAP_MESSAGE_COUNT: usize = 64;
 pub struct TranscriptPageDescriptor {
     pub id: String,
     pub revision: String,
+    /// SHA-256 of the serialized page object when prepared for immutable edge storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
     pub first_ordinal: usize,
     pub message_count: usize,
     pub estimated_bytes: usize,
@@ -116,8 +118,6 @@ impl TranscriptCatalog {
         let mut slots = Vec::new();
         let mut page_start = 0usize;
         let mut ordinal = 0usize;
-        let mut catalog_hash = Hash64::new();
-
         for physical_index in 0..physical_len {
             let Some(entry) = doc.read_entry_at(physical_index)? else {
                 continue;
@@ -126,7 +126,8 @@ impl TranscriptCatalog {
             if !is_continuation
                 && !logical.is_empty()
                 && (logical.len() >= TRANSCRIPT_PAGE_MESSAGE_COUNT
-                    || page_bytes(&logical) + message_bytes(&entry) > TRANSCRIPT_PAGE_TARGET_BYTES)
+                    || page_bytes(&logical) + message_estimated_bytes(&entry)
+                        > TRANSCRIPT_PAGE_TARGET_BYTES)
             {
                 push_slot(&mut slots, page_start, physical_index, ordinal, &logical);
                 ordinal += logical.len();
@@ -147,9 +148,6 @@ impl TranscriptCatalog {
             slot.descriptor.previous_page_id = previous;
             slot.descriptor.next_page_id = next;
             slot.descriptor.live = index + 1 == slot_count;
-            catalog_hash.write(slot.descriptor.id.as_bytes());
-            catalog_hash.write_u64(slot.descriptor.first_ordinal as u64);
-            catalog_hash.write_u64(slot.descriptor.message_count as u64);
         }
 
         let total_messages = slots.last().map_or(0, |slot| {
@@ -165,30 +163,31 @@ impl TranscriptCatalog {
                         message_id: entry.id.clone(),
                         ordinal: absolute,
                         page_id: slot.descriptor.id.clone(),
-                        prompt_preview: preview(entry, 160),
+                        prompt_preview: transcript_entry_preview(entry, 160),
                         reply_preview: None,
                     });
                 } else if entry.role == MessageRole::Assistant
                     && let Some(turn) = turns.last_mut()
                     && turn.reply_preview.is_none()
                 {
-                    let text = preview(entry, 200);
+                    let text = transcript_entry_preview(entry, 200);
                     if !text.is_empty() {
                         turn.reply_preview = Some(text);
                     }
                 }
             }
         }
-        for turn in &turns {
-            catalog_hash.write(turn.message_id.as_bytes());
-            catalog_hash.write_u64(turn.ordinal as u64);
-        }
+        let pages = slots
+            .iter()
+            .map(|slot| slot.descriptor.clone())
+            .collect::<Vec<_>>();
+        let catalog_revision = transcript_catalog_revision(&pages, &turns);
 
         Ok(Self {
             manifest: TranscriptManifest {
-                catalog_revision: catalog_hash.finish_hex(),
+                catalog_revision,
                 total_messages,
-                pages: slots.iter().map(|slot| slot.descriptor.clone()).collect(),
+                pages,
                 turns,
             },
             slots,
@@ -256,7 +255,7 @@ impl TranscriptCatalog {
         for slot in self.slots.iter().rev() {
             let entries = read_slot(doc, slot)?;
             for (offset, entry) in entries.iter().enumerate().rev() {
-                let text = searchable_text(entry);
+                let text = transcript_searchable_text(entry);
                 let lowercase = text.to_lowercase();
                 if !terms.iter().all(|term| lowercase.contains(term)) {
                     continue;
@@ -266,7 +265,7 @@ impl TranscriptCatalog {
                     page_id: slot.descriptor.id.clone(),
                     ordinal: slot.descriptor.first_ordinal + offset,
                     role: entry.role,
-                    preview: search_preview(&text, &terms, 240),
+                    preview: transcript_search_preview(&text, &terms, 240),
                     created_at: entry.created_at,
                 });
                 if results.len() == limit {
@@ -305,7 +304,8 @@ fn push_slot(
     slots.push(PageSlot {
         descriptor: TranscriptPageDescriptor {
             id,
-            revision: page_revision(messages),
+            revision: transcript_page_revision(messages),
+            content_hash: None,
             first_ordinal,
             message_count: messages.len(),
             estimated_bytes: page_bytes(messages),
@@ -322,7 +322,7 @@ fn page_from_slot(doc: &SessionDoc, slot: &PageSlot) -> Result<TranscriptPage, D
     let messages = read_slot(doc, slot)?;
     Ok(TranscriptPage {
         id: slot.descriptor.id.clone(),
-        revision: page_revision(&messages),
+        revision: transcript_page_revision(&messages),
         first_ordinal: slot.descriptor.first_ordinal,
         messages,
     })
@@ -339,10 +339,11 @@ fn read_slot(doc: &SessionDoc, slot: &PageSlot) -> Result<Vec<SessionMessageEntr
 }
 
 fn page_bytes(messages: &[SessionMessageEntry]) -> usize {
-    messages.iter().map(message_bytes).sum()
+    messages.iter().map(message_estimated_bytes).sum()
 }
 
-fn message_bytes(entry: &SessionMessageEntry) -> usize {
+/// Approximate serialized bytes used for page budgeting and local storage counters.
+pub fn message_estimated_bytes(entry: &SessionMessageEntry) -> usize {
     entry.id.len()
         + entry.device_id.len()
         + entry.continuation_of.as_ref().map_or(0, String::len)
@@ -350,7 +351,8 @@ fn message_bytes(entry: &SessionMessageEntry) -> usize {
         + 48
 }
 
-fn page_revision(messages: &[SessionMessageEntry]) -> String {
+/// Stable content revision for one materialized transcript page.
+pub fn transcript_page_revision(messages: &[SessionMessageEntry]) -> String {
     let mut hash = Hash64::new();
     for entry in messages {
         match serde_json::to_vec(entry) {
@@ -361,14 +363,15 @@ fn page_revision(messages: &[SessionMessageEntry]) -> String {
                 // fail if that invariant changes in a newer schema.
                 hash.write(entry.id.as_bytes());
                 hash.write_u64(entry.created_at as u64);
-                hash.write_u64(message_bytes(entry) as u64);
+                hash.write_u64(message_estimated_bytes(entry) as u64);
             }
         }
     }
     hash.finish_hex()
 }
 
-fn preview(entry: &SessionMessageEntry, limit: usize) -> String {
+/// Compact prose preview used by transcript manifests.
+pub fn transcript_entry_preview(entry: &SessionMessageEntry, limit: usize) -> String {
     let text = entry
         .parts
         .iter()
@@ -381,7 +384,8 @@ fn preview(entry: &SessionMessageEntry, limit: usize) -> String {
     truncate_text(&text, limit)
 }
 
-fn searchable_text(entry: &SessionMessageEntry) -> String {
+/// Render-safe searchable text extracted from one transcript entry.
+pub fn transcript_searchable_text(entry: &SessionMessageEntry) -> String {
     let mut fragments = Vec::new();
     for part in &entry.parts {
         match part {
@@ -426,7 +430,8 @@ fn append_json_strings(value: &serde_json::Value, strings: &mut Vec<String>) {
     }
 }
 
-fn search_preview(text: &str, terms: &[String], limit: usize) -> String {
+/// A bounded search result preview with the first match kept near the front.
+pub fn transcript_search_preview(text: &str, terms: &[String], limit: usize) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
     let matched = words.iter().position(|word| {
         let word = word.to_lowercase();
@@ -456,8 +461,26 @@ fn truncate_text(text: &str, limit: usize) -> String {
     out
 }
 
+/// Stable catalog revision for a manifest's page layout and turn anchors.
+pub fn transcript_catalog_revision(
+    pages: &[TranscriptPageDescriptor],
+    turns: &[TranscriptTurnDescriptor],
+) -> String {
+    let mut hash = Hash64::new();
+    for page in pages {
+        hash.write(page.id.as_bytes());
+        hash.write_u64(page.first_ordinal as u64);
+        hash.write_u64(page.message_count as u64);
+    }
+    for turn in turns {
+        hash.write(turn.message_id.as_bytes());
+        hash.write_u64(turn.ordinal as u64);
+    }
+    hash.finish_hex()
+}
+
 #[derive(Debug, Clone, Copy)]
-struct Hash64(u64);
+pub(crate) struct Hash64(u64);
 
 impl Hash64 {
     fn new() -> Self {
@@ -587,7 +610,7 @@ mod tests {
     #[test]
     fn search_preview_keeps_the_match_near_the_front() {
         let text = "one two three four five six seven eight nine distinctive Needle phrase after";
-        let preview = search_preview(text, &["needle".into()], 240);
+        let preview = transcript_search_preview(text, &["needle".into()], 240);
         assert!(preview.starts_with("… eight nine distinctive Needle"));
     }
 }

@@ -154,7 +154,7 @@ apps/
   ios/        SwiftUI mobile viewport
 crates/
   proto/      shared wire/domain types and view derivations
-  doc/        Loro session schema and workspace registry model
+  doc/        Semantic session types and workspace registry model
   sync/       room clients and local snapshot store
   harness/    Claude Code, Codex, Pi adapters
   engine/     machine-local backend capabilities

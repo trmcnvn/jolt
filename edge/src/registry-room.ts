@@ -423,6 +423,22 @@ export class RegistryRoom implements DurableObject {
     if (!response.ok) throw new Error(`session retire failed (${response.status})`);
   }
 
+  private async retireSessionHub(chatId: string, userId: string): Promise<void> {
+    const room = this.env.SESSION_HUBS.get(
+      this.env.SESSION_HUBS.idFromName(`hub1/${chatId}`)
+    );
+    const response = await room.fetch(new Request(
+      `https://session-hub/retire?chatId=${encodeURIComponent(chatId)}`,
+      {
+        method: "POST",
+        headers: { [AUTH_USER_HEADER]: userId }
+      }
+    ));
+    if (!response.ok && response.status !== 404) {
+      throw new Error(`session hub retire failed (${response.status})`);
+    }
+  }
+
   private async deleteAttachmentPrefix(chatId: string, userId: string): Promise<void> {
     const prefix = `att/${userId}/${chatId}/`;
     let cursor: string | undefined;
@@ -459,6 +475,7 @@ export class RegistryRoom implements DurableObject {
     for (const row of rows) {
       try {
         await this.retireSession(row.chat_id, row.user_id);
+        await this.retireSessionHub(row.chat_id, row.user_id);
         await this.deleteAttachmentPrefix(row.chat_id, row.user_id);
         if (row.sweeps === 0) {
           // UploadCommit mirrors asynchronously after committing the host-local

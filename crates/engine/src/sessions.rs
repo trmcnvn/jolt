@@ -4,8 +4,9 @@
 //! Run processing guarantees:
 //! - every `AgentEvent` is (a) appended to the on-disk run journal, (b) broadcast to
 //!   in-process subscribers, (c) folded via `fold_event_into_parts` and diffed into the
-//!   chat's `SessionDoc` through `SegmentWriter` on a coalesced `STREAM_COMMIT_MS` timer;
-//! - the user message entry is pushed to the doc immediately on dispatch (id = the
+//!   chat's normalized SQLite state through `SegmentWriter` on a coalesced
+//!   `STREAM_COMMIT_MS` timer;
+//! - the user message entry is committed immediately on dispatch (id = the
 //!   command's client-minted message id, so optimistic echoes never flicker);
 //! - a `Steered` event splits the assistant entry at the exact boundary;
 //! - recovery (interrupt or a stale journal at boot) stamps the streaming entry `aborted`.
@@ -37,9 +38,10 @@ use jolt_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 use jolt_session_doc::{
-    DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
-    fold_event_into_parts, sanitize_tool_call,
+    MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, fold_event_into_parts,
+    sanitize_tool_call,
 };
+use jolt_store::{StoreError, StoredSegmentWriter as SegmentWriter, StoredSession};
 
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::mcp::{McpHost, McpLease};

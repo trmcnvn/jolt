@@ -1,5 +1,8 @@
 export interface Env {
+  /** Legacy Loro rooms retained only through verified cutover/rollback. */
   SESSION_ROOMS: DurableObjectNamespace;
+  /** Wasm-free per-chat command and transcript projection hubs. */
+  SESSION_HUBS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
   /** Per-user workspace registries (`reg1/{orgId}/{userId}`) — the row-table
    * replacement for the Loro workspace doc (docs/sync.md). */
@@ -24,7 +27,3 @@ export interface Env {
  * the Worker (design §2: "DO never sees an unauthenticated frame"). */
 export const AUTH_USER_HEADER = "x-jolt-auth-user";
 
-/** Header the Worker stamps on requests forwarded into workspace-doc rooms
- * (`ws/{orgId}`). Membership (JWT org claim == orgId) is enforced at the
- * Worker; the SessionRoom DO sees this and skips its per-chat
- * claim-on-first-join ownership discipline for the room. */

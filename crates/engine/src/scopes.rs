@@ -3,14 +3,18 @@
 //! Local data lives in `scopes/local/current`. Account data lives in
 //! `scopes/accounts/<org>/<user>`.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::OptionalExtension as _;
 
 pub use jolt_api::{ScopeKind, ScopeStatus};
 use jolt_registry_model::{REGISTRY_DOC_ID, RegistryDoc};
-use jolt_session_doc::SessionDoc;
+use jolt_session_doc::{MessagePart, SessionCommandEntry, SessionCommandPayload, SessionDoc};
+use jolt_store::DocsStore;
+use sha2::{Digest, Sha256};
 
 use crate::{EngineError, new_id};
 
@@ -66,8 +70,8 @@ impl ScopeLayout {
 
     /// Merge Local into an existing account store while both runtimes are
     /// stopped, then replace Local with a blank scope. Registry rows are
-    /// re-authored for the account device, Loro documents are merged, and all
-    /// device-local ledgers/files are retained.
+    /// re-authored for the account device, semantic session state is copied
+    /// without interleaving divergent histories, and local ledgers/files remain.
     pub fn merge_local_into_account(
         &self,
         org_id: &str,
@@ -225,6 +229,14 @@ fn merge_docs(
         .map_err(|error| EngineError::Other(format!("open Local documents: {error}")))?;
     let target = rusqlite::Connection::open(&target_path)
         .map_err(|error| EngineError::Other(format!("open Account documents: {error}")))?;
+    let session_plan = merge_session_states(
+        source_dir,
+        target_dir,
+        source_device,
+        target_device,
+        upload_from,
+        upload_to,
+    )?;
 
     let snapshots = read_snapshots(&source)?;
     let source_registry = snapshots
@@ -253,41 +265,44 @@ fn merge_docs(
             target_registry.upsert_space(&space)?;
         }
         for mut chat in state.chats {
+            let source_chat_id = chat.id.clone();
+            if session_plan.shared.contains(&source_chat_id) {
+                continue;
+            }
+            chat.id = session_plan
+                .chat_ids
+                .get(&source_chat_id)
+                .cloned()
+                .unwrap_or(source_chat_id.clone());
+            if chat.id != source_chat_id {
+                let title = chat.title.as_deref().unwrap_or("Untitled");
+                chat.title = Some(format!("{title} (Local conflict)"));
+            }
             if chat.device_id == source_device {
                 chat.device_id = target_device.to_string();
             }
+            for conversation in &mut chat.harness_conversations {
+                if conversation.device_id == source_device {
+                    conversation.device_id = target_device.to_string();
+                }
+            }
             target_registry.upsert_chat(&chat)?;
         }
-        for session in state.sessions {
+        for mut session in state.sessions {
+            if session_plan.shared.contains(&session.chat_id) {
+                continue;
+            }
+            session.chat_id = session_plan
+                .chat_ids
+                .get(&session.chat_id)
+                .cloned()
+                .unwrap_or(session.chat_id);
+            if session.device_id == source_device {
+                session.device_id = target_device.to_string();
+            }
             target_registry.upsert_session(&session)?;
         }
         save_snapshot(&target, REGISTRY_DOC_ID, &target_registry.to_bytes()?)?;
-    }
-
-    for (chat_id, source_bytes) in snapshots.iter().filter(|(id, _)| id != REGISTRY_DOC_ID) {
-        let target_bytes: Option<Vec<u8>> = target
-            .query_row(
-                "SELECT bytes FROM snapshots WHERE doc_id = ?1",
-                [chat_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| EngineError::Other(format!("read Account document: {error}")))?;
-        let raw = loro::LoroDoc::new();
-        if let Some(bytes) = target_bytes {
-            raw.import(&bytes)
-                .map_err(|error| EngineError::Other(format!("import Account document: {error}")))?;
-        }
-        let source = loro::LoroDoc::new();
-        source
-            .import(source_bytes)
-            .map_err(|error| EngineError::Other(format!("import Local document: {error}")))?;
-        let source = SessionDoc::from_doc(source);
-        rewrite_document_prefix(&source, upload_from, upload_to)?;
-        raw.import(&source.export_snapshot()?)
-            .map_err(|error| EngineError::Other(format!("merge Local document: {error}")))?;
-        let document = SessionDoc::from_doc(raw);
-        save_snapshot(&target, chat_id, &document.export_snapshot()?)?;
     }
 
     let mut statement = source
@@ -311,11 +326,223 @@ fn merge_docs(
     Ok(())
 }
 
+struct SessionMergePlan {
+    chat_ids: HashMap<String, String>,
+    /// Same-id histories already represented by an Account registry row.
+    shared: HashSet<String>,
+}
+
+fn merge_session_states(
+    source_dir: &Path,
+    target_dir: &Path,
+    source_device: &str,
+    target_device: &str,
+    upload_from: &str,
+    upload_to: &str,
+) -> Result<SessionMergePlan, EngineError> {
+    let source = Arc::new(DocsStore::open(source_dir)?);
+    let target = Arc::new(DocsStore::open(target_dir)?);
+    source.migrate_legacy_sessions()?;
+    target.migrate_legacy_sessions()?;
+    source.verify_legacy_sessions()?;
+    target.verify_legacy_sessions()?;
+
+    let source_registry = source
+        .load_snapshot(REGISTRY_DOC_ID)?
+        .map(|bytes| RegistryDoc::from_bytes(&bytes, source_device))
+        .transpose()?;
+    let target_registry = target
+        .load_snapshot(REGISTRY_DOC_ID)?
+        .map(|bytes| RegistryDoc::from_bytes(&bytes, target_device))
+        .transpose()?;
+    let source_registry_ids = source_registry
+        .as_ref()
+        .map(RegistryDoc::read_all)
+        .transpose()?
+        .map_or_else(HashSet::new, |state| {
+            state.chats.into_iter().map(|chat| chat.id).collect()
+        });
+    let target_registry_ids = target_registry
+        .as_ref()
+        .map(RegistryDoc::read_all)
+        .transpose()?
+        .map_or_else(HashSet::new, |state| {
+            state.chats.into_iter().map(|chat| chat.id).collect()
+        });
+    let source_session_ids = source.session_ids()?;
+    let source_ids = source_session_ids
+        .iter()
+        .cloned()
+        .chain(source_registry_ids)
+        .collect::<HashSet<_>>();
+    let mut states = HashMap::new();
+    for chat_id in &source_session_ids {
+        let session = source.open_session(chat_id)?;
+        let mut messages = session.read_entries()?;
+        let mut commands = session.read_commands()?;
+        rewrite_session_prefix(&mut messages, &mut commands, upload_from, upload_to);
+        rewrite_session_device_ids(&mut messages, &mut commands, source_device, target_device);
+        let hash = semantic_state_hash(&messages, &commands)?;
+        states.insert(chat_id.clone(), (messages, commands, hash));
+    }
+
+    let mut chat_ids = HashMap::new();
+    let mut shared = HashSet::new();
+    for chat_id in source_ids {
+        let target_has_session = target.session_exists(&chat_id)?;
+        let target_has_registry = target_registry_ids.contains(&chat_id);
+        let same_history = match (states.get(&chat_id), target_has_session) {
+            (Some((_, _, source_hash)), true) => {
+                target.open_session(&chat_id)?.semantic_hash()? == *source_hash
+            }
+            _ => false,
+        };
+        let destination = if !target_has_session && !target_has_registry {
+            chat_id.clone()
+        } else if same_history {
+            if target_has_registry {
+                shared.insert(chat_id.clone());
+            }
+            chat_id.clone()
+        } else {
+            conflict_chat_id(source_device, &chat_id)
+        };
+        chat_ids.insert(chat_id.clone(), destination.clone());
+
+        let Some((messages, commands, source_hash)) = states.get(&chat_id) else {
+            continue;
+        };
+        if destination == chat_id && target_has_session {
+            continue;
+        }
+        if target.session_exists(&destination)? {
+            let existing_hash = target.open_session(&destination)?.semantic_hash()?;
+            if existing_hash != *source_hash {
+                return Err(EngineError::Other(format!(
+                    "conflict-copy id collision for chat {chat_id}"
+                )));
+            }
+        } else {
+            target.import_session_state(&destination, messages, commands)?;
+        }
+        if target.load_snapshot(&destination)?.is_none()
+            && source.load_snapshot(&chat_id)?.is_some()
+        {
+            let document = SessionDoc::init(&destination)?;
+            for message in messages {
+                document.push_message(message)?;
+            }
+            for command in commands {
+                document.queue_command(command)?;
+            }
+            target.save_snapshot(&destination, &document.export_snapshot()?)?;
+        }
+    }
+    Ok(SessionMergePlan { chat_ids, shared })
+}
+
+fn rewrite_session_prefix(
+    messages: &mut [jolt_session_doc::SessionMessageEntry],
+    commands: &mut [SessionCommandEntry],
+    from: &str,
+    to: &str,
+) {
+    let rewrite = |value: &mut String| {
+        if value.contains(from) {
+            *value = value.replace(from, to);
+        }
+    };
+    for message in messages {
+        for part in &mut message.parts {
+            if let MessagePart::Text { text, .. } = part {
+                rewrite(text);
+            }
+        }
+    }
+    for command in commands {
+        match &mut command.payload {
+            SessionCommandPayload::Run { request, .. }
+            | SessionCommandPayload::HiddenPrompt { request }
+            | SessionCommandPayload::Queue { request, .. } => {
+                rewrite(&mut request.prompt);
+                rewrite(&mut request.cwd);
+                for attachment in &mut request.attachments {
+                    rewrite(attachment);
+                }
+            }
+            SessionCommandPayload::Bash { command, cwd, .. } => {
+                rewrite(command);
+                rewrite(cwd);
+            }
+            SessionCommandPayload::Steer { prompt, .. } => rewrite(prompt),
+            SessionCommandPayload::ResumeQueue {}
+            | SessionCommandPayload::Interrupt {}
+            | SessionCommandPayload::RespondInput { .. }
+            | SessionCommandPayload::Goal { .. } => {}
+        }
+    }
+}
+
+fn rewrite_session_device_ids(
+    messages: &mut [jolt_session_doc::SessionMessageEntry],
+    commands: &mut [SessionCommandEntry],
+    from: &str,
+    to: &str,
+) {
+    for message in messages {
+        if message.device_id == from {
+            message.device_id = to.to_string();
+        }
+    }
+    for command in commands {
+        if command.issued_by == from {
+            command.issued_by = to.to_string();
+        }
+    }
+}
+
+fn semantic_state_hash(
+    messages: &[jolt_session_doc::SessionMessageEntry],
+    commands: &[SessionCommandEntry],
+) -> Result<String, EngineError> {
+    let bytes = serde_json::to_vec(&(messages, commands))
+        .map_err(|error| EngineError::Other(format!("hash session state: {error}")))?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn conflict_chat_id(source_device: &str, chat_id: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(source_device.as_bytes());
+    hash.update([0]);
+    hash.update(chat_id.as_bytes());
+    let suffix: String = hash.finalize()[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("local-conflict-{suffix}")
+}
+
 fn rewrite_stored_documents(scope_dir: &Path, from: &str, to: &str) -> Result<(), EngineError> {
     let path = scope_dir.join("docs.sqlite3");
     if !path.exists() {
         return Ok(());
     }
+    let store = Arc::new(DocsStore::open(scope_dir)?);
+    store.migrate_legacy_sessions()?;
+    for chat_id in store.session_ids()? {
+        let session = store.open_session(&chat_id)?;
+        let mut messages = session.read_entries()?;
+        let mut commands = session.read_commands()?;
+        let before = semantic_state_hash(&messages, &commands)?;
+        rewrite_session_prefix(&mut messages, &mut commands, from, to);
+        if semantic_state_hash(&messages, &commands)? != before {
+            store.replace_session_state(&chat_id, &messages, &commands)?;
+        }
+    }
+    drop(store);
     let connection = rusqlite::Connection::open(path)
         .map_err(|error| EngineError::Other(format!("open promoted documents: {error}")))?;
     for (chat_id, bytes) in read_snapshots(&connection)?
@@ -547,10 +774,78 @@ mod tests {
             _ => panic!("expected text attachment reference"),
         };
         assert!(text.starts_with(&account.join("uploads").to_string_lossy().into_owned()));
+        assert_eq!(entries[0].device_id, "account-device");
         assert!(account_store.is_processed("command-local").unwrap());
         assert!(account.join("uploads/image.png").exists());
         assert!(layout.local_dir().join(LOCAL_SCOPE_ID).exists());
         assert!(!layout.local_dir().join("uploads/image.png").exists());
+    }
+
+    #[test]
+    fn divergent_same_id_sessions_become_conflict_copies() {
+        use jolt_session_doc::{MessagePart, MessageRole, SessionMessageEntry};
+
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("local");
+        let target_dir = root.path().join("account");
+        let source = DocsStore::open(&source_dir).unwrap();
+        let target = DocsStore::open(&target_dir).unwrap();
+        for (store, text) in [(&source, "local history"), (&target, "account history")] {
+            let document = SessionDoc::init("same-chat").unwrap();
+            document
+                .push_message(&SessionMessageEntry {
+                    id: format!("message-{text}"),
+                    role: MessageRole::User,
+                    parts: vec![MessagePart::Text {
+                        id: "text".into(),
+                        text: text.into(),
+                    }],
+                    created_at: 1,
+                    device_id: "device".into(),
+                    status: None,
+                    continuation_of: None,
+                })
+                .unwrap();
+            store
+                .save_snapshot("same-chat", &document.export_snapshot().unwrap())
+                .unwrap();
+        }
+        drop(source);
+        drop(target);
+
+        let plan = merge_session_states(
+            &source_dir,
+            &target_dir,
+            "local-device",
+            "account-device",
+            "/local/uploads",
+            "/account/uploads",
+        )
+        .unwrap();
+        let conflict = plan.chat_ids.get("same-chat").unwrap();
+        assert_ne!(conflict, "same-chat");
+
+        let target = Arc::new(DocsStore::open(&target_dir).unwrap());
+        let account = target
+            .open_session("same-chat")
+            .unwrap()
+            .read_entries()
+            .unwrap();
+        let local = target
+            .open_session(conflict)
+            .unwrap()
+            .read_entries()
+            .unwrap();
+        assert_eq!(account.len(), 1);
+        assert_eq!(local.len(), 1);
+        assert!(matches!(
+            &account[0].parts[0],
+            MessagePart::Text { text, .. } if text == "account history"
+        ));
+        assert!(matches!(
+            &local[0].parts[0],
+            MessagePart::Text { text, .. } if text == "local history"
+        ));
     }
 
     #[test]

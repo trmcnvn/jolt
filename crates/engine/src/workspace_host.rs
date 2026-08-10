@@ -921,15 +921,17 @@ impl WorkspaceHost {
         Ok(true)
     }
 
-    /// Re-home a chat to another device (tooling/seeds; a future device
-    /// migration flow will drive this). Returns false when the chat doesn't
-    /// exist.
+    /// Host assignment is immutable because cwd, working-copy, and harness
+    /// state are machine-local. Permanent host loss must create a recovery fork.
     pub fn set_chat_host(&self, chat_id: &str, device_id: &str) -> Result<bool, EngineError> {
-        let Some(mut chat) = self.read(|doc| doc.chat(chat_id))? else {
+        let Some(chat) = self.read(|doc| doc.chat(chat_id))? else {
             return Ok(false);
         };
-        chat.device_id = device_id.to_string();
-        self.mutate(|doc| doc.upsert_chat(&chat))?;
+        if chat.device_id != device_id {
+            return Err(EngineError::Other(
+                "chat host assignment is immutable; create a recovery-fork chat".into(),
+            ));
+        }
         Ok(true)
     }
 

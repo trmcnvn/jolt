@@ -30,6 +30,24 @@ enum Command {
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
+    /// Create a fresh-host chat from a permanently lost host's published transcript.
+    RecoverChat {
+        /// Existing chat whose immutable host is gone.
+        source_chat_id: String,
+        /// Fresh id for the recovered chat.
+        chat_id: String,
+        /// Space owned by this engine; supplies the new cwd and host assignment.
+        space_id: String,
+    },
+    /// Back up, import, and semantically verify legacy session snapshots.
+    MigrateSessions {
+        /// Check existing imports without writing or backing up.
+        #[arg(long)]
+        verify_only: bool,
+        /// Scope directory containing docs.sqlite3 (repeatable; auto-discovers by default).
+        #[arg(long = "scope")]
+        scopes: Vec<std::path::PathBuf>,
+    },
     /// Manage `jolt headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -183,6 +201,23 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
         }
+        Some(Command::RecoverChat {
+            source_chat_id,
+            chat_id,
+            space_id,
+        }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(recover_chat(
+                engine_config_from_env().ipc_port,
+                source_chat_id,
+                chat_id,
+                space_id,
+            ))
+        }
+        Some(Command::MigrateSessions {
+            verify_only,
+            scopes,
+        }) => migrate_sessions(&engine_config_from_env(), verify_only, scopes),
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
@@ -197,6 +232,143 @@ fn main() -> anyhow::Result<()> {
         },
         None => run_headed(),
     }
+}
+
+async fn recover_chat(
+    ipc_port: u16,
+    source_chat_id: String,
+    chat_id: String,
+    space_id: String,
+) -> anyhow::Result<()> {
+    let client = jolt_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "no engine listening on 127.0.0.1:{ipc_port} ({error}) — start Jolt on the recovery host first"
+            )
+        })?;
+    client
+        .call(
+            jolt_api::methods::CREATE_RECOVERY_FORK,
+            serde_json::json!({
+                "sourceChatId": &source_chat_id,
+                "chatId": &chat_id,
+                "spaceId": &space_id,
+            }),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("CreateRecoveryFork failed: {error}"))?;
+    println!("Created recovery fork {chat_id} from {source_chat_id}");
+    Ok(())
+}
+
+fn migrate_sessions(
+    config: &jolt_engine::EngineConfig,
+    verify_only: bool,
+    mut scopes: Vec<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    if scopes.is_empty() {
+        discover_scope_dirs(&config.data_dir.join("scopes"), &mut scopes)?;
+        if config.data_dir.join("docs.sqlite3").is_file() {
+            scopes.push(config.data_dir.clone());
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+    if scopes.is_empty() {
+        anyhow::bail!(
+            "no docs.sqlite3 stores found under {}",
+            config.data_dir.display()
+        );
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    for scope in scopes {
+        let local_scope = config.data_dir.join("scopes/local/current");
+        let lock_dir = if scope == local_scope || scope == config.data_dir {
+            &config.data_dir
+        } else {
+            &scope
+        };
+        let _lock = jolt_engine::InstanceLock::acquire(lock_dir)?;
+        let backup = if verify_only {
+            None
+        } else {
+            let path = scope.join("backups").join(format!(
+                "docs-pre-sessionhub-{stamp}-{}.sqlite3",
+                std::process::id()
+            ));
+            jolt_store::DocsStore::backup_existing_database(&scope, &path)?;
+            Some(path)
+        };
+        let store = std::sync::Arc::new(if verify_only {
+            jolt_store::DocsStore::open_read_only(&scope)?
+        } else {
+            jolt_store::DocsStore::open(&scope)?
+        });
+        let pending_before = store.pending_legacy_session_ids()?;
+        let migrated = if verify_only {
+            Vec::new()
+        } else {
+            store.migrate_legacy_sessions()?
+        };
+        let verified = store.verify_legacy_sessions()?;
+        let pending_after = store.pending_legacy_session_ids()?;
+        if !pending_after.is_empty() {
+            anyhow::bail!(
+                "{} still has unmigrated sessions: {}",
+                scope.display(),
+                pending_after.join(", ")
+            );
+        }
+        let unseeded = store.unseeded_hub_session_ids()?;
+        let unpublished = store.unpublished_hub_session_ids()?;
+        println!(
+            "{}: pending={} migrated={} verified={} hub-unseeded={} hub-unpublished={}{}",
+            scope.display(),
+            pending_before.len(),
+            migrated.len(),
+            verified.len(),
+            unseeded.len(),
+            unpublished.len(),
+            backup
+                .as_ref()
+                .map(|path| format!(" backup={}", path.display()))
+                .unwrap_or_default()
+        );
+        for migration in verified {
+            println!(
+                "  {} messages={} commands={} sha256={}",
+                migration.chat_id,
+                migration.report.message_count,
+                migration.report.command_count,
+                migration.report.semantic_hash
+            );
+        }
+    }
+    Ok(())
+}
+
+fn discover_scope_dirs(
+    directory: &std::path::Path,
+    scopes: &mut Vec<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    if directory.join("docs.sqlite3").is_file() {
+        scopes.push(directory.to_path_buf());
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            discover_scope_dirs(&entry.path(), scopes)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "desktop")]
@@ -315,6 +487,20 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
             return "no room (dialing or edge-less)".into();
         };
         let get = |k: &str| room.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        if room.get("protocol").and_then(|value| value.as_str()) == Some("sessionHub") {
+            return format!(
+                "{} lease {} · projection {} · commands {} · reconnects {}",
+                if room.get("connected").and_then(|value| value.as_bool()) == Some(true) {
+                    "connected ·"
+                } else {
+                    "DISCONNECTED ·"
+                },
+                get("lease"),
+                get("projectionSequence"),
+                get("commandRevision"),
+                get("reconnects")
+            );
+        }
         // REJECTED is loud and only shown when nonzero: rejected writes with
         // a fresh-looking room is exactly the latched-session wedge
         // (2026-08-04) this readout previously masked.
@@ -350,6 +536,30 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
         "Workspace: {}",
         room_line(status.get("workspace").filter(|v| !v.is_null()))
     );
+    if let Some(hosted) = status
+        .get("hostedSessions")
+        .filter(|value| !value.is_null())
+    {
+        let count = |key: &str| {
+            hosted
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map_or(0, Vec::len)
+        };
+        println!(
+            "Hosted:    {}/{} normalized · {} unseeded · {} unpublished",
+            hosted
+                .get("normalized")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            hosted
+                .get("total")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            count("unseeded"),
+            count("unpublished"),
+        );
+    }
     let chats = status
         .get("chats")
         .and_then(|v| v.as_array())

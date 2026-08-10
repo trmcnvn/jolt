@@ -29,12 +29,18 @@ enum TranscriptPageDisk {
         else { return nil }
         try? FileManager.default.setAttributes([.modificationDate: Date()],
                                                 ofItemAtPath: url.path)
+        let revisions = Dictionary(uniqueKeysWithValues: bootstrap.manifest.pages.map {
+            ($0.id, $0.revision)
+        })
         let pages = bootstrap.pages.map { page in
-            loadPage(chatId: chatId, pageId: page.id) ?? page
+            guard let cached = loadPage(chatId: chatId, pageId: page.id),
+                  cached.revision == revisions[page.id] else { return page }
+            return cached
         }
         return MobileTranscriptBootstrap(sequence: bootstrap.sequence,
                                          manifest: bootstrap.manifest,
-                                         pages: pages)
+                                         pages: pages,
+                                         deltas: bootstrap.deltas).materialized()
     }
 
     static func saveBootstrap(_ data: Data, chatId: String) {
@@ -77,7 +83,7 @@ enum TranscriptPageDisk {
     }
 }
 
-private enum WireJSON: Decodable, Hashable {
+enum WireJSON: Decodable, Hashable {
     case null
     case bool(Bool)
     case integer(Int64)
@@ -113,23 +119,26 @@ private enum WireJSON: Decodable, Hashable {
 struct MobileTranscriptPageDescriptor: Decodable, Hashable {
     let id: String
     var revision: String
+    let contentHash: String?
     let firstOrdinal: Int
     var messageCount: Int
     let estimatedBytes: Int
     let previousPageId: String?
+    let live: Bool?
 }
 
 struct MobileTranscriptManifest: Decodable, Hashable {
     var pages: [MobileTranscriptPageDescriptor]
 }
 
-private struct WireMessagePart: Decodable {
+struct WireMessagePart: Decodable {
     let id: String
     let kind: String
-    let text: String?
+    var text: String?
     let call: [String: WireJSON]?
     let isError: Bool?
     let questions: [UserInputQuestion]?
+    let requestId: String?
     let resolved: Bool?
     let message: String?
     let from: String?
@@ -137,10 +146,10 @@ private struct WireMessagePart: Decodable {
     let diff: TurnDiffSummary?
 }
 
-private struct WireMessageEntry: Decodable {
+struct WireMessageEntry: Decodable {
     let id: String
     let role: MessageRole
-    let parts: [WireMessagePart]
+    var parts: [WireMessagePart]
     let createdAt: Int64
     let deviceId: String
     let status: MessageStatus?
@@ -162,9 +171,10 @@ private struct WireMessageEntry: Decodable {
                     result[field.key] = value
                 }
                 return .tool(id: part.id, call: RenderToolCall(tag: tag, fields: fields),
-                             isError: part.isError ?? false, resolved: part.isError != nil)
+                             isError: part.isError ?? false, resolved: part.resolved ?? false)
             case "input":
-                return .input(id: part.id, requestId: part.id,
+                guard let requestId = part.requestId else { return nil }
+                return .input(id: part.id, requestId: requestId,
                               questions: part.questions ?? [], resolved: part.resolved ?? false)
             case "error":
                 return .error(id: part.id, message: part.message ?? "")
@@ -201,12 +211,101 @@ struct MobileTranscriptPage: Decodable, Hashable {
         hasher.combine(id)
         hasher.combine(revision)
     }
+
+    func applying(_ delta: MobileTranscriptDelta) -> MobileTranscriptPage? {
+        guard delta.pageId == id else { return nil }
+        var entries = wireMessages
+        if let reset = delta.frame.reset {
+            entries = reset
+        } else {
+            let removed = Set(delta.frame.remove ?? [])
+            entries.removeAll { removed.contains($0.id) }
+            for upsert in delta.frame.upsert ?? [] {
+                entries.removeAll { $0.id == upsert.entry.id }
+                let index: Int
+                if let anchor = upsert.after {
+                    guard let anchorIndex = entries.firstIndex(where: { $0.id == anchor }) else {
+                        return nil
+                    }
+                    index = anchorIndex + 1
+                } else {
+                    index = 0
+                }
+                entries.insert(upsert.entry, at: index)
+            }
+            for append in delta.frame.append ?? [] {
+                guard let entryIndex = entries.firstIndex(where: { $0.id == append.entry }),
+                      let partIndex = entries[entryIndex].parts.firstIndex(where: {
+                          $0.id == append.part && $0.kind == "text"
+                      }) else { return nil }
+                entries[entryIndex].parts[partIndex].text =
+                    (entries[entryIndex].parts[partIndex].text ?? "") + append.text
+                guard entries[entryIndex].parts[partIndex].text?.utf8.count == append.len else {
+                    return nil
+                }
+            }
+            guard let count = delta.frame.count, entries.count == count else { return nil }
+        }
+        return MobileTranscriptPage(id: id, revision: delta.pageRevision,
+                                    firstOrdinal: firstOrdinal, wireMessages: entries)
+    }
+}
+
+struct MobileTranscriptUpsert: Decodable {
+    let after: String?
+    let entry: WireMessageEntry
+}
+
+struct MobileTranscriptAppend: Decodable {
+    let entry: String
+    let part: String
+    let text: String
+    let len: Int
+}
+
+struct MobileTranscriptFrame: Decodable {
+    let reset: [WireMessageEntry]?
+    let upsert: [MobileTranscriptUpsert]?
+    let append: [MobileTranscriptAppend]?
+    let remove: [String]?
+    let count: Int?
+}
+
+struct MobileTranscriptDelta: Decodable {
+    let pageId: String
+    let pageRevision: String
+    let frame: MobileTranscriptFrame
+}
+
+struct SequencedMobileTranscriptDelta: Decodable {
+    let sequence: UInt64
+    let delta: MobileTranscriptDelta
 }
 
 struct MobileTranscriptBootstrap: Decodable {
     let sequence: UInt64
-    let manifest: MobileTranscriptManifest
-    let pages: [MobileTranscriptPage]
+    var manifest: MobileTranscriptManifest
+    var pages: [MobileTranscriptPage]
+    fileprivate let deltas: [SequencedMobileTranscriptDelta]?
+
+    func materialized() -> MobileTranscriptBootstrap? {
+        guard let deltas, !deltas.isEmpty else { return self }
+        var result = self
+        var previous = sequence
+        for item in deltas {
+            guard item.sequence == previous &+ 1,
+                  let pageIndex = result.pages.firstIndex(where: { $0.id == item.delta.pageId }),
+                  let page = result.pages[pageIndex].applying(item.delta) else { return nil }
+            result.pages[pageIndex] = page
+            if let descriptor = result.manifest.pages.firstIndex(where: { $0.id == page.id }) {
+                result.manifest.pages[descriptor].revision = page.revision
+                result.manifest.pages[descriptor].messageCount = page.messages.count
+            }
+            previous = item.sequence
+        }
+        return MobileTranscriptBootstrap(sequence: previous, manifest: result.manifest,
+                                         pages: result.pages, deltas: nil)
+    }
 }
 
 private struct TranscriptEnvelope: Decodable {
@@ -214,11 +313,13 @@ private struct TranscriptEnvelope: Decodable {
     let bootstrap: MobileTranscriptBootstrap?
     let sequence: UInt64?
     let page: MobileTranscriptPage?
+    let delta: MobileTranscriptDelta?
 }
 
 enum MobileTranscriptEvent {
     case bootstrap(MobileTranscriptBootstrap)
     case page(sequence: UInt64, page: MobileTranscriptPage)
+    case delta(sequence: UInt64, delta: MobileTranscriptDelta)
 }
 
 @MainActor
@@ -252,9 +353,10 @@ final class TranscriptProjectionClient {
         socket = nil
     }
 
-    func page(id: String) async throws -> MobileTranscriptPage {
+    func page(id: String, expectedRevision: String) async throws -> MobileTranscriptPage {
+        let cached = TranscriptPageDisk.loadPage(chatId: chatId, pageId: id)
         guard let token = await config.currentToken() else {
-            if let cached = TranscriptPageDisk.loadPage(chatId: chatId, pageId: id) { return cached }
+            if let cached, cached.revision == expectedRevision { return cached }
             throw URLError(.userAuthenticationRequired)
         }
         var url = config.edgeURL.appending(path: "transcript/\(chatId)/page")
@@ -267,10 +369,13 @@ final class TranscriptProjectionClient {
                 throw URLError(.badServerResponse)
             }
             let page = try JSONDecoder().decode(MobileTranscriptPage.self, from: data)
+            guard page.id == id, page.revision == expectedRevision else {
+                throw URLError(.cannotParseResponse)
+            }
             TranscriptPageDisk.savePage(data, chatId: chatId, pageId: id)
             return page
         } catch {
-            if let cached = TranscriptPageDisk.loadPage(chatId: chatId, pageId: id) { return cached }
+            if let cached, cached.revision == expectedRevision { return cached }
             throw error
         }
     }
@@ -310,7 +415,10 @@ final class TranscriptProjectionClient {
                     let envelope = try JSONDecoder().decode(TranscriptEnvelope.self, from: data)
                     switch envelope.type {
                     case "bootstrap":
-                        guard let bootstrap = envelope.bootstrap else { continue }
+                        guard let wireBootstrap = envelope.bootstrap,
+                              let bootstrap = wireBootstrap.materialized() else {
+                            throw URLError(.cannotParseResponse)
+                        }
                         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                            let bootstrapObject = object["bootstrap"],
                            let bootstrapData = try? JSONSerialization.data(withJSONObject: bootstrapObject) {
@@ -325,6 +433,9 @@ final class TranscriptProjectionClient {
                             TranscriptPageDisk.savePage(pageData, chatId: chatId, pageId: page.id)
                         }
                         events(.page(sequence: sequence, page: page))
+                    case "delta":
+                        guard let sequence = envelope.sequence, let delta = envelope.delta else { continue }
+                        events(.delta(sequence: sequence, delta: delta))
                     default:
                         continue
                     }

@@ -90,7 +90,7 @@ Jolt also caches encoded/decoded images locally for transcript rendering. Signin
 
 ## Usage and telemetry
 
-Detailed harness usage is written to `{identity_dir}/usage.sqlite` on the host device. It is not embedded in Loro messages or workspace rows.
+Detailed harness usage is written to `{identity_dir}/usage.sqlite` on the host device. It is not embedded in transcript projections, SessionHub, or workspace rows.
 
 A viewport can request summaries from reachable devices and merge them for **Usage breakdown**. That RPC includes aggregate token, model, harness, cwd/space, call, session, and estimated API-equivalent cost data; it does not transfer the underlying event database.
 

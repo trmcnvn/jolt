@@ -1,22 +1,19 @@
-//! DocHost — per-chat `SessionDoc` handles: snapshot persistence (debounced), edge room
-//! sync (offline-tolerant), and the HOST-ONLY durable command executor.
+//! DocHost — normalized per-chat SQLite handles, SessionHub publication, and
+//! the host-only durable command executor.
 //!
-//! See docs/architecture.md and docs/sync.md:
-//! - the doc IS the outbox: commands and user entries commit locally and sync whenever a
-//!   room connection exists; the engine is fully functional with sync disabled;
-//! - on every doc change (local commit or remote import) the handle updates transcript
-//!   projections, drains pending commands, and schedules a snapshot save;
-//! - command drain: evaluate via `evaluate_command` (with the DocsStore processed
-//!   ledger), mark processed BEFORE execute, execute through the sessions engine, then
-//!   write the outcome status back into the doc as the sole outcome writer.
+//! See docs/session-hub.md:
+//! - SQLite is the offline-capable canonical transcript and local command store;
+//! - each committed semantic change refreshes bounded transcript projections and drains commands;
+//! - remote commands are claimed in SessionHub, marked locally before execution, then
+//!   resolved terminally by the sole host writer.
 //!
 //! Chat ownership is gated on the workspace registry (`chats[chat_id].deviceId`), with
 //! claim-on-first-command for unknown chats. Queueing a command for a chat hosted on
 //! another device POSTs a durable nudge to that device's room (§7 cold-chat delivery);
-//! the host's relay receives it and warm-opens the doc, which drains the queue.
+//! the host's relay receives it and warm-opens SQLite state, which drains the queue.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use tokio::sync::{broadcast, watch};
@@ -24,36 +21,31 @@ use tokio::sync::{broadcast, watch};
 use jolt_harness::{BashRequest, BashResult};
 use jolt_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
 use jolt_session_doc::{
-    COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    GoalOperation, MessagePart, MessageRole, MessageStatus, QueuedPrompt, SessionCommandEntry,
-    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
-    TranscriptBootstrap, TranscriptCatalog, TranscriptPage, TranscriptWatchFrame,
-    can_composer_cancel, evaluate_command, queued_prompts,
+    COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, EvaluationContext, GoalOperation,
+    MessagePart, MessageRole, MessageStatus, QueuedPrompt, SessionCommandEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionMessageEntry, TranscriptBootstrap,
+    TranscriptFrame, TranscriptManifest, TranscriptPage, TranscriptWatchFrame,
+    apply_transcript_frame, can_composer_cancel, evaluate_command, queued_prompts,
 };
-use jolt_store::DocsStore;
-use jolt_sync::RoomClient;
+use jolt_store::{DocsStore, StoreError, StoredSession};
+use jolt_sync::{SessionHubClient, SessionHubEvent};
+use sha2::{Digest, Sha256};
 
 use crate::sessions::{SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
-/// Debounce window for local snapshot saves after a doc change.
-const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
-
 /// Warm-doc LRU: how many unwatched, run-less docs stay fully open. Everything
 /// beyond this (and beyond [`jolt_session_doc::DOC_LRU_BYTE_BUDGET`]) is evicted
-/// oldest-access-first — reopening from the SQLite snapshot measured within
+/// oldest-access-first — reopening normalized SQLite rows measured within
 /// ~11ms of a warm doc, so the cap trades no perceptible open latency.
 const WARM_DOC_CAP: usize = 12;
 
-/// Resident-memory estimate per compressed snapshot byte. Loro snapshots are
-/// columnar+compressed; the in-memory doc plus mirror runs well above the blob
-/// size. A rough multiplier is enough here — the budget is a safety ceiling,
-/// the count cap does the day-to-day work.
-const RESIDENT_BYTES_PER_SNAPSHOT_BYTE: usize = 6;
-
 /// Floor per open doc (room socket buffers, tasks) regardless of content size.
 const DOC_RESIDENT_FLOOR_BYTES: usize = 512 * 1024;
+const COMMAND_RESOLUTION_MAX_BYTES: usize = 64 * 1024;
+const HUB_SEED_CONCURRENCY: usize = 8;
+const HUB_SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Docs touched this recently are never evicted. This closes the open→attach
 /// race before a transcript or command watcher pins the handle.
@@ -140,7 +132,8 @@ impl jolt_sync::UrlProvider for EdgeRoomUrl {
                 .token()
                 .await
                 .ok_or_else(|| jolt_sync::SyncError::Auth("no access token (signed out)".into()))?;
-            let mut url = format!("{base}?token={token}");
+            let separator = if base.contains('?') { '&' } else { '?' };
+            let mut url = format!("{base}{separator}token={token}");
             if !device.is_empty() {
                 url.push_str(&format!("&device={device}"));
             }
@@ -149,13 +142,21 @@ impl jolt_sync::UrlProvider for EdgeRoomUrl {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedHubPublicationStatus {
+    pub total: usize,
+    pub normalized: usize,
+    pub unseeded: Vec<String>,
+    pub unpublished: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DocHostConfig {
     pub device_id: String,
     /// Harness for doc-command runs on chats without a workspace `config` row.
     pub default_harness: HarnessId,
-    /// When present, each opened chat joins its edge session room. `None` = fully
-    /// offline operation (local snapshots only).
+    /// When present, each hosted chat joins its edge SessionHub. `None` = fully
+    /// offline operation (canonical local SQLite only).
     pub edge: Option<EdgeConfig>,
 }
 
@@ -171,37 +172,112 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn bounded_command_resolution(value: &str) -> String {
+    let mut end = value.len().min(COMMAND_RESOLUTION_MAX_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn valid_hub_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct DocHost {
     inner: Arc<DocHostInner>,
 }
 
-/// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
+/// One open chat: normalized state, change plumbing, and its SessionHub client.
 struct TranscriptProjectionState {
     sequence: u64,
-    catalog: TranscriptCatalog,
+    projection_revision: u64,
+    manifest: TranscriptManifest,
     live_page: Option<TranscriptPage>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubCommandPage {
+    commands: Vec<jolt_sync::HubCommand>,
+    next_revision: u64,
+    has_more: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubProjectionBootstrap {
+    sequence: u64,
+    manifest: TranscriptManifest,
+    #[serde(default)]
+    pages: Vec<TranscriptPage>,
+    #[serde(default)]
+    deltas: Vec<SequencedHubProjectionDelta>,
+}
+
+#[derive(serde::Deserialize)]
+struct SequencedHubProjectionDelta {
+    sequence: u64,
+    delta: HubProjectionDelta,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubProjectionDelta {
+    page_id: String,
+    page_revision: String,
+    frame: TranscriptFrame,
+}
+
+enum ProjectionUpdate {
+    Base,
+    Delta {
+        local_revision: u64,
+        page_id: String,
+        base_page_revision: String,
+        page_revision: String,
+        frame: jolt_session_doc::TranscriptFrame,
+    },
 }
 
 pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
-    doc: Arc<SessionDoc>,
+    doc: Arc<StoredSession>,
     queue_tx: watch::Sender<Vec<QueuedPrompt>>,
     /// Serializes change-driven drains with explicit session-transition kicks.
     drain_lock: tokio::sync::Mutex<()>,
-    /// V2 tail-first projection. Historical pages are decoded directly from
-    /// Loro only when requested; this state retains compact metadata and the
-    /// mutable live page.
+    /// Tail-first projection state retains compact metadata and only the
+    /// mutable live page; historical pages load from normalized rows on demand.
     transcript_projection: Mutex<Option<TranscriptProjectionState>>,
     transcript_tx: broadcast::Sender<TranscriptWatchFrame>,
     /// Epoch ms of the last open/watch touch — the LRU eviction key.
     last_access: AtomicI64,
-    /// Last known snapshot blob size — the eviction budget estimate's input.
-    snapshot_bytes: AtomicUsize,
-    room: Mutex<Option<RoomClient>>,
-    /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
-    _sub: loro::Subscription,
+    hub: Mutex<Option<Arc<SessionHubClient>>>,
+    hub_publish_lock: tokio::sync::Mutex<()>,
+    hub_base_retry_scheduled: AtomicBool,
+    hub_submit_lock: tokio::sync::Mutex<()>,
+    hub_commands: Mutex<HashMap<String, jolt_sync::HubCommand>>,
+    hub_uploaded_pages: Mutex<HashSet<String>>,
 }
 
 impl ChatDocHandle {
@@ -209,20 +285,17 @@ impl ChatDocHandle {
         &self.chat_id
     }
 
-    pub fn doc(&self) -> &SessionDoc {
+    pub fn doc(&self) -> &StoredSession {
         &self.doc
     }
 
-    pub fn doc_arc(&self) -> Arc<SessionDoc> {
+    pub fn doc_arc(&self) -> Arc<StoredSession> {
         self.doc.clone()
     }
 
     /// Pending queued turns, projected from the durable command ledger.
     pub fn watch_queue(&self) -> watch::Receiver<Vec<QueuedPrompt>> {
         self.touch();
-        if let Some(room) = lock(&self.room).as_ref() {
-            room.probe();
-        }
         let rx = self.queue_tx.subscribe();
         self.publish_queue();
         rx
@@ -250,124 +323,117 @@ impl ChatDocHandle {
             TranscriptBootstrap,
             broadcast::Receiver<TranscriptWatchFrame>,
         ),
-        DocError,
+        StoreError,
     > {
         self.touch();
-        if let Some(room) = lock(&self.room).as_ref() {
-            room.probe();
-        }
         let mut projection = lock(&self.transcript_projection);
         if projection.is_none() {
-            let catalog = TranscriptCatalog::build(&self.doc)?;
-            let live_page = catalog.live_page(&self.doc)?;
+            let manifest = self.doc.transcript_manifest()?;
+            let live_page = manifest
+                .pages
+                .last()
+                .map(|page| self.doc.transcript_page(&page.id))
+                .transpose()?
+                .flatten();
             *projection = Some(TranscriptProjectionState {
                 sequence: 0,
-                catalog,
+                projection_revision: self.doc.projection_revision()?,
+                manifest,
                 live_page,
             });
         }
         let receiver = self.transcript_tx.subscribe();
-        let state = projection.as_ref().expect("projection initialized above");
-        let bootstrap = state.catalog.bootstrap(&self.doc, state.sequence)?;
+        let sequence = projection
+            .as_ref()
+            .expect("projection initialized above")
+            .sequence;
+        let bootstrap = self.doc.transcript_bootstrap(sequence)?;
         Ok((bootstrap, receiver))
     }
 
-    pub fn transcript_page(&self, page_id: &str) -> Result<Option<TranscriptPage>, DocError> {
+    pub fn transcript_page(&self, page_id: &str) -> Result<Option<TranscriptPage>, StoreError> {
         self.touch();
-        let mut projection = lock(&self.transcript_projection);
-        if projection.is_none() {
-            let catalog = TranscriptCatalog::build(&self.doc)?;
-            let live_page = catalog.live_page(&self.doc)?;
-            *projection = Some(TranscriptProjectionState {
-                sequence: 0,
-                catalog,
-                live_page,
-            });
-        }
-        projection
-            .as_ref()
-            .expect("projection initialized above")
-            .catalog
-            .page(&self.doc, page_id)
+        self.doc.transcript_page(page_id)
     }
 
     pub fn search_transcript(
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<jolt_session_doc::TranscriptSearchResult>, DocError> {
+    ) -> Result<Vec<jolt_session_doc::TranscriptSearchResult>, StoreError> {
         self.touch();
-        let mut projection = lock(&self.transcript_projection);
-        if projection.is_none() {
-            let catalog = TranscriptCatalog::build(&self.doc)?;
-            let live_page = catalog.live_page(&self.doc)?;
-            *projection = Some(TranscriptProjectionState {
-                sequence: 0,
-                catalog,
-                live_page,
-            });
-        }
-        projection
-            .as_ref()
-            .expect("projection initialized above")
-            .catalog
-            .search(&self.doc, query, limit)
+        self.doc.search_transcript(query, limit)
     }
 
-    fn publish_transcript_if_watched(&self) {
-        if self.transcript_tx.receiver_count() == 0 {
-            // Keep no derived transcript alive for background command-only docs.
-            *lock(&self.transcript_projection) = None;
-            return;
-        }
+    fn refresh_projection(&self) -> Result<Option<ProjectionUpdate>, StoreError> {
         let mut projection = lock(&self.transcript_projection);
-        let Some(state) = projection.as_mut() else {
-            return;
-        };
-        let physical_len = self.doc.message_count();
-        if physical_len != state.catalog.physical_len() {
-            match TranscriptCatalog::build(&self.doc).and_then(|catalog| {
-                state.sequence = state.sequence.wrapping_add(1);
-                let bootstrap = catalog.bootstrap(&self.doc, state.sequence)?;
-                state.live_page = catalog.live_page(&self.doc)?;
-                state.catalog = catalog;
-                Ok(bootstrap)
-            }) {
-                Ok(bootstrap) => {
-                    let _ = self
-                        .transcript_tx
-                        .send(TranscriptWatchFrame::Bootstrap { bootstrap });
-                }
-                Err(err) => {
-                    tracing::warn!(chat = %self.chat_id, error = %err, "transcript catalog rebuild failed")
-                }
+        // Capture before materializing. A concurrent later write may be included
+        // in this frame, but the acknowledgement then remains conservatively old.
+        let local_revision = self.doc.projection_change_revision()?;
+        let projection_revision = self.doc.projection_revision()?;
+        if let Some(state) = projection.as_mut()
+            && state.projection_revision == projection_revision
+        {
+            let live_page = state
+                .manifest
+                .pages
+                .last()
+                .map(|page| self.doc.transcript_page(&page.id))
+                .transpose()?
+                .flatten();
+            let (Some(previous), Some(current)) = (state.live_page.as_ref(), live_page.as_ref())
+            else {
+                state.live_page = live_page;
+                return Ok(None);
+            };
+            let frame = jolt_session_doc::diff_transcript(&previous.messages, &current.messages);
+            let base_page_revision = previous.revision.clone();
+            if frame.is_empty_delta() {
+                state.live_page = live_page;
+                return Ok(None);
             }
-            return;
-        }
-        let current = match state.catalog.live_page(&self.doc) {
-            Ok(page) => page,
-            Err(err) => {
-                tracing::warn!(chat = %self.chat_id, error = %err, "live transcript page read failed");
-                return;
+            state.sequence = state.sequence.wrapping_add(1);
+            state.live_page = Some(current.clone());
+            if self.transcript_tx.receiver_count() > 0 {
+                let _ = self.transcript_tx.send(TranscriptWatchFrame::Delta {
+                    sequence: state.sequence,
+                    page_id: current.id.clone(),
+                    page_revision: current.revision.clone(),
+                    frame: frame.clone(),
+                });
             }
-        };
-        let (Some(previous), Some(current)) = (state.live_page.as_ref(), current.as_ref()) else {
-            state.live_page = current;
-            return;
-        };
-        let frame = jolt_session_doc::diff_transcript(&previous.messages, &current.messages);
-        if frame.is_empty_delta() {
-            return;
+            return Ok(Some(ProjectionUpdate::Delta {
+                local_revision,
+                page_id: current.id.clone(),
+                base_page_revision,
+                page_revision: current.revision.clone(),
+                frame,
+            }));
         }
-        state.sequence = state.sequence.wrapping_add(1);
-        let event = TranscriptWatchFrame::Delta {
-            sequence: state.sequence,
-            page_id: current.id.clone(),
-            page_revision: current.revision.clone(),
-            frame,
-        };
-        state.live_page = Some(current.clone());
-        let _ = self.transcript_tx.send(event);
+
+        let manifest = self.doc.transcript_manifest()?;
+        let live_page = manifest
+            .pages
+            .last()
+            .map(|page| self.doc.transcript_page(&page.id))
+            .transpose()?
+            .flatten();
+        let sequence = projection
+            .as_ref()
+            .map_or(0, |state| state.sequence.wrapping_add(1));
+        *projection = Some(TranscriptProjectionState {
+            sequence,
+            projection_revision,
+            manifest: manifest.clone(),
+            live_page: live_page.clone(),
+        });
+        if sequence > 0 && self.transcript_tx.receiver_count() > 0 {
+            let bootstrap = self.doc.transcript_bootstrap(sequence)?;
+            let _ = self
+                .transcript_tx
+                .send(TranscriptWatchFrame::Bootstrap { bootstrap });
+        }
+        Ok(Some(ProjectionUpdate::Base))
     }
 
     fn touch(&self) {
@@ -375,7 +441,9 @@ impl ChatDocHandle {
     }
 
     pub fn connected(&self) -> bool {
-        lock(&self.room).is_some()
+        lock(&self.hub)
+            .as_ref()
+            .is_some_and(|hub| hub.stats().connected)
     }
 
     /// Write a complete user message entry, idempotent by id (the client-minted message
@@ -385,7 +453,7 @@ impl ChatDocHandle {
         message_id: &str,
         text: &str,
         created_at: i64,
-    ) -> Result<(), DocError> {
+    ) -> Result<(), StoreError> {
         if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
             return Ok(());
         }
@@ -400,7 +468,8 @@ impl ChatDocHandle {
             device_id: self.device_id.clone(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
-        })
+        })?;
+        Ok(())
     }
 
     /// Insert a durable harness-transition boundary immediately before the
@@ -412,7 +481,7 @@ impl ChatDocHandle {
         from: HarnessId,
         to: HarnessId,
         created_at: i64,
-    ) -> Result<(), DocError> {
+    ) -> Result<(), StoreError> {
         let marker_id = format!("{next_message_id}#harness");
         if self
             .doc
@@ -434,7 +503,8 @@ impl ChatDocHandle {
             device_id: self.device_id.clone(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
-        })
+        })?;
+        Ok(())
     }
 
     /// Write or complete a system message, idempotent by its client-minted id.
@@ -443,7 +513,7 @@ impl ChatDocHandle {
         message_id: &str,
         text: &str,
         created_at: i64,
-    ) -> Result<(), DocError> {
+    ) -> Result<(), StoreError> {
         self.write_system_message_with_status(message_id, text, created_at, MessageStatus::Complete)
     }
 
@@ -453,7 +523,7 @@ impl ChatDocHandle {
         message_id: &str,
         text: &str,
         created_at: i64,
-    ) -> Result<(), DocError> {
+    ) -> Result<(), StoreError> {
         self.write_system_message_with_status(
             message_id,
             text,
@@ -468,7 +538,7 @@ impl ChatDocHandle {
         text: &str,
         created_at: i64,
         status: MessageStatus,
-    ) -> Result<(), DocError> {
+    ) -> Result<(), StoreError> {
         if self
             .doc
             .update_text_message(message_id, "t0", text, status)?
@@ -486,7 +556,8 @@ impl ChatDocHandle {
             device_id: self.device_id.clone(),
             status: Some(status),
             continuation_of: None,
-        })
+        })?;
+        Ok(())
     }
 
     /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
@@ -494,7 +565,7 @@ impl ChatDocHandle {
     /// ended (jolt folded "Run interrupted by backend restart" the same
     /// way). Returns the stamped entries' `(id, created_at)` — recovery uses
     /// them for the resume-freshness check.
-    pub fn mark_abandoned_streams(&self, note: &str) -> Result<Vec<(String, i64)>, DocError> {
+    pub fn mark_abandoned_streams(&self, note: &str) -> Result<Vec<(String, i64)>, StoreError> {
         let mut stamped = Vec::new();
         for entry in self.doc.read_entries()? {
             if entry.role == MessageRole::Assistant
@@ -516,8 +587,7 @@ impl ChatDocHandle {
 
     /// Rough resident cost for the LRU budget.
     fn resident_estimate(&self) -> usize {
-        (self.snapshot_bytes.load(Ordering::Relaxed) * RESIDENT_BYTES_PER_SNAPSHOT_BYTE)
-            .max(DOC_RESIDENT_FLOOR_BYTES)
+        DOC_RESIDENT_FLOOR_BYTES
     }
 }
 
@@ -550,6 +620,82 @@ impl DocHost {
         let _ = self.inner.workspace.set(workspace);
     }
 
+    /// Cutover/recovery publication for every locally hosted registry chat.
+    /// Later boots skip only chats with a seeded and acknowledged current projection.
+    pub fn seed_hosted_sessions(&self) {
+        if self.inner.config.edge.is_none() {
+            return;
+        }
+        let Some(workspace) = self.inner.workspace.get() else {
+            return;
+        };
+        let Ok(chats) = workspace.read_chats() else {
+            return;
+        };
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(HUB_SEED_CONCURRENCY));
+        for chat in chats
+            .into_iter()
+            .filter(|chat| chat.device_id == self.inner.config.device_id)
+        {
+            if self.inner.store.session_exists(&chat.id).unwrap_or(false)
+                && self
+                    .inner
+                    .store
+                    .open_session(&chat.id)
+                    .and_then(|session| {
+                        Ok(session.hub_seeded()? && !session.hub_projection_dirty()?)
+                    })
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let host = self.clone();
+            let semaphore = semaphore.clone();
+            tokio::spawn(async move {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return;
+                };
+                let handle = match host.open(&chat.id) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        tracing::warn!(chat = %chat.id, %error, "SessionHub seed open failed");
+                        return;
+                    }
+                };
+                let seeded = tokio::time::timeout(HUB_SEED_TIMEOUT, async {
+                    loop {
+                        match (
+                            handle.doc.hub_seeded(),
+                            handle.doc.hub_projection_dirty(),
+                        ) {
+                            (Ok(true), Ok(false)) => return true,
+                            (Ok(_), Ok(_)) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await
+                            }
+                            (Err(error), _) | (_, Err(error)) => {
+                                tracing::warn!(chat = %chat.id, %error, "SessionHub publication check failed");
+                                return false;
+                            }
+                        }
+                    }
+                })
+                .await
+                .unwrap_or(false);
+                if !seeded {
+                    tracing::warn!(chat = %chat.id, "SessionHub seed timed out; retrying next boot");
+                }
+                let mut handles = lock(&host.inner.handles);
+                if handles
+                    .get(&chat.id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                    && Arc::strong_count(&handle) <= 2
+                {
+                    handles.remove(&chat.id);
+                }
+            });
+        }
+    }
+
     /// The workspace host, once wired (tests may assemble a DocHost without one).
     pub fn workspace(&self) -> Option<&WorkspaceHost> {
         self.inner.workspace.get()
@@ -559,30 +705,285 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
-    /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
-    /// start the change-driven task, and join the edge room when configured.
+    /// Materialize the source SessionHub's complete published transcript under
+    /// a fresh local chat id. Commands and machine-local continuation state are
+    /// deliberately not copied; the caller creates the new registry row only
+    /// after this import succeeds.
+    pub async fn import_recovery_fork(
+        &self,
+        source_chat_id: &str,
+        chat_id: &str,
+    ) -> Result<usize, EngineError> {
+        if !valid_hub_id(source_chat_id) || !valid_hub_id(chat_id) {
+            return Err(EngineError::Other(
+                "recovery fork chat ids must be 1-128 URL-safe characters".into(),
+            ));
+        }
+        if source_chat_id == chat_id {
+            return Err(EngineError::Other(
+                "a recovery fork requires a fresh chat id".into(),
+            ));
+        }
+        if self.inner.store.session_exists(chat_id)? {
+            return Err(EngineError::Other(format!(
+                "recovery fork chat {chat_id} already has local state"
+            )));
+        }
+        let edge =
+            self.inner.config.edge.clone().ok_or_else(|| {
+                EngineError::Other("recovery requires an Account connection".into())
+            })?;
+        let bearer = edge
+            .bearer()
+            .await
+            .ok_or_else(|| EngineError::Other("recovery requires a signed-in account".into()))?;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!(
+                "{}/hub/{source_chat_id}/bootstrap",
+                edge.url.trim_end_matches('/')
+            ))
+            .bearer_auth(&bearer)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| EngineError::Other(format!("fetch recovery projection: {error}")))?;
+        if !response.status().is_success() {
+            return Err(EngineError::Other(format!(
+                "source SessionHub projection is unavailable ({})",
+                response.status()
+            )));
+        }
+        let bootstrap = response
+            .json::<HubProjectionBootstrap>()
+            .await
+            .map_err(|error| EngineError::Other(format!("decode recovery projection: {error}")))?;
+        let mut pages = HashMap::new();
+        for page in bootstrap.pages {
+            let page_id = page.id.clone();
+            if pages.insert(page_id.clone(), page).is_some() {
+                return Err(EngineError::Other(format!(
+                    "recovery projection repeated page {page_id}"
+                )));
+            }
+        }
+
+        for descriptor in bootstrap.manifest.pages.iter().filter(|page| !page.live) {
+            let hash = descriptor.content_hash.as_deref().ok_or_else(|| {
+                EngineError::Other(format!(
+                    "sealed recovery page {} has no content hash",
+                    descriptor.id
+                ))
+            })?;
+            if !valid_sha256(hash) {
+                return Err(EngineError::Other(format!(
+                    "sealed recovery page {} has an invalid content hash",
+                    descriptor.id
+                )));
+            }
+            let response = client
+                .get(format!(
+                    "{}/hub/{source_chat_id}/pages/{hash}",
+                    edge.url.trim_end_matches('/')
+                ))
+                .bearer_auth(&bearer)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|error| {
+                    EngineError::Other(format!(
+                        "fetch sealed recovery page {}: {error}",
+                        descriptor.id
+                    ))
+                })?;
+            if !response.status().is_success() {
+                return Err(EngineError::Other(format!(
+                    "sealed recovery page {} is unavailable ({})",
+                    descriptor.id,
+                    response.status()
+                )));
+            }
+            let bytes = response.bytes().await.map_err(|error| {
+                EngineError::Other(format!(
+                    "read sealed recovery page {}: {error}",
+                    descriptor.id
+                ))
+            })?;
+            if sha256_hex(&bytes) != hash {
+                return Err(EngineError::Other(format!(
+                    "sealed recovery page {} failed SHA-256 verification",
+                    descriptor.id
+                )));
+            }
+            let page: TranscriptPage = serde_json::from_slice(&bytes).map_err(|error| {
+                EngineError::Other(format!(
+                    "decode sealed recovery page {}: {error}",
+                    descriptor.id
+                ))
+            })?;
+            if pages.insert(page.id.clone(), page).is_some() {
+                return Err(EngineError::Other(format!(
+                    "recovery projection repeated page {}",
+                    descriptor.id
+                )));
+            }
+        }
+
+        let descriptors = bootstrap
+            .manifest
+            .pages
+            .iter()
+            .map(|page| (page.id.as_str(), page))
+            .collect::<HashMap<_, _>>();
+        for descriptor in &bootstrap.manifest.pages {
+            let page = pages.get(&descriptor.id).ok_or_else(|| {
+                EngineError::Other(format!(
+                    "recovery projection omitted page {}",
+                    descriptor.id
+                ))
+            })?;
+            if page.id != descriptor.id
+                || page.first_ordinal != descriptor.first_ordinal
+                || page.messages.len() != descriptor.message_count
+                || page.revision != descriptor.revision
+            {
+                return Err(EngineError::Other(format!(
+                    "recovery page {} does not match its manifest",
+                    descriptor.id
+                )));
+            }
+        }
+        if pages.len() != bootstrap.manifest.pages.len() {
+            return Err(EngineError::Other(
+                "recovery projection contained an unreferenced page".into(),
+            ));
+        }
+
+        let mut sequence = bootstrap.sequence;
+        for item in bootstrap.deltas {
+            let expected = sequence.checked_add(1).ok_or_else(|| {
+                EngineError::Other("recovery projection sequence overflowed".into())
+            })?;
+            if item.sequence != expected {
+                return Err(EngineError::Other(format!(
+                    "recovery projection sequence gap: expected {expected}, got {}",
+                    item.sequence
+                )));
+            }
+            let descriptor = descriptors
+                .get(item.delta.page_id.as_str())
+                .ok_or_else(|| {
+                    EngineError::Other(format!(
+                        "recovery delta references unknown page {}",
+                        item.delta.page_id
+                    ))
+                })?;
+            if !descriptor.live {
+                return Err(EngineError::Other(format!(
+                    "recovery delta targets sealed page {}",
+                    item.delta.page_id
+                )));
+            }
+            let page = pages.get_mut(&item.delta.page_id).ok_or_else(|| {
+                EngineError::Other(format!(
+                    "recovery delta omitted base page {}",
+                    item.delta.page_id
+                ))
+            })?;
+            apply_transcript_frame(&mut page.messages, item.delta.frame)
+                .map_err(|error| EngineError::Other(error.to_string()))?;
+            page.revision = item.delta.page_revision;
+            sequence = item.sequence;
+        }
+
+        let mut messages = Vec::with_capacity(bootstrap.manifest.total_messages + 1);
+        let mut message_ids = HashSet::new();
+        let mut expected_ordinal = 0usize;
+        for descriptor in &bootstrap.manifest.pages {
+            let page = pages.remove(&descriptor.id).expect("validated page exists");
+            if page.first_ordinal != expected_ordinal
+                || page.messages.len() != descriptor.message_count
+            {
+                return Err(EngineError::Other(format!(
+                    "recovery page {} has a non-contiguous range",
+                    descriptor.id
+                )));
+            }
+            for mut message in page.messages {
+                if !message_ids.insert(message.id.clone()) {
+                    return Err(EngineError::Other(format!(
+                        "recovery transcript repeated message {}",
+                        message.id
+                    )));
+                }
+                if message.status == Some(MessageStatus::Streaming) {
+                    message.status = Some(MessageStatus::Aborted);
+                    message.parts.push(MessagePart::Error {
+                        id: format!("recovery-{}", new_id()),
+                        message: "Stream ended when the original host was permanently lost.".into(),
+                    });
+                }
+                messages.push(message);
+            }
+            expected_ordinal += descriptor.message_count;
+        }
+        if expected_ordinal != bootstrap.manifest.total_messages {
+            return Err(EngineError::Other(format!(
+                "recovery transcript count mismatch: expected {}, got {expected_ordinal}",
+                bootstrap.manifest.total_messages
+            )));
+        }
+        messages.push(SessionMessageEntry {
+            id: new_id(),
+            role: MessageRole::System,
+            parts: vec![MessagePart::Text {
+                id: new_id(),
+                text: format!(
+                    "Recovery fork created from chat {source_chat_id}. Machine-local checkout and harness continuation state were not transferred."
+                ),
+            }],
+            created_at: now_ms(),
+            device_id: self.inner.config.device_id.clone(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        });
+        let count = messages.len();
+        self.inner
+            .store
+            .import_session_state(chat_id, &messages, &[])?;
+        Ok(count)
+    }
+
+    /// Open (or return) the chat's normalized local state and connect its
+    /// SessionHub when this device is the immutable host.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
         if let Some(handle) = lock(&self.inner.handles).get(chat_id) {
             handle.touch();
             return Ok(handle.clone());
         }
-        let mut snapshot_len = 0usize;
-        let doc = match self.inner.store.load_snapshot(chat_id)? {
-            Some(bytes) => {
-                snapshot_len = bytes.len();
-                let raw = loro::LoroDoc::new();
-                raw.import(&bytes)
-                    .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
-                SessionDoc::from_doc(raw)
-            }
-            None => SessionDoc::init(chat_id)?,
-        };
-        let doc = Arc::new(doc);
+        if !self.inner.store.session_exists(chat_id)?
+            && let Some(snapshot) = self.inner.store.load_snapshot(chat_id)?
+        {
+            let report = self.inner.store.import_legacy_session(chat_id, &snapshot)?;
+            tracing::info!(
+                chat = %chat_id,
+                messages = report.message_count,
+                commands = report.command_count,
+                hash = %report.semantic_hash,
+                "migrated legacy Loro session into SQLite"
+            );
+        }
 
         let (changed_tx, changed_rx) = watch::channel(0u64);
-        let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
-            changed_tx.send_modify(|v| *v = v.wrapping_add(1));
-        }));
+        let hook_tx = changed_tx.clone();
+        let doc = self
+            .inner
+            .store
+            .open_session(chat_id)?
+            .with_change_hook(Arc::new(move || {
+                hook_tx.send_modify(|value| *value = value.wrapping_add(1));
+            }));
+        let doc = Arc::new(doc);
         let (queue_tx, _) = watch::channel(Vec::new());
         let (transcript_tx, _) = broadcast::channel(128);
 
@@ -595,9 +996,12 @@ impl DocHost {
             transcript_projection: Mutex::new(None),
             transcript_tx,
             last_access: AtomicI64::new(now_ms()),
-            snapshot_bytes: AtomicUsize::new(snapshot_len),
-            room: Mutex::new(None),
-            _sub: sub,
+            hub: Mutex::new(None),
+            hub_publish_lock: tokio::sync::Mutex::new(()),
+            hub_base_retry_scheduled: AtomicBool::new(false),
+            hub_submit_lock: tokio::sync::Mutex::new(()),
+            hub_commands: Mutex::new(HashMap::new()),
+            hub_uploaded_pages: Mutex::new(HashSet::new()),
         });
         {
             let mut handles = lock(&self.inner.handles);
@@ -607,52 +1011,47 @@ impl DocHost {
             handles.insert(chat_id.to_string(), handle.clone());
         }
 
-        // Edge room join — offline-tolerant AND supervised. `RoomClient` only
-        // self-reconnects AFTER a first successful join; a one-shot attempt
-        // here (the pre-LRU design) left the doc silently local-only until
-        // app restart whenever the dial hit a transient gap — a post-wake
-        // network, `Auth::token()` momentarily `None` around a refresh, an
-        // edge deploy. The LRU made that dice-roll constant (every reopen),
-        // and a watched doc is pinned against eviction, so nothing ever
-        // retried: the exact "transcript frozen until restart" report.
-        // Retry on the workspace host's capped, jittered backoff; a system
-        // wake redials immediately; eviction/purge ends the loop via `weak`.
-        if let Some(edge) = &self.inner.config.edge {
-            let url = edge.room_url(format!("/session/{chat_id}/ws"));
-            let room_doc = doc.doc().clone();
+        if self.is_host(chat_id)
+            && let Some(edge) = &self.inner.config.edge
+        {
+            let url = edge.room_url(format!("/hub/{chat_id}/ws?role=host"));
             let chat = chat_id.to_string();
-            let weak = Arc::downgrade(&handle);
+            let weak_handle = Arc::downgrade(&handle);
+            let host = self.clone();
             tokio::spawn(async move {
-                let mut wake = jolt_platform::wake::subscribe();
-                let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                let mut backoff = std::time::Duration::from_millis(250);
                 loop {
-                    if weak.upgrade().is_none() {
-                        return; // evicted or purged while dialing
-                    }
-                    match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await {
+                    let Some(handle) = weak_handle.upgrade() else {
+                        return;
+                    };
+                    match SessionHubClient::connect_via(url.clone()).await {
                         Ok(client) => {
-                            let Some(handle) = weak.upgrade() else {
-                                return; // evicted mid-dial: drop leaves the room
-                            };
-                            *lock(&handle.room) = Some(client);
-                            tracing::info!(chat = %chat, "session room joined");
+                            let client = Arc::new(client);
+                            for command in client.commands() {
+                                if let Err(error) = host.ingest_hub_command(&handle, command) {
+                                    tracing::warn!(chat = %handle.chat_id, %error, "SessionHub command import failed");
+                                }
+                            }
+                            let events = client.subscribe();
+                            *lock(&handle.hub) = Some(client.clone());
+                            host.submit_unsent_hub_commands(&handle);
+                            if !host.publish_hub_base(&handle, &client).await {
+                                host.schedule_hub_base_retry(&handle);
+                            }
+                            host.reconcile_hub_commands(&handle).await;
+                            tokio::spawn(hub_event_task(
+                                host.clone(),
+                                Arc::downgrade(&handle),
+                                events,
+                            ));
+                            tracing::info!(chat = %chat, "SessionHub joined");
                             return;
                         }
-                        Err(err) => {
-                            tracing::warn!(
-                                chat = %chat,
-                                error = %err,
-                                backoff_ms = backoff.as_millis() as u64,
-                                "session room join failed; retrying"
-                            );
-                        }
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
-                            backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
-                        }
-                        _ = wake.recv() => {
-                            backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                        Err(error) => {
+                            tracing::warn!(chat = %chat, %error, "SessionHub join failed; retrying");
+                            drop(handle);
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(15));
                         }
                     }
                 }
@@ -664,16 +1063,367 @@ impl DocHost {
         Ok(handle)
     }
 
+    async fn reconcile_hub_commands(&self, handle: &Arc<ChatDocHandle>) {
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return;
+        };
+        loop {
+            let cursor = match handle.doc.command_cursor() {
+                Ok(cursor) => cursor,
+                Err(error) => {
+                    tracing::warn!(chat = %handle.chat_id, %error, "SessionHub command cursor read failed");
+                    return;
+                }
+            };
+            let Some(bearer) = edge.bearer().await else {
+                return;
+            };
+            let response = reqwest::Client::new()
+                .get(format!(
+                    "{}/hub/{}/commands?after={cursor}",
+                    edge.url.trim_end_matches('/'),
+                    handle.chat_id
+                ))
+                .bearer_auth(bearer)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await;
+            let page = match response {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<HubCommandPage>().await {
+                        Ok(page) => page,
+                        Err(error) => {
+                            tracing::warn!(chat = %handle.chat_id, %error, "SessionHub command page decode failed");
+                            return;
+                        }
+                    }
+                }
+                Ok(response) => {
+                    tracing::warn!(chat = %handle.chat_id, status = %response.status(), "SessionHub command reconciliation rejected");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(chat = %handle.chat_id, %error, "SessionHub command reconciliation failed");
+                    return;
+                }
+            };
+            for command in page.commands {
+                if let Err(error) = self.ingest_hub_command(handle, command) {
+                    tracing::warn!(chat = %handle.chat_id, %error, "SessionHub command page was not applied");
+                    return;
+                }
+            }
+            if let Err(error) = handle.doc.set_command_cursor(page.next_revision) {
+                tracing::warn!(chat = %handle.chat_id, %error, "SessionHub command cursor write failed");
+                return;
+            }
+            if !page.has_more {
+                return;
+            }
+            if page.next_revision <= cursor {
+                tracing::warn!(chat = %handle.chat_id, "SessionHub command cursor did not advance");
+                return;
+            }
+        }
+    }
+
+    fn ingest_hub_command(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        command: jolt_sync::HubCommand,
+    ) -> Result<(), StoreError> {
+        let entry = command.entry();
+        let local = handle.doc.read_command(&entry.id)?;
+        if let Some(local) = &local
+            && (local.payload != entry.payload
+                || local.issued_by != entry.issued_by
+                || local.issued_at != entry.issued_at
+                || local.based_on != entry.based_on
+                || local.effective_expiry() != entry.effective_expiry())
+        {
+            return Err(StoreError::Session(format!(
+                "SessionHub command {} conflicts with the local immutable envelope",
+                entry.id
+            )));
+        }
+        lock(&handle.hub_commands).insert(command.id.clone(), command.clone());
+        match local {
+            None => {
+                handle.doc.queue_command(&entry)?;
+            }
+            Some(local)
+                if local.status != SessionCommandStatus::Pending
+                    && command.delivery_state != jolt_sync::HubDeliveryState::Terminal =>
+            {
+                self.resolve_hub_command(
+                    handle,
+                    &local.id,
+                    local.status,
+                    local.resolution.as_deref(),
+                );
+            }
+            Some(local) if local.status != entry.status || local.resolution != entry.resolution => {
+                handle.doc.set_command_status(
+                    &entry.id,
+                    entry.status,
+                    entry.resolution.as_deref(),
+                )?;
+            }
+            Some(_) => {}
+        }
+        // An imported local pending row may already match the edge envelope,
+        // so no SQLite mutation would otherwise wake the executor.
+        self.kick_commands(&handle.chat_id);
+        Ok(())
+    }
+
+    async fn upload_hub_pages(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        manifest: &TranscriptManifest,
+    ) -> Result<(), EngineError> {
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return Ok(());
+        };
+        let uploaded = lock(&handle.hub_uploaded_pages).clone();
+        let mut candidates = Vec::new();
+        for page in manifest.pages.iter().filter(|page| !page.live) {
+            let Some(hash) = &page.content_hash else {
+                continue;
+            };
+            if uploaded.contains(hash) || handle.doc.page_is_published(&page.id, hash)? {
+                continue;
+            }
+            candidates.push((page.id.clone(), hash.clone()));
+        }
+        for (page_id, hash) in candidates {
+            let page = handle
+                .doc
+                .transcript_page(&page_id)?
+                .ok_or_else(|| EngineError::Other(format!("transcript page {page_id} missing")))?;
+            let bytes = serde_json::to_vec(&page).map_err(|error| {
+                EngineError::Other(format!("serialize transcript page: {error}"))
+            })?;
+            let bearer = edge
+                .bearer()
+                .await
+                .ok_or_else(|| EngineError::Other("signed out during transcript upload".into()))?;
+            let response = reqwest::Client::new()
+                .put(format!(
+                    "{}/hub/{}/pages/{hash}",
+                    edge.url.trim_end_matches('/'),
+                    handle.chat_id
+                ))
+                .bearer_auth(bearer)
+                .header("content-type", "application/json")
+                .body(bytes)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|error| EngineError::Other(format!("upload transcript page: {error}")))?;
+            if !response.status().is_success() {
+                return Err(EngineError::Other(format!(
+                    "upload transcript page failed ({})",
+                    response.status()
+                )));
+            }
+            handle.doc.mark_page_published(&page_id, &hash)?;
+            lock(&handle.hub_uploaded_pages).insert(hash);
+        }
+        Ok(())
+    }
+
+    async fn publish_hub_base(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        client: &Arc<SessionHubClient>,
+    ) -> bool {
+        let _publication = handle.hub_publish_lock.lock().await;
+        self.publish_hub_base_locked(handle, client).await
+    }
+
+    async fn publish_hub_base_locked(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        client: &Arc<SessionHubClient>,
+    ) -> bool {
+        // Read after taking the publication lock: an older reconnect/base task
+        // must never overwrite a newer projection that won the race. Capture
+        // the revision first so a concurrent write leaves a conservative dirty bit.
+        let local_revision = match handle.doc.projection_change_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                tracing::warn!(chat = %handle.chat_id, %error, "SessionHub base revision read failed");
+                return false;
+            }
+        };
+        let result = handle.doc.transcript_manifest().and_then(|manifest| {
+            let live_page = manifest
+                .pages
+                .last()
+                .map(|page| handle.doc.transcript_page(&page.id))
+                .transpose()?
+                .flatten();
+            Ok((manifest, live_page))
+        });
+        let (manifest, live_page) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(chat = %handle.chat_id, %error, "SessionHub base projection failed");
+                return false;
+            }
+        };
+        if let Err(error) = self.upload_hub_pages(handle, &manifest).await {
+            tracing::warn!(chat = %handle.chat_id, %error, "SessionHub page upload failed");
+            return false;
+        }
+        match client.publish_base(manifest, live_page).await {
+            Ok(_) => {
+                if let Err(error) = handle.doc.mark_hub_projection_published(local_revision) {
+                    tracing::warn!(chat = %handle.chat_id, %error, "SessionHub seed marker failed");
+                    return false;
+                }
+                handle
+                    .hub_base_retry_scheduled
+                    .store(false, Ordering::Release);
+                true
+            }
+            Err(error) => {
+                tracing::warn!(chat = %handle.chat_id, %error, "SessionHub base publish failed");
+                false
+            }
+        }
+    }
+
+    fn schedule_hub_base_retry(&self, handle: &Arc<ChatDocHandle>) {
+        if handle.hub_base_retry_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let host = self.clone();
+        let weak = Arc::downgrade(handle);
+        tokio::spawn(async move {
+            let mut backoff = std::time::Duration::from_secs(1);
+            loop {
+                tokio::time::sleep(backoff).await;
+                let Some(handle) = weak.upgrade() else {
+                    return;
+                };
+                if !handle.hub_base_retry_scheduled.load(Ordering::Acquire) {
+                    return;
+                }
+                let client = lock(&handle.hub).clone();
+                let published = match client {
+                    Some(client) => host.publish_hub_base(&handle, &client).await,
+                    None => false,
+                };
+                if published {
+                    return;
+                }
+                drop(handle);
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(15));
+            }
+        });
+    }
+
+    async fn publish_projection_update(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        update: ProjectionUpdate,
+    ) {
+        let client = lock(&handle.hub).clone();
+        let Some(client) = client else {
+            return;
+        };
+        let publication = handle.hub_publish_lock.lock().await;
+        let (result, local_revision) = match update {
+            ProjectionUpdate::Base => {
+                if !self.publish_hub_base_locked(handle, &client).await {
+                    self.schedule_hub_base_retry(handle);
+                }
+                return;
+            }
+            ProjectionUpdate::Delta {
+                local_revision,
+                page_id,
+                base_page_revision,
+                page_revision,
+                frame,
+            } => (
+                client
+                    .publish_delta(page_id, base_page_revision, page_revision, frame)
+                    .await,
+                local_revision,
+            ),
+        };
+        let mut need_base = false;
+        match result {
+            Ok(result) if result.need_base => need_base = true,
+            Ok(_) => {
+                if let Err(error) = handle.doc.mark_hub_projection_published(local_revision) {
+                    tracing::warn!(chat = %handle.chat_id, %error, "SessionHub projection acknowledgement failed");
+                    need_base = true;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(chat = %handle.chat_id, %error, "SessionHub projection publish failed")
+            }
+        }
+        drop(publication);
+        if need_base && !self.publish_hub_base(handle, &client).await {
+            self.schedule_hub_base_retry(handle);
+        }
+    }
+
+    fn resolve_hub_command(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        command_id: &str,
+        status: SessionCommandStatus,
+        resolution: Option<&str>,
+    ) {
+        let client = lock(&handle.hub).clone();
+        let command = lock(&handle.hub_commands).get(command_id).cloned();
+        let Some(client) = client else {
+            return;
+        };
+        let Some(command) = command else {
+            return;
+        };
+        let command_id = command_id.to_string();
+        let resolution = resolution.map(bounded_command_resolution);
+        tokio::spawn(async move {
+            let claimed = match command.claim_token {
+                Some(_) => command,
+                None => match client.claim_command(&command_id).await {
+                    Ok(command) => command,
+                    Err(error) => {
+                        tracing::warn!(command = %command_id, %error, "SessionHub command claim for resolution failed");
+                        return;
+                    }
+                },
+            };
+            let Some(claim_token) = claimed.claim_token else {
+                tracing::warn!(command = %command_id, "SessionHub claim omitted token");
+                return;
+            };
+            if let Err(error) = client
+                .resolve_command(&command_id, &claim_token, status, resolution.as_deref())
+                .await
+            {
+                tracing::warn!(command = %command_id, %error, "SessionHub command resolve failed");
+            }
+        });
+    }
+
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
     /// resident estimate exceeds `DOC_LRU_BYTE_BUDGET`, close the
     /// least-recently-touched unpinned docs. Pinned (never evicted):
     /// - watched docs (queue or transcript receivers);
-    /// - docs with a live writer (`Arc<SessionDoc>` held outside the handle —
-    ///   a run streaming into it);
+    /// - docs with a live writer (`Arc<StoredSession>` held outside the handle);
     /// - host-side docs with pending commands (the executor owes them work).
     ///
-    /// Eviction flushes a final snapshot, so reopen loses nothing; missed
-    /// remote updates re-arrive through the room join's VV backfill.
+    /// Mutations already committed synchronously, so eviction needs no flush.
+    /// A later open reconnects SessionHub and republishes the current base.
     fn evict_over_budget(&self) {
         let mut by_age: Vec<(i64, String)> = {
             let handles = lock(&self.inner.handles);
@@ -709,10 +1459,7 @@ impl DocHost {
                 }
             };
             if let Some(handle) = evicted {
-                // Final flush outside the map lock; ≤1s of changes could be
-                // pending in the snapshot debounce.
-                self.save_snapshot(&handle);
-                tracing::debug!(chat = %handle.chat_id, "doc evicted (LRU)");
+                tracing::debug!(chat = %handle.chat_id, "session handle evicted (LRU)");
             }
         }
     }
@@ -739,44 +1486,92 @@ impl DocHost {
         }
     }
 
-    /// Probe every open chat's room (window-focus liveness sweep). Each
-    /// room ignores the hint unless it has been broadcast-quiet ≥30s.
-    pub fn probe_open_chats(&self) {
-        let handles: Vec<Arc<ChatDocHandle>> =
-            lock(&self.inner.handles).values().cloned().collect();
-        for handle in handles {
-            if let Some(room) = lock(&handle.room).as_ref() {
-                room.probe();
+    /// SessionHub clients enforce their own transport silence lease.
+    pub fn probe_open_chats(&self) {}
+
+    /// Persistent publication state for every chat immutably hosted here.
+    pub fn hosted_hub_publication_status(
+        &self,
+    ) -> Result<Option<HostedHubPublicationStatus>, EngineError> {
+        if self.inner.config.edge.is_none() {
+            return Ok(None);
+        }
+        let Some(workspace) = self.inner.workspace.get() else {
+            return Ok(Some(HostedHubPublicationStatus {
+                total: 0,
+                normalized: 0,
+                unseeded: Vec::new(),
+                unpublished: Vec::new(),
+            }));
+        };
+        let hosted: HashSet<String> = workspace
+            .read_chats()?
+            .into_iter()
+            .filter(|chat| chat.device_id == self.inner.config.device_id)
+            .map(|chat| chat.id)
+            .collect();
+        let normalized: HashSet<String> = self.inner.store.session_ids()?.into_iter().collect();
+        let unseeded_rows: HashSet<String> = self
+            .inner
+            .store
+            .unseeded_hub_session_ids()?
+            .into_iter()
+            .collect();
+        let unpublished_rows: HashSet<String> = self
+            .inner
+            .store
+            .unpublished_hub_session_ids()?
+            .into_iter()
+            .collect();
+        let mut unseeded = Vec::new();
+        let mut unpublished = Vec::new();
+        for chat_id in &hosted {
+            if !normalized.contains(chat_id) || unseeded_rows.contains(chat_id) {
+                unseeded.push(chat_id.clone());
+            }
+            if !normalized.contains(chat_id) || unpublished_rows.contains(chat_id) {
+                unpublished.push(chat_id.clone());
             }
         }
+        unseeded.sort();
+        unpublished.sort();
+        Ok(Some(HostedHubPublicationStatus {
+            total: hosted.len(),
+            normalized: hosted.intersection(&normalized).count(),
+            unseeded,
+            unpublished,
+        }))
     }
 
     /// Per-open-chat room introspection for SyncStatus / `jolt sync`.
     /// `None` room = still dialing (join retry loop) or edge-less.
-    pub fn sync_statuses(&self) -> Vec<(String, Option<jolt_sync::RoomStatsSnapshot>)> {
+    pub fn sync_statuses(&self) -> Vec<(String, Option<jolt_sync::SessionHubStats>)> {
         let handles: Vec<Arc<ChatDocHandle>> =
             lock(&self.inner.handles).values().cloned().collect();
-        let mut rows: Vec<(String, Option<jolt_sync::RoomStatsSnapshot>)> = handles
+        let mut rows: Vec<(String, Option<jolt_sync::SessionHubStats>)> = handles
             .iter()
-            .map(|h| {
-                (
-                    h.chat_id.clone(),
-                    lock(&h.room).as_ref().map(RoomClient::stats),
-                )
+            .map(|handle| {
+                let stats = lock(&handle.hub).as_ref().map(|hub| hub.stats());
+                (handle.chat_id.clone(), stats)
             })
             .collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows
     }
 
-    /// Drop a chat's doc unconditionally and delete its local snapshot — the
+    /// Drop a chat's normalized state and its retained rollback snapshot — the
     /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
     /// stream end; a racing writer keeps its orphaned doc until the run ends.
     pub fn purge_chat(&self, chat_id: &str) {
         let removed = lock(&self.inner.handles).remove(chat_id);
         drop(removed);
-        if let Err(err) = self.inner.store.delete_snapshot(chat_id) {
-            tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
+        if let Ok(session) = self.inner.store.open_session(chat_id)
+            && let Err(error) = session.delete()
+        {
+            tracing::warn!(chat = %chat_id, %error, "normalized session delete failed");
+        }
+        if let Err(error) = self.inner.store.delete_snapshot(chat_id) {
+            tracing::warn!(chat = %chat_id, %error, "legacy snapshot delete failed");
         }
     }
 
@@ -795,7 +1590,7 @@ impl DocHost {
             turn_id: Some(m.id.clone()),
             frontier: None,
         });
-        handle.doc.queue_command(&SessionCommandEntry {
+        let entry = SessionCommandEntry {
             id: id.clone(),
             payload,
             issued_by: self.inner.config.device_id.clone(),
@@ -804,7 +1599,9 @@ impl DocHost {
             expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
             status: SessionCommandStatus::Pending,
             resolution: None,
-        })?;
+        };
+        handle.doc.queue_command(&entry)?;
+        self.submit_unsent_hub_commands(&handle);
         // §7 durable delivery: when another device hosts this chat, nudge its device
         // room so a cold host opens the doc and drains the queue. Fire-and-forget —
         // the command is durable in the doc either way (a host that opens the chat
@@ -840,6 +1637,7 @@ impl DocHost {
             SessionCommandStatus::Cancelled,
             Some("cancelled by composer"),
         )?;
+        self.cancel_hub_command(chat_id, command_id);
         self.nudge_remote_host(chat_id);
         Ok(true)
     }
@@ -861,6 +1659,135 @@ impl DocHost {
         for chat_id in chat_ids {
             self.kick_commands(&chat_id);
         }
+    }
+
+    fn submit_unsent_hub_commands(&self, handle: &Arc<ChatDocHandle>) {
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let handle = handle.clone();
+        runtime.spawn(async move {
+            let _submission = handle.hub_submit_lock.lock().await;
+            let http = reqwest::Client::new();
+            loop {
+                let entries = match handle.doc.commands_pending_hub_submission() {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        tracing::warn!(chat = %handle.chat_id, %error, "SessionHub command outbox read failed");
+                        return;
+                    }
+                };
+                if entries.is_empty() {
+                    return;
+                }
+                for entry in entries {
+                    let mut backoff = std::time::Duration::from_millis(250);
+                    loop {
+                        let Some(bearer) = edge.bearer().await else {
+                            tokio::time::sleep(backoff).await;
+                            backoff =
+                                (backoff * 2).min(std::time::Duration::from_secs(15));
+                            continue;
+                        };
+                        let response = http
+                            .post(format!(
+                                "{}/hub/{}/command",
+                                edge.url.trim_end_matches('/'),
+                                handle.chat_id
+                            ))
+                            .bearer_auth(bearer)
+                            .json(&serde_json::json!({
+                                "id": &entry.id,
+                                "kind": entry.kind(),
+                                "payload": &entry.payload,
+                                "issuedBy": &entry.issued_by,
+                                "issuedAt": entry.issued_at,
+                                "expiresAt": entry.effective_expiry(),
+                                "basedOn": &entry.based_on,
+                            }))
+                            .timeout(std::time::Duration::from_secs(10))
+                            .send()
+                            .await;
+                        match response {
+                            Ok(response) if response.status().is_success() => {
+                                if let Err(error) =
+                                    handle.doc.mark_command_hub_submitted(&entry.id)
+                                {
+                                    tracing::warn!(chat = %handle.chat_id, command = %entry.id, %error, "SessionHub command outbox acknowledgement failed");
+                                    return;
+                                }
+                                break;
+                            }
+                            Ok(response)
+                                if response.status().is_client_error()
+                                    && response.status().as_u16() != 401
+                                    && response.status().as_u16() != 429 =>
+                            {
+                                tracing::error!(chat = %handle.chat_id, command = %entry.id, status = %response.status(), "SessionHub permanently rejected command outbox entry");
+                                if let Err(error) =
+                                    handle.doc.mark_command_hub_rejected(&entry.id)
+                                {
+                                    tracing::warn!(chat = %handle.chat_id, command = %entry.id, %error, "SessionHub command rejection marker failed");
+                                    return;
+                                }
+                                if handle
+                                    .doc
+                                    .read_command(&entry.id)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|command| {
+                                        command.status == SessionCommandStatus::Pending
+                                    })
+                                    && let Err(error) = handle.doc.set_command_status(
+                                        &entry.id,
+                                        SessionCommandStatus::Rejected,
+                                        Some("SessionHub rejected the immutable command envelope"),
+                                    )
+                                {
+                                    tracing::warn!(chat = %handle.chat_id, command = %entry.id, %error, "SessionHub rejected command outcome write failed");
+                                }
+                                break;
+                            }
+                            Ok(_) | Err(_) => {
+                                tokio::time::sleep(backoff).await;
+                                backoff =
+                                    (backoff * 2).min(std::time::Duration::from_secs(15));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn cancel_hub_command(&self, chat_id: &str, command_id: &str) {
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let chat = chat_id.to_string();
+        let command = command_id.to_string();
+        let device = self.inner.config.device_id.clone();
+        runtime.spawn(async move {
+            let Some(bearer) = edge.bearer().await else {
+                return;
+            };
+            let _ = reqwest::Client::new()
+                .post(format!(
+                    "{}/hub/{chat}/command/cancel",
+                    edge.url.trim_end_matches('/')
+                ))
+                .bearer_auth(bearer)
+                .json(&serde_json::json!({ "commandId": command, "device": device }))
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+        });
     }
 
     fn nudge_remote_host(&self, chat_id: &str) {
@@ -1017,6 +1944,17 @@ impl DocHost {
                 }
             };
             let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+            if let Some(interrupted) = commands.iter().find(|command| {
+                command.status == SessionCommandStatus::Pending && is_processed(&command.id)
+            }) {
+                self.resolve_command(
+                    handle,
+                    &interrupted.id,
+                    SessionCommandStatus::Rejected,
+                    Some("execution was claimed before host restart; outcome is unknown"),
+                );
+                continue;
+            }
             let Some(entry) = commands
                 .iter()
                 .find(|c| {
@@ -1052,6 +1990,33 @@ impl DocHost {
                     turn_is_past: &turn_is_past,
                 },
             );
+            // Commands issued by another device are claimed durably at the
+            // SessionHub before local mark-before-execute. Commands issued on
+            // this host retain the selected offline-immediate behavior.
+            let hub_command = { lock(&handle.hub_commands).get(&entry.id).cloned() };
+            if disposition == CommandDisposition::Execute
+                && entry.issued_by != self.inner.config.device_id
+                && self.inner.config.edge.is_some()
+            {
+                let Some(hub_command) = hub_command else {
+                    return;
+                };
+                if hub_command.claim_token.is_none() {
+                    let client = lock(&handle.hub).clone();
+                    let Some(client) = client else {
+                        return;
+                    };
+                    match client.claim_command(&entry.id).await {
+                        Ok(claimed) => {
+                            lock(&handle.hub_commands).insert(entry.id.clone(), claimed);
+                        }
+                        Err(error) => {
+                            tracing::warn!(chat = %handle.chat_id, command = %entry.id, %error, "SessionHub command claim failed");
+                            return;
+                        }
+                    }
+                }
+            }
             // Mark BEFORE executing: a crash mid-execution must never double-run a
             // command whose side effect may already have happened.
             if let Err(err) = self.inner.store.mark_processed(&entry.id) {
@@ -1107,14 +2072,15 @@ impl DocHost {
     /// Host-only outcome write (ledger rule 2).
     fn resolve_command(
         &self,
-        handle: &ChatDocHandle,
+        handle: &Arc<ChatDocHandle>,
         command_id: &str,
         status: SessionCommandStatus,
         resolution: Option<&str>,
     ) {
+        let resolution = resolution.map(bounded_command_resolution);
         if let Err(err) = handle
             .doc
-            .set_command_status(command_id, status, resolution)
+            .set_command_status(command_id, status, resolution.as_deref())
         {
             tracing::warn!(
                 chat = %handle.chat_id,
@@ -1122,7 +2088,9 @@ impl DocHost {
                 error = %err,
                 "command outcome write failed"
             );
+            return;
         }
+        self.resolve_hub_command(handle, command_id, status, resolution.as_deref());
     }
 
     async fn execute(
@@ -1472,27 +2440,8 @@ impl DocHost {
         })
     }
 
-    fn save_snapshot(&self, handle: &ChatDocHandle) {
-        match handle.doc.export_snapshot() {
-            Ok(bytes) => {
-                handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
-                if let Err(err) = self.inner.store.save_snapshot(&handle.chat_id, &bytes) {
-                    tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot export failed");
-            }
-        }
-    }
-
-    /// Persist every open doc now (shutdown path; bypasses the debounce).
-    pub fn flush_all(&self) {
-        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
-        for handle in handles {
-            self.save_snapshot(&handle);
-        }
-    }
+    /// SQLite mutations commit synchronously; shutdown has no snapshot flush.
+    pub fn flush_all(&self) {}
 }
 
 /// Included shell transcripts after the last delivered prompt, in durable
@@ -1500,7 +2449,7 @@ impl DocHost {
 fn bash_context_before(
     handle: &ChatDocHandle,
     current_command_id: &str,
-) -> Result<Option<String>, DocError> {
+) -> Result<Option<String>, StoreError> {
     let transcripts: HashMap<String, String> = handle
         .doc
         .read_entries()?
@@ -1622,41 +2571,68 @@ pub fn respond_input_prompt(
     lines.join("\n")
 }
 
-/// Per-chat background task: reacts to doc changes (local commits and remote imports)
-/// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
-/// Holds only a weak handle so a dropped host tears the task down.
+/// Per-chat background task: reacts to committed SQLite state changes by
+/// publishing transcript projections and draining durable commands.
 async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: watch::Receiver<u64>) {
-    // Initial pass: the snapshot may already carry pending commands.
     {
         let Some(handle) = weak.upgrade() else { return };
+        if let Ok(Some(update)) = handle.refresh_projection() {
+            host.publish_projection_update(&handle, update).await;
+        }
         host.drain_commands(&handle).await;
     }
-    let mut save_deadline: Option<tokio::time::Instant> = None;
     loop {
-        let sleep_until = save_deadline.unwrap_or_else(tokio::time::Instant::now);
-        tokio::select! {
-            changed = changed_rx.changed() => {
-                if changed.is_err() {
-                    break; // doc handle (and its change sender) is gone
+        if changed_rx.changed().await.is_err() {
+            break;
+        }
+        let Some(handle) = weak.upgrade() else { break };
+        match handle.refresh_projection() {
+            Ok(Some(update)) => host.publish_projection_update(&handle, update).await,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(chat = %handle.chat_id, %error, "transcript projection refresh failed")
+            }
+        }
+        handle.publish_queue_if_watched();
+        host.drain_commands(&handle).await;
+        host.evict_over_budget();
+    }
+}
+
+async fn hub_event_task(
+    host: DocHost,
+    weak: Weak<ChatDocHandle>,
+    mut events: broadcast::Receiver<SessionHubEvent>,
+) {
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let Some(handle) = weak.upgrade() else { return };
+        match event {
+            SessionHubEvent::Connected { commands, .. } => {
+                for command in commands {
+                    if let Err(error) = host.ingest_hub_command(&handle, command) {
+                        tracing::warn!(chat = %handle.chat_id, %error, "SessionHub command import failed");
+                    }
                 }
-                let Some(handle) = weak.upgrade() else { break };
-                handle.publish_transcript_if_watched();
-                handle.publish_queue_if_watched();
-                host.drain_commands(&handle).await;
-                if save_deadline.is_none() {
-                    save_deadline = Some(
-                        tokio::time::Instant::now()
-                            + std::time::Duration::from_millis(SNAPSHOT_DEBOUNCE_MS),
-                    );
+                host.submit_unsent_hub_commands(&handle);
+                let client = lock(&handle.hub).clone();
+                if let Some(client) = client
+                    && !host.publish_hub_base(&handle, &client).await
+                {
+                    host.schedule_hub_base_retry(&handle);
+                }
+                host.reconcile_hub_commands(&handle).await;
+            }
+            SessionHubEvent::Command(command) => {
+                if let Err(error) = host.ingest_hub_command(&handle, *command) {
+                    tracing::warn!(chat = %handle.chat_id, %error, "SessionHub command import failed");
                 }
             }
-            _ = tokio::time::sleep_until(sleep_until), if save_deadline.is_some() => {
-                save_deadline = None;
-                let Some(handle) = weak.upgrade() else { break };
-                host.save_snapshot(&handle);
-                // Post-quiesce eviction pass: sizes just refreshed.
-                host.evict_over_budget();
-            }
+            SessionHubEvent::Disconnected => {}
         }
     }
 }

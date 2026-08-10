@@ -16,7 +16,8 @@ Jolt is a native, multi-device ADE for Claude Code, Codex, and Pi. Every compute
 ## Internals
 
 - [Architecture](architecture.md) — process topology, data ownership, storage, and crate map.
-- [Synchronization](sync.md) — workspace registry, Loro session documents, device relay, and recovery.
+- [Synchronization](sync.md) — workspace registry, SessionHub, device relay, and recovery.
+- [SessionHub](session-hub.md) — canonical SQLite schema, command/projection protocol, migration, and cutover gates.
 - [RPC](rpc.md) — envelopes, transports, routing, and the current method surface.
 - [Security and data](security.md) — trust boundaries, credentials, attachments, and local-only data.
 - [Environment variables](environment-variables.md) — supported runtime configuration and diagnostics.

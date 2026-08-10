@@ -1,15 +1,16 @@
-//! jolt-sync — Loro and workspace-registry room clients over WebSocket against the TS edge,
-//! plus ephemeral presence and reconnect/liveness handling.
+//! Jolt edge synchronization clients.
 //!
-//! - [`RoomClient`]: joins a SessionRoom DO room (`wss://…/session/{chatId}/ws?token=`),
-//!   backfills via version-vector diff, pushes local commits, imports remote updates,
-//!   reassembles/produces fragments, relays `%EPH` presence, and reconnects with
-//!   exponential backoff. Wire format is the official `loro-protocol` crate — byte-identical
-//!   to the npm package the edge imports.
+//! [`SessionHubClient`] is the active host command/projection protocol and
+//! [`RegistryClient`] synchronizes current workspace rows. [`RoomClient`] is
+//! retained only for rollback/import verification until SessionRoom removal is approved.
 
+mod hub;
 pub mod registry;
 mod room;
 
+pub use hub::{
+    HubCommand, HubDeliveryState, PublishResult, SessionHubClient, SessionHubEvent, SessionHubStats,
+};
 pub use registry::{RegistryClient, RegistryEvent, RegistryTuning};
 pub use room::{
     RoomClient, RoomEvent, RoomStatsSnapshot, RoomTuning, StaticUrl, SyncError, UrlProvider,

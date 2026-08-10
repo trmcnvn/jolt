@@ -111,7 +111,7 @@ Use **Settings → Secrets** to define an environment variable for one or more h
 - Values stay in the host OS credential store: macOS Keychain, Windows Credential Manager, or Secret Service on Linux.
 - Only labels, environment-variable names, and harness scopes are stored in Jolt's local metadata.
 - Values are injected into selected harness child processes only.
-- Values never enter the workspace registry, Loro documents, edge relay, or remote RPC surface.
+- Values never enter the workspace registry, canonical transcript rows, SessionHub, edge relay, or remote RPC surface.
 
 Secrets are device-local. Add the value separately on every device that needs it.
 

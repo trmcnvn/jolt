@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 /// Errors surfaced by [`DocsStore`].
 #[derive(Debug, thiserror::Error)]
@@ -15,6 +15,12 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("session document: {0}")]
+    SessionDoc(#[from] jolt_session_doc::DocError),
+    #[error("session store: {0}")]
+    Session(String),
 }
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS snapshots (
@@ -29,9 +35,9 @@ CREATE TABLE IF NOT EXISTS processed_commands (
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
 ///
-/// Holds warm-open doc snapshots (the DO room is authoritative; these make
-/// cold starts instant and offline restarts possible) and the command ledger
-/// that gives command execution mark-BEFORE-execute idempotence.
+/// Holds the canonical normalized session tables, retained legacy rollback
+/// snapshots, registry cache, and the command ledger that provides
+/// mark-before-execute idempotence.
 pub struct DocsStore {
     conn: Mutex<Connection>,
 }
@@ -41,11 +47,25 @@ impl DocsStore {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)?;
-        let conn = Connection::open(data_dir.join("docs.sqlite3"))?;
+        let mut conn = Connection::open(data_dir.join("docs.sqlite3"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        crate::sessions::migrate(&mut conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Open an existing store without running migrations or permitting writes.
+    /// Intended for stopped-world verification after a writable migration.
+    pub fn open_read_only(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(
+            data_dir.as_ref().join("docs.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -71,6 +91,38 @@ impl DocsStore {
              ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at",
             params![doc_id, bytes, now_ms()],
         )?;
+        Ok(())
+    }
+
+    /// Back up an existing database before opening it through [`DocsStore`].
+    /// This is the cutover path: schema migrations must not precede the
+    /// rollback artifact. The destination must not already exist.
+    pub fn backup_existing_database(
+        data_dir: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<(), StoreError> {
+        let destination = destination.as_ref();
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open_with_flags(
+            data_dir.as_ref().join("docs.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
+        Ok(())
+    }
+
+    /// Write a transactionally consistent standalone SQLite backup. The
+    /// destination must not already exist.
+    pub fn backup_database(&self, destination: impl AsRef<Path>) -> Result<(), StoreError> {
+        let destination = destination.as_ref();
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.conn()
+            .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
         Ok(())
     }
 
@@ -105,7 +157,7 @@ impl DocsStore {
         Ok(changed > 0)
     }
 
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         // A poisoned lock only means another thread panicked mid-query; the
         // connection itself is still usable.
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
@@ -159,6 +211,44 @@ mod tests {
             !store.mark_processed("cmd-1").unwrap(),
             "second mark must not re-claim"
         );
+    }
+
+    #[test]
+    fn pre_migration_backup_precedes_session_schema_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("docs.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO snapshots(doc_id, bytes, saved_at) VALUES ('chat-1', x'01', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let backup = directory.path().join("backups/pre.sqlite3");
+        DocsStore::backup_existing_database(directory.path(), &backup).unwrap();
+        DocsStore::open(directory.path()).unwrap();
+
+        let backup = Connection::open(backup).unwrap();
+        let session_schema = backup
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_chats'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap();
+        assert!(session_schema.is_none());
+        let bytes: Vec<u8> = backup
+            .query_row(
+                "SELECT bytes FROM snapshots WHERE doc_id = 'chat-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, vec![1]);
     }
 
     #[test]

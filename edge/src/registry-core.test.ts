@@ -79,6 +79,37 @@ describe("applyOp", () => {
     expect(row.clocks.archived).toBe(hlc(1000));
   });
 
+  it("keeps a live chat's host assignment immutable", () => {
+    const row = applied(undefined, upsert({
+      set: { deviceId: "device-a", title: "before" },
+      hlc: hlc(1000)
+    }));
+    const updated = applied(row, {
+      kind: "chats",
+      id: "chat-1",
+      op: "update",
+      set: { deviceId: "device-b", title: "after" },
+      hlc: hlc(2000)
+    });
+    expect(updated.fields.deviceId).toBe("device-a");
+    expect(updated.fields.title).toBe("after");
+    const rejected = applyOp(updated, {
+      kind: "chats",
+      id: "chat-1",
+      op: "update",
+      set: { deviceId: "device-b" },
+      hlc: hlc(3000)
+    });
+    expect(rejected.changed).toBe(false);
+
+    const first = upsert({ set: { deviceId: "device-a" }, hlc: hlc(1000) });
+    const second = upsert({ set: { deviceId: "device-b" }, hlc: hlc(2000) });
+    const ab = applyOp(applyOp(undefined, first).row, second).row;
+    const ba = applyOp(applyOp(undefined, second).row, first).row;
+    expect(ab?.fields.deviceId).toBe("device-a");
+    expect(ba?.fields.deviceId).toBe("device-a");
+  });
+
   it("same-ms conflicts settle by device id, deterministically", () => {
     const base = applied(undefined, upsert());
     const fromA: Op = { kind: "chats", id: "chat-1", op: "update", set: { title: "A" }, hlc: hlc(5000, "dev-a") };

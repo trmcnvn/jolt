@@ -145,7 +145,7 @@ Socket clients should be single-writer coroutine actors or otherwise serialize s
 
 ## Network and synchronization
 
-Android should use the existing mobile protocols rather than joining complete Loro session documents.
+Android should use the existing SessionHub mobile protocols and never replicate canonical host sessions.
 
 1. **Registry:** JSON text WebSocket to `/registry/{orgId}/ws`, with the same cursor, pending-batch, HLC, presence, probe, and recovery rules as Rust, TypeScript, and Swift.
 2. **Transcript:** JSON WebSocket to `/transcript/{chatId}/ws`; authenticated HTTP loads historical pages from `/transcript/{chatId}/page?id=...`.
@@ -153,7 +153,7 @@ Android should use the existing mobile protocols rather than joining complete Lo
 4. **Relay RPC:** binary WebSocket to `/device/{deviceId}/ws?role=client&connId=...`, carrying `uleb128(header length) + header JSON + NDJSON RPC payload`.
 5. **Attachments:** relay RPC stages host-local uploads; authenticated R2 reads use `/attachments/{chatId}/{sha256}` before falling back to host relay chunks.
 
-There is no supported Loro JVM binding in the current Loro language set, but this is not a parity blocker: registry synchronization is JSON and mobile transcripts and commands use edge projections.
+No Rust/JNI document bridge is needed: registry synchronization and SessionHub commands/transcript projections are JSON.
 
 ### Local persistence
 

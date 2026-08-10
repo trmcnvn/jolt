@@ -1,8 +1,7 @@
-// Tail-first session projection + durable command outbox for one chat. The
-// phone never holds the complete Loro session document: transcript pages come
-// from the edge, while commands persist locally before the edge idempotently
-// appends them to canonical Loro. Optimistic echoes use client-minted message
-// ids until the host writes matching transcript entries.
+// Tail-first SessionHub projection + durable command outbox for one chat. The
+// phone keeps only bounded transcript pages; commands persist locally before
+// idempotent edge submission. Optimistic echoes use client-minted message ids
+// until the host writes matching transcript entries.
 
 import Foundation
 import Observation
@@ -154,6 +153,20 @@ final class SessionStore {
                 transcriptManifest?.pages[descriptor].messageCount = page.messages.count
             }
             rebuildProjectedEntries()
+        case .delta(let sequence, let delta):
+            guard sequence == transcriptSequence &+ 1,
+                  let index = transcriptPages.firstIndex(where: { $0.id == delta.pageId }),
+                  let page = transcriptPages[index].applying(delta) else {
+                kickRoom()
+                return
+            }
+            transcriptSequence = sequence
+            transcriptPages[index] = page
+            if let descriptor = transcriptManifest?.pages.firstIndex(where: { $0.id == page.id }) {
+                transcriptManifest?.pages[descriptor].revision = page.revision
+                transcriptManifest?.pages[descriptor].messageCount = page.messages.count
+            }
+            rebuildProjectedEntries()
         }
     }
 
@@ -202,6 +215,9 @@ final class SessionStore {
 
     func loadPreviousTranscriptPage() {
         guard !loadingHistory, let pageId = previousTranscriptPageId,
+              let expectedRevision = transcriptManifest?.pages.first(where: {
+                  $0.id == pageId
+              })?.revision,
               let client = projectionClient else { return }
         loadingHistory = true
         historyLoadFailed = false
@@ -211,7 +227,8 @@ final class SessionStore {
             for delay in [UInt64(0), 250_000_000, 1_000_000_000] {
                 if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
                 do {
-                    let page = try await client.page(id: pageId)
+                    let page = try await client.page(id: pageId,
+                                                     expectedRevision: expectedRevision)
                     if !self.transcriptPages.contains(where: { $0.id == page.id }) {
                         self.transcriptPages.append(page)
                     }
@@ -406,8 +423,8 @@ final class SessionStore {
         ])
     }
 
-    /// Persist locally first, then idempotently append to the edge's canonical
-    /// Loro command ledger. Acceptance means durable; transcript appearance of
+    /// Persist locally first, then idempotently submit to SessionHub's command
+    /// mailbox. Acceptance means durable; transcript appearance of
     /// the client-minted message id remains the execution acknowledgement.
     private func queueCommand(kind: String, payload: [String: Any]) {
         let issuedAt = nowMs()
@@ -488,9 +505,8 @@ final class SessionStore {
         try? FileManager.default.removeItem(at: root)
     }
 
-    /// Durable-nudge the host device so a cold host opens the doc and drains
-    /// (doc_host.rs nudge_remote_host). Fire-and-forget; the command is
-    /// durable in the doc regardless.
+    /// Best-effort extra nudge so a cold host reconnects and drains the durable
+    /// SessionHub command. SessionHub also emits this nudge on acceptance.
     private func nudgeHost() {
         guard let hostDeviceId else { return }
         Task { [config, chatId] in

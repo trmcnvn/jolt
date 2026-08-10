@@ -10,21 +10,22 @@ pub use models::{
 pub use requests::{
     ActivateAgentAccount, ApplyHarnessUpdate, ApplyUpdate, BinaryStreamRequest, BinaryUnaryRequest,
     CancelAgentLogin, CancelQueuedPrompt, ChatPage, ChatSection, ChatWatchFrame,
-    CheckHarnessUpdates, CloseTerminal, CompleteAgentLogin, CreateWorktree, DeleteHarnessSecret,
-    DeleteReviewDraft, DeleteTheme, EnsurePersonalOrg, ExtractQuestions, ForgetAgentAccount,
-    GetCheckoutDiffPage, GetCheckoutReview, GetCheckoutVcsStatus, GetLocalDevice, GetReviewDraft,
-    GetTranscriptPage, GetTransportCapabilities, GetTurnDiffPage, ListAgentAccounts, ListCommands,
-    ListFolders, ListHarnessSecrets, ListHarnesses, ListModels, ListRefs, ListThemes, Mutate,
-    OpenTerminal, PinDiffDocument, PollAgentLogin, ProbeSync, PutReviewDraft, QueryChats,
-    QueueCommand, ReadAttachmentChunk, RegenerateChatTitle, ReleaseDiffDocument, ResizeTerminal,
-    ResolveAccountLink, RunVcsAction, SearchFiles, SearchTranscript, SessionWatchFrame,
-    SetTerminalCommand, SetVcsBackend, SignIn, SignOut, StartAgentLogin, StopEngine, StreamRequest,
-    SubscribeTerminal, SwitchRef, SwitchScope, TerminalSettings, TransportCapabilities,
-    UnaryRequest, UploadBinaryChunk, UploadChunk, UploadCommit, UpsertHarnessSecret, UpsertThemes,
-    UsageBreakdownRequest, VcsSettings, WatchAuthStatus, WatchChatUsage, WatchChats,
-    WatchCheckoutDiff, WatchDevices, WatchHarnessUpdates, WatchQueuedPrompts, WatchScopeStatus,
-    WatchSessions, WatchSpaces, WatchThemes, WatchTranscript, WatchUpdateStatus, WriteTerminal,
-    call, call_binary, subscribe, subscribe_binary,
+    CheckHarnessUpdates, CloseTerminal, CompleteAgentLogin, CreateRecoveryFork, CreateWorktree,
+    DeleteHarnessSecret, DeleteReviewDraft, DeleteTheme, EnsurePersonalOrg, ExtractQuestions,
+    ForgetAgentAccount, GetCheckoutDiffPage, GetCheckoutReview, GetCheckoutVcsStatus,
+    GetLocalDevice, GetReviewDraft, GetTranscriptPage, GetTransportCapabilities, GetTurnDiffPage,
+    ListAgentAccounts, ListCommands, ListFolders, ListHarnessSecrets, ListHarnesses, ListModels,
+    ListRefs, ListThemes, Mutate, OpenTerminal, PinDiffDocument, PollAgentLogin, ProbeSync,
+    PutReviewDraft, QueryChats, QueueCommand, ReadAttachmentChunk, RegenerateChatTitle,
+    ReleaseDiffDocument, ResizeTerminal, ResolveAccountLink, RunVcsAction, SearchFiles,
+    SearchTranscript, SessionWatchFrame, SetTerminalCommand, SetVcsBackend, SignIn, SignOut,
+    StartAgentLogin, StopEngine, StreamRequest, SubscribeTerminal, SwitchRef, SwitchScope,
+    TerminalSettings, TransportCapabilities, UnaryRequest, UploadBinaryChunk, UploadChunk,
+    UploadCommit, UpsertHarnessSecret, UpsertThemes, UsageBreakdownRequest, VcsSettings,
+    WatchAuthStatus, WatchChatUsage, WatchChats, WatchCheckoutDiff, WatchDevices,
+    WatchHarnessUpdates, WatchQueuedPrompts, WatchScopeStatus, WatchSessions, WatchSpaces,
+    WatchThemes, WatchTranscript, WatchUpdateStatus, WriteTerminal, call, call_binary, subscribe,
+    subscribe_binary,
 };
 
 pub mod methods {
@@ -47,6 +48,9 @@ pub mod methods {
     pub const GET_TRANSCRIPT_PAGE: &str = "GetTranscriptPage";
     /// Search all messages in one transcript and return page-backed anchors.
     pub const SEARCH_TRANSCRIPT: &str = "SearchTranscript";
+    /// Materialize the last published projection of a permanently lost host
+    /// under a fresh chat id assigned to this target device.
+    pub const CREATE_RECOVERY_FORK: &str = "CreateRecoveryFork";
     /// Extract prose questions from one completed assistant message.
     pub const EXTRACT_QUESTIONS: &str = "ExtractQuestions";
     /// Nudge every open room client to verify liveness NOW (window focus,

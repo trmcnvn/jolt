@@ -125,6 +125,43 @@ fn field_lww_newer_wins_older_and_ties_lose() {
 }
 
 #[test]
+fn live_chat_host_assignment_is_immutable() {
+    let row = applied(
+        None,
+        &upsert(
+            &[("deviceId", json!("device-a")), ("title", json!("before"))],
+            1000,
+        ),
+    );
+    let updated = applied(
+        Some(&row),
+        &update(
+            &[("deviceId", json!("device-b")), ("title", json!("after"))],
+            hlc(2000),
+        ),
+    );
+    assert_eq!(updated.fields["deviceId"], json!("device-a"));
+    assert_eq!(updated.fields["title"], json!("after"));
+
+    let (_, changed) = apply_op(
+        Some(&updated),
+        &update(&[("deviceId", json!("device-b"))], hlc(3000)),
+    );
+    assert!(!changed);
+
+    let first = upsert(&[("deviceId", json!("device-a"))], 1000);
+    let second = upsert(&[("deviceId", json!("device-b"))], 2000);
+    let ab = apply_op(apply_op(None, &first).0.as_ref(), &second)
+        .0
+        .unwrap();
+    let ba = apply_op(apply_op(None, &second).0.as_ref(), &first)
+        .0
+        .unwrap();
+    assert_eq!(ab.fields["deviceId"], json!("device-a"));
+    assert_eq!(ba.fields["deviceId"], json!("device-a"));
+}
+
+#[test]
 fn same_ms_conflicts_settle_by_device_deterministically() {
     let base = applied(None, &upsert(&[("title", json!("hello"))], 1000));
     let from_a = update(&[("title", json!("A"))], hlc_by(5000, "dev-a"));

@@ -141,6 +141,21 @@ export const applyOp = (row: Row | undefined, op: Op): ApplyResult => {
   let clocks = base.clocks;
   for (const [key, value] of Object.entries(op.set ?? {})) {
     const clock = clockFor(key);
+    // Earliest concurrent create selects the immutable chat host. Choosing by
+    // clock, not arrival order, keeps every registry replica convergent.
+    const currentClock = clocks[key];
+    if (op.kind === "chats" && key === "deviceId"
+      && key in fields && fields[key] !== value && currentClock !== undefined) {
+      if (typeof value !== "string" || clock >= currentClock) continue;
+      if (fields === base.fields) {
+        fields = { ...base.fields };
+        clocks = { ...base.clocks };
+      }
+      fields[key] = value;
+      clocks[key] = clock;
+      changed = true;
+      continue;
+    }
     if (!hlcNewer(clock, clocks[key])) continue;
     if (fields === base.fields) {
       fields = { ...base.fields };

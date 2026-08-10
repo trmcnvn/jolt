@@ -75,6 +75,29 @@ final class RegistryApplyOpTests: XCTestCase {
         XCTAssertEqual(row.clocks["archived"], hlc(1000))
     }
 
+    func testLiveChatHostAssignmentIsImmutable() {
+        let row = applied(nil, upsert(set: [
+            "deviceId": .string("device-a"),
+            "title": .string("before"),
+        ], hlc: hlc(1000)))
+        let updated = applied(row, update(set: [
+            "deviceId": .string("device-b"),
+            "title": .string("after"),
+        ], hlc: hlc(2000)))
+        XCTAssertEqual(updated.fields["deviceId"], .string("device-a"))
+        XCTAssertEqual(updated.fields["title"], .string("after"))
+        let rejected = applyOp(updated, update(
+            set: ["deviceId": .string("device-b")], hlc: hlc(3000)))
+        XCTAssertFalse(rejected.changed)
+
+        let first = upsert(set: ["deviceId": .string("device-a")], hlc: hlc(1000))
+        let second = upsert(set: ["deviceId": .string("device-b")], hlc: hlc(2000))
+        let ab = applyOp(applyOp(nil, first).row, second).row
+        let ba = applyOp(applyOp(nil, second).row, first).row
+        XCTAssertEqual(ab?.fields["deviceId"], .string("device-a"))
+        XCTAssertEqual(ba?.fields["deviceId"], .string("device-a"))
+    }
+
     func testSameMsConflictsSettleByDeviceIdDeterministically() {
         let base = applied(nil, upsert())
         let fromA = update(set: ["title": .string("A")], hlc: hlc(5000, "dev-a"))

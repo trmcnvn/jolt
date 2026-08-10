@@ -274,6 +274,17 @@ func applyOp(_ row: RegistryRow?, _ op: RegistryOp) -> RegistryApplyResult {
     var changed = row == nil || (row?.deleted == true && !base.deleted)
     for (key, value) in op.set ?? [:] {
         let clock = clockFor(key)
+        // Earliest concurrent create selects the immutable chat host. Clock
+        // order, rather than arrival order, keeps replicas convergent.
+        if op.kind == "chats", key == "deviceId",
+           let current = base.fields[key], current != value,
+           let currentClock = base.clocks[key] {
+            guard case .string = value, clock < currentClock else { continue }
+            base.fields[key] = value
+            base.clocks[key] = clock
+            changed = true
+            continue
+        }
         guard hlcNewer(clock, base.clocks[key]) else { continue }
         if value.isNull {
             base.fields.removeValue(forKey: key)

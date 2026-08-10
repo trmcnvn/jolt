@@ -410,14 +410,14 @@ pub(super) fn folded_text(parts: &[MessagePart]) -> String {
         .join("\n")
 }
 
-pub(super) fn sync_segment<'a>(
-    doc: &'a SessionDoc,
-    writer: &mut Option<SegmentWriter<'a>>,
+pub(super) fn sync_segment(
+    doc: &StoredSession,
+    writer: &mut Option<SegmentWriter>,
     entry_id: &str,
     device_id: &str,
     started_at: i64,
     folded: &[MessagePart],
-) -> Result<(), DocError> {
+) -> Result<(), StoreError> {
     if folded.is_empty() {
         return Ok(());
     }
@@ -431,15 +431,15 @@ pub(super) fn sync_segment<'a>(
     Ok(())
 }
 
-pub(super) fn finish_segment<'a>(
-    doc: &'a SessionDoc,
-    writer: Option<SegmentWriter<'a>>,
+pub(super) fn finish_segment(
+    doc: &StoredSession,
+    writer: Option<SegmentWriter>,
     entry_id: &str,
     device_id: &str,
     started_at: i64,
     folded: &[MessagePart],
     status: MessageStatus,
-) -> Result<(), DocError> {
+) -> Result<(), StoreError> {
     let rendered = render_parts(folded);
     match writer {
         Some(w) => w.finish(&rendered, status),
@@ -655,7 +655,7 @@ pub(super) async fn drive_run(
     run_id: String,
     harness: Arc<dyn Harness>,
     request: RunRequest,
-    doc: Arc<SessionDoc>,
+    doc: Arc<StoredSession>,
     controls: RunControls,
     mcp_lease: Option<McpLease>,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
@@ -726,7 +726,7 @@ pub(super) async fn drive_run(
         }
     };
 
-    let doc_ref: &SessionDoc = &doc;
+    let doc_ref: &StoredSession = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
     // Adapters can re-emit a completed tool call with refreshed metadata. Keep
     // ids across segment resets so an echo from an earlier segment cannot
@@ -734,7 +734,7 @@ pub(super) async fn drive_run(
     let mut seen_tools = std::collections::HashSet::<String>::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
-    let mut writer: Option<SegmentWriter<'_>> = None;
+    let mut writer: Option<SegmentWriter> = None;
     let mut dirty = false;
     let mut flush_at = tokio::time::Instant::now();
     // Set when the engine interrupts the run: the harness gets this long to end its own

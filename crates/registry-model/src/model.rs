@@ -421,6 +421,23 @@ pub fn apply_op(row: Option<&RegistryRow>, op: &RowOp) -> (Option<RegistryRow>, 
     if let Some(set) = &op.set {
         for (key, value) in set {
             let clock = op.clock_for(key);
+            // A chat host is selected by the earliest concurrent create and is
+            // immutable thereafter. Earliest-clock selection keeps peers
+            // convergent even when two create ops arrive in opposite orders.
+            if op.kind == KIND_CHATS
+                && key == "deviceId"
+                && let (Some(current), Some(current_clock)) =
+                    (base.fields.get(key), base.clocks.get(key))
+                && current != value
+            {
+                if !value.is_string() || clock >= current_clock {
+                    continue;
+                }
+                base.fields.insert(key.clone(), value.clone());
+                base.clocks.insert(key.clone(), clock.to_string());
+                changed = true;
+                continue;
+            }
             if !hlc_newer(clock, base.clocks.get(key).map(String::as_str)) {
                 continue;
             }

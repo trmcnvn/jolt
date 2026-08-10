@@ -4038,6 +4038,7 @@ dependencies = [
  "jolt-api",
  "jolt-engine",
  "jolt-rpc",
+ "jolt-store",
  "jolt-ui",
  "jolt-update",
  "libc",
@@ -4280,7 +4281,11 @@ dependencies = [
 name = "jolt-store"
 version = "0.1.9"
 dependencies = [
+ "jolt-session-doc",
+ "loro",
  "rusqlite",
+ "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
 ]
@@ -4296,8 +4301,10 @@ dependencies = [
  "jolt-registry-model",
  "jolt-session-doc",
  "jolt-store",
+ "jolt-sync",
  "loro",
  "loro-protocol",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",

@@ -185,7 +185,7 @@ impl SessionsEngine {
             None
         } else {
             crate::handoff::build(
-                handle.doc(),
+                handle.doc().read_entries()?,
                 goal.as_ref(),
                 source_harness,
                 harness_id,

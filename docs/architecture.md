@@ -9,10 +9,10 @@ Jolt is a multi-device ADE for local coding-agent CLIs. The engine is the author
                  ┌─────────────────────────────┐
                  │ Worker: auth and routing    │
                  │ RegistryRoom: workspace rows│
-                 │ SessionRoom: Loro per chat  │
+                 │ SessionHub: commands + views│
                  │ DeviceRoom: engine relay    │
-                 │ R2: attachments, backups,   │
-                 │     and release artifacts   │
+                 │ R2: pages, attachments,     │
+                 │     backups, and releases   │
                  └───────────┬─────────────────┘
                              │ TLS / WebSocket
               ┌──────────────┴──────────────┐
@@ -26,8 +26,8 @@ Jolt is a multi-device ADE for local coding-agent CLIs. The engine is the author
        │ desktop gpui│               │ desktop gpui│
        └─────────────┘               └─────────────┘
 
-             iOS joins registry/session rooms directly and
-             dials engines through DeviceRoom for live RPC.
+             iOS joins RegistryRoom and SessionHub directly,
+             and dials engines through DeviceRoom for live RPC.
 ```
 
 ## Processes
@@ -39,8 +39,8 @@ The Rust engine:
 - launches Claude Code, Codex, Pi, and test harness subprocesses;
 - hosts an authenticated loopback MCP endpoint injected into supported live harness processes;
 - owns local authentication, repositories, version-control commands, worktrees/workspaces, terminals, uploads, diffs, and usage;
-- hosts session documents and executes commands only for chats assigned to its device;
-- persists snapshots, command claims, run journals, settings, and identity-scoped telemetry;
+- owns canonical SQLite sessions and executes commands only for chats assigned to its device;
+- persists normalized transcript rows, command claims, run journals, settings, and identity-scoped telemetry;
 - exposes the RPC service on localhost and through its device relay room.
 
 A data directory has one engine owner, enforced by an OS-level lock.
@@ -58,15 +58,16 @@ On macOS and Linux, the Devices setting can install the same headless engine as 
 
 ### iOS viewport
 
-The SwiftUI app maintains a local workspace-registry replica and a byte-bounded transcript page cache. It consumes edge manifest/tail streams, submits commands through a durable device-local outbox, and uses relay RPC when an engine must touch a filesystem or CLI. It does not retain complete session Loro documents.
+The SwiftUI app maintains a local workspace-registry replica and a byte-bounded transcript page cache. It consumes SessionHub manifest/base/delta streams, submits typed commands through a durable device-local outbox, and uses relay RPC when an engine must touch a filesystem or CLI. It never retains canonical host session state.
 
 ### Edge
 
-`edge/` is a TypeScript Cloudflare Worker with three Durable Object classes:
+`edge/` is a TypeScript Cloudflare Worker with four Durable Object classes during cutover:
 
 - **RegistryRoom:** current-state workspace rows and per-field last-write-wins merge.
-- **SessionRoom:** per-chat canonical Loro synchronization, transcript manifest/page/live projections, durable command submission, diff sidecars, compaction, and backups.
+- **SessionHub:** per-chat immutable host assignment, fenced command mailbox, bounded transcript projections, and backups; it has no CRDT or WASM runtime.
 - **DeviceRoom:** one host socket per engine, client byte relay, durable nudges, and small latest-value sidecars.
+- **SessionRoom:** legacy rollback compatibility until migration approval, then removed.
 
 The Worker verifies WorkOS JWTs or development bearers before stamping identity into Durable Object requests. It also performs WorkOS code exchange/refresh and serves content-addressed attachments and signed release metadata.
 
@@ -85,38 +86,28 @@ A per-user RegistryRoom is authoritative for current rows. Clients retain an aut
 
 This data is small scalar index state. Transcript content never enters the registry. Chat tombstones also enter a durable artifact-purge queue: the registry retires the chat room and deletes its R2 backup and chat-scoped attachment prefix.
 
-### Session documents
+### Sessions
 
-Every chat has one Loro document with three roots:
+Every chat has normalized canonical state in its assigned host's `docs.sqlite3`: messages, typed parts, incremental text chunks, stable pages, commands, and publication metadata. The single transcript writer makes CRDT convergence unnecessary. Text chunks fold transactionally, while `textReveal` markers preserve the same semantic rendering boundaries. Synced tool projections still omit sensitive or bulky inputs not needed for rendering.
 
-```text
-meta      { chatId, schemaVersion }
-messages  [ { id, role, parts, createdAt, deviceId, status?, continuationOf? } ]
-commands  [ { id, payload, issuedBy, issuedAt, status, ... } ]
-```
-
-Text bodies use `LoroText`, allowing streamed appends to merge efficiently. `textReveal` part markers expose stable prose before tool, provider-message, input, and terminal boundaries while later text remains durably synced but unpainted; terminal recovery reveals preserved partial output. Large entries split into continuation records at part/code-point boundaries and join during projection.
-
-The host engine writes transcript entries and command outcomes. Authorized viewers submit their own idempotent command entries through the edge. Synced tool projections deliberately omit sensitive or bulky inputs that are not needed for rendering.
-
-Viewport transcript state is a derived projection: a compact whole-session manifest, byte-bounded historical pages, and a mutable live tail. Desktop builds the projection beside its local canonical document; iOS and remote viewers consume the edge projection. Unloaded pages remain estimated-height placeholders, so navigation and scrollbar range cover the complete conversation without decoding it.
+SessionHub is a command and projection plane, not another canonical document. It stores typed command current state, one manifest/live base, and small sequenced deltas. Sealed historical page JSON is SHA-256-addressed in R2. Unloaded pages remain estimated-height placeholders, so navigation and scrollbar range cover the complete conversation without decoding it. See [SessionHub session architecture](session-hub.md).
 
 The desktop Changes pane follows the same bounded-projection principle. The host captures one checkout snapshot, builds a compact complete file manifest, and splits retained unified patch text into immutable content-addressed pages. The pane renders collapsed headers without parsing bodies, fetches pages only for expanded viewport ranges, and virtualizes file headers, hunk headers, notices, lines, pending review cards, and unloaded placeholders in one list. Its expanded view offers explicit unified and split layouts; split rows pair deletion/addition blocks while side-specific review ranges and cards remain anchored to old or new coordinates. Assistant turns additionally capture the complete non-ignored VCS tree before and after execution, preserving pre-existing working-copy changes while deriving an immutable net turn delta. To avoid attributing another concurrent session's writes, the published delta is restricted to paths reported by successful file tools. A turn that also used opaque, potentially mutating tools is labeled partial; a turn with no safely attributable paths publishes no diff. Git baselines live in a disposable alternate object store rather than adding unreachable objects to the user's repository. The compact manifest travels with the transcript entry; versioned content-addressed pages remain in the host's turn-diff store, are removed with their chat, and load through the same desktop viewer. Edge manifests are chat-authorized while page bodies are deduplicated per checkout. iOS renders only the inline turn manifest as a collapsed changed-files card; it has no diff pane and never requests patch pages.
 
 Commit and Push are also checkout-scoped. Clients address a chat, the host resolves its canonical checkout, and one checkout mutex serializes Git/JJ mutations shared by every chat using it. Commit requests carry the exact diff catalog revision and selected file IDs; the host resolves those IDs to jailed paths, optionally generates a message from the retained patch, and revalidates before mutation. Git commits selected whole files and pushes its branch/upstream. JJ commits selected files into the completed `@-`, advances only Jolt-owned bookmarks, and pushes a `jolt/*` bookmark at `@-`, never mutable `@` or a user-owned bookmark. Action progress is a relay-forwardable stream; disconnected hosts do not queue publication work.
 
-Review is a target-neutral, device-local lifecycle layered over reviewable surfaces rather than a diff transcript schema. A typed review draft owns a retained snapshot plus target-specific anchors; the initial diff adapter records old/new line coordinates and excerpts, while the model also reserves assistant-message text selectors. Draft bodies auto-save to local SQLite and never enter Loro or edge storage. Beginning a working-copy annotation leases that immutable diff revision, so later head updates produce a “newer changes available” notice instead of moving anchors. Sending formats all pending annotations and uses the composer's ordinary Run/Steer command path without replacing its visible draft or staged attachments; the local review clears only after command submission succeeds.
+Review is a target-neutral, device-local lifecycle layered over reviewable surfaces rather than a diff transcript schema. A typed review draft owns a retained snapshot plus target-specific anchors; the initial diff adapter records old/new line coordinates and excerpts, while the model also reserves assistant-message text selectors. Draft bodies auto-save to local SQLite and never enter SessionHub or edge storage. Beginning a working-copy annotation leases that immutable diff revision, so later head updates produce a “newer changes available” notice instead of moving anchors. Sending formats all pending annotations and uses the composer's ordinary Run/Steer command path without replacing its visible draft or staged attachments; the local review clears only after command submission succeeds.
 
 ### Durable command plane
 
-Run, shell, steer, interrupt, and input-answer operations are session-document entries. The chat's host device:
+Run, shell, steer, interrupt, input-answer, and goal operations are typed SessionHub commands mirrored into host SQLite. The chat host:
 
-1. evaluates expiry and supersession rules;
-2. claims the command in its local processed-command ledger **before** execution;
-3. executes it at most once from that host store;
-4. writes the outcome and transcript changes back to the document.
+1. claims a remote command under its current writer lease;
+2. evaluates expiry and supersession rules;
+3. marks the command in its local processed ledger **before** execution;
+4. executes it at most once and resolves the mailbox row terminally.
 
-A device-room nudge tells a cold host to open the chat. Delivery does not depend on the nudge: the command itself is durable and remains pending while the host is offline.
+Host-local commands persist and execute while offline, then reconcile by ID after reconnect. A DeviceRoom nudge wakes a cold host; command durability does not depend on the nudge.
 
 ### Machine-local state
 
@@ -140,13 +131,13 @@ Some local state is queried from a reachable device through RPC for display.
 viewport
   → Mutate createChat in a synced space
   → persist Run command in the local outbox
-  → edge idempotently appends it to the chat Loro document
+  → SessionHub validates and stores it idempotently
   → POST durable nudge to the host's DeviceRoom
-  → host opens/syncs the document
-  → host claims command and launches the selected harness
-  → normalized events fold into transcript parts every ~120 ms
-  → SessionRoom refreshes the mutable tail projection
-  → viewports receive bounded live transcript frames
+  → host opens canonical SQLite state and claims the command
+  → host launches the selected harness
+  → normalized events fold into transcript chunks every ~120 ms
+  → host publishes a bounded live-page delta
+  → viewports apply sequenced transcript frames
 ```
 
 ### Live remote RPC
@@ -176,14 +167,14 @@ Default root: `~/.jolt`.
   scopes/local/current/
     local-scope-id
     device-id
-    docs.sqlite3
+    docs.sqlite3              # canonical normalized sessions + registry cache
     usage.sqlite
     journals/*.jsonl
     uploads/
   scopes/accounts/<org>/<user>/
     scope-layout-v1.json
     device-id
-    docs.sqlite3              # doc/registry snapshots + processed commands
+    docs.sqlite3              # canonical sessions, registry cache, rollback snapshots
     usage.sqlite
     journals/*.jsonl
     uploads/
@@ -199,10 +190,10 @@ Scope-isolated stores prevent Local data from entering edge synchronization and 
 | --- | --- |
 | `crates/proto` | Shared entities, agent events, usage, secrets, and pure view derivations |
 | `crates/platform` | Login-shell process environment and suspend/wake detection |
-| `crates/session-doc` | Session schema, command ledger, render parts, and transcript projections |
+| `crates/session-doc` | Semantic message/command types and transcript projections; legacy importer during cutover |
 | `crates/registry-model` | Workspace registry rows, HLC operations, and optimistic local state |
-| `crates/store` | Local SQLite document snapshots and processed-command ledger |
-| `crates/sync` | Loro session-room and workspace-registry network clients |
+| `crates/store` | Canonical normalized SQLite sessions, rollback snapshots, and processed-command ledger |
+| `crates/sync` | SessionHub host client and workspace-registry network client; legacy room client during cutover |
 | `crates/harness` | Common harness trait, controls, environment provider, and test mock |
 | `crates/harness-{claude,codex,pi}` | Isolated production CLI adapters and protocol tests |
 | `crates/mcp` | Loopback MCP host, bearer leases, tool schemas, and backend contract |
@@ -220,9 +211,9 @@ Scope-isolated stores prevent Local data from entering edge synchronization and 
 
 ## Design invariants
 
-- A session runs on exactly one host device at a time.
+- A session has one immutable host device and one fenced transcript writer.
 - A space fixes its owning device and folder.
-- Transcript/session commands use Loro; workspace index rows use RegistryRoom current state.
+- Canonical transcripts live in host SQLite; SessionHub carries typed commands and bounded projections.
 - Command outcomes are host-written and locally claimed before execution.
 - Viewports use the same RPC envelope in-process, over localhost, and through the relay.
 - Secret values never cross the device relay.

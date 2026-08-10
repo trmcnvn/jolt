@@ -87,6 +87,7 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | `WatchTranscriptV2` | stream | yes | Compact whole-session manifest + trailing pages, then sequenced live-page deltas |
 | `GetTranscriptPage` | unary | yes | Fetch one historical page by opaque page ID |
 | `SearchTranscript` | unary | yes | Search one transcript and return message/page anchors |
+| `CreateRecoveryFork` | unary | yes | Verify a lost host's published projection and import it under a fresh chat on the target host |
 | `ExtractQuestions` | unary | yes | Extract answerable questions from one completed assistant message |
 | `WatchChatUsage` | stream | yes | Current chat usage from its host ledger |
 | `UsageBreakdown` | unary | yes | 7/30/90-day local usage summary |
@@ -108,7 +109,7 @@ The host relay itself explicitly rejects harness-secret methods. Other non-forwa
 | `SyncStatus` | unary | no | Per-room push/ack/rejoin/probe/resync diagnostics |
 | `LocalDevice` | unary | no | Identity of the directly connected engine |
 
-`Mutate` operations are tagged by `op`. Current operations include `createChat`, `createSpace`, `renameSpace`, `deleteSpace`, `renameChat`, `setChatBranch`, `setChatCwd`, `setChatActivity`, `setChatHost`, `setChatPinned`, `setChatArchived`, `setChatConfig`, `deleteChat`, `renameDevice`, and `markChatSeen`.
+`Mutate` operations are tagged by `op`. Current operations include `createChat`, `createSpace`, `renameSpace`, `deleteSpace`, `renameChat`, `setChatBranch`, `setChatCwd`, `setChatActivity`, `setChatHost`, `setChatPinned`, `setChatArchived`, `setChatConfig`, `deleteChat`, `renameDevice`, and `markChatSeen`. Host reassignment is rejected. Permanent loss instead uses `CreateRecoveryFork { sourceChatId, chatId, spaceId, targetDeviceId }`; it preserves the source, imports only its verified published transcript into the fresh target-host chat, and does not copy commands or machine-local continuation/checkout state.
 
 ### Authentication
 

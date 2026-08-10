@@ -7,6 +7,8 @@ publish.workspace = true
 
 [dependencies]
 jolt-platform.workspace = true
+jolt-proto.workspace = true
+jolt-session-doc.workspace = true
 jolt-registry-model.workspace = true
 loro.workspace = true
 loro-protocol.workspace = true
@@ -28,9 +30,10 @@ mock-server = []
 
 [dev-dependencies]
 chrono.workspace = true
-jolt-session-doc.workspace = true
-jolt-proto.workspace = true
+# Integration tests compile this crate as a dependency, so activate their test support here.
+jolt-sync = { path = ".", features = ["mock-server"] }
 jolt-store.workspace = true
+reqwest.workspace = true
 tempfile.workspace = true
 # `start_paused` virtual-clock tests (the 2026-07-30 sync-stall regressions).
 tokio = { workspace = true, features = ["test-util"] }

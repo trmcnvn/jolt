@@ -259,7 +259,7 @@ impl DevicesPage {
             })
             .count();
         let copy = format!(
-            "Removing “{}” permanently deletes its {} {} and {} {}. Folders and local files aren’t affected.",
+            "Create recovery forks for any threads you need first. Removing “{}” permanently deletes its {} {} and {} {}. Folders and local files aren’t affected.",
             device.name,
             spaces.len(),
             if spaces.len() == 1 { "space" } else { "spaces" },

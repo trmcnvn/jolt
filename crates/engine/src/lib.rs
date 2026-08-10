@@ -269,7 +269,18 @@ impl EngineCore {
         let secrets = services.secrets;
         registry.set_environment_provider(Arc::new(secrets.clone()));
         let device_id = load_or_create_device_id(device_dir)?;
+        let edge = edge.map(|edge| edge.with_device(device_id.clone()));
         let store = Arc::new(DocsStore::open(identity_dir)?);
+        let migrated_sessions = store.migrate_legacy_sessions()?;
+        for migration in &migrated_sessions {
+            tracing::info!(
+                chat = %migration.chat_id,
+                messages = migration.report.message_count,
+                commands = migration.report.command_count,
+                semantic_hash = %migration.report.semantic_hash,
+                "legacy session migrated and verified"
+            );
+        }
         let journal = Arc::new(RunJournal::open(identity_dir.join("journals"))?);
         let usage = UsageStore::open_with_pricing(
             &identity_dir.join("usage.sqlite"),
@@ -308,6 +319,7 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        doc_host.seed_hosted_sessions();
         match workspace.pause_active_goals_after_restart() {
             Ok(0) => {}
             Ok(paused) => tracing::info!(paused, "active goals paused on boot"),

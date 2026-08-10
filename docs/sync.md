@@ -3,7 +3,7 @@
 Jolt uses three synchronization paths with different semantics:
 
 1. a current-state workspace registry for devices, spaces, chats, and live session rows;
-2. one Loro document per chat for transcript and durable commands;
+2. one fenced SessionHub per chat for typed commands and bounded transcript projections;
 3. one relay room per engine for live RPC and durable wake-up nudges.
 
 Each path uses persistence and conflict semantics suited to its data.
@@ -51,7 +51,7 @@ Hybrid logical clocks are fixed-width strings:
 <13-digit epoch-ms>-<6-digit counter>-<device-id>
 ```
 
-Lexicographic order is therefore total. A field applies only when its incoming clock is strictly newer.
+Lexicographic order is therefore total. A field applies only when its incoming clock is strictly newer. One identity exception is enforced identically in Rust, TypeScript, and Swift: a live chat's existing `deviceId` cannot change; recovery uses a fresh chat ID.
 
 - `upsert` creates rows and can revive a tombstone when newer than its delete clock.
 - `update` never creates or revives a row.
@@ -88,45 +88,35 @@ Server to client:
 - A full resync also reseeds local-only rows.
 - Registry snapshots are stored under the identity-scoped `docs.sqlite3`, so offline restarts keep rows and pending writes.
 
-RegistryRoom writes table backups to R2 and exposes authenticated stats/rows/reset routes for operations. Destructive batches trigger an immediate backup. When a chat row becomes tombstoned, the room durably queues retirement of its SessionRoom plus deletion of its chat-scoped R2 attachments; failed cleanup retries by alarm. A reset is self-healing because clients reseed automatically.
+RegistryRoom writes table backups to R2 and exposes authenticated stats/rows/reset routes for operations. Destructive batches trigger an immediate backup. When a chat row becomes tombstoned, the room durably queues retirement of its SessionHub (and legacy SessionRoom during cutover) plus deletion of chat-scoped R2 artifacts; failed cleanup retries by alarm. A reset is self-healing because clients reseed automatically.
 
-## Session documents
+## Sessions
 
-### Schema
+The assigned host is the only canonical transcript writer. Normalized messages, parts, incremental text chunks, page metadata, typed commands, and synchronization markers live in its identity-scoped `docs.sqlite3`. The host assignment is immutable because cwd, checkout, and harness state are machine-local; permanent loss creates a recovery-fork chat rather than silently changing writers.
 
-A session Loro document contains metadata, message entries, and append-only command entries. Text is held in `LoroText`; tool, input, and error parts use typed map fields. Message records larger than 256 KiB are split into continuations and joined during projection.
+SessionHub is a wasm-free Durable Object with:
 
-The Rust client and TypeScript edge use `loro-protocol` 0.3-compatible binary frames over WebSocket. Join sends the client's version vector, the room returns missing history or a snapshot, and both sides acknowledge update batches. Large updates fragment and reassemble at the protocol layer.
+- an immutable host device and monotonically increasing writer lease;
+- idempotent typed command current state and server ordering;
+- one compact transcript manifest and bounded live-page base;
+- a bounded sequence of live-page deltas;
+- daily JSON backup metadata.
 
-### SessionRoom
+Sealed transcript pages are immutable SHA-256-addressed JSON in R2. Viewers receive a base sequence followed by contiguous nested delta frames; any gap or delta tripwire failure reconnects for a new base. The host republishes a full base after reconnect and whenever the delta budget reaches 200 rows or 512 KiB.
 
-The per-chat Durable Object keeps:
+### Writer and command discipline
 
-- a current Loro snapshot;
-- a buffered update log;
-- a compact transcript catalog, byte-bounded historical pages, and a mutable tail projection;
-- the latest working-copy diff manifest and references to immutable, byte-bounded patch pages;
-- ephemeral presence;
-- daily R2 backups.
-
-Dirty update rows flush on a short cadence. Logical updates larger than Durable Object SQLite's row limit are split across continuation rows and reassembled before replay. When the update log reaches the configured threshold, the room folds it losslessly into the snapshot. Daily checkpoint-based trimming discards history beyond the three-day retention frontier while preserving current state. A joining client behind a shallow snapshot's retained frontier receives the full snapshot instead of an unusable partial diff.
-
-The host engine keeps local snapshots and an LRU of open documents. `WatchTranscriptV2` opens with compact whole-session metadata and enough trailing pages to cover at least 64 messages, then sends sequenced deltas only for the mutable live page. Historical pages are fetched by opaque ID and cached under a device byte budget. Retiring a deleted chat closes its room, prevents stale clients from recreating backups, and removes `backup/<chatId>/latest.loro`.
-
-Checkout diffs use the same projection shape without transcript-style line deltas. `WatchCheckoutDiffV2` is scoped to one chat checkout and sends a complete file/page manifest; expanded bodies load through `GetCheckoutDiffPage`. Pages are self-contained unified-patch fragments split at file, hunk, then line boundaries and addressed by SHA-256; descriptors carry unified and paired split-layout line counts so either viewport can reserve the correct unloaded height. The edge stores chat manifests in SessionRoom and deduplicates page bodies per user checkout in R2, deleting pages dropped by the latest checkout manifest. Files omitted by the bounded capture remain visible in the manifest with an explicit partial state. A device-local review can lease a working-copy catalog before annotating it; the host copies every referenced page into its pinned-diff store and serves that revision until the reviewing device deletes the draft and releases the lease. Pending comments themselves remain solely in the viewing device's `review-drafts.sqlite` and never participate in synchronization.
-
-### Writer discipline
-
-- Authorized clients submit only their own immutable command entries; the edge validates and idempotently appends them to canonical Loro.
-- The chat host is the sole writer of transcript entries and command outcomes.
+- Authorized viewers submit immutable typed commands by client-minted ID. Same ID/same canonical envelope is idempotent; same ID/different content is `409`.
+- Command delivery is `pending -> claimed -> terminal`; only the current host lease may claim and resolve.
 - The issuing composer may cancel only its own still-pending command.
-- Full tool inputs remain in the host's local journal; only render-safe projections sync.
+- The host claims remote commands before its local mark-before-execute ledger, then evaluates expiry and supersession.
+- Full tool inputs remain in the private host run journal; only render-safe transcript projections publish.
 
-### Offline commands
+Commands default to a 24-hour expiry. Mobile viewers persist them in an outbox before submission. Host-local commands persist and execute while offline, then submit and reconcile the same ID after reconnect. A command left pending after a crash but already present in the processed ledger is terminally rejected with an explicit unknown outcome rather than re-executed or left stuck.
 
-Commands default to a 24-hour expiry. Mobile and remote viewers persist commands in a device-local outbox before submission; an edge acknowledgement means the command is durable in canonical Loro, while the client-minted transcript message ID acknowledges execution. The host evaluates processed-ID dedupe, expiry, and supersession before executing. Newer pending steer/interrupt entries supersede older entries of the same kind. Interrupts aimed at completed turns are also superseded.
+Checkout diffs retain the same bounded manifest/page shape. SessionHub stores only the latest diff manifest and sequence; immutable hash-verified patch pages remain deduplicated in R2 by checkout. Pending review comments remain solely in the viewing device's `review-drafts.sqlite`.
 
-The host stores command claims in SQLite before execution. This prioritizes at-most-once side effects after a crash; recovery marks interrupted run state and resumes from durable journal/doc information where supported.
+The exact SQLite DDL, HTTP/WebSocket frames, R2 keys, importer, rollback process, and cutover gates are specified in [SessionHub session architecture](session-hub.md).
 
 ## Device relay
 
@@ -138,7 +128,7 @@ uleb128(header-length) + JSON header + payload
 
 The header carries stream ID, frame kind, and optional destination/source device IDs. The payload is an ordinary RPC text frame or stream item, so relay calls use the same dispatcher as localhost and in-process calls.
 
-DeviceRoom also stores durable chat nudges. A host receives them immediately when connected or on its next host join. The nudge only requests `open(chatId)`; the session document remains the source of truth for pending work.
+DeviceRoom also stores durable chat nudges. A host receives them immediately when connected or on its next host join. The nudge only requests `open(chatId)`; SessionHub plus host SQLite remain authoritative for pending work.
 
 ## Presence and liveness
 
@@ -158,20 +148,20 @@ Inspect `connected`, push/ack ages, rejoins, probes, full resyncs, disconnects, 
 
 Relevant edge endpoints are authenticated and intended for diagnostics/repair:
 
-- `/stats/:chatId`
-- `/snapshot/:chatId`
-- `/append/:chatId`
+- `/hub/:chatId/stats`
+- `/hub/:chatId/bootstrap`
 - `/registry/:orgId/stats`
 - `/registry/:orgId/rows`
 - `/registry/:orgId/reset`
 
 ## Source map
 
-- Registry model and merge: `crates/session-doc/src/registry.rs`
+- Registry model and merge: `crates/registry-model/src/model.rs`
 - Registry client: `crates/sync/src/registry.rs`
 - Registry DO: `edge/src/registry-room.ts`, `edge/src/registry-core.ts`
-- Session schema and commands: `crates/session-doc/src/schema.rs`, `crates/session-doc/src/commands.rs`
-- Loro room client: `crates/sync/src/room.rs`
-- Session DO: `edge/src/session-room.ts`
+- Canonical session store: `crates/store/src/sessions.rs`
+- Semantic commands/projections: `crates/session-doc/src/commands.rs`, `transcript_page.rs`
+- SessionHub client: `crates/sync/src/hub.rs`
+- SessionHub DO: `edge/src/session-hub.ts`
 - Device relay: `crates/relay/src/lib.rs`, `edge/src/device-room.ts`
 - Engine document host: `crates/engine/src/doc_host.rs`

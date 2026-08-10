@@ -29,7 +29,7 @@ The owning engine detects whether the folder is under the selected version-contr
 
 ### Threads
 
-A thread is one durable conversation attached to a space. Its row records the host device, folder, checkout, harness configuration, title, activity, pin, and seen state. The transcript and command queue live in a separate Loro document. After the first completed exchange, an untitled thread is named asynchronously with an economy-tier model; a user rename always wins, and Jolt-created worktree branches can be renamed with the generated title. The thread-row context menu can regenerate an existing name through the same model path.
+A thread is one durable conversation attached to a space. Its row records the immutable host device, folder, checkout, harness configuration, title, activity, pin, and seen state. Canonical transcript state lives in host SQLite; SessionHub carries its typed command mailbox and bounded viewer projection. After the first completed exchange, an untitled thread is named asynchronously with an economy-tier model; a user rename always wins, and Jolt-created worktree branches can be renamed with the generated title. The thread-row context menu can regenerate an existing name through the same model path.
 
 The desktop shows pinned threads first, then the remaining threads by recency. Pins sync across viewports and remain subject to the selected space filter. Threads are selected directly from this active sidebar order; `Mod+1` through `Mod+9` select its first nine rows, and holding `Mod` replaces those rows' timestamps with their configured shortcuts. Closing moves a thread into the compact **Closed** section below active threads without clearing its pin; an active run must be stopped first. Jolt also closes inactive threads automatically after three days, while live runs and active goals stay open. Selecting a closed row opens it without reopening it. Sending a message or using its hover reopen control returns it to the active list and its pinned bucket; reopening starts a fresh three-day inactivity window. Closed rows load automatically as the sidebar approaches the end, and title search covers active and closed threads.
 
@@ -116,7 +116,7 @@ When a harness requests structured input—or an agent calls Jolt's `request_ans
 
 ## Transcript and status
 
-Jolt derives the visible transcript from the thread document. Consecutive tools are grouped and can be folded. Assistant text is durably synced in small increments but appears only when the harness completes a semantic message chunk; tools and status remain live. Interrupted or failed runs reveal any preserved partial text.
+Jolt derives the visible transcript from normalized host state and its bounded projection. Consecutive tools are grouped and can be folded. Assistant text is durably synced in small increments but appears only when the harness completes a semantic message chunk; tools and status remain live. Interrupted or failed runs reveal any preserved partial text.
 
 Thread indicators are derived from live status plus the synced seen marker:
 

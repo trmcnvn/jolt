@@ -15,7 +15,10 @@ jolt [COMMAND]
 | `jolt login` | Complete paste-code sign-in, provision the hidden Personal organization, save the session, and exit. |
 | `jolt logout` | Remove the saved Jolt session. Refuses while an engine owns the data directory. |
 | `jolt status` | Show data directory, edge, Local/Account auth state, engine PID, and IPC reachability. Signed-out Local mode is healthy. |
-| `jolt sync` | Query the running engine for workspace/chat sync state and liveness counters. |
+| `jolt sync` | Query the running engine for registry and SessionHub state/counters. |
+| `jolt recover-chat SOURCE NEW SPACE` | Create a fresh-host chat from a permanently lost host's verified published transcript. |
+| `jolt migrate-sessions` | Back up, import, and semantically verify legacy session snapshots. |
+| `jolt migrate-sessions --verify-only` | Verify imports and fail if a snapshot is still pending. |
 | `jolt update` | Check, download, verify, apply, and restart a managed install. |
 | `jolt update --check` | Report whether an update exists. Exits `1` when one is available. |
 | `jolt daemon …` | Install or manage a system service. |
@@ -83,6 +86,21 @@ Managed headless daemons report available releases to signed-in desktops. Update
 
 Source builds and hand-copied binaries are report-only; update them through their source or package workflow.
 
+## Session migration
+
+Stop the desktop/daemon, then run `jolt migrate-sessions`. It discovers every Local and Account scope, creates a consistent backup under each scope's `backups/`, imports pending snapshots transactionally, and prints message/command counts plus semantic SHA-256 for every verified chat. It also reports chats never seeded to SessionHub and chats whose latest local revision is not yet publication-acknowledged. `--scope PATH` limits the operation to an explicit identity directory. See [SessionHub](session-hub.md#migration-and-rollback).
+
+## Permanent host recovery
+
+Run the target desktop/daemon, create or choose a space owned by that machine,
+then invoke `jolt recover-chat SOURCE_CHAT_ID NEW_CHAT_ID SPACE_ID`. The new ID
+must be fresh. Recovery verifies the source SessionHub projection and sealed
+page hashes, imports transcript history, and adds a provenance marker. It does
+not reassign or delete the source chat, and it cannot transfer pending commands,
+goals, native harness sessions, or machine-local checkout state. Recover every
+needed thread before removing the lost device, because device removal retires its
+source Hubs and their published recovery projections.
+
 ## Sync diagnostics
 
 ```bash
@@ -92,9 +110,10 @@ jolt sync
 The command reports:
 
 - connection state;
-- age of the last pushed frame and acknowledgement;
-- rejoin, probe, full-resync, disconnect, and rejection counters;
-- the workspace registry and every currently open chat document.
+- registry frame/ack ages and liveness counters;
+- SessionHub writer lease, projection sequence, command revision, and reconnects;
+- persistent hosted-chat totals, normalized rows, unseeded Hubs, and unpublished local projections;
+- the workspace registry and every currently open chat.
 
 It requires a running local engine. Use it before restarting a device when diagnosing stale workspace rows or transcripts.
 
