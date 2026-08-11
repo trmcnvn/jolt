@@ -160,6 +160,7 @@ Default root: `~/.jolt`.
   harness-secrets.json        # metadata only; values are in OS credentials
   repos.json
   repos/
+  managed-workspaces/        # ownership records + per-scope live references
   agent-accounts/
   logs/
   updates/
@@ -179,7 +180,7 @@ Default root: `~/.jolt`.
     uploads/
 ```
 
-Git worktrees default to `~/.jolt/worktrees`; Jujutsu workspaces default to `~/.jolt/workspaces`.
+Git worktrees default to `~/.jolt/worktrees`; Jujutsu workspaces default to `~/.jolt/workspaces`. Successful isolated-checkout creation records durable device-local ownership. When no live thread or space in any local scope references a managed workspace, a 24-hour orphan grace starts; the engine checks every six hours and removes only clean workspaces. Dirty, external, ownership-mismatched, and unprobeable workspaces are retained. Automatic Git cleanup preserves the branch; automatic JJ cleanup preserves the working-copy revision under a `jolt-retained/*` bookmark.
 
 Scope-isolated stores prevent Local data from entering edge synchronization and prevent a later WorkOS identity from reusing another account's cached documents. Scope and device identities use create-once atomic publication. Moving Local into Account prepares and rewrites a staged target while leaving the source immutable, then publishes the target and creates a fresh Local scope; a failed merge therefore keeps Local attachment references valid. Existing `orgs/<org>/<user>` stores are moved into this layout on first startup; the existing account device identity is preserved and a fresh Local scope is created.
 

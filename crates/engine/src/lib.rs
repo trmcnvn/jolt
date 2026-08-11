@@ -43,6 +43,7 @@ pub mod titles;
 pub mod turn_diffs;
 pub mod uploads;
 pub mod usage;
+mod workspace_cleanup;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -155,6 +156,7 @@ pub struct EngineCore {
     pub diff_sync: CheckoutDiffSync,
     pub review_store: ReviewStore,
     pub spaces_sync: SpacesSync,
+    _workspace_cleanup: workspace_cleanup::WorkspaceCleanup,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub secrets: HarnessSecrets,
@@ -338,6 +340,13 @@ impl EngineCore {
             .map_err(|error| EngineError::Other(format!("review store: {error}")))?;
         let spaces_sync =
             SpacesSync::start(repos.clone(), workspace.clone(), &device_id, turn_diffs);
+        let workspace_cleanup = workspace_cleanup::WorkspaceCleanup::start(
+            repos.clone(),
+            workspace.clone(),
+            sessions.clone(),
+            terminals.clone(),
+            &device_id,
+        );
         Ok(Self {
             sessions,
             doc_host,
@@ -348,6 +357,7 @@ impl EngineCore {
             diff_sync,
             review_store,
             spaces_sync,
+            _workspace_cleanup: workspace_cleanup,
             uploads,
             agent_accounts,
             secrets,

@@ -24,6 +24,9 @@ use jolt_proto::{
 };
 
 use crate::VcsError;
+use crate::managed::{
+    ManagedWorkspace, ManagedWorkspaceStore, WorkspaceCleanupReport, WorkspaceReference,
+};
 use crate::vcs::{Vcs, VcsCommand, compose_command_path};
 
 /// Existence probe timeout for user-chosen / remembered paths, which can point at
@@ -39,6 +42,13 @@ const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
 static TEMP_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
 
 fn parse_two_counts(value: &str) -> Result<(u32, u32), VcsError> {
     let mut fields = value.split_whitespace();
@@ -141,6 +151,8 @@ struct ReposInner {
     worktrees_root: PathBuf,
     workspaces_root: PathBuf,
     vcs: Vcs,
+    managed_workspaces: ManagedWorkspaceStore,
+    managed_workspace_lock: tokio::sync::Mutex<()>,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     action_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
@@ -192,6 +204,8 @@ impl Repos {
                 worktrees_root,
                 workspaces_root,
                 vcs,
+                managed_workspaces: ManagedWorkspaceStore::new(data_dir, device_id),
+                managed_workspace_lock: tokio::sync::Mutex::new(()),
                 file_searches: std::sync::Mutex::new(HashMap::new()),
                 action_locks: std::sync::Mutex::new(HashMap::new()),
             }),
@@ -1618,6 +1632,7 @@ impl Repos {
         repo_path: &Path,
         branch: &str,
     ) -> Result<Worktree, VcsError> {
+        let _managed_guard = self.inner.managed_workspace_lock.lock().await;
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1692,13 +1707,27 @@ impl Repos {
             }
         };
         let checkout = self.checkout_identity(&path).await?;
-        Ok(Worktree {
+        let worktree = Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
             path: path.to_string_lossy().to_string(),
             branch: branch_name,
             name,
             checkout_id: Some(checkout.id),
-        })
+        };
+        let Some(vcs_kind) = self.vcs_kind() else {
+            return Err(VcsError::new("No supported VCS executable found"));
+        };
+        if let Err(error) =
+            self.inner
+                .managed_workspaces
+                .register(vcs_kind, &worktree, unix_now_ms())
+        {
+            let _ = self
+                .delete_worktree(repo_path, Path::new(&worktree.path))
+                .await;
+            return Err(error);
+        }
+        Ok(worktree)
     }
 
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {
@@ -1799,6 +1828,7 @@ impl Repos {
             if worktree_path.exists() {
                 std::fs::remove_dir_all(worktree_path)?;
             }
+            self.inner.managed_workspaces.forget_path(worktree_path)?;
             return Ok(());
         }
         let branch = if worktree_path.exists() {
@@ -1827,7 +1857,233 @@ impl Repos {
         if branch.starts_with("jolt/") {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
+        self.inner.managed_workspaces.forget_path(worktree_path)?;
         Ok(())
+    }
+
+    /// Publish this runtime scope's live checkout references without removing
+    /// any workspace. Reference changes still start or reset orphan grace.
+    pub async fn publish_managed_workspace_references(
+        &self,
+        references: &[WorkspaceReference],
+    ) -> Result<(), VcsError> {
+        let _managed_guard = self.inner.managed_workspace_lock.lock().await;
+        self.inner
+            .managed_workspaces
+            .reconcile(references, unix_now_ms(), Duration::MAX)?;
+        Ok(())
+    }
+
+    /// Publish this runtime scope's live checkout references and reap clean,
+    /// Jolt-created workspaces whose orphan grace period has elapsed.
+    pub async fn reconcile_managed_workspaces(
+        &self,
+        references: &[WorkspaceReference],
+        grace: Duration,
+    ) -> Result<WorkspaceCleanupReport, VcsError> {
+        self.reconcile_managed_workspaces_at(references, unix_now_ms(), grace)
+            .await
+    }
+
+    async fn reconcile_managed_workspaces_at(
+        &self,
+        references: &[WorkspaceReference],
+        now_ms: i64,
+        grace: Duration,
+    ) -> Result<WorkspaceCleanupReport, VcsError> {
+        let _managed_guard = self.inner.managed_workspace_lock.lock().await;
+        let due = self
+            .inner
+            .managed_workspaces
+            .reconcile(references, now_ms, grace)?;
+        let mut report = WorkspaceCleanupReport::default();
+        for record in due {
+            let action_lock = self.action_lock(&record.checkout_id);
+            let _action_guard = action_lock.lock().await;
+            let still_due = self
+                .inner
+                .managed_workspaces
+                .reconcile(references, unix_now_ms().max(now_ms), grace)?
+                .into_iter()
+                .any(|candidate| candidate.checkout_id == record.checkout_id);
+            if !still_due {
+                continue;
+            }
+            let path = Path::new(&record.workspace_path);
+            if !path.exists() {
+                match self.prune_missing_managed_workspace(&record).await {
+                    Ok(()) => {
+                        self.inner.managed_workspaces.forget_path(path)?;
+                        report.removed += 1;
+                    }
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::debug!(
+                            path = %record.workspace_path,
+                            error = %error,
+                            "missing managed workspace metadata cleanup skipped"
+                        );
+                    }
+                }
+                continue;
+            }
+            match self.managed_workspace_is_clean(&record).await {
+                Ok(true) => match self.reap_managed_workspace(&record).await {
+                    Ok(()) => {
+                        self.inner.managed_workspaces.forget_path(path)?;
+                        report.removed += 1;
+                    }
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::warn!(
+                            path = %record.workspace_path,
+                            error = %error,
+                            "managed workspace cleanup failed"
+                        );
+                    }
+                },
+                Ok(false) => report.dirty += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::debug!(
+                        path = %record.workspace_path,
+                        error = %error,
+                        "managed workspace cleanup skipped"
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn managed_workspace_is_clean(
+        &self,
+        record: &ManagedWorkspace,
+    ) -> Result<bool, VcsError> {
+        if self.vcs_kind() != Some(record.vcs_kind) {
+            return Err(VcsError::new("managed workspace backend is not active"));
+        }
+        let root = match record.vcs_kind {
+            VcsKind::Git => &self.inner.worktrees_root,
+            VcsKind::Jujutsu => &self.inner.workspaces_root,
+        };
+        let root = std::fs::canonicalize(root)?;
+        let path = std::fs::canonicalize(&record.workspace_path)?;
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| VcsError::new("managed workspace escaped its Jolt root"))?;
+        if relative.components().count() < 2 {
+            return Err(VcsError::new(
+                "managed workspace path is not a child workspace",
+            ));
+        }
+        if self
+            .workspace_checkout(Path::new(&record.repo_path), &path)
+            .await
+            .is_none()
+        {
+            return Err(VcsError::new(
+                "managed workspace no longer belongs to its recorded repository",
+            ));
+        }
+        let status = match record.vcs_kind {
+            VcsKind::Git => {
+                self.git(
+                    &["status", "--porcelain=v1", "--untracked-files=all"],
+                    Some(&path),
+                )
+                .await?
+            }
+            VcsKind::Jujutsu => {
+                self.jj(&["diff", "-r", "@", "--summary"], Some(&path), false)
+                    .await?
+            }
+        };
+        Ok(status.trim().is_empty())
+    }
+
+    async fn reap_managed_workspace(&self, record: &ManagedWorkspace) -> Result<(), VcsError> {
+        let repo_path = Path::new(&record.repo_path);
+        let workspace_path = Path::new(&record.workspace_path);
+        match record.vcs_kind {
+            VcsKind::Git => {
+                self.git(
+                    &["worktree", "remove", &workspace_path.to_string_lossy()],
+                    Some(repo_path),
+                )
+                .await?;
+                let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
+            }
+            VcsKind::Jujutsu => {
+                let workspace = self
+                    .jj_workspace_name(repo_path, workspace_path)
+                    .await?
+                    .ok_or_else(|| VcsError::new("JJ workspace is no longer registered"))?;
+                let suffix = record.checkout_id.get(..8).unwrap_or(&record.checkout_id);
+                let retained = format!("jolt-retained/{}-{suffix}", record.name);
+                self.jj(
+                    &["bookmark", "set", &retained, "-r", "@"],
+                    Some(workspace_path),
+                    false,
+                )
+                .await?;
+                std::fs::remove_dir_all(workspace_path)?;
+                self.jj(&["workspace", "forget", &workspace], Some(repo_path), true)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn prune_missing_managed_workspace(
+        &self,
+        record: &ManagedWorkspace,
+    ) -> Result<(), VcsError> {
+        if self.vcs_kind() != Some(record.vcs_kind) {
+            return Err(VcsError::new("managed workspace backend is not active"));
+        }
+        let repo_path = Path::new(&record.repo_path);
+        match record.vcs_kind {
+            VcsKind::Git => {
+                self.git(&["worktree", "prune"], Some(repo_path)).await?;
+            }
+            VcsKind::Jujutsu => {
+                if let Some(workspace) = self
+                    .jj_workspace_name(repo_path, Path::new(&record.workspace_path))
+                    .await?
+                {
+                    self.jj(&["workspace", "forget", &workspace], Some(repo_path), true)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn jj_workspace_name(
+        &self,
+        repo_path: &Path,
+        workspace_path: &Path,
+    ) -> Result<Option<String>, VcsError> {
+        let out = self
+            .jj(
+                &[
+                    "workspace",
+                    "list",
+                    "-T",
+                    "name ++ \"\\t\" ++ root ++ \"\\n\"",
+                ],
+                Some(repo_path),
+                true,
+            )
+            .await?;
+        let canonical =
+            std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
+        Ok(out.lines().find_map(|line| {
+            let (name, root) = line.split_once('\t')?;
+            let root = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
+            (root == canonical).then(|| name.to_string())
+        }))
     }
 
     // ── ListFolders ─────────────────────────────────────────────────────────
@@ -2280,6 +2536,80 @@ mod tests {
         assert!(err.contains("cancelled"));
     }
 
+    async fn git_repo_with_initial_commit(repos: &Repos, name: &str) -> PathBuf {
+        let repo = repos.create(name).await.unwrap();
+        let root = PathBuf::from(repo.path);
+        repos
+            .git(&["config", "user.email", "test@example.com"], Some(&root))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "user.name", "Test User"], Some(&root))
+            .await
+            .unwrap();
+        std::fs::write(root.join("README.md"), "initial\n").unwrap();
+        repos
+            .commit_changes(&root, None, "Initial commit")
+            .await
+            .unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_removes_clean_worktree_but_preserves_branch() {
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let root = git_repo_with_initial_commit(&repos, "cleanup-clean").await;
+        let worktree = repos.create_worktree(&root, "main").await.unwrap();
+
+        let report = repos
+            .reconcile_managed_workspaces_at(&[], 100, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(report.removed, 1);
+        assert!(!Path::new(&worktree.path).exists());
+        repos
+            .git(
+                &[
+                    "show-ref",
+                    "--verify",
+                    &format!("refs/heads/{}", worktree.branch),
+                ],
+                Some(&root),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_skips_dirty_worktree() {
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let root = git_repo_with_initial_commit(&repos, "cleanup-dirty").await;
+        let worktree = repos.create_worktree(&root, "main").await.unwrap();
+        std::fs::write(Path::new(&worktree.path).join("dirty.txt"), "keep\n").unwrap();
+
+        let report = repos
+            .reconcile_managed_workspaces_at(&[], 100, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(report.dirty, 1);
+        assert_eq!(report.removed, 0);
+        assert!(Path::new(&worktree.path).exists());
+
+        std::fs::remove_file(Path::new(&worktree.path).join("dirty.txt")).unwrap();
+        let report = repos
+            .reconcile_managed_workspaces_at(&[], 200, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(report.removed, 1);
+        assert!(!Path::new(&worktree.path).exists());
+    }
+
     #[tokio::test]
     async fn git_review_context_uses_current_branch_and_dedupes_remote_urls() {
         let data = tempfile::tempdir().unwrap();
@@ -2364,6 +2694,42 @@ mod tests {
             .await
             .unwrap();
         assert!(!Path::new(&workspace.path).exists());
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_removes_clean_jj_workspace_and_retains_revision() {
+        let data = tempfile::tempdir().unwrap();
+        let repos = Repos::with_roots(
+            data.path(),
+            "device",
+            data.path().join("git-worktrees"),
+            data.path().join("jj-workspaces"),
+            false,
+        );
+        if repos.set_vcs(VcsKind::Jujutsu).is_err() {
+            return;
+        }
+        let repo = repos.create("jj-cleanup").await.unwrap();
+        let root = PathBuf::from(&repo.path);
+        let workspace = repos.create_worktree(&root, "@").await.unwrap();
+        let checkout_id = workspace.checkout_id.as_deref().unwrap();
+        let retained = format!(
+            "jolt-retained/{}-{}",
+            workspace.name,
+            checkout_id.get(..8).unwrap_or(checkout_id)
+        );
+
+        let report = repos
+            .reconcile_managed_workspaces_at(&[], 100, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(report.removed, 1);
+        assert!(!Path::new(&workspace.path).exists());
+        repos
+            .jj(&["log", "-r", &retained], Some(&root), true)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
