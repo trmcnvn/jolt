@@ -1,19 +1,17 @@
 //! Normalized current-state storage for chat transcripts and durable commands.
 //!
-//! Unlike the legacy Loro snapshots, these tables retain no merge history. The
-//! assigned chat host is the only transcript writer; other devices submit typed
-//! commands and consume paged transcript projections.
+//! The assigned chat host is the only transcript writer; other devices submit
+//! typed commands and consume paged transcript projections.
 
 use std::sync::Arc;
 
 use jolt_session_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandStatus, SessionDoc,
+    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandStatus,
     SessionMessageEntry, TRANSCRIPT_BOOTSTRAP_MESSAGE_COUNT, TRANSCRIPT_PAGE_MESSAGE_COUNT,
     TRANSCRIPT_PAGE_TARGET_BYTES, TranscriptBootstrap, TranscriptManifest, TranscriptPage,
     TranscriptPageDescriptor, TranscriptSearchResult, TranscriptTurnDescriptor,
-    join_continuation_entries, message_estimated_bytes, transcript_catalog_revision,
-    transcript_entry_preview, transcript_page_revision, transcript_search_preview,
-    transcript_searchable_text,
+    message_estimated_bytes, transcript_catalog_revision, transcript_entry_preview,
+    transcript_page_revision, transcript_search_preview, transcript_searchable_text,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -23,6 +21,7 @@ use crate::{DocsStore, StoreError};
 const SESSION_SCHEMA_MIGRATION: &str = "session-current-state-v1";
 const SESSION_PROJECTION_CACHE_MIGRATION: &str = "session-projection-cache-v2";
 const SESSION_PUBLICATION_REVISION_MIGRATION: &str = "session-publication-revision-v3";
+const SESSION_LEGACY_CLEANUP_MIGRATION: &str = "session-legacy-cleanup-v4";
 const TEXT_CHUNK_FOLD_COUNT: i64 = 64;
 const TEXT_CHUNK_FOLD_BYTES: i64 = 64 * 1024;
 
@@ -131,14 +130,6 @@ CREATE TABLE session_sync (
     FOREIGN KEY (chat_id) REFERENCES session_chats(chat_id) ON DELETE CASCADE
 ) STRICT;
 
-CREATE TABLE legacy_session_imports (
-    chat_id                  TEXT PRIMARY KEY,
-    semantic_hash           TEXT NOT NULL,
-    message_count            INTEGER NOT NULL,
-    command_count            INTEGER NOT NULL,
-    imported_at              INTEGER NOT NULL,
-    FOREIGN KEY (chat_id) REFERENCES session_chats(chat_id) ON DELETE CASCADE
-) STRICT;
 "#;
 
 const SESSION_PROJECTION_CACHE_SCHEMA: &str = r#"
@@ -158,22 +149,6 @@ CREATE TABLE session_turns (
     FOREIGN KEY (chat_id) REFERENCES session_chats(chat_id) ON DELETE CASCADE
 ) STRICT;
 "#;
-
-/// Result of importing one legacy Loro snapshot into current-state tables.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyImportReport {
-    pub semantic_hash: String,
-    pub message_count: usize,
-    pub command_count: usize,
-    pub already_imported: bool,
-}
-
-/// Verified result for one snapshot discovered during a stopped-world batch import.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacySessionMigration {
-    pub chat_id: String,
-    pub report: LegacyImportReport,
-}
 
 /// One chat backed by normalized rows in a shared [`DocsStore`].
 #[derive(Clone)]
@@ -223,7 +198,8 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         .optional()?
         .is_some();
     if projection_cache_applied {
-        return migrate_publication_revision(conn);
+        migrate_publication_revision(conn)?;
+        return migrate_legacy_state(conn);
     }
     let transaction = conn.transaction()?;
     transaction.execute_batch(SESSION_PROJECTION_CACHE_SCHEMA)?;
@@ -254,7 +230,8 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         params![SESSION_PROJECTION_CACHE_MIGRATION, now_ms()],
     )?;
     transaction.commit()?;
-    migrate_publication_revision(conn)
+    migrate_publication_revision(conn)?;
+    migrate_legacy_state(conn)
 }
 
 fn migrate_publication_revision(conn: &mut Connection) -> Result<(), StoreError> {
@@ -304,6 +281,36 @@ fn migrate_publication_revision(conn: &mut Connection) -> Result<(), StoreError>
         params![SESSION_PUBLICATION_REVISION_MIGRATION, now_ms()],
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_legacy_state(conn: &mut Connection) -> Result<(), StoreError> {
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM session_store_migrations WHERE name = ?1",
+            [SESSION_LEGACY_CLEANUP_MIGRATION],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = conn.transaction()?;
+    // The snapshots table remains the registry cache. Session snapshots and
+    // import reports have no runtime or rollback role after the SessionHub cutover.
+    if table_exists(&transaction, "snapshots")? {
+        transaction.execute("DELETE FROM snapshots WHERE doc_id != 'registry1'", [])?;
+    }
+    transaction.execute_batch("DROP TABLE IF EXISTS legacy_session_imports;")?;
+    transaction.execute(
+        "INSERT INTO session_store_migrations(name, applied_at) VALUES (?1, ?2)",
+        params![SESSION_LEGACY_CLEANUP_MIGRATION, now_ms()],
+    )?;
+    transaction.commit()?;
+    // Reclaim pages occupied by removed session snapshots instead of leaving
+    // the deleted payload as permanent freelist capacity.
+    conn.execute_batch("VACUUM;")?;
     Ok(())
 }
 
@@ -363,17 +370,6 @@ impl DocsStore {
             .is_some())
     }
 
-    fn existing_session(
-        self: &Arc<Self>,
-        chat_id: &str,
-    ) -> Result<Option<StoredSession>, StoreError> {
-        Ok(self.session_exists(chat_id)?.then(|| StoredSession {
-            store: self.clone(),
-            chat_id: Arc::from(chat_id),
-            change_hook: None,
-        }))
-    }
-
     /// Open a normalized session, creating an empty one when necessary.
     pub fn open_session(self: &Arc<Self>, chat_id: &str) -> Result<StoredSession, StoreError> {
         let now = now_ms();
@@ -387,122 +383,6 @@ impl DocsStore {
             chat_id: Arc::from(chat_id),
             change_hook: None,
         })
-    }
-
-    pub fn pending_legacy_session_ids(&self) -> Result<Vec<String>, StoreError> {
-        let conn = self.conn();
-        if !table_exists(&conn, "snapshots")? {
-            return Ok(Vec::new());
-        }
-        let sql = if table_exists(&conn, "legacy_session_imports")? {
-            "SELECT doc_id FROM snapshots
-             WHERE doc_id != 'registry1'
-               AND NOT EXISTS (
-                   SELECT 1 FROM legacy_session_imports
-                   WHERE chat_id = snapshots.doc_id
-               )
-             ORDER BY doc_id"
-        } else {
-            "SELECT doc_id FROM snapshots
-             WHERE doc_id != 'registry1' ORDER BY doc_id"
-        };
-        let mut statement = conn.prepare(sql)?;
-        Ok(statement
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// Import and verify every legacy session snapshot not already represented
-    /// in normalized tables. Registry snapshots are intentionally excluded and
-    /// all source rows remain untouched for rollback.
-    pub fn migrate_legacy_sessions(
-        self: &Arc<Self>,
-    ) -> Result<Vec<LegacySessionMigration>, StoreError> {
-        let snapshots = {
-            let conn = self.conn();
-            let mut statement = conn.prepare(
-                "SELECT doc_id, bytes
-                 FROM snapshots
-                 WHERE doc_id != 'registry1'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM legacy_session_imports
-                       WHERE chat_id = snapshots.doc_id
-                   )
-                 ORDER BY doc_id",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        snapshots
-            .into_iter()
-            .map(|(chat_id, snapshot)| {
-                let report = self.import_legacy_session(&chat_id, &snapshot)?;
-                Ok(LegacySessionMigration { chat_id, report })
-            })
-            .collect()
-    }
-
-    /// Recompute semantic hashes and counts for every imported snapshot.
-    pub fn verify_legacy_sessions(
-        self: &Arc<Self>,
-    ) -> Result<Vec<LegacySessionMigration>, StoreError> {
-        let expected = {
-            let conn = self.conn();
-            if !table_exists(&conn, "legacy_session_imports")? {
-                return Ok(Vec::new());
-            }
-            let mut statement = conn.prepare(
-                "SELECT chat_id, semantic_hash, message_count, command_count
-                 FROM legacy_session_imports ORDER BY chat_id",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        expected
-            .into_iter()
-            .map(
-                |(chat_id, expected_hash, expected_messages, expected_commands)| {
-                    let session = self.existing_session(&chat_id)?.ok_or_else(|| {
-                        StoreError::Session(format!(
-                            "legacy import marker has no normalized session for {chat_id}"
-                        ))
-                    })?;
-                    let messages = session.read_entries()?;
-                    let commands = session.read_commands()?;
-                    let actual_hash = semantic_hash(&messages, &commands)?;
-                    let message_count = messages.len();
-                    let command_count = commands.len();
-                    if actual_hash != expected_hash
-                        || sql_usize(message_count)? != expected_messages
-                        || sql_usize(command_count)? != expected_commands
-                    {
-                        return Err(StoreError::Session(format!(
-                            "legacy session verification failed for {chat_id}"
-                        )));
-                    }
-                    Ok(LegacySessionMigration {
-                        chat_id,
-                        report: LegacyImportReport {
-                            semantic_hash: actual_hash,
-                            message_count,
-                            command_count,
-                            already_imported: true,
-                        },
-                    })
-                },
-            )
-            .collect()
     }
 
     /// Insert already-decoded semantic state under a fresh chat id. This is used
@@ -534,17 +414,12 @@ impl DocsStore {
     }
 
     /// Replace one session's semantic state during a stopped-world scope move.
-    /// The operation is atomic and retains a verified legacy-import marker when present.
     pub fn replace_session_state(
         self: &Arc<Self>,
         chat_id: &str,
         messages: &[SessionMessageEntry],
         commands: &[SessionCommandEntry],
     ) -> Result<StoredSession, StoreError> {
-        let imported = self.legacy_import_report(chat_id)?.is_some();
-        let hash = imported
-            .then(|| semantic_hash(messages, commands))
-            .transpose()?;
         let mut conn = self.conn();
         let transaction = conn.transaction()?;
         transaction.execute("DELETE FROM session_chats WHERE chat_id = ?1", [chat_id])?;
@@ -556,119 +431,9 @@ impl DocsStore {
             insert_command(&transaction, chat_id, command)?;
         }
         archive_terminal_command_deliveries(&transaction, chat_id)?;
-        if let Some(hash) = hash {
-            transaction.execute(
-                "INSERT INTO legacy_session_imports (
-                    chat_id, semantic_hash, message_count, command_count, imported_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    chat_id,
-                    hash,
-                    sql_usize(messages.len())?,
-                    sql_usize(commands.len())?,
-                    now_ms()
-                ],
-            )?;
-        }
         transaction.commit()?;
         drop(conn);
         self.open_session(chat_id)
-    }
-
-    /// Import one legacy Loro snapshot exactly once, preserving the snapshot row
-    /// as a rollback source. Existing normalized state is never overwritten.
-    pub fn import_legacy_session(
-        self: &Arc<Self>,
-        chat_id: &str,
-        snapshot: &[u8],
-    ) -> Result<LegacyImportReport, StoreError> {
-        if let Some(report) = self.legacy_import_report(chat_id)? {
-            return Ok(LegacyImportReport {
-                already_imported: true,
-                ..report
-            });
-        }
-        if self.session_exists(chat_id)? {
-            return Err(StoreError::Session(format!(
-                "normalized session {chat_id} exists without a legacy import marker"
-            )));
-        }
-
-        let raw = loro::LoroDoc::new();
-        raw.import(snapshot)
-            .map_err(|error| StoreError::Session(format!("legacy Loro import: {error}")))?;
-        let legacy = SessionDoc::from_doc(raw);
-        let messages = join_continuation_entries(legacy.read_entries()?);
-        let commands = legacy.read_commands()?;
-        let imported_hash = semantic_hash(&messages, &commands)?;
-
-        let mut conn = self.conn();
-        let transaction = conn.transaction()?;
-        ensure_chat(&transaction, chat_id, now_ms())?;
-        for message in &messages {
-            insert_message(&transaction, chat_id, message)?;
-        }
-        for command in &commands {
-            insert_command(&transaction, chat_id, command)?;
-        }
-        archive_terminal_command_deliveries(&transaction, chat_id)?;
-        let stored_messages = message_ids(&transaction, chat_id, None)?
-            .into_iter()
-            .map(|id| read_entry(&transaction, chat_id, &id))
-            .collect::<Result<Vec<_>, _>>()?;
-        let stored_commands = read_commands(&transaction, chat_id)?;
-        let stored_hash = semantic_hash(&stored_messages, &stored_commands)?;
-        if stored_hash != imported_hash
-            || stored_messages.len() != messages.len()
-            || stored_commands.len() != commands.len()
-        {
-            return Err(StoreError::Session(format!(
-                "legacy session verification failed for {chat_id}: {imported_hash} != {stored_hash}"
-            )));
-        }
-        transaction.execute(
-            "INSERT INTO legacy_session_imports (
-                chat_id, semantic_hash, message_count, command_count, imported_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                chat_id,
-                imported_hash,
-                sql_usize(messages.len())?,
-                sql_usize(commands.len())?,
-                now_ms()
-            ],
-        )?;
-        transaction.commit()?;
-        drop(conn);
-
-        Ok(LegacyImportReport {
-            semantic_hash: imported_hash,
-            message_count: messages.len(),
-            command_count: commands.len(),
-            already_imported: false,
-        })
-    }
-
-    fn legacy_import_report(
-        &self,
-        chat_id: &str,
-    ) -> Result<Option<LegacyImportReport>, StoreError> {
-        self.conn()
-            .query_row(
-                "SELECT semantic_hash, message_count, command_count
-                 FROM legacy_session_imports WHERE chat_id = ?1",
-                [chat_id],
-                |row| {
-                    Ok(LegacyImportReport {
-                        semantic_hash: row.get(0)?,
-                        message_count: usize_from_sql(row.get(1)?)?,
-                        command_count: usize_from_sql(row.get(2)?)?,
-                        already_imported: false,
-                    })
-                },
-            )
-            .optional()
-            .map_err(StoreError::from)
     }
 }
 
@@ -2378,7 +2143,7 @@ fn now_ms() -> i64 {
 mod tests {
     use jolt_session_doc::{
         MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionCommandStatus,
-        SessionDoc, SessionMessageEntry,
+        SessionMessageEntry,
     };
 
     use super::*;
@@ -2619,174 +2384,36 @@ mod tests {
     }
 
     #[test]
-    fn batch_migration_excludes_registry_and_verifies_imports() {
+    fn legacy_cleanup_preserves_only_the_registry_snapshot() {
         let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(DocsStore::open(directory.path()).unwrap());
-        let legacy = SessionDoc::init("chat-batch").unwrap();
-        legacy
-            .push_message(&entry("u1", MessageRole::User, "batch"))
-            .unwrap();
-        let snapshot = legacy.export_snapshot().unwrap();
-        store.save_snapshot("chat-batch", &snapshot).unwrap();
-        store.save_snapshot("registry1", b"not a session").unwrap();
-
-        let migrated = store.migrate_legacy_sessions().unwrap();
-        assert_eq!(migrated.len(), 1);
-        assert_eq!(migrated[0].chat_id, "chat-batch");
-        assert_eq!(migrated[0].report.message_count, 1);
-        assert!(store.migrate_legacy_sessions().unwrap().is_empty());
-        assert_eq!(store.verify_legacy_sessions().unwrap().len(), 1);
-        assert_eq!(store.load_snapshot("chat-batch").unwrap(), Some(snapshot));
-        assert_eq!(
-            store.load_snapshot("registry1").unwrap().as_deref(),
-            Some(b"not a session".as_slice())
-        );
+        let store = DocsStore::open(directory.path()).unwrap();
+        store.save_snapshot("chat-old", b"session").unwrap();
+        store.save_snapshot("registry1", b"registry").unwrap();
         drop(store);
 
-        let store = Arc::new(DocsStore::open_read_only(directory.path()).unwrap());
-        assert_eq!(
-            store.pending_legacy_session_ids().unwrap(),
-            Vec::<String>::new()
-        );
-        assert_eq!(store.verify_legacy_sessions().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn read_only_verification_reports_an_unmigrated_legacy_store() {
-        let directory = tempfile::tempdir().unwrap();
         let connection = Connection::open(directory.path().join("docs.sqlite3")).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE snapshots (
-                    doc_id TEXT PRIMARY KEY, bytes BLOB NOT NULL, saved_at INTEGER NOT NULL
+                "CREATE TABLE legacy_session_imports (
+                    chat_id TEXT PRIMARY KEY,
+                    semantic_hash TEXT NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    command_count INTEGER NOT NULL,
+                    imported_at INTEGER NOT NULL
                  ) STRICT;
-                 INSERT INTO snapshots(doc_id, bytes, saved_at)
-                 VALUES ('chat-old', x'00', 1), ('registry1', x'00', 1);",
+                 DELETE FROM session_store_migrations
+                 WHERE name = 'session-legacy-cleanup-v4';",
             )
             .unwrap();
         drop(connection);
 
-        let store = Arc::new(DocsStore::open_read_only(directory.path()).unwrap());
+        let store = DocsStore::open(directory.path()).unwrap();
+        assert_eq!(store.load_snapshot("chat-old").unwrap(), None);
         assert_eq!(
-            store.pending_legacy_session_ids().unwrap(),
-            vec!["chat-old"]
+            store.load_snapshot("registry1").unwrap().as_deref(),
+            Some(b"registry".as_slice())
         );
-        assert!(store.verify_legacy_sessions().unwrap().is_empty());
-        assert!(store.session_ids().unwrap().is_empty());
-        assert!(store.unseeded_hub_session_ids().unwrap().is_empty());
-        assert!(store.unpublished_hub_session_ids().unwrap().is_empty());
-    }
-
-    #[test]
-    fn normalized_row_without_import_marker_does_not_hide_legacy_snapshot() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(DocsStore::open(directory.path()).unwrap());
-        let legacy = SessionDoc::init("chat-shadowed").unwrap();
-        legacy
-            .push_message(&entry("u1", MessageRole::User, "must not disappear"))
-            .unwrap();
-        store
-            .save_snapshot("chat-shadowed", &legacy.export_snapshot().unwrap())
-            .unwrap();
-        store.open_session("chat-shadowed").unwrap();
-
-        assert_eq!(
-            store.pending_legacy_session_ids().unwrap(),
-            vec!["chat-shadowed"]
-        );
-        assert!(store.migrate_legacy_sessions().is_err());
-    }
-
-    #[test]
-    fn legacy_import_matches_transcript_and_command_semantics_across_pages() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(DocsStore::open(directory.path()).unwrap());
-        let legacy = SessionDoc::init("chat-differential").unwrap();
-        for index in 0..70 {
-            let id = format!("message-{index}");
-            legacy
-                .push_message(&SessionMessageEntry {
-                    id: id.clone(),
-                    role: if index % 2 == 0 {
-                        MessageRole::User
-                    } else {
-                        MessageRole::Assistant
-                    },
-                    parts: vec![MessagePart::Text {
-                        id: format!("text-{index}"),
-                        text: format!("unicode λ transcript {index}"),
-                    }],
-                    created_at: index,
-                    device_id: "legacy-device".into(),
-                    status: Some(MessageStatus::Complete),
-                    continuation_of: None,
-                })
-                .unwrap();
-            if index == 11 {
-                legacy
-                    .push_message(&SessionMessageEntry {
-                        id: "message-11-continuation".into(),
-                        role: MessageRole::Assistant,
-                        parts: vec![MessagePart::Text {
-                            id: "text-11-continuation".into(),
-                            text: "continued".into(),
-                        }],
-                        created_at: index,
-                        device_id: "legacy-device".into(),
-                        status: Some(MessageStatus::Complete),
-                        continuation_of: Some(id),
-                    })
-                    .unwrap();
-            }
-        }
-        legacy.queue_command(&command("command-1")).unwrap();
-        let expected_entries = join_continuation_entries(legacy.read_entries().unwrap());
-        let expected_commands = legacy.read_commands().unwrap();
-        let expected_manifest = jolt_session_doc::TranscriptCatalog::build(&legacy)
-            .unwrap()
-            .manifest()
-            .clone();
-        let snapshot = legacy.export_snapshot().unwrap();
-
-        store
-            .import_legacy_session("chat-differential", &snapshot)
-            .unwrap();
-        let session = store.open_session("chat-differential").unwrap();
-        assert_eq!(session.read_entries().unwrap(), expected_entries);
-        assert_eq!(session.read_commands().unwrap(), expected_commands);
-        let mut actual_manifest = session.transcript_manifest().unwrap();
-        for page in &mut actual_manifest.pages {
-            page.content_hash = None;
-        }
-        assert_eq!(actual_manifest, expected_manifest);
-    }
-
-    #[test]
-    fn legacy_loro_import_is_verified_and_idempotent() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(DocsStore::open(directory.path()).unwrap());
-        let legacy = SessionDoc::init("chat-legacy").unwrap();
-        legacy
-            .push_message(&entry("u1", MessageRole::User, "from Loro"))
-            .unwrap();
-        legacy.queue_command(&command("c1")).unwrap();
-        let snapshot = legacy.export_snapshot().unwrap();
-        store.save_snapshot("chat-legacy", &snapshot).unwrap();
-
-        let first = store
-            .import_legacy_session("chat-legacy", &snapshot)
-            .unwrap();
-        assert!(!first.already_imported);
-        let second = store
-            .import_legacy_session("chat-legacy", &snapshot)
-            .unwrap();
-        assert!(second.already_imported);
-        assert_eq!(first.semantic_hash, second.semantic_hash);
-
-        let session = store.open_session("chat-legacy").unwrap();
-        assert_eq!(session.read_entries().unwrap().len(), 1);
-        assert_eq!(session.read_commands().unwrap().len(), 1);
-        assert_eq!(session.semantic_hash().unwrap(), first.semantic_hash);
-        assert_eq!(store.load_snapshot("chat-legacy").unwrap(), Some(snapshot));
+        let connection = Connection::open(directory.path().join("docs.sqlite3")).unwrap();
+        assert!(!table_exists(&connection, "legacy_session_imports").unwrap());
     }
 }

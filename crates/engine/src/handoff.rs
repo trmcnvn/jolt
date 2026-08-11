@@ -205,7 +205,7 @@ fn collect_tool_paths(call: &ToolCall, paths: &mut BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jolt_session_doc::{SessionDoc, SessionMessageEntry};
+    use jolt_session_doc::SessionMessageEntry;
 
     fn entry(id: &str, role: MessageRole, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -224,7 +224,6 @@ mod tests {
 
     #[test]
     fn handoff_never_copies_private_tool_payloads() {
-        let doc = SessionDoc::init("chat").unwrap();
         let mut assistant = entry("a1", MessageRole::Assistant, "Changed the config");
         assistant.parts.push(MessagePart::Tool {
             id: "tool-1".into(),
@@ -235,10 +234,8 @@ mod tests {
             is_error: false,
             resolved: true,
         });
-        doc.push_message(&assistant).unwrap();
-
         let handoff = build(
-            doc.read_entries().unwrap(),
+            vec![assistant],
             None,
             Some(HarnessId::ClaudeCode),
             HarnessId::Codex,
@@ -252,18 +249,15 @@ mod tests {
 
     #[test]
     fn full_then_delta_handoff_uses_coverage_cursor() {
-        let doc = SessionDoc::init("chat").unwrap();
-        doc.push_message(&entry("u1", MessageRole::User, "Build it"))
-            .unwrap();
-        doc.push_message(&entry("a1", MessageRole::Assistant, "Implemented one"))
-            .unwrap();
-        doc.push_message(&entry("u2", MessageRole::User, "Continue"))
-            .unwrap();
-        doc.push_message(&entry("a2", MessageRole::Assistant, "Implemented two"))
-            .unwrap();
+        let entries = vec![
+            entry("u1", MessageRole::User, "Build it"),
+            entry("a1", MessageRole::Assistant, "Implemented one"),
+            entry("u2", MessageRole::User, "Continue"),
+            entry("a2", MessageRole::Assistant, "Implemented two"),
+        ];
 
         let full = build(
-            doc.read_entries().unwrap(),
+            entries.clone(),
             None,
             Some(HarnessId::ClaudeCode),
             HarnessId::Codex,
@@ -276,7 +270,7 @@ mod tests {
         assert_eq!(full.through_message_id, "a2");
 
         let delta = build(
-            doc.read_entries().unwrap(),
+            entries.clone(),
             None,
             Some(HarnessId::ClaudeCode),
             HarnessId::Codex,
@@ -291,7 +285,7 @@ mod tests {
 
         assert!(
             build(
-                doc.read_entries().unwrap(),
+                entries,
                 None,
                 Some(HarnessId::ClaudeCode),
                 HarnessId::Codex,

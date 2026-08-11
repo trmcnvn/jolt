@@ -29,17 +29,8 @@
       "fallthrough": true
     }
   ],
-  // loro-crdt's default entry loads its WASM via URL fetch, which workerd
-  // cannot do at runtime; the base64 entry inlines the module instead.
-  "alias": {
-    "loro-crdt": "loro-crdt/base64"
-  },
   "durable_objects": {
     "bindings": [
-      {
-        "name": "SESSION_ROOMS",
-        "class_name": "SessionRoom"
-      },
       {
         "name": "SESSION_HUBS",
         "class_name": "SessionHub"
@@ -63,19 +54,23 @@
       ]
     },
     {
-      // Workspace registry (docs/sync.md) — the row-table sidebar
-      // sync that replaces the Loro workspace doc rooms.
+      // Workspace registry (docs/sync.md) — row-table sidebar sync.
       "tag": "v2",
       "new_sqlite_classes": [
         "RegistryRoom"
       ]
     },
     {
-      // Typed commands plus host-published transcript projections. SessionHub
-      // never imports Loro or any other CRDT runtime.
+      // Typed commands plus host-published transcript projections.
       "tag": "v3",
       "new_sqlite_classes": [
         "SessionHub"
+      ]
+    },
+    {
+      "tag": "v4",
+      "deleted_classes": [
+        "SessionRoom"
       ]
     }
   ],

@@ -17,8 +17,6 @@ jolt [COMMAND]
 | `jolt status` | Show data directory, edge, Local/Account auth state, engine PID, and IPC reachability. Signed-out Local mode is healthy. |
 | `jolt sync` | Query the running engine for registry and SessionHub state/counters. |
 | `jolt recover-chat SOURCE NEW SPACE` | Create a fresh-host chat from a permanently lost host's verified published transcript. |
-| `jolt migrate-sessions` | Back up, import, and semantically verify legacy session snapshots. |
-| `jolt migrate-sessions --verify-only` | Verify imports and fail if a snapshot is still pending. |
 | `jolt update` | Check, download, verify, apply, and restart a managed install. |
 | `jolt update --check` | Report whether an update exists. Exits `1` when one is available. |
 | `jolt daemon …` | Install or manage a system service. |
@@ -85,10 +83,6 @@ Managed Linux installs use versioned directories under `~/.jolt/app/<version>` a
 Managed headless daemons report available releases to signed-in desktops. Updates run only after an explicit **Update** action on **Settings → Devices**, and wait for active runs and terminals to finish before restarting the service.
 
 Source builds and hand-copied binaries are report-only; update them through their source or package workflow.
-
-## Session migration
-
-Stop the desktop/daemon, then run `jolt migrate-sessions`. It discovers every Local and Account scope, creates a consistent backup under each scope's `backups/`, imports pending snapshots transactionally, and prints message/command counts plus semantic SHA-256 for every verified chat. It also reports chats never seeded to SessionHub and chats whose latest local revision is not yet publication-acknowledged. `--scope PATH` limits the operation to an explicit identity directory. See [SessionHub](session-hub.md#migration-and-rollback).
 
 ## Permanent host recovery
 

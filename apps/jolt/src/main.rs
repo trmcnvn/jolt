@@ -39,15 +39,6 @@ enum Command {
         /// Space owned by this engine; supplies the new cwd and host assignment.
         space_id: String,
     },
-    /// Back up, import, and semantically verify legacy session snapshots.
-    MigrateSessions {
-        /// Check existing imports without writing or backing up.
-        #[arg(long)]
-        verify_only: bool,
-        /// Scope directory containing docs.sqlite3 (repeatable; auto-discovers by default).
-        #[arg(long = "scope")]
-        scopes: Vec<std::path::PathBuf>,
-    },
     /// Manage `jolt headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -128,16 +119,8 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).
-    // loro's internal block-encode diagnostics log at info and flood
-    // journald on every snapshot export — enough to fill a disk on a
-    // long-running headless host. Quiet them by default (RUST_LOG still
-    // overrides the whole filter).
     let long_running = matches!(&cli.command, None | Some(Command::Headless));
-    let default_filter = if long_running {
-        "info,loro_internal=warn,loro=warn"
-    } else {
-        "warn"
-    };
+    let default_filter = if long_running { "info" } else { "warn" };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_filter.into());
     // Long-running modes mirror stdout logging to {data_dir}/logs — a headed
@@ -214,10 +197,6 @@ fn main() -> anyhow::Result<()> {
                 space_id,
             ))
         }
-        Some(Command::MigrateSessions {
-            verify_only,
-            scopes,
-        }) => migrate_sessions(&engine_config_from_env(), verify_only, scopes),
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
@@ -259,115 +238,6 @@ async fn recover_chat(
         .await
         .map_err(|error| anyhow::anyhow!("CreateRecoveryFork failed: {error}"))?;
     println!("Created recovery fork {chat_id} from {source_chat_id}");
-    Ok(())
-}
-
-fn migrate_sessions(
-    config: &jolt_engine::EngineConfig,
-    verify_only: bool,
-    mut scopes: Vec<std::path::PathBuf>,
-) -> anyhow::Result<()> {
-    if scopes.is_empty() {
-        discover_scope_dirs(&config.data_dir.join("scopes"), &mut scopes)?;
-        if config.data_dir.join("docs.sqlite3").is_file() {
-            scopes.push(config.data_dir.clone());
-        }
-    }
-    scopes.sort();
-    scopes.dedup();
-    if scopes.is_empty() {
-        anyhow::bail!(
-            "no docs.sqlite3 stores found under {}",
-            config.data_dir.display()
-        );
-    }
-
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
-    for scope in scopes {
-        let local_scope = config.data_dir.join("scopes/local/current");
-        let lock_dir = if scope == local_scope || scope == config.data_dir {
-            &config.data_dir
-        } else {
-            &scope
-        };
-        let _lock = jolt_engine::InstanceLock::acquire(lock_dir)?;
-        let backup = if verify_only {
-            None
-        } else {
-            let path = scope.join("backups").join(format!(
-                "docs-pre-sessionhub-{stamp}-{}.sqlite3",
-                std::process::id()
-            ));
-            jolt_store::DocsStore::backup_existing_database(&scope, &path)?;
-            Some(path)
-        };
-        let store = std::sync::Arc::new(if verify_only {
-            jolt_store::DocsStore::open_read_only(&scope)?
-        } else {
-            jolt_store::DocsStore::open(&scope)?
-        });
-        let pending_before = store.pending_legacy_session_ids()?;
-        let migrated = if verify_only {
-            Vec::new()
-        } else {
-            store.migrate_legacy_sessions()?
-        };
-        let verified = store.verify_legacy_sessions()?;
-        let pending_after = store.pending_legacy_session_ids()?;
-        if !pending_after.is_empty() {
-            anyhow::bail!(
-                "{} still has unmigrated sessions: {}",
-                scope.display(),
-                pending_after.join(", ")
-            );
-        }
-        let unseeded = store.unseeded_hub_session_ids()?;
-        let unpublished = store.unpublished_hub_session_ids()?;
-        println!(
-            "{}: pending={} migrated={} verified={} hub-unseeded={} hub-unpublished={}{}",
-            scope.display(),
-            pending_before.len(),
-            migrated.len(),
-            verified.len(),
-            unseeded.len(),
-            unpublished.len(),
-            backup
-                .as_ref()
-                .map(|path| format!(" backup={}", path.display()))
-                .unwrap_or_default()
-        );
-        for migration in verified {
-            println!(
-                "  {} messages={} commands={} sha256={}",
-                migration.chat_id,
-                migration.report.message_count,
-                migration.report.command_count,
-                migration.report.semantic_hash
-            );
-        }
-    }
-    Ok(())
-}
-
-fn discover_scope_dirs(
-    directory: &std::path::Path,
-    scopes: &mut Vec<std::path::PathBuf>,
-) -> anyhow::Result<()> {
-    if !directory.exists() {
-        return Ok(());
-    }
-    if directory.join("docs.sqlite3").is_file() {
-        scopes.push(directory.to_path_buf());
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            discover_scope_dirs(&entry.path(), scopes)?;
-        }
-    }
     Ok(())
 }
 

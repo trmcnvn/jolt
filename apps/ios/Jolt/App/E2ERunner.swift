@@ -1,7 +1,7 @@
 // Headless e2e rig — launch with `-e2e` (plus a local wrangler dev edge and a
 // `jolt headless` engine in dev mode) and the app exercises the full live
 // stack with no taps: workspace-registry backfill, device-relay RPCs, space/chat
-// creation, the command plane, and session-room streaming. Results append to
+// creation, the command plane, and SessionHub transcript streaming. Results append to
 // Documents/e2e.log for the harness to read via simctl.
 
 import Foundation

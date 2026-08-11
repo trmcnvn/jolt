@@ -1,5 +1,5 @@
 //! Workspace registry — the client side of the row-table sidebar sync that
-//! replaces the Loro workspace doc (docs/sync.md).
+//! provides current-state workspace synchronization (docs/sync.md).
 //!
 //! [`RegistryDoc`] is a local replica of the per-user registry room:
 //! - `authoritative` rows — the server's truth, replaced wholesale by `state`/
@@ -1471,7 +1471,7 @@ fn row_to<T: serde::de::DeserializeOwned>(row: &RegistryRow) -> Option<T> {
     }
 }
 
-// SessionStatus needs to serialize to the same strings the loro doc used
+// SessionStatus uses stable wire strings across Rust, TypeScript, and Swift.
 // ("idle"/"working"/…) — jolt_proto's serde derives already use camelCase;
 // the compile-time check lives in the tests below.
 

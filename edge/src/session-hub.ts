@@ -8,7 +8,7 @@
  */
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { AUTH_USER_HEADER, type Env } from "./env";
-import { parseDiffSidecar, type StoredDiffSidecar } from "./session-doc/sidecar";
+import { parseDiffSidecar, type StoredDiffSidecar } from "./diff-sidecar";
 
 const HOST_TAG = "host";
 const VIEWER_TAG = "viewer";

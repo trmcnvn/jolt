@@ -224,8 +224,8 @@ impl Harness for MockHarness {
                 And a wide, uneven one:\n\n\
                 | Stage | What happens | p95 |\n\
                 |:--|:--|--:|\n\
-                | Fold | Events fold into parts and diff into the Loro doc on a 120ms coalesced commit cadence, keeping the oplog RLE-merged across devices | 4.2ms |\n\
-                | Sync | Session-room fan-out | 18ms |\n\n"
+                | Fold | Events fold into parts and persist to SQLite on a 120ms coalesced commit cadence | 4.2ms |\n\
+                | Sync | SessionHub projection fan-out | 18ms |\n\n"
                 .into(),
         });
         // Dev/testing knob: `JOLT_MOCK_MEND=1` appends a link/list-heavy
@@ -239,7 +239,7 @@ impl Harness for MockHarness {
                 "\n### Streaming mend check\n\n",
                 "Inline styles hold while text arrives: **bold stays bold**, ",
                 "*italic stays italic*, `code stays code`, and ~~this stays struck~~.\n\n",
-                "- **Fold** — parts diff into the [Loro doc](https://loro.dev) on a 120ms cadence\n",
+                "- **Fold** — parts persist into normalized SQLite on a 120ms cadence\n",
                 "- **Relay** — commits fan out through the [session room](https://developers.cloudflare.com/durable-objects/) to every device\n",
                 "- **Paint** — the [display tree](https://github.com/pulldown-cmark/pulldown-cmark) mends hanging markers in the last block only\n\n",
                 "Links above never flash their URLs, and closing markers never reflow the paragraph.\n",

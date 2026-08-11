@@ -17,10 +17,10 @@ use jolt_proto::{
     SessionStatus, SteeringMode, ToolCall,
 };
 use jolt_session_doc::{
-    GoalOperation, MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
-    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
+    GoalOperation, MessagePart, MessageRole, MessageStatus, SessionCommandEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionMessageEntry,
 };
-use jolt_store::DocsStore;
+use jolt_store::{DocsStore, StoredSegmentWriter};
 
 const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
@@ -2243,8 +2243,8 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
     std::fs::create_dir_all(&scope).unwrap();
     std::fs::write(scope.join("device-id"), device_id).unwrap();
 
-    // Craft the crash state: a journal without a terminal Done + a doc snapshot whose
-    // assistant entry is still `streaming`.
+    // Craft the crash state: a journal without a terminal Done and a normalized
+    // assistant entry that is still streaming.
     {
         let journal =
             RunJournal::open(dir.path().join("scopes/accounts/dev-org/dev-user/journals")).unwrap();
@@ -2257,32 +2257,30 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             )
             .unwrap();
 
-        let doc = SessionDoc::init(CHAT).unwrap();
-        doc.push_message(&SessionMessageEntry {
-            id: "m-user".into(),
-            role: MessageRole::User,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: "hi".into(),
-            }],
-            created_at: 1,
-            device_id: device_id.into(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: None,
-        })
-        .unwrap();
-        let mut writer = SegmentWriter::begin(&doc, "m-assist", device_id, 2).unwrap();
+        let store = Arc::new(DocsStore::open(&scope).unwrap());
+        let session = store.open_session(CHAT).unwrap();
+        session
+            .push_message(&SessionMessageEntry {
+                id: "m-user".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "hi".into(),
+                }],
+                created_at: 1,
+                device_id: device_id.into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })
+            .unwrap();
+        let mut writer = StoredSegmentWriter::begin(&session, "m-assist", device_id, 2).unwrap();
         writer
             .sync(&[MessagePart::Text {
                 id: "t0".into(),
                 text: "doomed".into(),
             }])
             .unwrap();
-        // No finish — the "process" dies here with the entry still streaming.
-        let store = DocsStore::open(dir.path().join("scopes/accounts/dev-org/dev-user")).unwrap();
-        store
-            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
-            .unwrap();
+        // No finish — the process dies here with the entry still streaming.
     }
 
     // Boot: EngineCore::assemble runs recover_stale.

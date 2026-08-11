@@ -12,7 +12,7 @@ use rusqlite::OptionalExtension as _;
 
 pub use jolt_api::{ScopeKind, ScopeStatus};
 use jolt_registry_model::{REGISTRY_DOC_ID, RegistryDoc};
-use jolt_session_doc::{MessagePart, SessionCommandEntry, SessionCommandPayload, SessionDoc};
+use jolt_session_doc::{MessagePart, SessionCommandEntry, SessionCommandPayload};
 use jolt_store::DocsStore;
 use sha2::{Digest, Sha256};
 
@@ -238,13 +238,16 @@ fn merge_docs(
         upload_to,
     )?;
 
-    let snapshots = read_snapshots(&source)?;
-    let source_registry = snapshots
-        .iter()
-        .find(|(id, _)| id == REGISTRY_DOC_ID)
-        .map(|(_, bytes)| bytes.as_slice());
+    let source_registry: Option<Vec<u8>> = source
+        .query_row(
+            "SELECT bytes FROM snapshots WHERE doc_id = ?1",
+            [REGISTRY_DOC_ID],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| EngineError::Other(format!("read Local registry: {error}")))?;
     if let Some(source_registry) = source_registry {
-        let source_registry = RegistryDoc::from_bytes(source_registry, source_device)?;
+        let source_registry = RegistryDoc::from_bytes(&source_registry, source_device)?;
         let target_bytes: Option<Vec<u8>> = target
             .query_row(
                 "SELECT bytes FROM snapshots WHERE doc_id = ?1",
@@ -342,11 +345,6 @@ fn merge_session_states(
 ) -> Result<SessionMergePlan, EngineError> {
     let source = Arc::new(DocsStore::open(source_dir)?);
     let target = Arc::new(DocsStore::open(target_dir)?);
-    source.migrate_legacy_sessions()?;
-    target.migrate_legacy_sessions()?;
-    source.verify_legacy_sessions()?;
-    target.verify_legacy_sessions()?;
-
     let source_registry = source
         .load_snapshot(REGISTRY_DOC_ID)?
         .map(|bytes| RegistryDoc::from_bytes(&bytes, source_device))
@@ -424,18 +422,6 @@ fn merge_session_states(
             }
         } else {
             target.import_session_state(&destination, messages, commands)?;
-        }
-        if target.load_snapshot(&destination)?.is_none()
-            && source.load_snapshot(&chat_id)?.is_some()
-        {
-            let document = SessionDoc::init(&destination)?;
-            for message in messages {
-                document.push_message(message)?;
-            }
-            for command in commands {
-                document.queue_command(command)?;
-            }
-            target.save_snapshot(&destination, &document.export_snapshot()?)?;
         }
     }
     Ok(SessionMergePlan { chat_ids, shared })
@@ -531,7 +517,6 @@ fn rewrite_stored_documents(scope_dir: &Path, from: &str, to: &str) -> Result<()
         return Ok(());
     }
     let store = Arc::new(DocsStore::open(scope_dir)?);
-    store.migrate_legacy_sessions()?;
     for chat_id in store.session_ids()? {
         let session = store.open_session(&chat_id)?;
         let mut messages = session.read_entries()?;
@@ -542,55 +527,7 @@ fn rewrite_stored_documents(scope_dir: &Path, from: &str, to: &str) -> Result<()
             store.replace_session_state(&chat_id, &messages, &commands)?;
         }
     }
-    drop(store);
-    let connection = rusqlite::Connection::open(path)
-        .map_err(|error| EngineError::Other(format!("open promoted documents: {error}")))?;
-    for (chat_id, bytes) in read_snapshots(&connection)?
-        .into_iter()
-        .filter(|(id, _)| id != REGISTRY_DOC_ID)
-    {
-        let raw = loro::LoroDoc::new();
-        raw.import(&bytes)
-            .map_err(|error| EngineError::Other(format!("import promoted document: {error}")))?;
-        let document = SessionDoc::from_doc(raw);
-        if rewrite_document_prefix(&document, from, to)? {
-            save_snapshot(&connection, &chat_id, &document.export_snapshot()?)?;
-        }
-    }
     Ok(())
-}
-
-fn rewrite_document_prefix(
-    document: &SessionDoc,
-    from: &str,
-    to: &str,
-) -> Result<bool, EngineError> {
-    let mut changed = false;
-    for entry in document.read_entries()? {
-        let message_id = entry.id;
-        for part in entry.parts {
-            let jolt_session_doc::MessagePart::Text { id, text } = part else {
-                continue;
-            };
-            if text.contains(from) {
-                changed |= document.replace_text_part(&message_id, &id, &text.replace(from, to))?;
-            }
-        }
-    }
-    Ok(changed)
-}
-
-fn read_snapshots(
-    connection: &rusqlite::Connection,
-) -> Result<Vec<(String, Vec<u8>)>, EngineError> {
-    let mut statement = connection
-        .prepare("SELECT doc_id, bytes FROM snapshots")
-        .map_err(|error| EngineError::Other(format!("read snapshots: {error}")))?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|error| EngineError::Other(format!("read snapshots: {error}")))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| EngineError::Other(format!("read snapshot: {error}")))
 }
 
 fn save_snapshot(
@@ -717,41 +654,33 @@ mod tests {
         std::fs::create_dir_all(&account).unwrap();
         std::fs::write(account.join("device-id"), "account-device").unwrap();
 
-        let local_store = DocsStore::open(&local).unwrap();
-        let local_doc = SessionDoc::init("chat-local").unwrap();
-        local_doc
-            .push_message(&SessionMessageEntry {
-                id: "message-local".into(),
-                role: MessageRole::User,
-                parts: vec![MessagePart::Text {
-                    id: "text-local".into(),
-                    text: local
-                        .join("uploads/image.png")
-                        .to_string_lossy()
-                        .into_owned(),
-                }],
-                created_at: 1,
-                device_id: "local-device".into(),
-                status: Some(MessageStatus::Complete),
-                continuation_of: None,
-            })
-            .unwrap();
+        let local_store = Arc::new(DocsStore::open(&local).unwrap());
         local_store
-            .save_snapshot("chat-local", &local_doc.export_snapshot().unwrap())
+            .import_session_state(
+                "chat-local",
+                &[SessionMessageEntry {
+                    id: "message-local".into(),
+                    role: MessageRole::User,
+                    parts: vec![MessagePart::Text {
+                        id: "text-local".into(),
+                        text: local
+                            .join("uploads/image.png")
+                            .to_string_lossy()
+                            .into_owned(),
+                    }],
+                    created_at: 1,
+                    device_id: "local-device".into(),
+                    status: Some(MessageStatus::Complete),
+                    continuation_of: None,
+                }],
+                &[],
+            )
             .unwrap();
         local_store.mark_processed("command-local").unwrap();
         drop(local_store);
 
-        let account_store = DocsStore::open(&account).unwrap();
-        account_store
-            .save_snapshot(
-                "chat-account",
-                &SessionDoc::init("chat-account")
-                    .unwrap()
-                    .export_snapshot()
-                    .unwrap(),
-            )
-            .unwrap();
+        let account_store = Arc::new(DocsStore::open(&account).unwrap());
+        account_store.open_session("chat-account").unwrap();
         drop(account_store);
         UsageStore::open(&local.join("usage.sqlite"), "local-device".into()).unwrap();
         UsageStore::open(&account.join("usage.sqlite"), "account-device".into()).unwrap();
@@ -760,15 +689,12 @@ mod tests {
 
         layout.merge_local_into_account("org", "user").unwrap();
 
-        let account_store = DocsStore::open(&account).unwrap();
-        let merged = account_store
-            .load_snapshot("chat-local")
+        let account_store = Arc::new(DocsStore::open(&account).unwrap());
+        let entries = account_store
+            .open_session("chat-local")
             .unwrap()
-            .expect("merged Local snapshot");
-        let raw = loro::LoroDoc::new();
-        raw.import(&merged).unwrap();
-        let merged = SessionDoc::from_doc(raw);
-        let entries = merged.read_entries().unwrap();
+            .read_entries()
+            .unwrap();
         let text = match &entries[0].parts[0] {
             MessagePart::Text { text, .. } => text,
             _ => panic!("expected text attachment reference"),
@@ -788,26 +714,26 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source_dir = root.path().join("local");
         let target_dir = root.path().join("account");
-        let source = DocsStore::open(&source_dir).unwrap();
-        let target = DocsStore::open(&target_dir).unwrap();
+        let source = Arc::new(DocsStore::open(&source_dir).unwrap());
+        let target = Arc::new(DocsStore::open(&target_dir).unwrap());
         for (store, text) in [(&source, "local history"), (&target, "account history")] {
-            let document = SessionDoc::init("same-chat").unwrap();
-            document
-                .push_message(&SessionMessageEntry {
-                    id: format!("message-{text}"),
-                    role: MessageRole::User,
-                    parts: vec![MessagePart::Text {
-                        id: "text".into(),
-                        text: text.into(),
-                    }],
-                    created_at: 1,
-                    device_id: "device".into(),
-                    status: None,
-                    continuation_of: None,
-                })
-                .unwrap();
             store
-                .save_snapshot("same-chat", &document.export_snapshot().unwrap())
+                .import_session_state(
+                    "same-chat",
+                    &[SessionMessageEntry {
+                        id: format!("message-{text}"),
+                        role: MessageRole::User,
+                        parts: vec![MessagePart::Text {
+                            id: "text".into(),
+                            text: text.into(),
+                        }],
+                        created_at: 1,
+                        device_id: "device".into(),
+                        status: None,
+                        continuation_of: None,
+                    }],
+                    &[],
+                )
                 .unwrap();
         }
         drop(source);
@@ -863,24 +789,24 @@ mod tests {
             .join("uploads/image.png")
             .to_string_lossy()
             .into_owned();
-        let store = DocsStore::open(&local).unwrap();
-        let document = SessionDoc::init("chat-local").unwrap();
-        document
-            .push_message(&SessionMessageEntry {
-                id: "message-local".into(),
-                role: MessageRole::User,
-                parts: vec![MessagePart::Text {
-                    id: "text-local".into(),
-                    text: local_path.clone(),
-                }],
-                created_at: 1,
-                device_id: "local-device".into(),
-                status: Some(MessageStatus::Complete),
-                continuation_of: None,
-            })
-            .unwrap();
+        let store = Arc::new(DocsStore::open(&local).unwrap());
         store
-            .save_snapshot("chat-local", &document.export_snapshot().unwrap())
+            .import_session_state(
+                "chat-local",
+                &[SessionMessageEntry {
+                    id: "message-local".into(),
+                    role: MessageRole::User,
+                    parts: vec![MessagePart::Text {
+                        id: "text-local".into(),
+                        text: local_path.clone(),
+                    }],
+                    created_at: 1,
+                    device_id: "local-device".into(),
+                    status: Some(MessageStatus::Complete),
+                    continuation_of: None,
+                }],
+                &[],
+            )
             .unwrap();
         drop(store);
         std::fs::create_dir_all(local.join("uploads")).unwrap();
@@ -892,15 +818,12 @@ mod tests {
             .merge_local_into_account("org", "user")
             .expect_err("different upload contents must stop the merge");
 
-        let store = DocsStore::open(&local).unwrap();
-        let bytes = store
-            .load_snapshot("chat-local")
+        let store = Arc::new(DocsStore::open(&local).unwrap());
+        let entries = store
+            .open_session("chat-local")
             .unwrap()
-            .expect("Local source remains");
-        let raw = loro::LoroDoc::new();
-        raw.import(&bytes).unwrap();
-        let document = SessionDoc::from_doc(raw);
-        let entries = document.read_entries().unwrap();
+            .read_entries()
+            .unwrap();
         let text = match &entries[0].parts[0] {
             MessagePart::Text { text, .. } => text,
             _ => panic!("expected text attachment reference"),

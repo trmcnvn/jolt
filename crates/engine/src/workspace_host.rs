@@ -1,5 +1,5 @@
 //! WorkspaceHost — owns the per-user workspace **registry** (docs/
-//! registry-sync.md; replaces the Loro workspace doc after the 2026-07/08
+//! registry-sync.md; replaced the earlier workspace document after the 2026-07/08
 //! wedge incidents): local snapshot persistence, edge room sync
 //! (`/registry/{orgId}/ws` → room `reg1/{orgId}/{userId}`, offline-tolerant —
 //! spaces/sessions are private to their owner, never org-visible), the device

@@ -1,6 +1,6 @@
 //! Device-local persistence for pending review feedback.
 //!
-//! Review drafts deliberately live outside Loro and the edge. The reviewing
+//! Review drafts deliberately remain device-local and unpublished. The reviewing
 //! device keeps one JSON payload per logical review subject in SQLite so target
 //! adapters can evolve their typed anchor schemas without a table migration.
 

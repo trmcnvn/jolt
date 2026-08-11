@@ -88,7 +88,7 @@ Server to client:
 - A full resync also reseeds local-only rows.
 - Registry snapshots are stored under the identity-scoped `docs.sqlite3`, so offline restarts keep rows and pending writes.
 
-RegistryRoom writes table backups to R2 and exposes authenticated stats/rows/reset routes for operations. Destructive batches trigger an immediate backup. When a chat row becomes tombstoned, the room durably queues retirement of its SessionHub (and legacy SessionRoom during cutover) plus deletion of chat-scoped R2 artifacts; failed cleanup retries by alarm. A reset is self-healing because clients reseed automatically.
+RegistryRoom writes table backups to R2 and exposes authenticated stats/rows/reset routes for operations. Destructive batches trigger an immediate backup. When a chat row becomes tombstoned, the room durably queues retirement of its SessionHub plus deletion of chat-scoped R2 artifacts; failed cleanup retries by alarm. A reset is self-healing because clients reseed automatically.
 
 ## Sessions
 
@@ -116,7 +116,7 @@ Commands default to a 24-hour expiry. Mobile viewers persist them in an outbox b
 
 Checkout diffs retain the same bounded manifest/page shape. SessionHub stores only the latest diff manifest and sequence; immutable hash-verified patch pages remain deduplicated in R2 by checkout. Pending review comments remain solely in the viewing device's `review-drafts.sqlite`.
 
-The exact SQLite DDL, HTTP/WebSocket frames, R2 keys, importer, rollback process, and cutover gates are specified in [SessionHub session architecture](session-hub.md).
+The exact SQLite DDL, HTTP/WebSocket frames, R2 keys, and recovery behavior are specified in [SessionHub session architecture](session-hub.md).
 
 ## Device relay
 

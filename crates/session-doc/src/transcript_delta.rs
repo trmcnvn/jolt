@@ -11,8 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::SessionMessageEntry;
 use crate::parts::MessagePart;
-use crate::schema::SessionMessageEntry;
 
 /// One transcript-page update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,7 +110,7 @@ fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Op
 }
 
 /// Diff two transcript states into a frame. An entry is upserted when it is
-/// new, its content changed, or its predecessor changed (a Loro list merge can
+/// new, its content changed, or its predecessor changed (an insertion can
 /// interleave a remote entry mid-list). Falls back to `Reset` when the delta
 /// would carry most of the transcript anyway.
 pub fn diff_transcript(
@@ -251,8 +251,8 @@ pub fn apply_transcript_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MessageRole;
     use crate::parts::MessagePart;
-    use crate::schema::MessageRole;
 
     fn entry(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {

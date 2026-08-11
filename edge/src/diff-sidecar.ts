@@ -1,13 +1,4 @@
-/** Non-CRDT sidecar payloads served by SessionRoom. */
-import type { SessionMessageEntry } from "./messages";
-
-export interface SessionTail {
-  readonly chatId: string;
-  readonly schemaVersion: number;
-  readonly messages: ReadonlyArray<SessionMessageEntry>;
-  readonly totalMessages: number;
-  readonly updatedAt: number;
-}
+/** Checkout diff projection contracts served by SessionHub. */
 
 export type DiffCompleteness = "complete" | "binary" | "snapshotTruncated" | "oversizedLine";
 

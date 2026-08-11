@@ -75,7 +75,7 @@ export class RegistryRoom implements DurableObject {
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS artifact_purges (chat_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, attempts INTEGER NOT NULL, sweeps INTEGER NOT NULL, next_attempt_at INTEGER NOT NULL)"
     );
-    // Same protocol-level keepalive as SessionRoom — and the same caveat: a
+    // Protocol-level keepalive distinguishes actor health from socket health: a
     // pong is runtime-answered and proves nothing about this DO's health.
     // Clients judge liveness by probe frames (crates/sync/src/registry.rs).
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -193,7 +193,7 @@ export class RegistryRoom implements DurableObject {
         pendingArtifactPurges,
         connectedSockets: this.ctx.getWebSockets().length,
         // The ONLY per-device attribution surface — kept from the 2026-08-05
-        // incident tooling (SessionRoom's /stats pushOutcomes).
+        // incident tooling exposed through registry stats.
         pushOutcomes: JSON.parse(this.getMeta("pushOutcomes") ?? "{}") as Record<string, PushOutcome>,
         lastBackupSeq: Number(this.getMeta("backupSeq") ?? "0"),
         lastGcAt: Number(this.getMeta("lastGcAt") ?? "0")
@@ -408,21 +408,6 @@ export class RegistryRoom implements DurableObject {
     this.scheduleAlarm(now + 100);
   }
 
-  private async retireSession(chatId: string, userId: string): Promise<void> {
-    const room = this.env.SESSION_ROOMS.get(
-      this.env.SESSION_ROOMS.idFromName(`s2/${chatId}`)
-    );
-    const request = new Request(
-      `https://session-room/retire?chatId=${encodeURIComponent(chatId)}`,
-      {
-        method: "POST",
-        headers: { [AUTH_USER_HEADER]: userId }
-      }
-    );
-    const response = await room.fetch(request);
-    if (!response.ok) throw new Error(`session retire failed (${response.status})`);
-  }
-
   private async retireSessionHub(chatId: string, userId: string): Promise<void> {
     const room = this.env.SESSION_HUBS.get(
       this.env.SESSION_HUBS.idFromName(`hub1/${chatId}`)
@@ -474,7 +459,6 @@ export class RegistryRoom implements DurableObject {
     }
     for (const row of rows) {
       try {
-        await this.retireSession(row.chat_id, row.user_id);
         await this.retireSessionHub(row.chat_id, row.user_id);
         await this.deleteAttachmentPrefix(row.chat_id, row.user_id);
         if (row.sweeps === 0) {

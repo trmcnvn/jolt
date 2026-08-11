@@ -23,7 +23,6 @@ jolt-terminal.workspace = true
 jolt-rpc.workspace = true
 jolt-relay.workspace = true
 jolt-update.workspace = true
-loro.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true

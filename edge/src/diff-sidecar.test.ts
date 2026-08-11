@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseDiffSidecar } from "./session-doc";
+import { parseDiffSidecar } from "./diff-sidecar";
 
 const sidecar = {
   chatId: "chat-1",

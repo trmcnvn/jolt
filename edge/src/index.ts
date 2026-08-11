@@ -16,14 +16,10 @@
  *   GET  /hub/:chatId/commands        — revision-paged command reconciliation
  *   GET  /hub/:chatId/bootstrap       — bounded transcript projection
  *   PUT  /hub/:chatId/pages/:sha256   — immutable transcript page
- *   GET  /session/:chatId/ws          — legacy rollback room during cutover
- *   GET  /tail/:chatId                — legacy rollback tail during cutover
  *   GET  /diff/:chatId                — latest paged working-tree manifest
  *   GET  /diff/:chatId/page?id=       — one immutable patch page
  *   GET  /diff/:chatId/ws             — manifest update stream
  *   POST /diff/:chatId                — host publishes manifest + missing pages
- *   GET  /snapshot/:chatId            — legacy repair snapshot during cutover
- *   POST /append/:chatId              — legacy repair import during cutover
  *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
  *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
  *   GET  /registry/:orgId/rows        — registry full-table repair read
@@ -39,14 +35,13 @@
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
 import { AUTH_USER_HEADER, type Env } from "./env";
-import { SessionRoom } from "./session-room";
 import { SessionHub } from "./session-hub";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
-import { parseDiffSidecar, type CheckoutDiffPage, type StoredDiffSidecar } from "./session-doc";
+import { parseDiffSidecar, type CheckoutDiffPage, type StoredDiffSidecar } from "./diff-sidecar";
 import installSh from "./install.sh";
 
-export { SessionRoom, SessionHub, DeviceRoom, RegistryRoom };
+export { SessionHub, DeviceRoom, RegistryRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -268,28 +263,6 @@ export default {
       }
     }
 
-    // ── legacy Loro session rooms ───────────────────────────────────────────
-    if (parts[0] === "session" && parts[1] && ID_RE.test(parts[1]) && parts[2] === "ws") {
-      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-        return json({ error: "expected websocket" }, 426);
-      }
-      // `s2/` = the WorkOS staging→production identity break: rooms are
-      // claim-on-first-join per user id, and prod issued a fresh id for
-      // everyone — a new namespace lets prod identities claim fresh rooms
-      // while hosts re-upload doc state from their local snapshots.
-      // Frame-level room ids stay the bare chatId.
-      return forward(
-        env.SESSION_ROOMS,
-        `s2/${parts[1]}`,
-        request,
-        auth.userId,
-        "/ws",
-        `?chatId=${parts[1]}${deviceParam(url)}`
-      );
-    }
-    if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/tail", "");
-    }
     if (parts[0] === "transcript" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
       const chatId = parts[1];
       const room = `hub1/${chatId}`;
@@ -353,9 +326,6 @@ export default {
         "/command",
         `?chatId=${encodeURIComponent(parts[1])}`
       );
-    }
-    if (parts[0] === "stats" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/stats", "");
     }
     if (parts[0] === "diff" && parts[1] && ID_RE.test(parts[1])) {
       const chatId = parts[1];
@@ -438,13 +408,6 @@ export default {
         `?chatId=${encodeURIComponent(chatId)}`
       );
     }
-    if (parts[0] === "snapshot" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/snapshot", "");
-    }
-    if (parts[0] === "append" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
-    }
-
     // ── registry rooms (docs/sync.md): org claim must match the URL,
     //    room derived from the caller's OWN user id, and the DO
     //    trusts the stamped header. `reg1` = first registry generation. ─────

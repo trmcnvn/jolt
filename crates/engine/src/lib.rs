@@ -72,8 +72,6 @@ pub use workspace_host::{DEFAULT_ORG_ID, DEFAULT_USER_ID, WorkspaceHost, Workspa
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    #[error("doc: {0}")]
-    Doc(#[from] jolt_session_doc::DocError),
     #[error("registry: {0}")]
     Registry(#[from] jolt_registry_model::RegistryError),
     #[error("journal: {0}")]
@@ -271,16 +269,6 @@ impl EngineCore {
         let device_id = load_or_create_device_id(device_dir)?;
         let edge = edge.map(|edge| edge.with_device(device_id.clone()));
         let store = Arc::new(DocsStore::open(identity_dir)?);
-        let migrated_sessions = store.migrate_legacy_sessions()?;
-        for migration in &migrated_sessions {
-            tracing::info!(
-                chat = %migration.chat_id,
-                messages = migration.report.message_count,
-                commands = migration.report.command_count,
-                semantic_hash = %migration.report.semantic_hash,
-                "legacy session migrated and verified"
-            );
-        }
         let journal = Arc::new(RunJournal::open(identity_dir.join("journals"))?);
         let usage = UsageStore::open_with_pricing(
             &identity_dir.join("usage.sqlite"),

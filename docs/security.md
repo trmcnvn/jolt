@@ -18,7 +18,7 @@ Development auth is intentionally weaker. An edge with `AUTH_MODE=dev` accepts t
 
 ## Transport
 
-Production traffic uses HTTPS/WSS. Transcript documents are not end-to-end encrypted at the application layer: the edge can process synchronized document bytes and stores snapshots/backups.
+Production traffic uses HTTPS/WSS. Transcript projections are not end-to-end encrypted at the application layer: the edge processes render-safe live pages and stores sealed pages and SessionHub recovery objects.
 
 Local engine RPC binds only `127.0.0.1`. It has no additional IPC authentication token, so other processes running as the same machine user—or any process able to reach that loopback port—should be treated as inside the local trust boundary.
 

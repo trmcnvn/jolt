@@ -1486,7 +1486,7 @@ impl Repos {
                     "workspace",
                     "list",
                     "-T",
-                    "name ++ \"\\t\" ++ target.change_id().shortest(8) ++ \"\\t\" ++ root ++ \"\\n\"",
+                    "name ++ \"\\t\" ++ target.change_id().shortest(8) ++ \"\\t\" ++ target.current_working_copy() ++ \"\\t\" ++ root ++ \"\\n\"",
                 ],
                 Some(repo_path),
                 true,
@@ -1494,13 +1494,23 @@ impl Repos {
             .await?;
         let mut rows = Vec::new();
         for line in out.lines() {
-            let mut fields = line.splitn(3, '\t');
-            let (Some(workspace), Some(change_id), Some(root)) =
-                (fields.next(), fields.next(), fields.next())
+            let mut fields = line.splitn(4, '\t');
+            let (Some(workspace), Some(change_id), Some(target_is_current), Some(root)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
             else {
                 continue;
             };
-            let root_path = PathBuf::from(root);
+            // Repositories initialized by older JJ versions can omit the current
+            // workspace path from the repo store. JJ renders `root` as an error
+            // string in that case even though `jj root` above resolved it. Never
+            // expose that diagnostic as a selectable checkout path.
+            let missing_current_root = target_is_current == "true"
+                && root.starts_with("<Error: Workspace has no recorded path:");
+            let root_path = if missing_current_root {
+                current_root.clone()
+            } else {
+                PathBuf::from(root)
+            };
             let canonical = std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
             let current = canonical == current_root;
             rows.push(RepoRef {
@@ -1512,7 +1522,7 @@ impl Repos {
                 },
                 kind: RepoRefKind::WorkingCopy,
                 current,
-                worktree_path: (!current).then(|| root.to_string()),
+                worktree_path: (!current).then(|| root_path.to_string_lossy().into_owned()),
             });
         }
         rows.sort_by_key(|row| !row.current);
@@ -2321,6 +2331,17 @@ mod tests {
         assert_eq!(current.kind, RepoRefKind::WorkingCopy);
         assert_eq!(current.revision, "@");
         assert_eq!(current.name, branch);
+
+        // Older JJ repositories did not persist the default workspace path.
+        // `workspace list` renders a diagnostic in its place; it must still map
+        // to this repository root rather than becoming a fake worktree path.
+        std::fs::write(root.join(".jj/repo/workspace_store/index"), []).unwrap();
+        let refs = repos.refs(&root).await.unwrap();
+        let current = refs.iter().find(|row| row.current).unwrap();
+        assert_eq!(current.kind, RepoRefKind::WorkingCopy);
+        assert_eq!(current.revision, "@");
+        assert_eq!(current.name, branch);
+        assert_eq!(current.worktree_path, None);
 
         let workspace = repos.create_worktree(&root, "@").await.unwrap();
         assert!(Path::new(&workspace.path).join(".jj").is_dir());

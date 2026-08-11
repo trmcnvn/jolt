@@ -1,12 +1,12 @@
-//! `DocsStore` — local SQLite persistence for doc snapshots and the
-//! processed-command ledger (docs/architecture.md): entries are marked processed
-//! BEFORE execution so a crash can never double-execute a command.
+//! Local SQLite persistence for the registry cache, normalized sessions, and
+//! processed-command ledger. Commands are marked processed before execution so
+//! a crash can never double-execute one.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Errors surfaced by [`DocsStore`].
 #[derive(Debug, thiserror::Error)]
@@ -17,8 +17,6 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("session document: {0}")]
-    SessionDoc(#[from] jolt_session_doc::DocError),
     #[error("session store: {0}")]
     Session(String),
 }
@@ -35,9 +33,8 @@ CREATE TABLE IF NOT EXISTS processed_commands (
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
 ///
-/// Holds the canonical normalized session tables, retained legacy rollback
-/// snapshots, registry cache, and the command ledger that provides
-/// mark-before-execute idempotence.
+/// Holds canonical normalized sessions, the registry cache, and the command
+/// ledger that provides mark-before-execute idempotence.
 pub struct DocsStore {
     conn: Mutex<Connection>,
 }
@@ -53,19 +50,6 @@ impl DocsStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         crate::sessions::migrate(&mut conn)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
-    }
-
-    /// Open an existing store without running migrations or permitting writes.
-    /// Intended for stopped-world verification after a writable migration.
-    pub fn open_read_only(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let conn = Connection::open_with_flags(
-            data_dir.as_ref().join("docs.sqlite3"),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -91,45 +75,6 @@ impl DocsStore {
              ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at",
             params![doc_id, bytes, now_ms()],
         )?;
-        Ok(())
-    }
-
-    /// Back up an existing database before opening it through [`DocsStore`].
-    /// This is the cutover path: schema migrations must not precede the
-    /// rollback artifact. The destination must not already exist.
-    pub fn backup_existing_database(
-        data_dir: impl AsRef<Path>,
-        destination: impl AsRef<Path>,
-    ) -> Result<(), StoreError> {
-        let destination = destination.as_ref();
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let connection = Connection::open_with_flags(
-            data_dir.as_ref().join("docs.sqlite3"),
-            OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
-        Ok(())
-    }
-
-    /// Write a transactionally consistent standalone SQLite backup. The
-    /// destination must not already exist.
-    pub fn backup_database(&self, destination: impl AsRef<Path>) -> Result<(), StoreError> {
-        let destination = destination.as_ref();
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        self.conn()
-            .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
-        Ok(())
-    }
-
-    /// Delete the snapshot row for `doc_id`. Missing rows are a no-op.
-    pub fn delete_snapshot(&self, doc_id: &str) -> Result<(), StoreError> {
-        self.conn()
-            .execute("DELETE FROM snapshots WHERE doc_id = ?1", params![doc_id])?;
         Ok(())
     }
 
@@ -176,33 +121,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_roundtrip_and_overwrite() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
+    fn registry_snapshot_roundtrips_and_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(directory.path()).unwrap();
 
-        assert_eq!(store.load_snapshot("chat-1").unwrap(), None);
-        store.save_snapshot("chat-1", b"v1").unwrap();
+        assert_eq!(store.load_snapshot("registry1").unwrap(), None);
+        store.save_snapshot("registry1", b"v1").unwrap();
         assert_eq!(
-            store.load_snapshot("chat-1").unwrap().as_deref(),
-            Some(&b"v1"[..])
+            store.load_snapshot("registry1").unwrap().as_deref(),
+            Some(b"v1".as_slice())
         );
-        store.save_snapshot("chat-1", b"v2-longer-bytes").unwrap();
+        store
+            .save_snapshot("registry1", b"v2-longer-bytes")
+            .unwrap();
         assert_eq!(
-            store.load_snapshot("chat-1").unwrap().as_deref(),
-            Some(&b"v2-longer-bytes"[..])
-        );
-        // Distinct docs do not collide.
-        store.save_snapshot("chat-2", b"other").unwrap();
-        assert_eq!(
-            store.load_snapshot("chat-1").unwrap().as_deref(),
-            Some(&b"v2-longer-bytes"[..])
+            store.load_snapshot("registry1").unwrap().as_deref(),
+            Some(b"v2-longer-bytes".as_slice())
         );
     }
 
     #[test]
     fn processed_ledger_claims_exactly_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(directory.path()).unwrap();
 
         assert!(!store.is_processed("cmd-1").unwrap());
         assert!(store.mark_processed("cmd-1").unwrap(), "first mark claims");
@@ -214,55 +155,17 @@ mod tests {
     }
 
     #[test]
-    fn pre_migration_backup_precedes_session_schema_changes() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("docs.sqlite3");
-        let connection = Connection::open(&database).unwrap();
-        connection.execute_batch(SCHEMA).unwrap();
-        connection
-            .execute(
-                "INSERT INTO snapshots(doc_id, bytes, saved_at) VALUES ('chat-1', x'01', 1)",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-
-        let backup = directory.path().join("backups/pre.sqlite3");
-        DocsStore::backup_existing_database(directory.path(), &backup).unwrap();
-        DocsStore::open(directory.path()).unwrap();
-
-        let backup = Connection::open(backup).unwrap();
-        let session_schema = backup
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_chats'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .unwrap();
-        assert!(session_schema.is_none());
-        let bytes: Vec<u8> = backup
-            .query_row(
-                "SELECT bytes FROM snapshots WHERE doc_id = 'chat-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(bytes, vec![1]);
-    }
-
-    #[test]
     fn reopen_preserves_data() {
-        let dir = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
         {
-            let store = DocsStore::open(dir.path()).unwrap();
-            store.save_snapshot("chat-1", b"persisted").unwrap();
+            let store = DocsStore::open(directory.path()).unwrap();
+            store.save_snapshot("registry1", b"persisted").unwrap();
             store.mark_processed("cmd-1").unwrap();
         }
-        let store = DocsStore::open(dir.path()).unwrap();
+        let store = DocsStore::open(directory.path()).unwrap();
         assert_eq!(
-            store.load_snapshot("chat-1").unwrap().as_deref(),
-            Some(&b"persisted"[..])
+            store.load_snapshot("registry1").unwrap().as_deref(),
+            Some(b"persisted".as_slice())
         );
         assert!(store.is_processed("cmd-1").unwrap());
         assert!(!store.mark_processed("cmd-1").unwrap());

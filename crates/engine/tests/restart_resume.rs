@@ -26,7 +26,7 @@ use jolt_proto::{
     SteeringMode,
 };
 use jolt_session_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionDoc, SessionMessageEntry,
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry,
 };
 use jolt_store::DocsStore;
 
@@ -450,41 +450,41 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     std::fs::write(scope.join("device-id"), "dev-crash").unwrap();
 
     // Manufacture the on-disk state a kill -9 mid-run leaves behind:
-    // - a chat doc snapshot whose assistant entry is still `streaming`;
+    // - a normalized assistant entry that is still streaming;
     // - a journal whose last event is NOT `Done` (run died mid-stream), holding
     //   the only copy of the harness session id (the debounced workspace-row
     //   write never landed).
     {
-        let store = DocsStore::open(dir.join("scopes/accounts/dev-org/dev-user")).unwrap();
-        let doc = SessionDoc::init(CHAT).unwrap();
-        doc.push_message(&SessionMessageEntry {
-            id: "msg-user-1".into(),
-            role: MessageRole::User,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: "long task".into(),
-            }],
-            created_at: 1,
-            device_id: "dev-crash".into(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: None,
-        })
-        .unwrap();
-        doc.push_message(&SessionMessageEntry {
-            id: "msg-assistant-1".into(),
-            role: MessageRole::Assistant,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: "partial…".into(),
-            }],
-            created_at: 2,
-            device_id: "dev-crash".into(),
-            status: Some(MessageStatus::Streaming),
-            continuation_of: None,
-        })
-        .unwrap();
-        store
-            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+        let store =
+            Arc::new(DocsStore::open(dir.join("scopes/accounts/dev-org/dev-user")).unwrap());
+        let session = store.open_session(CHAT).unwrap();
+        session
+            .push_message(&SessionMessageEntry {
+                id: "msg-user-1".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "long task".into(),
+                }],
+                created_at: 1,
+                device_id: "dev-crash".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })
+            .unwrap();
+        session
+            .push_message(&SessionMessageEntry {
+                id: "msg-assistant-1".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "partial…".into(),
+                }],
+                created_at: 2,
+                device_id: "dev-crash".into(),
+                status: Some(MessageStatus::Streaming),
+                continuation_of: None,
+            })
             .unwrap();
 
         let journal =
@@ -717,36 +717,36 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         .unwrap()
         .as_millis() as i64;
     {
-        let store = DocsStore::open(dir.join("scopes/accounts/dev-org/dev-user")).unwrap();
-        let doc = SessionDoc::init(CHAT).unwrap();
-        doc.push_message(&SessionMessageEntry {
-            id: "msg-user-1".into(),
-            role: MessageRole::User,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: "long task".into(),
-            }],
-            created_at: now - 60_000,
-            device_id: "dev-crash".into(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: None,
-        })
-        .unwrap();
-        doc.push_message(&SessionMessageEntry {
-            id: "msg-assistant-1".into(),
-            role: MessageRole::Assistant,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: "partial…".into(),
-            }],
-            created_at: now - 30_000,
-            device_id: "dev-crash".into(),
-            status: Some(MessageStatus::Streaming),
-            continuation_of: None,
-        })
-        .unwrap();
-        store
-            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+        let store =
+            Arc::new(DocsStore::open(dir.join("scopes/accounts/dev-org/dev-user")).unwrap());
+        let session = store.open_session(CHAT).unwrap();
+        session
+            .push_message(&SessionMessageEntry {
+                id: "msg-user-1".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "long task".into(),
+                }],
+                created_at: now - 60_000,
+                device_id: "dev-crash".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })
+            .unwrap();
+        session
+            .push_message(&SessionMessageEntry {
+                id: "msg-assistant-1".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "partial…".into(),
+                }],
+                created_at: now - 30_000,
+                device_id: "dev-crash".into(),
+                status: Some(MessageStatus::Streaming),
+                continuation_of: None,
+            })
             .unwrap();
 
         let journal =

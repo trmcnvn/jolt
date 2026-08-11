@@ -961,19 +961,6 @@ impl DocHost {
             handle.touch();
             return Ok(handle.clone());
         }
-        if !self.inner.store.session_exists(chat_id)?
-            && let Some(snapshot) = self.inner.store.load_snapshot(chat_id)?
-        {
-            let report = self.inner.store.import_legacy_session(chat_id, &snapshot)?;
-            tracing::info!(
-                chat = %chat_id,
-                messages = report.message_count,
-                commands = report.command_count,
-                hash = %report.semantic_hash,
-                "migrated legacy Loro session into SQLite"
-            );
-        }
-
         let (changed_tx, changed_rx) = watch::channel(0u64);
         let hook_tx = changed_tx.clone();
         let doc = self
@@ -1559,8 +1546,8 @@ impl DocHost {
         rows
     }
 
-    /// Drop a chat's normalized state and its retained rollback snapshot — the
-    /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
+    /// Drop a chat's normalized state. The chat is gone (DeleteChat / DeleteSpace
+    /// cascade). Watchers see the
     /// stream end; a racing writer keeps its orphaned doc until the run ends.
     pub fn purge_chat(&self, chat_id: &str) {
         let removed = lock(&self.inner.handles).remove(chat_id);
@@ -1569,9 +1556,6 @@ impl DocHost {
             && let Err(error) = session.delete()
         {
             tracing::warn!(chat = %chat_id, %error, "normalized session delete failed");
-        }
-        if let Err(error) = self.inner.store.delete_snapshot(chat_id) {
-            tracing::warn!(chat = %chat_id, %error, "legacy snapshot delete failed");
         }
     }
 

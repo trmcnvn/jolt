@@ -14,7 +14,6 @@
  * snapshot for instant new-chat pickers §8.1; capability metadata) so pickers
  * render last-known state while the live RPC happens at confirm time.
  */
-import { BytesWriter } from "loro-protocol";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { AUTH_USER_HEADER, type Env } from "./env";
 
@@ -74,15 +73,26 @@ const validateDeviceFrameSize = (headerBytes: number, payloadBytes: number): voi
   }
 };
 
+const encodeUleb128 = (value: number): Uint8Array => {
+  const bytes: number[] = [];
+  do {
+    const remainder = value % 128;
+    value = Math.floor(value / 128);
+    bytes.push(value === 0 ? remainder : remainder | 0x80);
+  } while (value !== 0);
+  return Uint8Array.from(bytes);
+};
+
 export const encodeDeviceFrame = (header: DeviceFrameHeader, payload: Uint8Array): Uint8Array => {
   const validated = parseDeviceFrameHeader(header);
-  const headerJson = JSON.stringify(validated);
-  const headerBytes = new TextEncoder().encode(headerJson).length;
-  validateDeviceFrameSize(headerBytes, payload.length);
-  const writer = new BytesWriter();
-  writer.pushVarString(headerJson);
-  writer.pushBytes(payload);
-  return writer.finalize();
+  const headerBytes = new TextEncoder().encode(JSON.stringify(validated));
+  validateDeviceFrameSize(headerBytes.length, payload.length);
+  const length = encodeUleb128(headerBytes.length);
+  const frame = new Uint8Array(length.length + headerBytes.length + payload.length);
+  frame.set(length);
+  frame.set(headerBytes, length.length);
+  frame.set(payload, length.length + headerBytes.length);
+  return frame;
 };
 
 export const decodeDeviceFrame = (

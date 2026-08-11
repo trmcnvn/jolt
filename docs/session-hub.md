@@ -1,6 +1,6 @@
 # SessionHub session architecture
 
-SessionHub replaces per-chat Loro synchronization with a fenced single-writer model. The assigned engine host owns canonical transcript state in SQLite. Other devices submit typed commands and read bounded transcript projections. The private run journal remains separate and is never published.
+SessionHub uses a fenced single-writer model. The assigned engine host owns canonical transcript state in SQLite. Other devices submit typed commands and read bounded transcript projections. The private run journal remains separate and is never published.
 
 ## Invariants
 
@@ -12,8 +12,7 @@ SessionHub replaces per-chat Loro synchronization with a fenced single-writer mo
 6. Host-local commands persist and execute from SQLite while offline. Reconnection submits the original command ID and reconciles its terminal result to SessionHub.
 7. Transcript projection sequence is monotonic within one SessionHub. A viewer applies only `sequence == previous + 1`; otherwise it reconnects for a base plus retained deltas.
 8. Sealed page bodies are immutable and SHA-256 addressed. SessionHub stores only the manifest, one bounded live-page base, and bounded deltas.
-9. Legacy snapshots and stopped-world database backups remain available until semantic verification and explicit approval to remove them.
-10. Divergent same-ID histories are never interleaved. Local-to-Account migration creates a deterministic `local-conflict-*` chat.
+9. Divergent same-ID histories are never interleaved. Local-to-Account migration creates a deterministic `local-conflict-*` chat.
 
 ## Host SQLite
 
@@ -133,19 +132,11 @@ CREATE TABLE session_sync (
     FOREIGN KEY (chat_id) REFERENCES session_chats(chat_id) ON DELETE CASCADE
 ) STRICT;
 
-CREATE TABLE legacy_session_imports (
-    chat_id TEXT PRIMARY KEY,
-    semantic_hash TEXT NOT NULL,
-    message_count INTEGER NOT NULL,
-    command_count INTEGER NOT NULL,
-    imported_at INTEGER NOT NULL,
-    FOREIGN KEY (chat_id) REFERENCES session_chats(chat_id) ON DELETE CASCADE
-) STRICT;
 ```
 
 Indexes cover page message order and pending command order. Streaming text appends into `session_text_chunks`; 64 chunks or 64 KiB fold atomically into `text_base`. Page assignment is stable: 32 logical messages or 384 KiB seals the current page, and the first message ID anchors the next page ID. Page hashes/revisions and turn previews are cached and invalidated transactionally, so a streaming tick reads only the bounded live page. Any sealed-page edit clears `published_hash`.
 
-`protocol_generation = 2` means a full base was accepted by SessionHub. `projection_change_revision` advances only for transcript projection mutations (not command-ledger changes); an acknowledgement clears `projection_dirty` only if it covers that revision. On the first cutover boot, the engine opens and seeds every locally hosted registry chat that has not reached generation 2, then releases inactive handles.
+`protocol_generation = 2` means a full base was accepted by SessionHub. `projection_change_revision` advances only for transcript projection mutations (not command-ledger changes); an acknowledgement clears `projection_dirty` only if it covers that revision. On startup, the engine opens and seeds every locally hosted registry chat that has not reached generation 2, then releases inactive handles.
 
 ## SessionHub Durable Object
 
@@ -185,7 +176,7 @@ hashes, ranges, counts, IDs, and delta sequence, then imports the projected
 messages into its local SQLite. Any abandoned streaming message becomes aborted.
 The fork adds a visible provenance marker, starts with no commands, goals, native
 harness continuation, or checkout state, and receives the target space's cwd and
-immutable host. The source chat and all rollback artifacts remain untouched.
+immutable host. The source chat remains untouched.
 Recovery must precede removal of the lost device: device deletion retires its
 source Hubs and published projections.
 
@@ -274,40 +265,13 @@ hub-backup/{userId}/{chatId}/latest.json
 
 It includes manifest/live base, retained deltas, command state, host assignment, and counters. Retirement deletes the backup and chat-scoped transcript pages.
 
-## Migration and rollback
+## Local-to-Account moves
 
-The importer reads each non-registry row in legacy `snapshots`, joins continuation entries into semantic messages, imports messages and commands in one transaction, and records SHA-256 over canonical JSON `(messages, commands)`. It then reads SQLite back and requires the same hash and counts. Re-running is idempotent. Source snapshots are never deleted by import.
-
-Stopped-world command:
-
-```sh
-jolt migrate-sessions
-jolt migrate-sessions --verify-only
-# or repeat an explicit scope:
-jolt migrate-sessions --scope ~/.jolt/scopes/accounts/ORG/USER
-```
-
-Mutation refuses to run while the local engine IPC port is live. Each writable run first creates a consistent `VACUUM INTO` backup under `backups/docs-pre-sessionhub-*.sqlite3`, imports pending snapshots, and prints per-chat counts and hashes. `--verify-only` fails when any legacy snapshot remains unrepresented.
-
-Local-to-Account migration normalizes both stores first. Equal histories retain one chat. Divergent same-ID histories copy Local state to a deterministic conflict chat and preserve both histories; no automatic transcript interleaving occurs.
-
-## Cutover gates
-
-Before switching production aliases away from SessionRoom:
-
-- Rust store/session/engine suites pass;
-- edge typecheck and tests pass;
-- iOS builds and transcript delta tests pass;
-- live Wrangler tests prove host lease, command claim/resolve, engine execution, projection publication, sealed R2 page retrieval, and registry convergence;
-- every scope reports zero pending legacy snapshots and all recorded hashes/counts verify;
-- every hosted chat reaches `protocol_generation = 2`, has `projection_dirty = 0`, and its Hub manifest count matches local SQLite;
-- old `docs.sqlite3`, snapshot rows, and R2/DO backups are retained.
-
-Only after those gates and explicit operator approval may the legacy SessionRoom routes, Loro room client, importer, snapshot rows, and Loro dependencies be removed. Rollback before that point restores the pre-cutover database backup and routes clients back to SessionRoom.
+Equal histories retain one chat. Divergent same-ID histories copy Local state to a deterministic conflict chat and preserve both histories; no automatic transcript interleaving occurs.
 
 ## Source map
 
-- SQLite and importer: `crates/store/src/sessions.rs`
+- Canonical SQLite storage: `crates/store/src/sessions.rs`
 - Host integration: `crates/engine/src/doc_host.rs`
 - Host protocol client: `crates/sync/src/hub.rs`
 - Durable Object: `edge/src/session-hub.ts`

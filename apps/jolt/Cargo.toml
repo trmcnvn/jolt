@@ -26,7 +26,6 @@ required-features = ["cli"]
 jolt-api.workspace = true
 jolt-engine.workspace = true
 jolt-rpc.workspace = true
-jolt-store.workspace = true
 jolt-ui = { workspace = true, optional = true }
 jolt-update.workspace = true
 tokio.workspace = true

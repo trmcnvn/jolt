@@ -50,13 +50,6 @@ jolt-relay = { path = "crates/relay" }
 jolt-update = { path = "crates/update" }
 jolt-ui = { path = "crates/ui" }
 
-# CRDT
-loro = "1.13"
-# Wire protocol for the SessionRoom DO rooms — official Rust twin of the npm
-# `loro-protocol` package the TS edge speaks (same monorepo, byte-identical
-# frames, cross-checked by its js_snapshots tests).
-loro-protocol = "0.3"
-
 # gpui — the wingleeio/zed fork: upstream f14fea9 plus project-specific commits
 # at the pinned revision. a6bf17c fixes BOTH wrap-rule copies (LineWrapper +
 # line_layout's shaped-text duplicate); 14baea0 adds the EdgeFade primitive

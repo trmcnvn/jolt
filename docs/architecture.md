@@ -62,12 +62,11 @@ The SwiftUI app maintains a local workspace-registry replica and a byte-bounded 
 
 ### Edge
 
-`edge/` is a TypeScript Cloudflare Worker with four Durable Object classes during cutover:
+`edge/` is a TypeScript Cloudflare Worker with three Durable Object classes:
 
 - **RegistryRoom:** current-state workspace rows and per-field last-write-wins merge.
 - **SessionHub:** per-chat immutable host assignment, fenced command mailbox, bounded transcript projections, and backups; it has no CRDT or WASM runtime.
 - **DeviceRoom:** one host socket per engine, client byte relay, durable nudges, and small latest-value sidecars.
-- **SessionRoom:** legacy rollback compatibility until migration approval, then removed.
 
 The Worker verifies WorkOS JWTs or development bearers before stamping identity into Durable Object requests. It also performs WorkOS code exchange/refresh and serves content-addressed attachments and signed release metadata.
 
@@ -84,7 +83,7 @@ The sidebar and session index use a replicated table with four row kinds:
 
 A per-user RegistryRoom is authoritative for current rows. Clients retain an authoritative snapshot plus pending local operations, which are overlaid for optimistic reads and replayed after reconnect. Per-field hybrid logical clocks provide deterministic last-write-wins behavior.
 
-This data is small scalar index state. Transcript content never enters the registry. Chat tombstones also enter a durable artifact-purge queue: the registry retires the chat room and deletes its R2 backup and chat-scoped attachment prefix.
+This data is small scalar index state. Transcript content never enters the registry. Chat tombstones also enter a durable artifact-purge queue: the registry retires the chat's SessionHub and deletes its R2 backup and chat-scoped attachment prefix.
 
 ### Sessions
 
@@ -174,7 +173,7 @@ Default root: `~/.jolt`.
   scopes/accounts/<org>/<user>/
     scope-layout-v1.json
     device-id
-    docs.sqlite3              # canonical sessions, registry cache, rollback snapshots
+    docs.sqlite3              # canonical normalized sessions + registry cache
     usage.sqlite
     journals/*.jsonl
     uploads/
@@ -190,10 +189,10 @@ Scope-isolated stores prevent Local data from entering edge synchronization and 
 | --- | --- |
 | `crates/proto` | Shared entities, agent events, usage, secrets, and pure view derivations |
 | `crates/platform` | Login-shell process environment and suspend/wake detection |
-| `crates/session-doc` | Semantic message/command types and transcript projections; legacy importer during cutover |
+| `crates/session-doc` | Semantic message/command types and transcript projection contracts |
 | `crates/registry-model` | Workspace registry rows, HLC operations, and optimistic local state |
-| `crates/store` | Canonical normalized SQLite sessions, rollback snapshots, and processed-command ledger |
-| `crates/sync` | SessionHub host client and workspace-registry network client; legacy room client during cutover |
+| `crates/store` | Canonical normalized SQLite sessions, registry cache, and processed-command ledger |
+| `crates/sync` | SessionHub host client and workspace-registry network client |
 | `crates/harness` | Common harness trait, controls, environment provider, and test mock |
 | `crates/harness-{claude,codex,pi}` | Isolated production CLI adapters and protocol tests |
 | `crates/mcp` | Loopback MCP host, bearer leases, tool schemas, and backend contract |

@@ -7,7 +7,7 @@
 //! [`jolt_registry_model::RegistryDoc`] under a lock. Wire frames are JSON text —
 //! byte-compatible with `edge/src/registry-room.ts`.
 //!
-//! Liveness discipline is inherited from `room.rs` and its incidents: the
+//! Liveness discipline distinguishes transport from protocol health: the
 //! transport-level text ping elicits a runtime auto-pong that proves NOTHING
 //! about the DO (2026-07-30), so room-level health is judged only by protocol
 //! frames — a probe that goes unanswered past its deadline tears the session
@@ -27,7 +27,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use jolt_registry_model::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
 
-use crate::room::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
+use crate::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
 /// Text `"ping"` keepalive interval (answered by the DO auto-response pair
 /// without waking it — transport liveness only).
@@ -293,7 +293,7 @@ impl RegistryClient {
     /// Connect with a per-dial URL provider (fresh `?token=` every attempt).
     /// Resolves once the initial hello/state handshake lands; a first-attempt
     /// failure is returned as `Err` (callers own the initial-join retry, same
-    /// contract as `RoomClient`). After that the client reconnects itself.
+    /// contract as the other sync clients. After that it reconnects itself.
     pub async fn connect_via(
         provider: Arc<dyn UrlProvider>,
         doc: Arc<Mutex<RegistryDoc>>,

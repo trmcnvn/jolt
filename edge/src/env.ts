@@ -1,11 +1,8 @@
 export interface Env {
-  /** Legacy Loro rooms retained only through verified cutover/rollback. */
-  SESSION_ROOMS: DurableObjectNamespace;
   /** Wasm-free per-chat command and transcript projection hubs. */
   SESSION_HUBS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
-  /** Per-user workspace registries (`reg1/{orgId}/{userId}`) — the row-table
-   * replacement for the Loro workspace doc (docs/sync.md). */
+  /** Per-user workspace registries (`reg1/{orgId}/{userId}`). */
   REGISTRY_ROOMS: DurableObjectNamespace;
   BLOBS: R2Bucket;
   /** Release artifacts (headless tarballs, dmgs, latest.txt) served at
