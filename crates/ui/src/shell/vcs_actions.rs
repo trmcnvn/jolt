@@ -27,6 +27,24 @@ pub(super) struct PendingVcsAction {
     pub target: String,
 }
 
+struct VcsActionTooltip(SharedString);
+
+impl Render for VcsActionTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            .child(self.0.clone())
+    }
+}
+
 fn publication_target(status: &VcsPublicationState) -> Option<&jolt_proto::VcsPublishTarget> {
     match status {
         VcsPublicationState::NoCompletedChanges { target, .. }
@@ -82,8 +100,8 @@ fn quick_action(status: &CheckoutVcsStatus) -> (VcsQuickAction, &'static str, Op
         ),
         VcsPublicationState::NoCompletedChanges { .. } => (
             VcsQuickAction::Disabled,
-            "Up to date",
-            Some("No completed changes to push".into()),
+            "Commit",
+            Some("Branch is up to date. No action needed.".into()),
         ),
         VcsPublicationState::Behind { behind, .. } => (
             VcsQuickAction::Disabled,
@@ -105,6 +123,65 @@ fn quick_action(status: &CheckoutVcsStatus) -> (VcsQuickAction, &'static str, Op
             "Unavailable",
             Some(reason.clone()),
         ),
+    }
+}
+
+fn quick_action_icon(action: VcsQuickAction) -> &'static str {
+    match action {
+        VcsQuickAction::Commit => icons::GIT_COMMIT,
+        VcsQuickAction::CommitAndPush | VcsQuickAction::Push => icons::CLOUD_UPLOAD,
+        VcsQuickAction::Disabled => icons::INFO_CIRCLE,
+    }
+}
+
+fn commit_disabled_reason(
+    status: Option<&CheckoutVcsStatus>,
+    busy: bool,
+    agent_active: bool,
+) -> Option<String> {
+    if busy {
+        return Some("Version-control action in progress.".into());
+    }
+    if agent_active {
+        return Some("Wait for active agent work in this checkout to finish.".into());
+    }
+    match status {
+        None => Some("Version-control status is unavailable.".into()),
+        Some(status) if status.working_copy.files.is_empty() => {
+            Some("Working copy is clean. Make changes before committing.".into())
+        }
+        Some(_) => None,
+    }
+}
+
+fn push_disabled_reason(
+    status: Option<&CheckoutVcsStatus>,
+    busy: bool,
+    agent_active: bool,
+) -> Option<String> {
+    if busy {
+        return Some("Version-control action in progress.".into());
+    }
+    if agent_active {
+        return Some("Wait for active agent work in this checkout to finish.".into());
+    }
+    let Some(status) = status else {
+        return Some("Version-control status is unavailable.".into());
+    };
+    match &status.publication {
+        VcsPublicationState::Ready { .. } => None,
+        VcsPublicationState::NoRemote => Some("No remote is configured.".into()),
+        VcsPublicationState::NoCompletedChanges { .. } => {
+            Some("No completed changes to push.".into())
+        }
+        VcsPublicationState::Behind { behind, .. } => Some(format!(
+            "Remote is {behind} commit(s) ahead. Update the checkout first."
+        )),
+        VcsPublicationState::Diverged { ahead, behind, .. } => Some(format!(
+            "Local is {ahead} commit(s) ahead and {behind} behind. Resolve the divergence first."
+        )),
+        VcsPublicationState::Ambiguous { .. } => Some("Choose a Jolt bookmark below.".into()),
+        VcsPublicationState::Unavailable { reason } => Some(reason.clone()),
     }
 }
 
@@ -141,8 +218,12 @@ impl Shell {
         let target_device_id = (self.state.read(cx).local_device_id.as_deref()
             != Some(device_id.as_str()))
         .then_some(device_id);
+        let initial_load = self.vcs_status_chat.as_deref() != Some(chat_id.as_str())
+            || matches!(self.vcs_status, Loadable::Idle);
         self.vcs_status_chat = Some(chat_id.clone());
-        self.vcs_status = Loadable::Loading;
+        if initial_load {
+            self.vcs_status = Loadable::Loading;
+        }
         self.vcs_status_task = Some(cx.spawn(async move |this, cx| {
             let result = call_api(
                 engine.client(),
@@ -157,10 +238,15 @@ impl Shell {
                     return;
                 }
                 shell.vcs_status_task = None;
-                shell.vcs_status = match result {
-                    Ok(status) => Loadable::Ready(status),
-                    Err(error) => Loadable::Error(error.to_string()),
-                };
+                match result {
+                    Ok(status) => shell.vcs_status = Loadable::Ready(status),
+                    Err(error) if shell.vcs_status.ready().is_none() => {
+                        shell.vcs_status = Loadable::Error(error.to_string());
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "background VCS status refresh failed");
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -443,7 +529,11 @@ impl Shell {
         let (action, label, mut hint) = match &self.vcs_status {
             Loadable::Ready(status) => quick_action(status),
             Loadable::Error(error) => (VcsQuickAction::Disabled, "VCS", Some(error.clone())),
-            Loadable::Idle | Loadable::Loading => (VcsQuickAction::Disabled, "Loading…", None),
+            Loadable::Idle | Loadable::Loading => (
+                VcsQuickAction::Disabled,
+                "Loading…",
+                Some("Loading version-control status.".into()),
+            ),
         };
         let busy = self.vcs_action_task.is_some();
         let agent_active = self.vcs_status.ready().is_some_and(|status| {
@@ -462,21 +552,26 @@ impl Shell {
                     )
             })
         });
-        if agent_active {
-            hint = Some("Wait for active agent work in this checkout to finish".into());
+        if busy {
+            hint = Some("Version-control action in progress.".into());
+        } else if agent_active {
+            hint = Some("Wait for active agent work in this checkout to finish.".into());
         }
         let available = !busy && !agent_active;
         let enabled = action != VcsQuickAction::Disabled && available;
         let menu_open = self.vcs_menu_open;
-        let can_commit = available
-            && self
-                .vcs_status
-                .ready()
-                .is_some_and(|status| !status.working_copy.files.is_empty());
-        let can_push = available
-            && self.vcs_status.ready().is_some_and(|status| {
-                matches!(status.publication, VcsPublicationState::Ready { .. })
-            });
+        let status = self.vcs_status.ready();
+        let commit_reason = commit_disabled_reason(status, busy, agent_active);
+        let push_reason = push_disabled_reason(status, busy, agent_active);
+        let can_commit = commit_reason.is_none();
+        let can_push = push_reason.is_none();
+        let action_icon = quick_action_icon(action);
+        let action_color = if enabled {
+            theme.text
+        } else {
+            theme.text_faint
+        };
+        let primary_hint = if enabled { None } else { hint };
         let mut control = div()
             .relative()
             .h(px(28.0))
@@ -497,11 +592,7 @@ impl Shell {
                     .items_center()
                     .gap(px(5.0))
                     .text_size(px(11.0))
-                    .text_color(if enabled {
-                        theme.text
-                    } else {
-                        theme.text_faint
-                    })
+                    .text_color(action_color)
                     .when(enabled, |button| {
                         button
                             .cursor_pointer()
@@ -510,7 +601,12 @@ impl Shell {
                                 cx.listener(|this, _, _, cx| this.activate_vcs_quick_action(cx)),
                             )
                     })
-                    .child(icon(icons::GIT_BRANCH).size(px(14.0)))
+                    .when_some(primary_hint, |button, hint| {
+                        button.tooltip(move |_, cx| {
+                            cx.new(|_| VcsActionTooltip(hint.clone().into())).into()
+                        })
+                    })
+                    .child(icon(action_icon).size(px(14.0)).text_color(action_color))
                     .child(SharedString::from(if busy { "Working…" } else { label })),
             )
             .child(
@@ -523,16 +619,27 @@ impl Shell {
                     .justify_center()
                     .border_l_1()
                     .border_color(theme.border)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(crate::theme::wash(0.08)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.vcs_menu_open = !this.vcs_menu_open;
-                        cx.notify();
-                    }))
+                    .when(!busy, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(|style| style.bg(crate::theme::wash(0.08)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let opening = !this.vcs_menu_open;
+                                this.vcs_menu_open = opening;
+                                if opening && this.vcs_status_task.is_none() {
+                                    this.refresh_vcs_status(cx);
+                                }
+                                cx.notify();
+                            }))
+                    })
                     .child(
                         icon(icons::CHEVRON_DOWN)
                             .size(px(13.0))
-                            .text_color(theme.text_muted),
+                            .text_color(if busy {
+                                theme.text_faint
+                            } else {
+                                theme.text_muted
+                            }),
                     ),
             );
         if menu_open {
@@ -562,7 +669,16 @@ impl Shell {
                                     this.open_vcs_commit_dialog(false, cx)
                                 }))
                             })
-                            .child(icon(icons::CHECK).size(px(15.0)).text_color(commit_color))
+                            .when_some(commit_reason.clone(), |row, reason| {
+                                row.tooltip(move |_, cx| {
+                                    cx.new(|_| VcsActionTooltip(reason.clone().into())).into()
+                                })
+                            })
+                            .child(
+                                icon(icons::GIT_COMMIT)
+                                    .size(px(15.0))
+                                    .text_color(commit_color),
+                            )
                             .child("Commit…"),
                     )
                     .child(
@@ -574,7 +690,16 @@ impl Shell {
                                     cx.listener(|this, _, _, cx| this.request_vcs_push(None, cx)),
                                 )
                             })
-                            .child(icon(icons::ARROW_UP).size(px(15.0)).text_color(push_color))
+                            .when_some(push_reason.clone(), |row, reason| {
+                                row.tooltip(move |_, cx| {
+                                    cx.new(|_| VcsActionTooltip(reason.clone().into())).into()
+                                })
+                            })
+                            .child(
+                                icon(icons::CLOUD_UPLOAD)
+                                    .size(px(15.0))
+                                    .text_color(push_color),
+                            )
                             .child("Push"),
                     );
             let candidates = self
@@ -605,18 +730,8 @@ impl Shell {
                                 this.request_vcs_push(Some(selected.clone()), cx)
                             }))
                         })
-                        .child(icon(icons::ARROW_UP).size(px(15.0)).text_color(color))
+                        .child(icon(icons::CLOUD_UPLOAD).size(px(15.0)).text_color(color))
                         .child(format!("Push {}", candidate.ref_name)),
-                );
-            }
-            if let Some(hint) = hint {
-                menu = menu.child(popover::menu_separator()).child(
-                    div()
-                        .px(px(9.0))
-                        .py(px(7.0))
-                        .text_size(px(10.0))
-                        .text_color(theme.text_muted)
-                        .child(hint),
                 );
             }
             control = control.child(popover::anchored_menu_below(
