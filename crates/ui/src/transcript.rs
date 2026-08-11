@@ -192,7 +192,7 @@ mod projection;
 use projection::*;
 pub use projection::{
     ParseOutcome, Row, RowKind, ToolItem, chips_height, diff_rows, flavour_seed, flavour_word,
-    format_elapsed, format_timestamp, parse_for_row, rows_for_entry, single_line,
+    format_elapsed, format_timestamp, parse_for_row, rows_for_entry, single_line, tool_activity,
     tool_chip_content, tool_group_summary, top_gap_for,
 };
 
@@ -2027,7 +2027,14 @@ impl Transcript {
         } else {
             visible_tools.clone()
         };
-        let summary = tool_group_summary(tools);
+        let summary = if active {
+            tools.last().map_or_else(
+                || tool_group_summary(tools),
+                |tool| tool_activity(&tool.call, tool.resolved, tool.is_error),
+            )
+        } else {
+            tool_group_summary(tools)
+        };
 
         let toggle_id = row_id.clone();
         let tool_count = tools.len();
@@ -2074,6 +2081,7 @@ impl Transcript {
                     .child(SharedString::from(summary)),
             );
 
+        let first_rendered = rendered_tools.start;
         let chips = div()
             .pt(px(CHIPS_TOP_PAD))
             .flex()
@@ -2082,7 +2090,18 @@ impl Transcript {
             .children(
                 tools[rendered_tools]
                     .iter()
-                    .map(|tool| tool_chip(tool, theme)),
+                    .enumerate()
+                    .map(|(offset, tool)| {
+                        tool_chip(
+                            tool,
+                            theme,
+                            SharedString::from(format!(
+                                "{row_id}-tool-state-{}",
+                                first_rendered + offset
+                            )),
+                            cx,
+                        )
+                    }),
             );
 
         // Fold body: 200ms committed-height tween on a USER toggle only — and
@@ -2346,12 +2365,33 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 /// One tool chip row: a guide rail on the left (continuous across stacked
 /// chips; the rail spans the row's full height, threading the chips to their
 /// group toggle, then the chip card.
-fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
+fn tool_chip(
+    tool: &ToolItem,
+    theme: &Theme,
+    activity_key: SharedString,
+    cx: &mut Context<Transcript>,
+) -> AnyElement {
     let (label, detail) = tool_chip_content(&tool.call);
     let tint = if tool.is_error {
         theme.danger
-    } else {
+    } else if tool.resolved {
         theme.text_muted
+    } else {
+        theme.text
+    };
+    let lifecycle: AnyElement = if tool.is_error {
+        crate::icons::icon(crate::icons::CIRCLE_X)
+            .size(px(13.0))
+            .text_color(theme.danger)
+            .into_any_element()
+    } else if tool.resolved {
+        crate::icons::icon(crate::icons::CHECK)
+            .size(px(13.0))
+            .text_color(theme.success_muted.opacity(0.8))
+            .into_any_element()
+    } else {
+        crate::loaders::activity_spinner(activity_key, theme, 12.0, cx.entity_id(), cx)
+            .into_any_element()
     };
     div()
         .h(px(CHIP_HEIGHT))
@@ -2382,8 +2422,12 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
-                .border_color(crate::theme::hairline(0.07))
-                .bg(crate::theme::ink(0.03))
+                .border_color(crate::theme::hairline(if tool.resolved {
+                    0.07
+                } else {
+                    0.12
+                }))
+                .bg(crate::theme::ink(if tool.resolved { 0.03 } else { 0.055 }))
                 .px(px(8.0))
                 .text_size(px(12.0))
                 .child(
@@ -2421,6 +2465,15 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                             theme.text.opacity(0.85)
                         })
                         .child(SharedString::from(detail)),
+                )
+                .child(
+                    div()
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(lifecycle),
                 ),
         )
         .into_any_element()

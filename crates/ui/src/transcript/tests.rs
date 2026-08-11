@@ -883,6 +883,33 @@ fn tool_chip_labels_per_kind() {
 }
 
 #[test]
+fn tool_activity_uses_concrete_lifecycle_language() {
+    let run = ToolCall::Exec {
+        command: "cargo test".into(),
+    };
+    assert_eq!(tool_activity(&run, false, false), "Running cargo test");
+    assert_eq!(tool_activity(&run, true, false), "Ran cargo test");
+    assert_eq!(tool_activity(&run, true, true), "Run failed · cargo test");
+
+    let plan = ToolCall::Todo {
+        items: vec![
+            jolt_proto::TodoItem {
+                text: "Inspect".into(),
+                done: true,
+            },
+            jolt_proto::TodoItem {
+                text: "Verify".into(),
+                done: false,
+            },
+        ],
+    };
+    assert_eq!(
+        tool_activity(&plan, false, false),
+        "Updating plan · 1/2 done"
+    );
+}
+
+#[test]
 fn multiline_command_flattens_to_one_chip_line() {
     // The user's breaker: a multi-line script in a Run chip. The detail
     // must come out as ONE sanitized line — the chip's fixed 30px card

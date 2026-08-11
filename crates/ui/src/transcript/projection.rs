@@ -701,6 +701,61 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
 // cell grid).
 pub use jolt_proto::view::{single_line, tool_chip_content};
 
+/// A present-tense activity label while a tool is running, or a compact
+/// completed label while the harness moves on to its next step.
+pub fn tool_activity(call: &ToolCall, resolved: bool, is_error: bool) -> String {
+    let (label, detail) = tool_chip_content(call);
+    if is_error {
+        return format!("{label} failed · {detail}");
+    }
+    match call {
+        ToolCall::Exec { .. } => {
+            format!("{} {detail}", if resolved { "Ran" } else { "Running" })
+        }
+        ToolCall::ReadFile { .. } => {
+            format!("{} {detail}", if resolved { "Read" } else { "Reading" })
+        }
+        ToolCall::WriteFile { .. } => {
+            format!("{} {detail}", if resolved { "Wrote" } else { "Writing" })
+        }
+        ToolCall::EditFile { .. } => {
+            format!("{} {detail}", if resolved { "Edited" } else { "Editing" })
+        }
+        ToolCall::ApplyPatch { .. } => format!(
+            "{} patch to {detail}",
+            if resolved { "Applied" } else { "Applying" }
+        ),
+        ToolCall::Search { .. } => format!(
+            "{} {detail}",
+            if resolved { "Searched" } else { "Searching" }
+        ),
+        ToolCall::Glob { .. } => {
+            format!("{} {detail}", if resolved { "Found" } else { "Finding" })
+        }
+        ToolCall::WebFetch { .. } => {
+            format!("{} {detail}", if resolved { "Fetched" } else { "Fetching" })
+        }
+        ToolCall::WebSearch { .. } => format!(
+            "{} for {detail}",
+            if resolved { "Searched" } else { "Searching" }
+        ),
+        ToolCall::Todo { .. } => format!(
+            "{} plan · {detail}",
+            if resolved { "Updated" } else { "Updating" }
+        ),
+        ToolCall::SpawnAgent { agent_type } => {
+            let kind = agent_type
+                .as_deref()
+                .filter(|kind| !kind.is_empty())
+                .map_or_else(|| "subagent".to_string(), |kind| format!("{kind} subagent"));
+            format!("{} {kind}", if resolved { "Started" } else { "Starting" })
+        }
+        ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => {
+            format!("{} {detail}", if resolved { "Called" } else { "Calling" })
+        }
+    }
+}
+
 /// Analytic expanded-chips height — no measurement needed for the fold tween.
 pub fn chips_height(count: usize) -> f32 {
     if count == 0 {
