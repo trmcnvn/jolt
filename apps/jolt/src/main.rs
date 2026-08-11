@@ -3,6 +3,7 @@
 // service-managed `jolt headless` only ever loads saved credentials.
 
 mod auth_cli;
+mod data_dir;
 #[cfg(feature = "desktop")]
 mod desktop_engine;
 mod update_cli;
@@ -117,6 +118,7 @@ fn configure_dependency_env() {
 fn main() -> anyhow::Result<()> {
     configure_dependency_env();
     let cli = Cli::parse();
+    let data_dir = data_dir::resolve()?;
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).
     let long_running = matches!(&cli.command, None | Some(Command::Headless));
@@ -134,7 +136,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             "headed"
         };
-        open_log_file(mode)
+        open_log_file(&data_dir, mode)
     } else {
         None
     };
@@ -164,25 +166,25 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
-                let engine = jolt_engine::Engine::new(engine_config_from_env());
+                let engine = jolt_engine::Engine::new(engine_config_from_env(&data_dir));
                 engine.run().await
             })
         }
         Some(Command::Login) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::login(engine_config_from_env()))
+            runtime.block_on(auth_cli::login(engine_config_from_env(&data_dir)))
         }
         Some(Command::Logout) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::logout(engine_config_from_env()))
+            runtime.block_on(auth_cli::logout(engine_config_from_env(&data_dir)))
         }
         Some(Command::Status) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::status(engine_config_from_env()))
+            runtime.block_on(auth_cli::status(engine_config_from_env(&data_dir)))
         }
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+            runtime.block_on(sync_cli(engine_config_from_env(&data_dir).ipc_port))
         }
         Some(Command::RecoverChat {
             source_chat_id,
@@ -191,7 +193,7 @@ fn main() -> anyhow::Result<()> {
         }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(recover_chat(
-                engine_config_from_env().ipc_port,
+                engine_config_from_env(&data_dir).ipc_port,
                 source_chat_id,
                 chat_id,
                 space_id,
@@ -199,17 +201,17 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+            runtime.block_on(update_cli::update(&edge_url_from_env(), &data_dir, check))
         }
         Some(Command::Daemon { command }) => match command {
-            DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
+            DaemonCommand::Install => daemon::install(&data_dir),
             DaemonCommand::Uninstall => daemon::uninstall(),
             DaemonCommand::Start => daemon::start(),
             DaemonCommand::Stop => daemon::stop(),
             DaemonCommand::Restart => daemon::restart(),
             DaemonCommand::Status => daemon::status(),
         },
-        None => run_headed(),
+        None => run_headed(data_dir),
     }
 }
 
@@ -242,14 +244,12 @@ async fn recover_chat(
 }
 
 #[cfg(feature = "desktop")]
-fn run_headed() -> anyhow::Result<()> {
+fn run_headed(data_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let edge_token = std::env::var("JOLT_EDGE_TOKEN").ok();
     // Headed: the UI probes JOLT_IPC_PORT and connects to a running daemon,
     // or embeds the engine in-process (docs/architecture.md).
     jolt_ui::run_app(jolt_ui::UiConfig {
-        data_dir: std::env::var_os("JOLT_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(dirs_data_dir),
+        data_dir,
         ipc_port: std::env::var("JOLT_IPC_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
@@ -265,7 +265,7 @@ fn run_headed() -> anyhow::Result<()> {
 }
 
 #[cfg(not(feature = "desktop"))]
-fn run_headed() -> anyhow::Result<()> {
+fn run_headed(_data_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let current = std::env::current_exe()
         .map_err(|err| anyhow::anyhow!("could not locate the Jolt desktop executable: {err}"))?;
     let packaged = current.with_file_name("jolt-desktop");
@@ -286,13 +286,11 @@ fn run_headed() -> anyhow::Result<()> {
 /// The env-resolved engine configuration shared by `headless`, `login`,
 /// `logout`, and `status` — one resolution so the CLI auth commands always
 /// operate on the exact session the daemon will load.
-fn engine_config_from_env() -> jolt_engine::EngineConfig {
+fn engine_config_from_env(data_dir: &std::path::Path) -> jolt_engine::EngineConfig {
     // Dev-mode bearer (no WorkOS): an explicit token enables sync.
     let edge_token = std::env::var("JOLT_EDGE_TOKEN").ok();
     jolt_engine::EngineConfig {
-        data_dir: std::env::var_os("JOLT_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(dirs_data_dir),
+        data_dir: data_dir.to_path_buf(),
         edge_url: edge_url_from_env(),
         ipc_port: std::env::var("JOLT_IPC_PORT")
             .ok()
@@ -318,11 +316,6 @@ fn harness_from_env() -> jolt_engine::HarnessId {
         Ok("pi") => jolt_engine::HarnessId::Pi,
         _ => jolt_engine::HarnessId::ClaudeCode,
     }
-}
-
-fn dirs_data_dir() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME").expect("HOME not set");
-    std::path::PathBuf::from(home).join(".jolt")
 }
 
 /// `jolt sync`: dial the running engine's IPC and print per-room sync state.
@@ -464,12 +457,8 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
 /// the exact moment they were needed). A launch that finds the canonical file
 /// locked logs to `jolt-{mode}.{pid}.log` instead; the next lock-holding
 /// launch sweeps pid-suffixed files older than a week.
-fn open_log_file(mode: &str) -> Option<std::fs::File> {
-    let dir = std::env::var_os("JOLT_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(dirs_data_dir)
-        .join("logs");
-    open_log_file_in(&dir, mode)
+fn open_log_file(data_dir: &std::path::Path, mode: &str) -> Option<std::fs::File> {
+    open_log_file_in(&data_dir.join("logs"), mode)
 }
 
 /// Dir-parameterized body of [`open_log_file`] (unit-testable without env).

@@ -3,9 +3,9 @@
 //! Repos are device-local (paths differ per machine), so the known set is a plain
 //! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Git worktrees
-//! are created under `~/.jolt/worktrees/<repoName>/<worktreeName>`, with an
+//! are created under `{data_dir}/worktrees/<repoName>/<worktreeName>`, with an
 //! auto-generated name and matching `jolt/<name>` branch. JJ workspaces use
-//! `~/.jolt/workspaces/<repoName>/<workspaceName>`. `JOLT_WORKTREES_DIR` and
+//! `{data_dir}/workspaces/<repoName>/<workspaceName>`. `JOLT_WORKTREES_DIR` and
 //! `JOLT_WORKSPACES_DIR` override those roots.
 //!
 //! VCS access is via subprocess (`tokio::process`). Exactly one device-local
@@ -128,21 +128,20 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// Where new worktrees live. Deliberately NOT under the backend data dir —
-/// worktrees are user-facing working checkouts. `JOLT_WORKTREES_DIR` overrides
-/// (test isolation); empty reads as unset.
-fn default_worktrees_root() -> PathBuf {
+/// Where new worktrees live. They are user-facing working checkouts under the
+/// installation's platform-native data root unless explicitly overridden.
+fn default_worktrees_root(data_dir: &Path) -> PathBuf {
     std::env::var_os("JOLT_WORKTREES_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".jolt").join("worktrees"))
+        .unwrap_or_else(|| data_dir.join("worktrees"))
 }
 
-fn default_workspaces_root() -> PathBuf {
+fn default_workspaces_root(data_dir: &Path) -> PathBuf {
     std::env::var_os("JOLT_WORKSPACES_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".jolt").join("workspaces"))
+        .unwrap_or_else(|| data_dir.join("workspaces"))
 }
 
 struct ReposInner {
@@ -163,14 +162,14 @@ pub struct Repos {
 }
 
 impl Repos {
-    /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
-    /// comes from `$JOLT_WORKTREES_DIR` or `~/.jolt/worktrees`.
+    /// `data_dir` holds `repos.json` + cloned/created repos; worktree and JJ
+    /// workspace roots default beneath it unless their overrides are set.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
         Self::with_roots(
             data_dir,
             device_id,
-            default_worktrees_root(),
-            default_workspaces_root(),
+            default_worktrees_root(data_dir),
+            default_workspaces_root(data_dir),
             false,
         )
     }

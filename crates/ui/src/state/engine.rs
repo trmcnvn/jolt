@@ -7,7 +7,7 @@ use jolt_rpc::RpcClient;
 /// Everything needed to reach (or start) an engine.
 #[derive(Debug, Clone)]
 pub struct EngineBootConfig {
-    /// Data directory for the embedded engine (`~/.jolt`).
+    /// Platform-native data directory for the embedded engine.
     pub data_dir: PathBuf,
     /// Localhost IPC port to dial / serve.
     pub ipc_port: u16,

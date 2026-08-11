@@ -3,13 +3,14 @@
 #
 #   curl -fsSL https://jolt.trmcnvn.dev/install.sh | sh
 #
-# Installs the UI-free CLI/engine and desktop app to ~/.jolt/app, puts `jolt`
-# on PATH, adds a desktop launcher, and — once you've
-# signed in — runs it as a systemd user service that survives reboots.
-# Re-running upgrades in place; ~/.jolt state is preserved.
+# Installs the UI-free CLI/engine and desktop app under Jolt's XDG data root,
+# puts `jolt` on PATH, adds a desktop launcher, and — once you've signed in —
+# runs it as a systemd user service that survives reboots. Re-running upgrades
+# in place preserves application state.
 #
 # The binary ships with production endpoints baked in: no JOLT_EDGE_URL or
-# client-id configuration needed. Overrides (if any) go in ~/.jolt/env.
+# client-id configuration needed. Overrides (if any) go in the data root's
+# `env` file.
 set -eu
 
 BASE="${JOLT_BASE_URL:-https://jolt.trmcnvn.dev}"
@@ -42,7 +43,26 @@ esac
 ver="$(curl -fsSL "$BASE/releases/latest.txt" | tr -d '[:space:]')"
 [ -n "$ver" ] || { echo "jolt install: could not resolve latest version" >&2; exit 1; }
 file="jolt-$ver-$plat-$arch.tar.gz"
-data_root="$HOME/.jolt"
+if [ -n "${JOLT_DATA_DIR:-}" ]; then
+  data_root="$JOLT_DATA_DIR"
+else
+  case "${XDG_DATA_HOME:-}" in
+    /*) platform_data_root="$XDG_DATA_HOME/jolt" ;;
+    *) platform_data_root="$HOME/.local/share/jolt" ;;
+  esac
+  legacy_data_root="$HOME/.jolt"
+  # Do not move a live legacy engine out from under itself. Install this release
+  # there; its first lock-free startup performs the migration and leaves a
+  # compatibility symlink for this installer and existing service units.
+  if [ -e "$platform_data_root" ] && [ -d "$legacy_data_root" ] && [ ! -L "$legacy_data_root" ]; then
+    echo "jolt install: both '$legacy_data_root' and '$platform_data_root' exist; move or remove one first." >&2
+    exit 1
+  elif [ ! -e "$platform_data_root" ] && [ -d "$legacy_data_root" ] && [ ! -L "$legacy_data_root" ]; then
+    data_root="$legacy_data_root"
+  else
+    data_root="$platform_data_root"
+  fi
+fi
 app_root="$data_root/app"
 dest="$app_root/$ver"
 tmp=""
@@ -64,7 +84,10 @@ mkdir -p "$HOME/.local/bin"
 ln -sf "$app_root/current/jolt" "$HOME/.local/bin/jolt"
 
 # --- desktop integration -----------------------------------------------------
-data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+case "${XDG_DATA_HOME:-}" in
+  /*) data_home="$XDG_DATA_HOME" ;;
+  *) data_home="$HOME/.local/share" ;;
+esac
 applications_dir="$data_home/applications"
 icon_dir_512="$data_home/icons/hicolor/512x512/apps"
 icon_dir_1024="$data_home/icons/hicolor/1024x1024/apps"
@@ -111,7 +134,17 @@ signed_in=no
 service=manual
 if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
   mkdir -p "$HOME/.config/systemd/user"
-  cat >"$HOME/.config/systemd/user/jolt.service" <<'UNIT'
+  service_exec="$(printf '%s' "$app_root/current/jolt" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')"
+  service_env="$(printf '%s' "$data_root/env" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')"
+  service_data_environment=""
+  if [ -n "${JOLT_DATA_DIR:-}" ]; then
+    service_data_value="$(printf '%s' "$JOLT_DATA_DIR" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    service_data_environment="Environment=\"JOLT_DATA_DIR=$service_data_value\""
+  elif [ -n "${XDG_DATA_HOME:-}" ]; then
+    service_data_value="$(printf '%s' "$XDG_DATA_HOME" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    service_data_environment="Environment=\"XDG_DATA_HOME=$service_data_value\""
+  fi
+  cat >"$HOME/.config/systemd/user/jolt.service" <<UNIT
 [Unit]
 Description=Jolt headless engine
 After=network-online.target
@@ -119,10 +152,11 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-ExecStart=%h/.jolt/app/current/jolt headless
+$service_data_environment
+ExecStart="$service_exec" headless
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=-%h/.jolt/env
+EnvironmentFile=-"$service_env"
 
 [Install]
 WantedBy=default.target

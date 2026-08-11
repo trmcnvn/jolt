@@ -57,7 +57,8 @@ Each device uses one command-line VCS backend. Jolt selects Jujutsu 0.43+
 when available, then falls back to Git; the active backend can be changed per
 device under **Settings → Version control**. `JOLT_JJ_EXECUTABLE` and
 `JOLT_GIT_EXECUTABLE` override executable discovery. Jolt-created JJ workspaces
-live under `~/.jolt/workspaces` (`JOLT_WORKSPACES_DIR` overrides the root).
+live under the platform data directory's `workspaces` folder
+(`JOLT_WORKSPACES_DIR` overrides the root).
 
 ## Comet
 

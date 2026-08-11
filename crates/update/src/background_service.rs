@@ -177,6 +177,7 @@ pub fn relaunch_after_exit() -> anyhow::Result<()> {
 /// default PATH won't find); the `JOLT_*`/logging vars only when set.
 const CAPTURED_ENV: &[&str] = &[
     "PATH",
+    "XDG_DATA_HOME",
     "JOLT_DATA_DIR",
     "JOLT_EDGE_URL",
     "JOLT_EDGE_TOKEN",
@@ -189,6 +190,7 @@ const CAPTURED_ENV: &[&str] = &[
     "JOLT_PI_EXECUTABLE",
     "JOLT_JJ_EXECUTABLE",
     "JOLT_GIT_EXECUTABLE",
+    "JOLT_WORKTREES_DIR",
     "JOLT_WORKSPACES_DIR",
     "JOLT_DEVICE_NAME",
     "RUST_LOG",
@@ -218,7 +220,7 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
     } else if cfg!(target_os = "linux") {
         let unit = systemd_unit_path()?;
         std::fs::create_dir_all(unit.parent().expect("systemd user dir"))?;
-        std::fs::write(&unit, render_systemd_unit(&exe, &env))?;
+        std::fs::write(&unit, render_systemd_unit(&exe, &env, data_dir))?;
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT])?;
         println!("Installed and started {SYSTEMD_UNIT} ({}).", unit.display());
@@ -380,7 +382,7 @@ fn captured_env() -> Vec<(String, String)> {
         .collect()
 }
 
-fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
+fn render_systemd_unit(exe: &Path, env: &[(String, String)], data_dir: &Path) -> String {
     // The start limit must actually trip on the "run `jolt login` first"
     // fail-fast exit (5 × RestartSec=5 lands inside the 60s window) — otherwise
     // a signed-out daemon restart-loops forever.
@@ -394,29 +396,33 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
-        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.jolt/env\n\n[Install]\nWantedBy=default.target\n",
-        systemd_exec_path(exe)
+        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-{}\n\n[Install]\nWantedBy=default.target\n",
+        systemd_quote(&systemd_exec_path(exe)),
+        systemd_quote(&data_dir.join("env").to_string_lossy())
     ));
     unit
 }
 
-/// The ExecStart binary path. An exe under `~/.jolt/app/` came from the
-/// curl|sh installer, whose upgrades relink `app/current` — point the unit at
-/// the symlink (as the installer's own unit does) so it never pins one version.
-/// (`current_exe` resolves symlinks, so the versioned dir is what we see here.)
+/// The ExecStart binary path. A managed executable lives in a versioned
+/// directory, so point the unit back at `current` rather than pinning a release.
 fn systemd_exec_path(exe: &Path) -> String {
-    exec_path_for(exe, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+    let app_root = crate::managed_app_root(exe);
+    systemd_exec_path_from(exe, app_root.as_deref())
 }
 
-fn exec_path_for(exe: &Path, home: Option<&Path>) -> String {
-    let installed = home
-        .map(|home| home.join(".jolt/app"))
-        .is_some_and(|app_root| exe.starts_with(app_root));
-    if installed {
-        "%h/.jolt/app/current/jolt".to_string()
-    } else {
-        format!("{}", exe.display())
-    }
+fn systemd_exec_path_from(exe: &Path, app_root: Option<&Path>) -> String {
+    app_root.map_or_else(
+        || exe.to_string_lossy().into_owned(),
+        |app_root| app_root.join("current/jolt").to_string_lossy().into_owned(),
+    )
+}
+
+fn systemd_quote(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
 }
 
 fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> String {
@@ -558,14 +564,15 @@ mod tests {
                 ("JOLT_EDGE_URL".into(), "https://edge.example".into()),
                 ("RUST_LOG".into(), "info,jolt=\"debug\"".into()),
             ],
+            Path::new("/home/u/.local/share/jolt"),
         );
-        assert!(unit.contains("ExecStart=/usr/local/bin/jolt headless\n"));
+        assert!(unit.contains("ExecStart=\"/usr/local/bin/jolt\" headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
         assert!(unit.contains("Environment=\"JOLT_EDGE_URL=https://edge.example\"\n"));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,jolt=\\\"debug\\\"\"\n"));
         assert!(unit.contains("Restart=on-failure"));
-        assert!(unit.contains("EnvironmentFile=-%h/.jolt/env"));
+        assert!(unit.contains("EnvironmentFile=-\"/home/u/.local/share/jolt/env\""));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
@@ -573,19 +580,17 @@ mod tests {
     fn installed_exe_uses_the_current_symlink() {
         // Installer-managed binary (current_exe resolves the `current` symlink to
         // the versioned dir): the unit must point back at the symlink.
+        let app_root = Path::new("/home/u/.local/share/jolt/app");
         assert_eq!(
-            exec_path_for(
-                Path::new("/home/u/.jolt/app/0.3.0/jolt"),
-                Some(Path::new("/home/u")),
+            systemd_exec_path_from(
+                Path::new("/home/u/.local/share/jolt/app/0.3.0/jolt"),
+                Some(app_root),
             ),
-            "%h/.jolt/app/current/jolt"
+            "/home/u/.local/share/jolt/app/current/jolt"
         );
         // Source build: literal path.
         assert_eq!(
-            exec_path_for(
-                Path::new("/src/target/debug/Jolt"),
-                Some(Path::new("/home/u"))
-            ),
+            systemd_exec_path_from(Path::new("/src/target/debug/Jolt"), None),
             "/src/target/debug/Jolt"
         );
     }

@@ -8,7 +8,7 @@
 //! digest for every artifact.
 //!
 //! Install kinds and their update paths:
-//! - **Managed** (`~/.jolt/app/<ver>` + `current` symlink — the curl|sh
+//! - **Managed** (`{data_dir}/app/<ver>` + `current` symlink — the curl|sh
 //!   installer): download the headless tarball into a new versioned dir, flip
 //!   the symlink, refresh Linux desktop integration, and restart the service.
 //!   Same flow the installer script performs, natively.
@@ -138,7 +138,7 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
 /// How this binary was installed — decides the update path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallKind {
-    /// `~/.jolt/app/<ver>/jolt` behind the `current` symlink
+    /// `<data-dir>/app/<ver>/jolt` behind the `current` symlink
     /// (curl|sh installer / a previous `jolt update`).
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
@@ -151,17 +151,40 @@ pub fn detect_install() -> InstallKind {
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Unmanaged;
     };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    detect_install_from(&exe, home.as_deref())
+    detect_install_from(&exe, &managed_app_roots())
 }
 
-fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
-    if let Some(home) = home {
-        // `current_exe` resolves the `current` symlink to the versioned dir.
-        let app_root = home.join(".jolt").join("app");
-        if exe.starts_with(&app_root) {
-            return InstallKind::Managed { app_root };
+fn managed_app_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(data_dir) = std::env::var_os("JOLT_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        roots.push(data_dir.join("app"));
+    } else if let Ok(data_dir) = jolt_platform::data_dir::default_data_dir() {
+        roots.push(data_dir.join("app"));
+    }
+    if let Ok(legacy) = jolt_platform::data_dir::legacy_data_dir() {
+        let legacy = legacy.join("app");
+        if !roots.contains(&legacy) {
+            roots.push(legacy);
         }
+    }
+    roots
+}
+
+fn managed_app_root_from(exe: &Path, app_roots: &[PathBuf]) -> Option<PathBuf> {
+    // `current_exe` resolves the `current` symlink to the versioned dir.
+    app_roots.iter().find(|root| exe.starts_with(root)).cloned()
+}
+
+pub(crate) fn managed_app_root(exe: &Path) -> Option<PathBuf> {
+    managed_app_root_from(exe, &managed_app_roots())
+}
+
+fn detect_install_from(exe: &Path, app_roots: &[PathBuf]) -> InstallKind {
+    if let Some(app_root) = managed_app_root_from(exe, app_roots) {
+        return InstallKind::Managed { app_root };
     }
     for ancestor in exe.ancestors() {
         if ancestor.extension().is_some_and(|ext| ext == "app")
@@ -839,11 +862,21 @@ mod tests {
 
     #[test]
     fn install_kind_detection() {
+        let app_roots = vec![
+            PathBuf::from("/home/u/.local/share/jolt/app"),
+            PathBuf::from("/home/u/.jolt/app"),
+        ];
         assert_eq!(
             detect_install_from(
-                Path::new("/home/u/.jolt/app/0.1.1/jolt"),
-                Some(Path::new("/home/u")),
+                Path::new("/home/u/.local/share/jolt/app/0.1.1/jolt"),
+                &app_roots,
             ),
+            InstallKind::Managed {
+                app_root: PathBuf::from("/home/u/.local/share/jolt/app")
+            }
+        );
+        assert_eq!(
+            detect_install_from(Path::new("/home/u/.jolt/app/0.1.1/jolt"), &app_roots),
             InstallKind::Managed {
                 app_root: PathBuf::from("/home/u/.jolt/app")
             }
@@ -851,7 +884,7 @@ mod tests {
         assert_eq!(
             detect_install_from(
                 Path::new("/Applications/Jolt.app/Contents/MacOS/Jolt"),
-                Some(Path::new("/Users/u")),
+                &app_roots,
             ),
             InstallKind::MacApp {
                 bundle: PathBuf::from("/Applications/Jolt.app")
@@ -859,14 +892,11 @@ mod tests {
         );
         // A path merely containing `.app` without the bundle layout is not a bundle.
         assert_eq!(
-            detect_install_from(Path::new("/tmp/foo.app/jolt"), None),
+            detect_install_from(Path::new("/tmp/foo.app/jolt"), &app_roots),
             InstallKind::Unmanaged
         );
         assert_eq!(
-            detect_install_from(
-                Path::new("/src/target/release/Jolt"),
-                Some(Path::new("/home/u"))
-            ),
+            detect_install_from(Path::new("/src/target/release/Jolt"), &app_roots),
             InstallKind::Unmanaged
         );
     }

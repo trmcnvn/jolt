@@ -6,13 +6,15 @@ Jolt works without environment configuration in production. Variables are primar
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `JOLT_DATA_DIR` | `~/.jolt` | Engine stores, auth session, UI settings, logs, uploads, and managed update staging |
+| `JOLT_DATA_DIR` | platform data directory | Engine stores, auth session, UI settings, logs, uploads, and managed update staging |
 | `JOLT_EDGE_URL` | `https://edge.jolt.trmcnvn.dev` | Worker base URL for auth, sync, relay, attachments, and releases |
 | `JOLT_IPC_PORT` | `27654` | Localhost engine RPC port probed by the desktop and served by engines |
 | `JOLT_CALLBACK_PORT` | `27641` | Preferred headed WorkOS loopback callback port |
 | `JOLT_DEVICE_NAME` | hostname | Display name stamped into this engine's device row |
 | `JOLT_HARNESS` | `claude-code` | Fallback harness for chats without config; supported production values are `claude-code`, `codex`, and `pi` (`mock` is for tests/demo) |
 | `RUST_LOG` | mode-specific | `tracing_subscriber` filter; long-running modes default to info |
+
+The default data directory is `$XDG_DATA_HOME/jolt` on Linux (normally `~/.local/share/jolt`) and `~/Library/Application Support/Jolt` on macOS. On first lock-free startup, Jolt moves an existing default `~/.jolt` directory there, using a staged copy when the roots span filesystems, and leaves a compatibility symlink. An explicit `JOLT_DATA_DIR` is used as-is and never migrated.
 
 Changing `JOLT_DATA_DIR` creates a distinct device identity, auth session, repository registry, and local usage store unless data is copied intentionally.
 
@@ -46,11 +48,11 @@ With WorkOS disabled and no edge token, the engine opens the offline Local scope
 | `JOLT_PI_EXECUTABLE` | Absolute path to a non-standard Pi executable |
 | `JOLT_JJ_EXECUTABLE` | Override Jujutsu executable discovery |
 | `JOLT_GIT_EXECUTABLE` | Override Git executable discovery |
-| `JOLT_WORKTREES_DIR` | Root for Jolt-created Git worktrees; default `~/.jolt/worktrees` |
-| `JOLT_WORKSPACES_DIR` | Root for Jolt-created Jujutsu workspaces; default `~/.jolt/workspaces` |
+| `JOLT_WORKTREES_DIR` | Root for Jolt-created Git worktrees; default `{data_dir}/worktrees` |
+| `JOLT_WORKSPACES_DIR` | Root for Jolt-created Jujutsu workspaces; default `{data_dir}/workspaces` |
 | `JOLT_NO_LOGIN_SHELL` | Any non-empty value disables the login-shell PATH snapshot |
 
-Harnesses also inspect the process PATH, a login-shell PATH snapshot, and common fnm/nvm/Volta/Bun/pnpm locations. `jolt daemon install` captures the current PATH and selected Jolt variables into the service definition.
+Harnesses also inspect the process PATH, a login-shell PATH snapshot, and common fnm/nvm/Volta/Bun/pnpm locations. `jolt daemon install` captures the current PATH, `XDG_DATA_HOME`, and selected Jolt variables into the service definition.
 
 For arbitrary API keys or service credentials that should reach only selected agent CLIs, use **Settings → Secrets** instead of Jolt process variables.
 
@@ -69,6 +71,7 @@ Debug builds contain additional UI/render/test knobs (`JOLT_FRAME_STATS`, `JOLT_
 
 ```text
 PATH
+XDG_DATA_HOME
 JOLT_DATA_DIR
 JOLT_EDGE_URL
 JOLT_EDGE_TOKEN
@@ -81,12 +84,13 @@ JOLT_HARNESS
 JOLT_PI_EXECUTABLE
 JOLT_JJ_EXECUTABLE
 JOLT_GIT_EXECUTABLE
+JOLT_WORKTREES_DIR
 JOLT_WORKSPACES_DIR
 JOLT_DEVICE_NAME
 RUST_LOG
 ```
 
-On Linux, the generated unit also reads `~/.jolt/env` if it exists. After changing captured values, reinstall the daemon unit or update its environment file and restart it.
+On Linux, the generated unit also reads `{data_dir}/env` if it exists. After changing captured values, reinstall the daemon unit or update its environment file and restart it.
 
 ## Edge variables and secrets
 

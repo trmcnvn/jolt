@@ -106,7 +106,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Data directory (default `~/.jolt`, dev `~/.jolt-dev`).
+    /// Platform-native data directory (or an explicit `JOLT_DATA_DIR`).
     pub data_dir: PathBuf,
     /// Edge base URL.
     pub edge_url: String,

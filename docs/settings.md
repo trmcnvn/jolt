@@ -120,4 +120,4 @@ Custom themes are stored individually in `{data_dir}/themes/<uuid>.json`. These 
 
 New-thread composer defaults are stored separately in `{data_dir}/composer-defaults.json`. Corrupt or missing settings files fall back to defaults; numeric layout values are clamped on load.
 
-The default data directory is `~/.jolt`. Set `JOLT_DATA_DIR` to isolate another installation.
+The default data directory is `$XDG_DATA_HOME/jolt` on Linux (normally `~/.local/share/jolt`) and `~/Library/Application Support/Jolt` on macOS. Jolt migrates an existing default `~/.jolt` root on the first startup that can acquire its engine lock. Set `JOLT_DATA_DIR` to isolate another installation or bypass default-path migration.

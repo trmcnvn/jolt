@@ -3796,6 +3796,7 @@ dependencies = [
  "futures",
  "jolt-api",
  "jolt-engine",
+ "jolt-platform",
  "jolt-rpc",
  "jolt-ui",
  "jolt-update",
@@ -4129,6 +4130,7 @@ version = "0.1.13"
 dependencies = [
  "anyhow",
  "futures",
+ "jolt-platform",
  "reqwest",
  "serde",
  "serde_json",

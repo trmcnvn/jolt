@@ -46,7 +46,7 @@ jolt daemon start
 
 `login` and `logout` take the same data-directory lock as the engine. If the desktop app or daemon is running, use its UI or stop it first.
 
-The saved WorkOS session is `~/.jolt/session.json` by default and is written with owner-only permissions. Organization setup is automatic and requires exactly zero or one active membership.
+The saved WorkOS session is `{data_dir}/session.json` and is written with owner-only permissions. Organization setup is automatic and requires exactly zero or one active membership.
 
 ## Daemon management
 
@@ -64,7 +64,7 @@ jolt daemon status
 - **Linux:** installs `~/.config/systemd/user/jolt.service`, enables it, and starts it.
 - **macOS:** installs `~/Library/LaunchAgents/dev.trmcnvn.jolt.plist`, bootstraps it, and starts it.
 
-Installation captures `PATH`, supported `JOLT_*` variables, and `RUST_LOG` from the current shell. Linux also reads optional overrides from `~/.jolt/env` through the systemd unit.
+Installation captures `PATH`, `XDG_DATA_HOME`, supported `JOLT_*` variables, and `RUST_LOG` from the current shell. Linux also reads optional overrides from `{data_dir}/env` through the systemd unit.
 
 For Linux logs:
 
@@ -72,13 +72,13 @@ For Linux logs:
 journalctl --user -u jolt.service -f
 ```
 
-For the macOS LaunchAgent, the default service log is `~/.jolt/daemon.log`.
+For the macOS LaunchAgent, the default service log is `{data_dir}/daemon.log`.
 
 ## Updates
 
 Jolt polls the edge release manifest every six hours after startup. The UI reports available versions and can update a packaged macOS app or a managed remote device. Restarting after a macOS app update also restarts an installed background engine so both processes load the same release.
 
-Managed Linux installs use versioned directories under `~/.jolt/app/<version>` and an atomic `current` symlink. Downloads are verified against the release manifest's SHA-256 when present. On startup, the active version refreshes its desktop launcher and icon, including for installations created before desktop integration was available.
+Managed Linux installs use versioned directories under `{data_dir}/app/<version>` and an atomic `current` symlink. Downloads are verified against the release manifest's SHA-256 when present. On startup, the active version refreshes its desktop launcher and icon, including for installations created before desktop integration was available.
 
 Managed headless daemons report available releases to signed-in desktops. Updates run only after an explicit **Update** action on **Settings → Devices**, and wait for active runs and terminals to finish before restarting the service.
 
@@ -111,7 +111,7 @@ The command reports:
 
 It requires a running local engine. Use it before restarting a device when diagnosing stale workspace rows or transcripts.
 
-Long-running headed and headless modes also write launch logs under `~/.jolt/logs/` by default. The current and previous launch are retained separately; concurrent processes use PID-suffixed overflow logs rather than rotating a live file.
+Long-running headed and headless modes also write launch logs under `{data_dir}/logs/` by default. The current and previous launch are retained separately; concurrent processes use PID-suffixed overflow logs rather than rotating a live file.
 
 ## Configuration
 
