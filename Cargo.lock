@@ -3789,7 +3789,7 @@ dependencies = [
 
 [[package]]
 name = "jolt"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "clap",
@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-api"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "bytes",
  "jolt-proto",
@@ -3826,7 +3826,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-engine"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3872,7 +3872,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-harness"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3886,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-harness-claude"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "futures",
@@ -3903,7 +3903,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-harness-codex"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "futures",
@@ -3920,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-harness-pi"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "futures",
@@ -3940,7 +3940,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-mcp"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "axum",
  "futures",
@@ -3958,7 +3958,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-platform"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "libc",
  "tempfile",
@@ -3968,7 +3968,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-proto"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "serde",
@@ -3977,7 +3977,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-registry-model"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "jolt-proto",
@@ -3989,7 +3989,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-relay"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4008,7 +4008,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-rpc"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4024,7 +4024,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-session-doc"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "jolt-proto",
@@ -4036,7 +4036,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-store"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "jolt-session-doc",
  "rusqlite",
@@ -4048,7 +4048,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-sync"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "futures",
@@ -4072,7 +4072,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-terminal"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base64 0.23.1",
  "jolt-proto",
@@ -4088,7 +4088,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-ui"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4126,7 +4126,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-update"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "futures",
@@ -4142,7 +4142,7 @@ dependencies = [
 
 [[package]]
 name = "jolt-vcs"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "ignore",
