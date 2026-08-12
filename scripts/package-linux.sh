@@ -40,6 +40,8 @@ fi
 install -m 644 "$ROOT/dist/jolt.desktop" "$STAGE/jolt.desktop"
 install -m 644 "$ROOT/dist/jolt-512.png" "$STAGE/jolt-512.png"
 install -m 644 "$ROOT/dist/jolt.png" "$STAGE/jolt.png"
+install -m 644 "$ROOT/LICENSE" "$STAGE/LICENSE"
+install -m 644 "$ROOT/THIRD_PARTY_LICENSES.md" "$STAGE/THIRD_PARTY_LICENSES.md"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
@@ -51,6 +53,8 @@ install -Dm755 "$HERE/jolt-desktop" "$HOME/.local/bin/jolt-desktop"
 install -Dm644 "$HERE/jolt.desktop" "$HOME/.local/share/applications/jolt.desktop"
 install -Dm644 "$HERE/jolt-512.png" "$HOME/.local/share/icons/hicolor/512x512/apps/jolt.png"
 install -Dm644 "$HERE/jolt.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/jolt.png"
+install -Dm644 "$HERE/LICENSE" "$HOME/.local/share/doc/jolt/LICENSE"
+install -Dm644 "$HERE/THIRD_PARTY_LICENSES.md" "$HOME/.local/share/doc/jolt/THIRD_PARTY_LICENSES.md"
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$HOME/.local/share/applications" || true
 echo "Installed. Make sure ~/.local/bin is on your PATH."

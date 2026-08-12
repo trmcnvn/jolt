@@ -61,6 +61,9 @@ rm -rf "$APP" "$DMG" "$APP_TARBALL" "$NOTARY_ARCHIVE"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/Jolt" "$APP/Contents/MacOS/Jolt"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
+install -m 644 "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
+install -m 644 "$ROOT/THIRD_PARTY_LICENSES.md" \
+  "$APP/Contents/Resources/THIRD_PARTY_LICENSES.md"
 
 # Icon: iconset generated from the Jolt distribution artwork.
 ICONSET="$OUT_DIR/jolt.iconset"

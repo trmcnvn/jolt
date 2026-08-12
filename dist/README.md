@@ -13,7 +13,8 @@ Produces `target/package/jolt-<version>-linux-<arch>.tar.gz` containing:
 - `jolt-desktop` — desktop application
 - `jolt.desktop` — XDG desktop entry
 - `jolt-512.png` and `jolt.png` — 512×512 and 1024×1024 app icons (vector source `jolt.svg`)
-- `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
+- `LICENSE` and `THIRD_PARTY_LICENSES.md` — Jolt and bundled-work notices
+- `install.sh` — installs into `~/.local/{bin,share}`
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 `strip = "symbols"` for distribution builds.

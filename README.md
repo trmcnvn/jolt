@@ -1,11 +1,13 @@
 # Jolt
 
-Jolt is a multi-device ADE for Claude Code, Codex, and Pi. Use it locally without an account, or sign in to control your agents from any of your devices.
+Jolt is a local-first ADE for Claude Code, Codex, and Pi. The desktop and
+headless engine work without an account or cloud service; your Local scope
+stays on that device.
 
-The desktop always provides a Local scope that never syncs. When signed in, every device runs a small account engine that keeps your sessions in sync: start an
-agent on one machine, follow and drive it from another. Install the engine as
-a daemon on an always-on machine (a VPS, a spare box) and your agents keep
-working after you close your laptop.
+Remote control and multi-device sync are optional self-hosted capabilities.
+They require a Jolt edge deployment backed by Cloudflare Workers, Durable
+Objects, R2, and WorkOS AuthKit. The public Jolt service does not provide open
+account registration.
 
 ## Install the daemon (Linux)
 
@@ -24,6 +26,25 @@ jolt daemon start|stop|restart|status
 ```
 
 On macOS and Linux desktops, enable **Settings → Devices → Keep this device available** to run the engine in the background. The CLI equivalent is `jolt daemon install`.
+
+## Remote devices and sync
+
+Local mode needs no setup. To use Account mode for remote devices, synchronized
+spaces, and mobile access, deploy your own backend:
+
+1. Create and configure a WorkOS AuthKit environment.
+2. Deploy `edge/` to Cloudflare with its Durable Object classes and R2 buckets.
+3. Configure the Worker’s `WORKOS_CLIENT_ID`, set `WORKOS_API_KEY` as a Wrangler
+   secret, and use `AUTH_MODE=workos` for public deployments.
+4. Point desktop and headless clients at it with `JOLT_EDGE_URL` and
+   `JOLT_WORKOS_CLIENT_ID`. Native mobile builds must use the same endpoints and
+   WorkOS client ID.
+
+The checked-in deployment configuration contains Jolt’s production resource
+names and must be adapted for your own Cloudflare account and domains. See
+[environment variables](docs/environment-variables.md),
+[development](docs/development.md), and [security](docs/security.md) before
+exposing an edge deployment publicly.
 
 ## Agent CLIs
 
