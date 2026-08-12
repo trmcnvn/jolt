@@ -1110,12 +1110,11 @@ impl Transcript {
     fn toggle_fold(&mut self, row_id: SharedString, tool_count: usize, active: bool) {
         let entry = self.folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(false);
-        entry.from = chips_height(visible_tool_range(tool_count, currently_open, active).len());
+        entry.from = chips_height(visible_tool_range(tool_count, currently_open).len());
         entry.open = Some(!currently_open);
         entry.epoch += 1;
-        // Switching between the active preview and the full list changes which
-        // chips are mounted, so animate only inactive groups where clipping is
-        // visually continuous.
+        // Active groups can grow while open, so animate only inactive groups
+        // where clipping is visually continuous.
         entry.toggled_at = (!active).then(Instant::now);
     }
 
@@ -2012,7 +2011,7 @@ impl Transcript {
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(false);
-        let visible_tools = visible_tool_range(tools.len(), open, active);
+        let visible_tools = visible_tool_range(tools.len(), open);
         let target = chips_height(visible_tools.len());
         let animating = !active
             && fold.epoch > 0
@@ -2021,13 +2020,13 @@ impl Transcript {
                 .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
         // Keep all chips mounted while an inactive group collapses so the
         // existing height tween clips its content instead of shrinking blank
-        // space. Active preview toggles do not animate.
+        // space. Active group toggles do not animate.
         let rendered_tools = if animating && fold.from > target {
             0..tools.len()
         } else {
             visible_tools.clone()
         };
-        let summary = if active {
+        let summary = if active && !open {
             tools.last().map_or_else(
                 || tool_group_summary(tools),
                 |tool| tool_activity(&tool.call, tool.resolved, tool.is_error),
@@ -2105,7 +2104,7 @@ impl Transcript {
             );
 
         // Fold body: 200ms committed-height tween on a USER toggle only — and
-        // only within a short window of the click. Active-preview changes and
+        // only within a short window of the click. Active-group toggles and
         // content growth never tween, and a SETTLED fold renders at its static
         // height: leaving the tween armed replayed it on every remount, which
         // in a virtualized list means every scroll-back-into-view (only `open`

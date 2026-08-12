@@ -1004,11 +1004,10 @@ fn chips_height_is_analytic() {
 }
 
 #[test]
-fn collapsed_active_tool_group_previews_only_the_latest_tool() {
-    assert_eq!(visible_tool_range(4, false, true), 3..4);
-    assert_eq!(visible_tool_range(4, false, false), 4..4);
-    assert_eq!(visible_tool_range(4, true, true), 0..4);
-    assert_eq!(visible_tool_range(0, false, true), 0..0);
+fn collapsed_tool_groups_hide_redundant_chip_previews() {
+    assert_eq!(visible_tool_range(4, false), 4..4);
+    assert_eq!(visible_tool_range(4, true), 0..4);
+    assert_eq!(visible_tool_range(0, false), 0..0);
 }
 
 #[test]

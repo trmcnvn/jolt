@@ -42,8 +42,8 @@ pub enum RowKind {
     },
     ToolGroup {
         tools: Arc<Vec<ToolItem>>,
-        /// This is the trailing tool group of a streaming reply. Collapsed
-        /// active groups preview their latest tool instead of opening fully.
+        /// This is the trailing tool group of a streaming reply. Its collapsed
+        /// header describes the latest tool's concrete activity.
         active: bool,
     },
     /// Compact, immutable filesystem delta for the owning assistant entry.
@@ -764,16 +764,10 @@ pub fn chips_height(count: usize) -> f32 {
     CHIPS_TOP_PAD + count as f32 * CHIP_HEIGHT + (count as f32 - 1.0) * CHIP_GAP
 }
 
-/// Tools visible for a group's current fold state. Collapsed active groups
-/// retain only the latest chip; inactive groups retain none.
-pub(super) fn visible_tool_range(count: usize, open: bool, active: bool) -> Range<usize> {
-    if open {
-        0..count
-    } else if active && count > 0 {
-        count - 1..count
-    } else {
-        count..count
-    }
+/// Tools visible for a group's current fold state. Collapsed groups rely on
+/// their header for activity and summary details instead of repeating a chip.
+pub(super) fn visible_tool_range(count: usize, open: bool) -> Range<usize> {
+    if open { 0..count } else { count..count }
 }
 
 // ---------------------------------------------------------------------------
